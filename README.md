@@ -41,8 +41,10 @@ swift build -c release -Xswiftc -warnings-as-errors
 xcrun swift-format lint --recursive --strict Sources Tests
 ```
 
-These are local implementation checks. The repository has not yet been pushed,
-so no GitHub Actions result or signed/admin-installed cross-UID proof exists.
+The repository CI workflow is configured to run these checks using the
+explicit `macos-26` runner label. Availability and inspected-run status are
+recorded in the acceptance ledger; CI is plumbing-tier evidence only and is
+not a substitute for signed/admin-installed cross-UID or real product proof.
 
 No credentials belong in this repository. ChatGPT and Discord credentials are
 stored at runtime in the macOS Keychain.

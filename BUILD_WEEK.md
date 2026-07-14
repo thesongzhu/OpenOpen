@@ -12,10 +12,13 @@
 
 - The standalone OpenOpen repository, master product specification, acceptance
   ledger, and provenance disclosure.
-- A pre-commit local Rust foundation implementation and adversarial test suite
-  covering protocol types, lifecycle, approval, Evidence, encrypted state,
-  channel dedupe, and audit mechanisms. The foundation is still under isolated
-  review; no lifecycle, gate, or audit capability is claimed accepted yet.
+- A committed Rust/Swift foundation and adversarial test suite covering
+  protocol types, lifecycle, approval, Evidence, encrypted state, channel
+  dedupe, audit mechanisms, and the protected effect-broker contract. Public
+  bootstrap `19ecdd9…` passes 95 Rust and 25 Swift tests locally and the
+  foundation has two isolated reviewer PASS reports. GitHub CI, signed/admin
+  installation, cross-UID proof, product E2E, and release acceptance remain
+  unclaimed.
 
 ## Planned Build Week additions (not yet claimed)
 
