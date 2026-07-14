@@ -12,8 +12,8 @@ staging.
 
 | OpenOpen module | Friday source | Adaptation | Verification |
 | --- | --- | --- | --- |
-| `crates/openopen-core/src/mission.rs` | `rust-core/crates/friday-core/src/mission.rs` | Independent OpenOpen lifecycle adapted from Friday's legal-transition and proof-before-completion invariants | local Rust tests; reviewer rerun pending |
-| `crates/openopen-core/src/store.rs` | `rust-core/crates/friday-storage/src/mission.rs`, `rust-core/crates/friday-storage/src/audit.rs` | Independent encrypted lifecycle persistence and signed/tail-anchored audit design | local Rust tests; reviewer rerun pending |
+| `crates/openopen-core/src/mission.rs` | `rust-core/crates/friday-core/src/mission.rs` | Independent OpenOpen lifecycle adapted from Friday's legal-transition and proof-before-completion invariants | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; PR run `29369643001` PASS on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-head and release proof pending |
+| `crates/openopen-core/src/store.rs` | `rust-core/crates/friday-storage/src/mission.rs`, `rust-core/crates/friday-storage/src/audit.rs` | Independent encrypted lifecycle persistence and signed/tail-anchored audit design | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; PR run `29369643001` PASS on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-head and release proof pending |
 
 Workflow and Skill adaptations remain planned and are not yet present or
 claimed.

@@ -7,8 +7,8 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | 95 local uncommitted tests pass across Core, protocol, host, broker engine, persistent worker, concurrent Store→broker ordering, reconciliation, lost-response/session-rotation recovery, crash recovery, and outcome rollback/tamper coverage; release build, strict workspace Clippy, and fmt pass; fresh reviewers and commit-SHA proof remain pending |
-| SwiftUI build and tests | Current-SHA build/test log | EffectBrokerBridge and real daemon executable pass 25 local tests including typed reconciliation routing; warnings-as-errors test/release build, strict format, and plist lint pass locally; commit-SHA proof and the product SwiftUI app remain pending |
+| Rust domain and security tests | Current-SHA test log | Bootstrap `19ecdd9…` passes all 95 tests, strict Clippy, and fmt locally; PR run `29369643001` passes the same Rust suite plus release build on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-current-SHA release proof remains pending |
+| SwiftUI build and tests | Current-SHA build/test log | PR run `29369643001` passes all 25 EffectBrokerBridge/daemon tests, warnings-as-errors release build, strict format, and plist lint on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; the product SwiftUI app and release proof remain pending |
 | Codex stable protocol contract | Generated schema and live handshake | pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
@@ -249,3 +249,67 @@ different commit/build.
   artifacts. This closes the foundation Stage 5 reviewer gate only; commit
   SHA, remote/GitHub CI, signed/admin install, cross-UID/XPC adversarial proof,
   notarization, real product E2E, and release proof remain absent.
+- 2026-07-14 repository bootstrap: public `thesongzhu/OpenOpen` was created and
+  reviewed commit `19ecdd9c290dd685f1e79ff525c71b8d38504db8` was pushed as the
+  initial `main`; `git ls-remote` confirms parity. The exact SHA then passed 95
+  Rust and 25 Swift tests plus strict local format/lint/release checks. No
+  Actions workflow existed on that SHA, so no remote test result is claimed.
+- 2026-07-14 CI slice: a minimal read-only `macos-26` workflow pins the official
+  checkout action to a full commit and Rust to 1.96.0, records runner/Xcode/
+  Swift versions, runs the complete strict Rust and Swift suites, checks the
+  LaunchDaemon plist, and rejects tracked-file rewrites. Local verification,
+  two isolated reviewers, push, draft PR, and the first real Actions run are
+  pending.
+- 2026-07-14 first CI reviewer cycle: technical Reviewer A PASS; governance
+  Reviewer B FAIL. The workflow, action pin, runner/tool availability,
+  permission floor, event semantics, and local command suite passed review.
+  Reviewer B found only contradictory evidence state: the plan still called
+  commit SHA absent after `19ecdd9…` existed, and README used present tense
+  before any remote run. Those statements are corrected without changing the
+  workflow or proof floor. Two fresh isolated reviewer PASS reports remain
+  required before push.
+- 2026-07-14 second CI reviewer cycle: Reviewer C PASS; Reviewer D FAIL. The
+  workflow and corrected master-plan/README evidence state passed, but
+  `BUILD_WEEK.md` and `PROVENANCE.md` still called the foundation pre-commit or
+  reviewer-pending. A full Markdown current-state scan found no other live
+  occurrence outside chronological history. Both current provenance surfaces
+  now record bootstrap `19ecdd9…`, local 95/25 tests, foundation reviewer PASS,
+  and the still-missing CI/signed/admin/cross-UID/product/release proof. A third
+  fresh reviewer cycle is required before push.
+- 2026-07-14 third CI reviewer cycle: Reviewer E PASS; Reviewer F PASS. Both
+  independently accepted the least-privilege workflow, pinned action/toolchain,
+  runner/tool availability, local 95/25 disposable reruns, live `19ecdd9…`
+  remote facts, and repository-wide current evidence wording. This closes the
+  CI slice Stage 5 reviewer gate only; the branch, draft PR, and first inspected
+  GitHub Actions run remain pending, and no signed/admin/cross-UID/product or
+  release proof is implied.
+- 2026-07-14 first GitHub Actions proof: commit
+  `b61766b5f6cb5f208583633cc0d8244b8cfd2ea8` was pushed to
+  `agent/foundation-ci` and draft PR #1 triggered run `29369643001`. GitHub
+  associated the run with head `b61766b…`, while checkout used synthesized
+  merge `e0fed49af5ff7f65f579f6f94f509d1f7e253ff8`; their tree SHA is the same.
+  The `Rust and Swift verification` job passed all steps in 1m47s: 95 Rust
+  tests, Rust release build/fmt/strict Clippy, 25 Swift tests,
+  warnings-as-errors release build, strict format, LaunchDaemon plist lint,
+  and clean tracked diff. The runner reported macOS 26.4, Xcode 26.5, Swift
+  6.3.2, and Rust 1.96.0. This is inspected PR integration-tree CI plumbing,
+  not exact-head/current-SHA release proof. The evidence-only follow-up tree
+  must pass its own PR check; signed/admin installation, cross-UID/XPC
+  adversarial proof, notarization, real product E2E, external-user validation,
+  and release proof remain absent.
+- 2026-07-14 first post-run evidence reviewer cycle: factual Reviewer A PASS;
+  governance Reviewer B FAIL. Reviewer B confirmed that GitHub's run API
+  associates `29369643001` with head `b61766b…`, but checkout logs prove the
+  workflow actually executed synthesized merge `e0fed49…`. Direct Git object
+  inspection proves both commits have tree
+  `56083d29024a5f389beeeaae7c5b925ee7d531d0`. Current evidence wording now
+  distinguishes PR integration-tree CI from exact-head/current-SHA release
+  proof. Two fresh isolated reviewer PASS reports remain required before the
+  evidence-only follow-up commit.
+- 2026-07-14 second post-run evidence reviewer cycle: Reviewer C PASS;
+  Reviewer D PASS. Both independently verified live PR/base/head state,
+  GitHub's merge-ref checkout, exact head/merge tree parity, the 95 Rust and 25
+  Swift log totals, runner versions, the prior FAIL history, and the explicit
+  distinction between PR integration-tree plumbing and exact-current-SHA or
+  release proof. This closes the evidence-update Stage 5 gate only; its exact
+  commit, push, and follow-up PR check remain pending.
