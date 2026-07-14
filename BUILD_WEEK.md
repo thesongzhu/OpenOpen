@@ -16,9 +16,12 @@
   protocol types, lifecycle, approval, Evidence, encrypted state, channel
   dedupe, audit mechanisms, and the protected effect-broker contract. Public
   bootstrap `19ecdd9…` passes 95 Rust and 25 Swift tests locally and the
-  foundation has two isolated reviewer PASS reports. GitHub CI, signed/admin
-  installation, cross-UID proof, product E2E, and release acceptance remain
-  unclaimed.
+  foundation has two isolated reviewer PASS reports. GitHub Actions run
+  `29369643001`, associated with PR head `b61766b…`, passes the 95 Rust and 25
+  Swift tests plus the strict build, lint, format, plist, and clean-diff checks
+  on synthesized merge `e0fed49…`; both commits have the same tree. This is PR
+  integration-tree evidence, not exact-head proof. Signed/admin installation,
+  cross-UID proof, product E2E, and release acceptance remain unclaimed.
 
 ## Planned Build Week additions (not yet claimed)
 

@@ -7,8 +7,8 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Bootstrap `19ecdd9…` passes all 95 tests, strict Clippy, and fmt locally with local/remote SHA parity; GitHub CI for the next workflow SHA and release proof remain pending |
-| SwiftUI build and tests | Current-SHA build/test log | Bootstrap `19ecdd9…` passes 25 EffectBrokerBridge/daemon tests, warnings-as-errors test/release build, strict format, and plist lint locally; the product SwiftUI app and release proof remain pending |
+| Rust domain and security tests | Current-SHA test log | Bootstrap `19ecdd9…` passes all 95 tests, strict Clippy, and fmt locally; PR run `29369643001` passes the same Rust suite plus release build on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-current-SHA release proof remains pending |
+| SwiftUI build and tests | Current-SHA build/test log | PR run `29369643001` passes all 25 EffectBrokerBridge/daemon tests, warnings-as-errors release build, strict format, and plist lint on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; the product SwiftUI app and release proof remain pending |
 | Codex stable protocol contract | Generated schema and live handshake | pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
@@ -283,3 +283,33 @@ different commit/build.
   CI slice Stage 5 reviewer gate only; the branch, draft PR, and first inspected
   GitHub Actions run remain pending, and no signed/admin/cross-UID/product or
   release proof is implied.
+- 2026-07-14 first GitHub Actions proof: commit
+  `b61766b5f6cb5f208583633cc0d8244b8cfd2ea8` was pushed to
+  `agent/foundation-ci` and draft PR #1 triggered run `29369643001`. GitHub
+  associated the run with head `b61766b…`, while checkout used synthesized
+  merge `e0fed49af5ff7f65f579f6f94f509d1f7e253ff8`; their tree SHA is the same.
+  The `Rust and Swift verification` job passed all steps in 1m47s: 95 Rust
+  tests, Rust release build/fmt/strict Clippy, 25 Swift tests,
+  warnings-as-errors release build, strict format, LaunchDaemon plist lint,
+  and clean tracked diff. The runner reported macOS 26.4, Xcode 26.5, Swift
+  6.3.2, and Rust 1.96.0. This is inspected PR integration-tree CI plumbing,
+  not exact-head/current-SHA release proof. The evidence-only follow-up tree
+  must pass its own PR check; signed/admin installation, cross-UID/XPC
+  adversarial proof, notarization, real product E2E, external-user validation,
+  and release proof remain absent.
+- 2026-07-14 first post-run evidence reviewer cycle: factual Reviewer A PASS;
+  governance Reviewer B FAIL. Reviewer B confirmed that GitHub's run API
+  associates `29369643001` with head `b61766b…`, but checkout logs prove the
+  workflow actually executed synthesized merge `e0fed49…`. Direct Git object
+  inspection proves both commits have tree
+  `56083d29024a5f389beeeaae7c5b925ee7d531d0`. Current evidence wording now
+  distinguishes PR integration-tree CI from exact-head/current-SHA release
+  proof. Two fresh isolated reviewer PASS reports remain required before the
+  evidence-only follow-up commit.
+- 2026-07-14 second post-run evidence reviewer cycle: Reviewer C PASS;
+  Reviewer D PASS. Both independently verified live PR/base/head state,
+  GitHub's merge-ref checkout, exact head/merge tree parity, the 95 Rust and 25
+  Swift log totals, runner versions, the prior FAIL history, and the explicit
+  distinction between PR integration-tree plumbing and exact-current-SHA or
+  release proof. This closes the evidence-update Stage 5 gate only; its exact
+  commit, push, and follow-up PR check remain pending.

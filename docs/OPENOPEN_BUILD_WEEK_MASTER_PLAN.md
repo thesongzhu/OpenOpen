@@ -454,17 +454,21 @@ mock-only route, secret, or unfinished claimed route.
 | 2026-07-14 | First CI review: technical Reviewer A PASS; governance Reviewer B FAIL because one blocker still said commit SHA was absent and README used present tense before any workflow run | two isolated reviewer reports | evidence wording corrected without changing workflow or proof gates; two fresh reviewers pending |
 | 2026-07-14 | Second CI review: Reviewer C PASS; Reviewer D FAIL because `BUILD_WEEK.md` and `PROVENANCE.md` still described the foundation as pre-commit/reviewer-pending | two isolated reviewer reports plus full Markdown current-state scan | all current provenance/disclosure surfaces synchronized; historical ledger rows remain chronological; third fresh reviewer cycle pending |
 | 2026-07-14 | Third CI review: Reviewer E PASS; Reviewer F PASS | two fresh isolated reports covering workflow security, live remote facts, disposable 95/25 reruns, and repository-wide evidence-state consistency | CI Stage 5 PASS; branch commit/push, draft PR, and first inspected Actions run pending |
+| 2026-07-14 | CI branch commit `b61766b5f6cb5f208583633cc0d8244b8cfd2ea8` was pushed, draft PR #1 was opened, and pull-request Actions run `29369643001` passed every workflow step | GitHub PR/run API and logs show checkout of synthesized merge `e0fed49af5ff7f65f579f6f94f509d1f7e253ff8`, whose tree equals PR head `b61766b…`; 95 Rust and 25 Swift tests, release builds, strict lint/format, plist lint, and clean tracked diff pass on macOS 26.4 / Xcode 26.5 / Swift 6.3.2 / Rust 1.96.0 | CI Stage 7 PR integration-tree plumbing PASS, not exact-head proof; the PR remains draft and the evidence-only follow-up tree must pass its own check; no signed/admin, cross-UID, notarization, product-E2E, or release proof is implied |
+| 2026-07-14 | First post-run evidence review: factual Reviewer A PASS; governance Reviewer B FAIL because the initial wording treated a `pull_request` run as direct head-SHA execution | two isolated reports plus checkout-log and commit-tree verification | wording now records synthesized merge `e0fed49…`, equal tree with head `b61766b…`, and the exact-head/release-proof boundary; two fresh reviewers pending |
+| 2026-07-14 | Second post-run evidence review: Reviewer C PASS; Reviewer D PASS | two fresh isolated reports independently verifying PR/base/head state, merge-ref checkout, tree parity, 95/25 logs, toolchain versions, reviewer history, and no-overclaim boundaries | evidence-update Stage 5 PASS; exact-file commit/push and the follow-up PR integration check remain pending |
 
 ## Current blockers
 
 - The linearizable global effect fence/reconciliation foundation is committed
-  at `19ecdd9…`, has two fresh isolated reviewer PASS reports, passes the local
-  same-SHA suites, and has exact remote parity. GitHub CI, signed/admin,
-  cross-UID, and release proof remain absent.
+  at `19ecdd9…`, has two fresh isolated reviewer PASS reports, and passes the
+  local same-SHA suites. Actions run `29369643001` passes synthesized PR merge
+  `e0fed49…`, whose tree equals CI workflow head `b61766b…`; this is not direct
+  exact-head proof. Signed/admin, cross-UID, and release proof remain absent.
 - Public `thesongzhu/OpenOpen` now exists and `main` points to reviewed
-  bootstrap `19ecdd9…`. GitHub CI is not yet proven; its workflow remains on an
-  unpushed review branch until local verification and two isolated reviewers
-  pass.
+  bootstrap `19ecdd9…`. Draft PR #1 carries the CI workflow on
+  `agent/foundation-ci`; it must remain unmerged until its current head checks
+  and the applicable later proof gates are honestly satisfied.
 - Real ChatGPT, iMessage, Discord, Reminders, notarization, clean-machine, and
   three-user evidence have not yet been run. They remain required and cannot be
   represented by mocks.
