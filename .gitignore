@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+target/
+dist/
+DerivedData/
+*.dmg
+*.xcarchive
+*.profraw
+.env
+.env.*
+!.env.example
+evidence/private/
+vendor/bin/
