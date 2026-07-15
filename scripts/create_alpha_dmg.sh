@@ -297,7 +297,7 @@ EOF
     "$candidate/Contents/Resources/iMessage/0.13.0/BUILD-RECEIPT.json"
   verify_sha 818495226dda3332f711fc6d6408eacf1776e08fcddfa06342ab3f5196417839 \
     "$candidate/Contents/Resources/Notices/third_party/manifest.json"
-  verify_sha 155aa65ad397c56a1acb9f0b31405952042cdb4fa53d0a6ee25d9805c07e969e \
+  verify_sha 1046fc149ee4a2e607ed91afa48d1ab98a98ab62f7e8acd57b67f44e8f3b13bd \
     "$candidate/Contents/Resources/Notices/PROVENANCE.md"
   verify_sha c1b3af67fd28bbf768765357251f7b29d315150068cb41101dc77eb8a42bc7eb \
     "$candidate/Contents/Resources/Codex/0.144.0/codex-package.json"
@@ -309,7 +309,7 @@ EOF
     "$candidate/Contents/Info.plist"
   verify_sha fc061f73b2490648d1bffe58a1342fe8d41b2a640093317f6aad07c8b674ba3a \
     "$candidate/Contents/Library/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist"
-  verify_sha e61cd3f100f437cc232ea20400f516219bfc53f12ab0ce0905b6612f72b6dc98 \
+  verify_sha 8c2dce8fc7a250d57b6b1583acb3033c66769e5281151953cbf139539aca11ca \
     "$candidate/Contents/Resources/Notices/THIRD_PARTY_NOTICES.md"
   verify_sha 8ca856c3507586427462bfb2dfcfd3dfb94070e40efc272430b88481e71ba283 \
     "$candidate/Contents/Resources/iMessage/0.13.0/bin/PhoneNumberKit_PhoneNumberKit.bundle/PhoneNumberMetadata.json"
