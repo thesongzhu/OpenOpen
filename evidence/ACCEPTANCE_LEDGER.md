@@ -7,7 +7,7 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Reviewed commit `5a461ef…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test plus release, strict Clippy, format, metadata, script, and clean-diff checks. Two fresh Final2 reviewers PASS fingerprint `026b2b1f…`; PR #2 Actions `29450863581` passes on equal-tree synthesized merge `da3d7d1…`. This is plumbing evidence, not provider or release proof |
+| Rust domain and security tests | Current-SHA test log | Current implementation commit `5c185ab…` passes 191 ordinary Rust tests with one explicit environment-gated Codex test plus release, strict Clippy, format, metadata, script, diff, conflict-marker, and credential-pattern checks locally. Its PR CI and fresh final reviewers remain pending. The prior reviewed `5a461ef…` package/CI evidence remains valid only for that older implementation fingerprint; none of this is provider or release proof |
 | SwiftUI build and tests | Current-SHA build/test log | Reviewed commit `5a461ef…` passes 40 broker/signing plus 53 App tests. Final2 DMG SHA is `7c022b83…`; the reviewed package binds the exact owner leaf, layout, modes, content, signatures, and receipts. It remains unnotarized and has no provider, administrator/cross-UID, clean-install, or release PASS |
 | Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the reviewed tree. PR #2 run `29450863581` passes integration-tree plumbing for head `5a461ef…`. Real managed login, required-model catalog, structured turn, signed-build provider proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
@@ -18,7 +18,7 @@ different commit/build.
 | Receipt image → XLSX | Input/output hashes and workbook verification | pending |
 | Restart recovery and dedupe | Same-SHA runtime record | pending |
 | Skill lifecycle and containment | Security test report | pending |
-| Stress suite | Nonzero all-pass scenario artifact | pending |
+| Stress suite | Nonzero all-pass scenario artifact | Current implementation commit `5c185ab…` adds and locally passes the required ten-coexisting-Mission isolation scenario: ten bounded Missions are simultaneously Active, each cross-Mission Evidence injection is rejected without advancing the audit anchor, every Mission closes across a fresh Store restart, and ten exact Evidence/Reminder-source/Receipt chains remain isolated. The existing same-suite 100 shuffled duplicate-envelope test also passes. Provider failure/revocation and the one continuous real signed-build Mission trace remain pending, so the stress gate is not PASS |
 | Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | Final2 signing/evidence review passes and exact commit `5a461ef…` is pushed, but DMG `7c022b83…` remains `Unnotarized Developer ID`. Notarization, staple, Gatekeeper acceptance, administrator/cross-UID and clean-install evidence remain pending; the current package is not release proof |
 | Three external users | Consent-safe aggregate and 48-hour reuse | pending |
 | Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Final2 reviewers PASS code/signing fingerprint `026b2b1f…`; exact commit `5a461ef…` is pushed with equal-tree PR CI PASS. This ledger does not self-certify review of its own current document fingerprint; only external same-fingerprint reports and a stage-bound Advisor handoff can do that. Provider proof and final release-SHA review remain pending |
@@ -1176,3 +1176,16 @@ different commit/build.
   plumbing only. PR #2 remains draft/open; the package remains unnotarized and
   is not provider, administrator/cross-UID, `FRIDAY_ALPHA_READY`, or release
   proof.
+- 2026-07-15 Friday Alpha stress-gap closure candidate: implementation commit
+  `5c185ab161b9404614eb4039250a8ca53da6fd80` adds one deterministic
+  ten-coexisting-Mission persistence test. It keeps all ten bounded Missions
+  Active together, rejects ten cross-Mission Evidence injections without an
+  audit advance, reopens the same encrypted Store before each closure, and
+  verifies ten isolated Mission/owner/scope/Evidence/Reminder-source/Receipt
+  chains after the final restart. The full local 191-Rust/40+53-Swift suite,
+  release builds, strict lint/format, metadata/script/diff, conflict-marker,
+  and credential-pattern checks pass; the first conflict scan false-positive
+  was a third-party-license separator and the next shell-only scan attempt had
+  a quoting error before the corrected exact checks passed. PR CI, a current
+  signed build, real integrated provider proof, and two fresh final reviewers
+  remain pending; no milestone is claimed.
