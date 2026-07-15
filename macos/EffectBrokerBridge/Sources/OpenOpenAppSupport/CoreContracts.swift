@@ -1,3 +1,4 @@
+import CryptoKit
 import EffectBrokerBridge
 import Foundation
 
@@ -139,11 +140,197 @@ public struct OutcomeSuggestion: Codable, Equatable, Identifiable, Sendable {
   public let sourceRefs: [String]
 }
 
+public struct MissionWorkItem: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let title: String
+}
+
+public struct ReminderTarget: Codable, Equatable, Sendable {
+  public let sourceIdentifier: String
+  public let calendarIdentifier: String
+
+  public init(sourceIdentifier: String, calendarIdentifier: String) {
+    self.sourceIdentifier = sourceIdentifier
+    self.calendarIdentifier = calendarIdentifier
+  }
+
+  public var isValid: Bool {
+    let source = sourceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !source.isEmpty, source == sourceIdentifier, source.utf8.count <= 512 else {
+      return false
+    }
+    let calendar = calendarIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !calendar.isEmpty && calendar == calendarIdentifier && calendar.utf8.count <= 512
+  }
+}
+
+public enum ReminderWriteDisposition: String, Codable, Equatable, Sendable {
+  case createOnce
+  case recoverOnly
+}
+
+public struct ReminderWriteAuthorization: Codable, Equatable, Sendable {
+  public static let logicalListId = "openopen.default-reminders"
+  private static let domain = Data("OPENOPEN_REMINDER_WRITE_V2\0".utf8)
+
+  public let missionId: String
+  public let listId: String
+  public let payloadSha256: String
+  public let approvalId: String
+  public let approvalDigest: String
+  public let target: ReminderTarget
+  public let writeDisposition: ReminderWriteDisposition
+
+  public static func payloadSha256(
+    missionId: String, target: ReminderTarget, workItems: [MissionWorkItem]
+  ) -> String {
+    var payload = domain
+    appendLengthPrefixed(missionId, to: &payload)
+    appendLengthPrefixed(logicalListId, to: &payload)
+    appendLengthPrefixed(target.sourceIdentifier, to: &payload)
+    appendLengthPrefixed(target.calendarIdentifier, to: &payload)
+    for workItem in workItems {
+      appendLengthPrefixed(workItem.id, to: &payload)
+      appendLengthPrefixed(workItem.title, to: &payload)
+    }
+    return SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+  }
+
+  public func validates(missionId: String, workItems: [MissionWorkItem]) -> Bool {
+    self.missionId == missionId
+      && listId == Self.logicalListId
+      && Self.isLowercaseHex(payloadSha256, count: 64)
+      && !approvalId.isEmpty
+      && Self.isLowercaseHex(approvalDigest, count: 64)
+      && target.isValid
+      && payloadSha256
+        == Self.payloadSha256(missionId: missionId, target: target, workItems: workItems)
+  }
+
+  private static func appendLengthPrefixed(_ value: String, to data: inout Data) {
+    let encoded = Data(value.utf8)
+    var length = UInt64(encoded.count).bigEndian
+    withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+    data.append(encoded)
+  }
+
+  private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
+    value.utf8.count == count
+      && value.utf8.allSatisfy { byte in
+        (48...57).contains(byte) || (97...102).contains(byte)
+      }
+  }
+}
+
+public struct ConfirmedMission: Codable, Equatable, Identifiable, Sendable {
+  public var id: String { missionId }
+  public let missionId: String
+  public let title: String
+  public let workItems: [MissionWorkItem]
+  public let reminderAuthorization: ReminderWriteAuthorization
+  public let reminderDispatch: [ConfirmedReminderDispatch]
+  public let reminderLinks: [ReminderLink]
+
+  public func recoveryOnly() -> Self {
+    Self(
+      missionId: missionId,
+      title: title,
+      workItems: workItems,
+      reminderAuthorization: ReminderWriteAuthorization(
+        missionId: reminderAuthorization.missionId,
+        listId: reminderAuthorization.listId,
+        payloadSha256: reminderAuthorization.payloadSha256,
+        approvalId: reminderAuthorization.approvalId,
+        approvalDigest: reminderAuthorization.approvalDigest,
+        target: reminderAuthorization.target,
+        writeDisposition: .recoverOnly
+      ),
+      reminderDispatch: reminderDispatch,
+      reminderLinks: reminderLinks
+    )
+  }
+}
+
+public struct ConfirmedReminderDispatch: Codable, Equatable, Identifiable, Sendable {
+  public var id: String { workItemId }
+  public let workItemId: String
+  public let token: String
+}
+
+public struct ReminderDispatchStart: Codable, Equatable, Sendable {
+  public let mission: ConfirmedMission
+  public let executeNow: Bool
+}
+
+public struct ReminderLink: Codable, Equatable, Identifiable, Sendable {
+  public var id: String { workItemId }
+  public let missionId: String
+  public let workItemId: String
+  public let sourceIdentifier: String
+  public let calendarIdentifier: String
+  public let calendarItemIdentifier: String
+  public let dispatchToken: String
+  public let title: String
+}
+
+public struct ReminderCompletionInput: Codable, Equatable, Sendable {
+  public let workItemId: String
+  public let sourceId: String
+  public let completedAtMs: Int64
+}
+
+public struct MissionReceipt: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let missionId: String
+  public let summary: String
+  public let actualModel: String
+  public let evidenceIds: [String]
+  public let outputHashes: [String]
+  public let completedAtMs: Int64
+}
+
+public struct ConfirmSuggestionParameters: Codable, Sendable {
+  public let suggestionId: String
+  public let reminderTarget: ReminderTarget
+}
+
+public struct CompleteReminderMissionParameters: Codable, Sendable {
+  public let missionId: String
+  public let completions: [ReminderCompletionInput]
+}
+
+public struct RecordReminderMirrorParameters: Codable, Sendable {
+  public let missionId: String
+  public let links: [ReminderLink]
+}
+
+public struct BeginReminderDispatchParameters: Codable, Sendable {
+  public let missionId: String
+}
+
 public struct DashboardState: Codable, Equatable, Sendable {
   public let activeCards: [ActiveOutcomeCard]
   public let microphone: MicrophoneState
   public let runtime: RuntimeControl
   public let suggestion: OutcomeSuggestion?
+  public let confirmedMission: ConfirmedMission?
+  public let receipt: MissionReceipt?
+
+  public init(
+    activeCards: [ActiveOutcomeCard],
+    microphone: MicrophoneState,
+    runtime: RuntimeControl,
+    suggestion: OutcomeSuggestion?,
+    confirmedMission: ConfirmedMission? = nil,
+    receipt: MissionReceipt? = nil
+  ) {
+    self.activeCards = activeCards
+    self.microphone = microphone
+    self.runtime = runtime
+    self.suggestion = suggestion
+    self.confirmedMission = confirmedMission
+    self.receipt = receipt
+  }
 
   public func validated() throws -> Self {
     guard activeCards.count <= 3 else {

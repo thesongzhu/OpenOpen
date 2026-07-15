@@ -33,6 +33,7 @@ let package = Package(
       name: "OpenOpenAppSupport",
       dependencies: ["EffectBrokerBridge"],
       linkerSettings: [
+        .linkedFramework("EventKit"),
         .linkedFramework("Security"),
         .linkedFramework("ServiceManagement"),
       ]

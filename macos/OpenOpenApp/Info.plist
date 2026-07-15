@@ -24,7 +24,9 @@
   <true/>
   <key>LSUIElement</key>
   <true/>
-  <key>NSHumanReadableCopyright</key>
-  <string>Copyright © 2026 OpenOpen contributors.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 OpenOpen contributors.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>OpenOpen creates only the exact Mission steps you confirm and reads their completion status as Evidence.</string>
 </dict>
 </plist>

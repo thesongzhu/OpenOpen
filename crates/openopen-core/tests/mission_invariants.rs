@@ -24,6 +24,7 @@ fn approval_with_id(
         kind,
         prompt: "Approve this bounded action?".into(),
         scope_digest: digest.into(),
+        target: None,
         status,
         requested_by_id: "owner-1".into(),
         decided_by_id: (status != ApprovalStatus::Pending).then(|| "owner-1".into()),

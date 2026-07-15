@@ -7,9 +7,9 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Reviewed bootstrap remains 95-test green; thirteenth repaired uncommitted product-shell tree passes 134 ordinary Rust tests, release build, strict Clippy, fmt, and the explicit real pinned-runtime sandbox diagnostic twice from Repair20. Follow-up PR run `29370433505` covers only head `923c88a…`, not this working tree; two new formal reviewers, current-commit CI, and release proof remain pending |
-| SwiftUI build and tests | Current-SHA build/test log | Thirteenth repaired uncommitted product-shell tree passes 40 broker/signing tests plus 27 App tests, warnings-as-errors debug/release build, strict format, both plists, staging syntax, and diff checks. Exclusive `/private/tmp/OpenOpen-Stage-Repair20.app` passes deep strict ad-hoc verification with exact identifiers and pinned Codex identity/four hashes. No product-shell commit or Actions run exists yet; signed/admin runtime proof remains pending |
-| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; local outer-sandbox initialize plus account/read diagnostic passes. Real managed login, required-model catalog, structured turn, reviewers, current-commit CI, and signed-build proof remain pending |
+| Rust domain and security tests | Current-SHA test log | Product-shell commit `e2313fe…` passes 134 ordinary Rust tests, release build, strict Clippy, fmt, and the explicit pinned-runtime sandbox diagnostic twice locally. Two fresh Repair20 reviewers PASS fingerprint `29a00413…`. PR #2 Actions run `29386477267` passes the full strict suite on synthesized merge `487dae1…`, whose tree `2cae9eb…` equals the head tree; this is integration-tree plumbing, not exact-head or release proof |
+| SwiftUI build and tests | Current-SHA build/test log | Product-shell commit `e2313fe…` passes 40 broker/signing tests plus 27 App tests, warnings-as-errors debug/release build, strict format, both plists, staging syntax, and diff checks locally and in PR #2 run `29386477267`. Exclusive `/private/tmp/OpenOpen-Stage-Repair20.app` passes deep strict ad-hoc verification with exact identifiers and pinned Codex identity/four hashes. Signed/admin and cross-UID runtime proof remain pending |
+| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; local outer-sandbox initialize plus account/read diagnostic passes. Two reviewers and product-shell PR CI pass at the stated tiers. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
 | Discord bidirectional route | Signed-build bot/channel message IDs | pending |
@@ -648,7 +648,180 @@ different commit/build.
   signing plus 27 App Swift tests pass with strict build/lint/format/plist/
   script/diff and credential scans. Repair20 is freshly staged and explicitly
   ad-hoc; deep exact identity/four-hash verification and two correctly selected
-  real pinned-runtime diagnostics pass. Two entirely fresh reviewer PASS
-  reports remain required before commit/push; no product-shell CI,
-  signed/admin, cross-UID, real-provider, notarization, clean-install,
-  product-E2E, external-user, or release proof is claimed.
+  real pinned-runtime diagnostics pass. No signed/admin, cross-UID,
+  real-provider, notarization, clean-install, product-E2E, external-user, or
+  release proof is claimed.
+- 2026-07-14 Repair20 Stage 5: fresh security Reviewer AC and governance
+  Reviewer AD both PASS frozen fingerprint `29a004131a5987713eb4500de5060312ab954fde5c6bf0cbbd7efa2d4bb142ac`
+  with no P0/P1/P2 findings. AC verifies static exact Core identifier/App-Team
+  validation, running Mach audit-token validation, Keychain ordering, failure
+  cleanup, and protected Off/timestamp invariants. AD independently verifies
+  reviewer accounting, test counts, live remote facts, staging/provenance, and
+  no-overclaim boundaries. Both confirm the fingerprint is unchanged.
+- 2026-07-14 product-shell Stage 6/7: reviewed commit
+  `e2313fe8b28cbdb8aac4bc41661394d8e39806cd` was pushed to
+  `agent/product-shell` and draft PR #2 was opened against `main`. Actions run
+  `29386477267` passed every strict Rust/Swift/build/lint/format/plist/script/
+  clean-diff step. GitHub's pull-request run used synthesized merge
+  `487dae18c6c3030e78d0200698981f9b6f33f4f1`; its tree
+  `2cae9eb80e7bb07a988565999c29579abbf21a3d` equals the PR head tree. This is
+  integration-tree plumbing evidence only, not exact-head, signed/admin,
+  cross-UID, real-provider, notarized, clean-install, product-E2E,
+  external-user, or release proof. PR #2 remains draft and unmerged.
+- 2026-07-14 Hero A local implementation candidate: explicit text input uses
+  the existing protected GPT-5.6 structured Outcome route; Core consumes the
+  exact in-memory suggestion and persists typed Create, confirmation, owner
+  approval, and activation commands; EventKit requests full Reminders access,
+  creates an exact OpenOpen mirror in the default Reminders source, and returns
+  stable calendar-item identifiers; exact completed-item readback becomes
+  signed `ReminderCompleted` Evidence before Core can issue a Receipt. Invalid,
+  partial, duplicate, changed, missing, or future completion input fails
+  closed, and permission failure retains the Mission for explicit retry.
+  All 139 ordinary Rust tests and 40 broker/signing plus 30 App Swift tests,
+  release builds, strict lint/format/plist/script/diff/credential checks pass.
+  `/private/tmp/OpenOpen-Stage-HeroA.app` is freshly staged and explicitly
+  `STAGED_AD_HOC_NOT_RELEASE_PROOF`; two fresh isolated closure reviews remain
+  pending. No real provider output, user Reminders write/readback, signed/admin,
+  cross-UID, current GitHub CI, notarization, clean-install, product-E2E,
+  external-user, or release proof is claimed.
+- 2026-07-14 first Hero A closure review: both fresh reviewers FAIL frozen
+  fingerprint `1711864f1e5af30f6c7ea6a3ee85630b2c098ddb15274dfe2bcf359e671ca935`.
+  They reproduce nonrecoverable partial/response-loss confirmation and
+  completion, completed-Mission reuse by a second Outcome, direct EventKit
+  write without the required exact `NewExternalWrite` approval, fabricated
+  approval time copied from suggestion creation, and the one-test count error.
+  The candidate is superseded; repair preserves the frozen shell and adds no
+  optional feature or proof claim.
+- 2026-07-14 Hero A closure repair: each composite confirm/complete operation
+  is one atomic Store transaction over typed commands, audit rows, encrypted
+  results, Evidence, and Receipt. Exact response-loss retries reopen the same
+  Store and return the same authorized Mission or Receipt; changed completion
+  input is rejected without audit movement. Dashboard recovery returns separate
+  max-three cards, the newest exact active Mission authorization, and latest
+  Receipt. The confirmation click uses its observed time and explicitly binds
+  the exact logical Reminders list plus ordered Mission/work-item payload to an
+  owner-approved `NewExternalWrite`; App and EventKit both reject an invalid
+  authorization before any external writer call. Sequential Outcome tests prove
+  a completed Mission cannot be reused. The full 143-Rust/75-Swift suite,
+  release builds, strict Clippy/format, shared payload vector, plist/script/diff,
+  and credential checks pass locally. Fresh
+  `/private/tmp/OpenOpen-Stage-HeroA-Repair1.app` passes deep ad-hoc staging and
+  is explicitly `STAGED_AD_HOC_NOT_RELEASE_PROOF`. Two fresh reviewers are
+  pending; no real provider/Reminders, signed/admin, cross-UID, CI, notarized,
+  clean-install, product-E2E, external-user, or release proof is claimed.
+- 2026-07-14 Hero A Repair1 replacement review: governance Reviewer E PASS and
+  functional Reviewer F FAIL the unchanged fingerprint `3e839145…`. Reviewer F
+  proves that restarting after a successful EventKit write, then renaming the
+  original list or changing the default account, could resolve the same logical
+  approval against another physical calendar and duplicate the mirror. Both
+  reviewers independently confirm the 143-Rust/75-Swift suites and unchanged
+  fingerprint; the governance PASS is historical only after the repair.
+- 2026-07-14 Hero A Repair2: Swift resolves the EventKit source/calendar before
+  Core confirmation without writing. Core persists that exact target in the
+  audited `NewExternalWrite` approval and V2 payload digest; a response-loss
+  retry with a changed source/calendar is rejected without audit movement.
+  EventKit recovery is restricted to the approved source/calendar and recovers
+  exact Mission markers even after a list rename; missing or ambiguous physical
+  targets fail closed. The shared Rust/Swift V2 vector is `188605fc…`.
+  All 144 ordinary Rust tests and 40 broker/signing plus 37 App Swift tests,
+  release builds, strict Clippy/format, plist/script/diff checks pass. Fresh
+  `/private/tmp/OpenOpen-Stage-HeroA-Repair2.app` passes deep ad-hoc staging and
+  is explicitly `STAGED_AD_HOC_NOT_RELEASE_PROOF`. Two fresh reviewers remain
+  pending; no real provider/Reminders, signed/admin, cross-UID, CI, notarized,
+  clean-install, product-E2E, external-user, or release proof is claimed.
+- 2026-07-14 Hero A Repair2 replacement review: fresh functional and governance
+  reviewers both FAIL frozen fingerprint `76ca9834…`. The functional reviewer
+  proves that a restart after every Mission marker is deleted, moved, or made
+  unrecognizable produces zero recovered markers and Repair2 recreates the full
+  mirror. The governance reviewer proves that an approval with no initial
+  calendar identifier could bind to a newly appearing same-name list later,
+  and that cancellation after awaited discovery could still enter calendar
+  persistence. Both rerun the 144-Rust/77-Swift suites and verify the unchanged
+  fingerprint. Repair2 is superseded; neither report is a PASS.
+- 2026-07-14 Hero A Repair3: the user must pre-create one uniquely selectable
+  OpenOpen Reminders list; OpenOpen does not create or silently choose a
+  calendar. Core issues `createOnce` only in the original confirmation response
+  and `recoverOnly` for response-loss recovery, dashboard, and restart. Exact
+  EventKit readback is recorded atomically as signed `ReminderMirrored`
+  Evidence for every WorkItem. Persisted links restore without another EventKit
+  write; missing or partial markers without persisted links fail closed.
+  Cancellation is checked after awaited work and around the final EventKit
+  commit/readback boundary. All 145 ordinary Rust tests pass with one exact-
+  runtime test ignored unless its pinned binary is supplied; 40 broker/signing
+  and 40 App Swift tests pass. Release builds, strict Clippy, Rust/Swift format,
+  plist/script, and diff checks pass locally. Fresh
+  `/private/tmp/OpenOpen-Stage-HeroA-Repair3.app` reports
+  `STAGED_AD_HOC_NOT_RELEASE_PROOF` and passes deep exact-identity and pinned-
+  hash verification. Two entirely fresh reviewers remain pending. No real
+  ChatGPT output, user
+  Reminders mutation/readback, signed/admin, cross-UID, current CI,
+  notarization, clean install, product E2E, external-user, or release proof is
+  claimed.
+- 2026-07-14 Hero A Repair3 replacement review: both fresh reviewers FAIL
+  frozen fingerprint
+  `fa9d905ec85907719c98c4f968fff497261677a2e175e6631b6f34ccebad1417`.
+  They independently prove the same route: EventKit may commit, then readback
+  may fail or Off may intervene while the App still retains volatile
+  `createOnce` authority. If every marker is later deleted, moved, or mutated,
+  retry can issue a second batch. The three repairs share this missing durable
+  dispatch invariant; the supervisor returns `STUCK: same_root_cause`. The
+  owner's standing approval of recommended in-direction fixes selects strict
+  at-most-once dispatch. Repair3's green tests and stage are historical only.
+- 2026-07-14 Hero A Repair4: Core route `mission.reminders.begin` atomically
+  persists signed deterministic `ReminderDispatchStarted` Evidence for every
+  WorkItem before EventKit. The first committed call alone returns
+  `executeNow=true`; exact response-loss/restart retries return false.
+  App caches the resulting recovery-only Mission before EventKit and splits
+  external execution from strictly read-only recovery. Marker v2, readback
+  links, and signed `ReminderMirrored` Evidence bind the exact per-item dispatch
+  token. Deterministic tests cover begin response loss/restart, precommit
+  failure, post-commit readback failure, Off after commit, missing recovery,
+  exact persisted links, and zero second writes. All 146 ordinary Rust tests
+  pass with one pinned-runtime test skipped in the ordinary run; 40
+  broker/signing and 42 App Swift tests pass. Release builds, strict Clippy,
+  warnings-as-errors, Rust/Swift format, plist/script/diff checks, and two
+  explicit pinned-runtime sandbox diagnostics pass. Fresh
+  `/private/tmp/OpenOpen-Stage-HeroA-Repair4.app` reports
+  `STAGED_AD_HOC_NOT_RELEASE_PROOF` and passes exact identity/four-hash
+  staging. Two entirely fresh reviewers remain required. No real ChatGPT
+  output, user Reminders mutation/readback, signed/admin, cross-UID, current CI,
+  notarization, clean install, product E2E, external-user, or release proof is
+  claimed.
+- 2026-07-14 Hero A Repair4 replacement review: functional Reviewer A PASS and
+  governance Reviewer B FAIL frozen fingerprint
+  `4cabaeb4c041ef383cca8ca64a4f9bf1e9cf8fe0b3ebd36284e9abe983e40b58`.
+  Governance proves the lower-level public EventKit writer accepted a reusable
+  `ConfirmedMission` rather than consuming the one-shot start: retain the first
+  Mission, execute, delete every marker, call the writer again, and
+  `allowMissingAll` can commit a second batch. Both reviewers rerun the complete
+  suites and keep the fingerprint unchanged. Repair4 is superseded; its
+  functional PASS cannot carry across the safety edit.
+- 2026-07-14 Hero A Repair5: the EventKit writer is no longer public and now
+  accepts the full `ReminderDispatchStart`. A process-local execution gate
+  consumes the Mission claim before permission requests, marker discovery, or
+  EventKit; replaying the retained first start fails before any external
+  boundary. Restart cannot recreate that start because durable Core dispatch
+  returns only `executeNow=false` and App selects strictly read-only recovery.
+  A direct retained-start regression test is added. All 146 ordinary Rust
+  tests pass with one pinned-runtime test skipped in the ordinary run; 40
+  broker/signing and 43 App Swift tests pass. Release builds, strict Clippy,
+  warnings-as-errors, Rust/Swift format, plist/script/diff checks, and two
+  explicit pinned-runtime sandbox diagnostics pass. Fresh
+  `/private/tmp/OpenOpen-Stage-HeroA-Repair5.app` reports
+  `STAGED_AD_HOC_NOT_RELEASE_PROOF` and passes exact identity/four-hash
+  staging.
+- 2026-07-14 Hero A Repair5 closure review: two entirely fresh isolated
+  reviewers PASS frozen fingerprint
+  `4b41a04f7b28573e1a04cb19c79f499b497a2240efbcc236f003f4feb97971cf`
+  before and after, with zero P0/P1/P2 findings. Functional review traces the
+  sole internal EventKit writer, complete one-shot start consumption, durable
+  restart/Off recovery-only behavior, target/token/link bindings, completion
+  Evidence/Receipt, and sequential Mission isolation. Governance independently
+  verifies the same live routes, Store/audit/ActionGate/global-Off boundaries,
+  disclosure history, remote facts, and no alternate client/writer path. Each
+  reruns all 146 ordinary Rust tests and 40 broker/signing plus 43 App Swift
+  tests, strict release/lint/format/plist/script/diff checks, ad-hoc staging,
+  and two pinned-runtime sandbox diagnostics. Hero A Stage 5 passes; reviewed
+  commit/push and current Actions remain pending. No real ChatGPT output, user
+  Reminders mutation/readback, signed/admin, cross-UID, notarization, clean
+  install, product E2E, external-user, or release proof is claimed.

@@ -28,6 +28,16 @@ public protocol CoreServing: Sendable {
   func awaitLogin(identifier: String, proof: BrokerRuntimeState) async throws -> AccountState
   func models(proof: BrokerRuntimeState) async throws -> [GptModel]
   func propose(prompt: String, proof: BrokerRuntimeState) async throws -> OutcomeSuggestion
+  func confirmSuggestion(
+    identifier: String, reminderTarget: ReminderTarget
+  ) async throws -> ConfirmedMission
+  func beginReminderDispatch(identifier: String) async throws -> ReminderDispatchStart
+  func recordReminderMirror(
+    identifier: String, links: [ReminderLink]
+  ) async throws -> ConfirmedMission
+  func completeReminderMission(
+    identifier: String, completions: [ReminderCompletionInput]
+  ) async throws -> MissionReceipt
 }
 
 public protocol BrokerRuntimeServing: Sendable {
@@ -80,6 +90,9 @@ public final class AppModel: ObservableObject {
   @Published public var prompt = ""
   @Published public private(set) var suggestion: OutcomeSuggestion?
   @Published public private(set) var activeCards: [ActiveOutcomeCard] = []
+  @Published public private(set) var confirmedMission: ConfirmedMission?
+  @Published public private(set) var reminderLinks: [ReminderLink] = []
+  @Published public private(set) var receipt: MissionReceipt?
   @Published public private(set) var microphone = MicrophoneState(
     available: false,
     reason: "Microphone unavailable until Voice setup"
@@ -92,11 +105,13 @@ public final class AppModel: ObservableObject {
 
   private let core: any CoreServing
   private let broker: any BrokerRuntimeServing
+  private let reminders: any RemindersServing
   private let registerLoginItem: @Sendable () throws -> Void
   private var confirmedEnabled = false
   private var desiredEnabled = false
   private var pendingRuntimeIntent: Bool?
   private var switchTask: Task<Void, Never>?
+  private var heroTask: Task<Void, Never>?
   private var loginItemRegistered = false
   private var runtimeGeneration: UInt64 = 0
   private var protectedRuntime: BrokerRuntimeState?
@@ -111,16 +126,19 @@ public final class AppModel: ObservableObject {
   public init(core: any CoreServing = CoreProcessClient()) {
     self.core = core
     broker = PrivilegedBrokerRuntimeClient()
+    reminders = RemindersClient()
     registerLoginItem = { try LoginItemController.registerAfterOnboarding() }
   }
 
   init(
     core: any CoreServing,
     broker: any BrokerRuntimeServing = PrivilegedBrokerRuntimeClient(),
+    reminders: any RemindersServing = RemindersClient(),
     registerLoginItem: @escaping @Sendable () throws -> Void
   ) {
     self.core = core
     self.broker = broker
+    self.reminders = reminders
     self.registerLoginItem = registerLoginItem
   }
 
@@ -145,6 +163,9 @@ public final class AppModel: ObservableObject {
       guard generation == runtimeGeneration, switchTask == nil else { return }
       suggestion = dashboard.suggestion
       activeCards = dashboard.activeCards
+      confirmedMission = dashboard.confirmedMission
+      reminderLinks = dashboard.confirmedMission?.reminderLinks ?? []
+      receipt = dashboard.receipt
       microphone = dashboard.microphone
       protectedRuntime = protected
       let protectedMatchesRuntime =
@@ -184,6 +205,10 @@ public final class AppModel: ObservableObject {
 
   public func requestEnabled(_ requested: Bool) {
     runtimeGeneration &+= 1
+    if !requested {
+      heroTask?.cancel()
+      heroTask = nil
+    }
     desiredEnabled = requested
     pendingRuntimeIntent = requested
     if requested {
@@ -422,7 +447,7 @@ public final class AppModel: ObservableObject {
 
   public func submitPrompt() async {
     let value = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard modelEntryEnabled, !isBusy, !value.isEmpty else { return }
+    guard modelEntryEnabled, !isBusy, confirmedMission == nil, !value.isEmpty else { return }
     guard value.utf8.count <= 16 * 1024 else {
       errorMessage = "Outcome requests are limited to 16 KiB."
       return
@@ -435,11 +460,221 @@ public final class AppModel: ObservableObject {
       let proposed = try await core.propose(prompt: value, proof: proof)
       try requireCurrentOnGeneration(generation)
       suggestion = proposed
+      receipt = nil
       prompt = ""
       errorMessage = nil
     } catch {
       guard generation == runtimeGeneration else { return }
       errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func confirmSuggestion() async {
+    guard modelEntryEnabled, !isBusy, suggestion != nil || confirmedMission != nil else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      try requireCurrentOnGeneration(generation)
+      let mission: ConfirmedMission
+      if let confirmedMission {
+        guard suggestion.map({ Self.matches(confirmedMission, suggestion: $0) }) ?? true else {
+          throw CoreClientError.contractViolation(
+            "The pending Mission does not match the current suggestion."
+          )
+        }
+        mission = confirmedMission
+      } else {
+        guard let suggestion else {
+          throw CoreClientError.contractViolation("There is no suggestion to confirm.")
+        }
+        let target = try await reminders.prepareTarget()
+        try Task.checkCancellation()
+        try requireCurrentOnGeneration(generation)
+        mission = try await core.confirmSuggestion(
+          identifier: suggestion.id, reminderTarget: target
+        )
+        try requireCurrentOnGeneration(generation)
+        guard Self.matches(mission, suggestion: suggestion) else {
+          throw CoreClientError.contractViolation(
+            "Core confirmed a Mission that does not match the exact suggestion."
+          )
+        }
+        confirmedMission = mission
+      }
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard
+        mission.reminderAuthorization.validates(
+          missionId: mission.missionId, workItems: mission.workItems
+        )
+      else {
+        throw CoreClientError.contractViolation(
+          "Core did not authorize the exact Reminder write."
+        )
+      }
+      if !mission.reminderLinks.isEmpty {
+        reminderLinks = mission.reminderLinks
+        let count = mission.reminderLinks.count
+        activeCards = [
+          ActiveOutcomeCard(
+            id: mission.missionId,
+            title: mission.title,
+            state: "Waiting for \(count) Reminder completion\(count == 1 ? "" : "s")"
+          )
+        ]
+        self.suggestion = nil
+        errorMessage = nil
+        return
+      }
+      let dispatchStart = try await core.beginReminderDispatch(identifier: mission.missionId)
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard Self.matchesDispatchStart(dispatchStart, mission: mission) else {
+        throw CoreClientError.contractViolation(
+          "Core did not durably bind the exact Reminder dispatch."
+        )
+      }
+      confirmedMission = dispatchStart.mission
+      if !dispatchStart.mission.reminderLinks.isEmpty {
+        reminderLinks = dispatchStart.mission.reminderLinks
+        let count = dispatchStart.mission.reminderLinks.count
+        activeCards = [
+          ActiveOutcomeCard(
+            id: dispatchStart.mission.missionId,
+            title: dispatchStart.mission.title,
+            state: "Waiting for \(count) Reminder completion\(count == 1 ? "" : "s")"
+          )
+        ]
+        self.suggestion = nil
+        errorMessage = nil
+        return
+      }
+      let links =
+        if dispatchStart.executeNow {
+          try await reminders.executeInitialMirror(dispatchStart)
+        } else {
+          try await reminders.recoverMirror(for: dispatchStart.mission)
+        }
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard links.count == mission.workItems.count,
+        Set(links.map(\.workItemId)) == Set(mission.workItems.map(\.id))
+      else {
+        throw CoreClientError.contractViolation(
+          "Reminders did not return an exact link for every Mission step."
+        )
+      }
+      let persisted = try await core.recordReminderMirror(
+        identifier: mission.missionId, links: links
+      )
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard persisted.missionId == mission.missionId,
+        persisted.reminderAuthorization == dispatchStart.mission.reminderAuthorization,
+        persisted.reminderDispatch == dispatchStart.mission.reminderDispatch,
+        persisted.reminderLinks == links
+      else {
+        throw CoreClientError.contractViolation(
+          "Core did not persist the exact Reminder mirror."
+        )
+      }
+      confirmedMission = persisted
+      reminderLinks = persisted.reminderLinks
+      activeCards = [
+        ActiveOutcomeCard(
+          id: mission.missionId,
+          title: mission.title,
+          state: "Waiting for \(links.count) Reminder completion\(links.count == 1 ? "" : "s")"
+        )
+      ]
+      self.suggestion = nil
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      if let mission = confirmedMission {
+        activeCards = [
+          ActiveOutcomeCard(
+            id: mission.missionId,
+            title: mission.title,
+            state: "Need you: inspect the OpenOpen Reminders list before retrying"
+          )
+        ]
+      }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  private static func matchesDispatchStart(
+    _ start: ReminderDispatchStart, mission: ConfirmedMission
+  ) -> Bool {
+    let dispatched = start.mission
+    return dispatched.missionId == mission.missionId
+      && dispatched.title == mission.title
+      && dispatched.workItems == mission.workItems
+      && dispatched.reminderAuthorization == mission.recoveryOnly().reminderAuthorization
+      && dispatched.reminderDispatch.count == mission.workItems.count
+      && Set(dispatched.reminderDispatch.map(\.workItemId)) == Set(mission.workItems.map(\.id))
+      && Set(dispatched.reminderDispatch.map(\.token)).count
+        == dispatched.reminderDispatch.count
+      && dispatched.reminderDispatch.allSatisfy {
+        !$0.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      }
+      && (!start.executeNow || dispatched.reminderLinks.isEmpty)
+  }
+
+  public func checkMissionProgress() async {
+    guard modelEntryEnabled, !isBusy, let mission = confirmedMission, !reminderLinks.isEmpty else {
+      return
+    }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      try requireCurrentOnGeneration(generation)
+      let completed = try await reminders.completedReminders(for: reminderLinks)
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard completed.count == mission.workItems.count,
+        Set(completed.map(\.workItemId)) == Set(mission.workItems.map(\.id))
+      else {
+        throw CoreClientError.contractViolation(
+          "Finish every OpenOpen reminder, then check progress again."
+        )
+      }
+      let receipt = try await core.completeReminderMission(
+        identifier: mission.missionId,
+        completions: completed
+      )
+      try requireCurrentOnGeneration(generation)
+      guard receipt.missionId == mission.missionId else {
+        throw CoreClientError.contractViolation("Core returned a Receipt for another Mission.")
+      }
+      self.receipt = receipt
+      activeCards = []
+      confirmedMission = nil
+      reminderLinks = []
+      suggestion = nil
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func requestSuggestionConfirmation() {
+    guard heroTask == nil else { return }
+    heroTask = Task { [weak self] in
+      await self?.confirmSuggestion()
+      self?.heroTask = nil
+    }
+  }
+
+  public func requestMissionProgressCheck() {
+    guard heroTask == nil else { return }
+    heroTask = Task { [weak self] in
+      await self?.checkMissionProgress()
+      self?.heroTask = nil
     }
   }
 
@@ -496,5 +731,12 @@ public final class AppModel: ObservableObject {
 
   private func userMessage(for error: Error) -> String {
     (error as? LocalizedError)?.errorDescription ?? "OpenOpen failed closed. Please try again."
+  }
+
+  private static func matches(
+    _ mission: ConfirmedMission, suggestion: OutcomeSuggestion
+  ) -> Bool {
+    mission.title == suggestion.title
+      && mission.workItems.map(\.title) == suggestion.proposedSteps
   }
 }

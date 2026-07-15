@@ -13,7 +13,7 @@ use openopen_protocol::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -124,6 +124,8 @@ pub enum StoreError {
     CommandConflict,
     #[error("stored command result does not match its original bound result")]
     CommandResultMismatch,
+    #[error("Mission command batch is empty, mixed, duplicated, or has an invalid chained anchor")]
+    InvalidCommandBatch,
     #[error("effect id must be one canonical lowercase identifier")]
     InvalidEffectId,
     #[error("effect id was reused with a different typed effect")]
@@ -763,69 +765,60 @@ impl Store {
         &mut self,
         envelope: &MissionCommandEnvelope,
     ) -> Result<MissionCommandResult, StoreError> {
-        validate_command_id(&envelope.command_id)?;
-        let command_hash = command_hash(envelope)?;
-        let transaction = self.connection.transaction()?;
+        self.execute_mission_command_batch(std::slice::from_ref(envelope))?
+            .pop()
+            .ok_or(StoreError::InvalidCommandBatch)
+    }
 
-        if let Some(result) = load_duplicate_result(
-            &transaction,
-            &self.authority,
-            self.trusted_broker.as_ref(),
-            &envelope.command_id,
-            &command_hash,
-        )? {
-            transaction.commit()?;
-            return Ok(result);
-        }
-        require_no_effect_fence(&transaction)?;
-        verify_expected_anchor(
-            &transaction,
-            &self.authority,
-            self.trusted_broker.as_ref(),
-            envelope.expected_anchor.as_ref(),
-        )?;
-        let mission_id = envelope.command.mission_id();
-        let current = load_mission_for_update(&transaction, &self.authority, mission_id)?;
-        let applied = apply_mission_command(current, &envelope.command, &self.authority)?;
-        let actor = applied.mission.owner_id.clone();
-        let audit = CommandAuditContext {
-            command_id: &envelope.command_id,
-            command_hash: &command_hash,
-            actor: &actor,
+    /// Applies one ordered batch of typed commands for the same Mission in a
+    /// single transaction. The first envelope carries the caller's verified
+    /// anchor; later envelopes must omit it because the Store owns chaining to
+    /// each preceding command result.
+    ///
+    /// Exact whole-batch retries return the original bound results. A new
+    /// command after an already committed prefix is accepted only when that
+    /// prefix is still the current audit tail. Any failure rolls back every
+    /// state, Receipt, command-result, and audit write in the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a write for an empty/mixed/duplicate batch,
+    /// caller-supplied inner anchor, concurrency conflict, domain failure,
+    /// invalid binding, or database failure.
+    pub fn execute_mission_command_batch(
+        &mut self,
+        envelopes: &[MissionCommandEnvelope],
+    ) -> Result<Vec<MissionCommandResult>, StoreError> {
+        let Some(first) = envelopes.first() else {
+            return Err(StoreError::InvalidCommandBatch);
         };
-        let mission_anchor = write_mission(
-            &transaction,
-            &self.authority,
-            &applied.mission,
-            &audit,
-            &format!("{}:mission", envelope.command_id),
-        )?;
-        let anchor = if let Some(receipt) = applied.receipt.as_ref() {
-            write_receipt(
+        let mission_id = first.command.mission_id();
+        let mut command_ids = HashSet::new();
+        for (index, envelope) in envelopes.iter().enumerate() {
+            validate_command_id(&envelope.command_id)?;
+            if envelope.command.mission_id() != mission_id
+                || !command_ids.insert(envelope.command_id.as_str())
+                || (index > 0 && envelope.expected_anchor.is_some())
+            {
+                return Err(StoreError::InvalidCommandBatch);
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        let mut expected_anchor = first.expected_anchor.clone();
+        let mut results = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            let result = execute_mission_command_in_transaction(
                 &transaction,
                 &self.authority,
-                &applied.mission,
-                receipt,
-                &audit,
-                &format!("{}:receipt", envelope.command_id),
-            )?
-        } else {
-            mission_anchor
-        };
-        let result = MissionCommandResult {
-            mission: applied.mission,
-            receipt: applied.receipt,
-            anchor,
-        };
-        write_command_result(
-            &transaction,
-            &self.authority,
-            &envelope.command_id,
-            &command_hash,
-            &result,
-        )?;
+                self.trusted_broker.as_ref(),
+                envelope,
+                expected_anchor.as_ref(),
+            )?;
+            expected_anchor = Some(result.anchor.clone());
+            results.push(result);
+        }
         transaction.commit()?;
-        Ok(result)
+        Ok(results)
     }
 
     /// Loads a Mission only after its ciphertext matches its latest signed audit row.
@@ -1239,6 +1232,75 @@ impl Store {
         }
     }
 
+    /// Lists all verified Missions newest-first after checking the complete
+    /// audit chain and every persisted binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid anchor, binding, ciphertext, or Mission.
+    pub fn list_missions(&self, expected_anchor: &AuditAnchor) -> Result<Vec<Mission>, StoreError> {
+        self.verify_audit_chain(expected_anchor)?;
+        let mission_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT mission_id FROM mission_state ORDER BY updated_at_ms DESC, mission_id ASC",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        mission_ids
+            .into_iter()
+            .map(|mission_id| {
+                load_mission_for_update(&self.connection, &self.authority, &mission_id)?
+                    .ok_or(StoreError::MissionStateMismatch)
+            })
+            .collect()
+    }
+
+    /// Lists immutable verified Receipts newest-first after checking the
+    /// complete audit chain and every persisted binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid anchor, binding, ciphertext, Receipt,
+    /// or completed Mission.
+    pub fn list_receipts(&self, expected_anchor: &AuditAnchor) -> Result<Vec<Receipt>, StoreError> {
+        self.verify_audit_chain(expected_anchor)?;
+        let receipt_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT receipt_id FROM receipt_state ORDER BY completed_at_ms DESC, receipt_id ASC",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        receipt_ids
+            .into_iter()
+            .map(|receipt_id| {
+                self.get_receipt(&receipt_id, expected_anchor)?
+                    .ok_or(StoreError::MissionStateMismatch)
+            })
+            .collect()
+    }
+
+    /// Returns the current audit tail only after the complete signed chain and
+    /// every persisted binding have been verified. A pristine Store has no
+    /// anchor yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid row, signature, tail, state, command,
+    /// or effect binding.
+    pub fn current_verified_audit_anchor(&self) -> Result<Option<AuditAnchor>, StoreError> {
+        let anchor = verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        Ok(anchor)
+    }
+
     /// Verifies the complete signed chain, external tail, current state bindings,
     /// and bidirectional command/audit reconciliation.
     ///
@@ -1258,6 +1320,68 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn execute_mission_command_in_transaction(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+    envelope: &MissionCommandEnvelope,
+    expected_anchor: Option<&AuditAnchor>,
+) -> Result<MissionCommandResult, StoreError> {
+    let command_hash = command_hash(envelope)?;
+    if let Some(result) = load_duplicate_result(
+        transaction,
+        authority,
+        trusted_broker,
+        &envelope.command_id,
+        &command_hash,
+    )? {
+        return Ok(result);
+    }
+    require_no_effect_fence(transaction)?;
+    verify_expected_anchor(transaction, authority, trusted_broker, expected_anchor)?;
+    let mission_id = envelope.command.mission_id();
+    let current = load_mission_for_update(transaction, authority, mission_id)?;
+    let applied = apply_mission_command(current, &envelope.command, authority)?;
+    let actor = applied.mission.owner_id.clone();
+    let audit = CommandAuditContext {
+        command_id: &envelope.command_id,
+        command_hash: &command_hash,
+        actor: &actor,
+    };
+    let mission_anchor = write_mission(
+        transaction,
+        authority,
+        &applied.mission,
+        &audit,
+        &format!("{}:mission", envelope.command_id),
+    )?;
+    let anchor = if let Some(receipt) = applied.receipt.as_ref() {
+        write_receipt(
+            transaction,
+            authority,
+            &applied.mission,
+            receipt,
+            &audit,
+            &format!("{}:receipt", envelope.command_id),
+        )?
+    } else {
+        mission_anchor
+    };
+    let result = MissionCommandResult {
+        mission: applied.mission,
+        receipt: applied.receipt,
+        anchor,
+    };
+    write_command_result(
+        transaction,
+        authority,
+        &envelope.command_id,
+        &command_hash,
+        &result,
+    )?;
+    Ok(result)
 }
 
 fn validate_command_id(command_id: &str) -> Result<(), StoreError> {

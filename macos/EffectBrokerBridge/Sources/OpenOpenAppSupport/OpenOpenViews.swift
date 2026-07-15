@@ -100,12 +100,14 @@ private struct DashboardView: View {
         TextField("What outcome would help right now?", text: $model.prompt)
           .textFieldStyle(.roundedBorder)
           .onSubmit { Task { await model.submitPrompt() } }
-          .disabled(!model.modelEntryEnabled || model.isBusy)
+          .disabled(
+            !model.modelEntryEnabled || model.isBusy || model.confirmedMission != nil
+          )
         Button(model.isBusy ? "Thinking…" : "Ask") {
           Task { await model.submitPrompt() }
         }
         .disabled(
-          !model.modelEntryEnabled || model.isBusy
+          !model.modelEntryEnabled || model.isBusy || model.confirmedMission != nil
             || model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || model.prompt.utf8.count > 16 * 1024
         )
@@ -122,6 +124,18 @@ private struct DashboardView: View {
             ForEach(Array(suggestion.proposedSteps.enumerated()), id: \.offset) { index, step in
               Text("\(index + 1). \(step)")
             }
+            Text(
+              "Confirming authorizes OpenOpen to create these exact items in its OpenOpen Reminders list."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Button(
+              model.confirmedMission == nil
+                ? "Confirm & Create Reminders" : "Retry Reminders setup"
+            ) {
+              model.requestSuggestionConfirmation()
+            }
+            .disabled(model.isBusy || !model.modelEntryEnabled)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(4)
@@ -141,7 +155,37 @@ private struct DashboardView: View {
       if !model.activeCards.isEmpty {
         Text("Working on it").font(.title2.bold())
         ForEach(model.activeCards) { card in
-          GroupBox(card.title) { Text(card.state) }
+          GroupBox(card.title) {
+            VStack(alignment: .leading, spacing: 8) {
+              Text(card.state)
+              if model.reminderLinks.isEmpty, model.confirmedMission != nil {
+                Button("Set up Reminders") {
+                  model.requestSuggestionConfirmation()
+                }
+                .disabled(model.isBusy || !model.modelEntryEnabled)
+              } else if model.confirmedMission != nil {
+                Button("Check progress") {
+                  model.requestMissionProgressCheck()
+                }
+                .disabled(model.isBusy || !model.modelEntryEnabled)
+              }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+          }
+        }
+      }
+      if let receipt = model.receipt {
+        GroupBox("Done") {
+          VStack(alignment: .leading, spacing: 8) {
+            Text(receipt.summary).font(.headline)
+            Text("Evidence: \(receipt.evidenceIds.count) Reminder completion(s)")
+              .foregroundStyle(.secondary)
+            Text("Model: \(receipt.actualModel)")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(4)
         }
       }
       Spacer()

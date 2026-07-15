@@ -1,19 +1,24 @@
 //! Production Rust host for `OpenOpen`'s local JSON-RPC surface.
 
 use openopen_codex_client::{
-    ChatGptLogin, CodexClient, CodexError, CodexRuntimeConfig, OutcomeRequest,
+    ChatGptLogin, CodexClient, CodexError, CodexRuntimeConfig, OutcomeRequest, REQUIRED_MODEL,
 };
 use openopen_core::{
-    BrokerEnrollmentRecord, LocalAuthority, Store, StoreError, TrustedBrokerEnrollment,
-    authorize_broker_enrollment, verify_core_instance_lease,
+    ActionGate, ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor,
+    BrokerEnrollmentRecord, CreateMission, CreateWorkItem, EffectKind, EvidenceClaims,
+    GateDecision, LocalAuthority, MissionCommand, MissionCommandEnvelope, NewBoundaryApproval,
+    NewReceipt, Store, StoreError, TrustedBrokerEnrollment, authorize_broker_enrollment,
+    verify_core_instance_lease,
 };
 use openopen_protocol::{
-    CoreInstanceLease, OutcomeSuggestion, RpcError, RpcRequest, RpcResponse,
-    RuntimeControlAuthorization, RuntimeControlReceipt,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, CoreInstanceLease, EvidenceKind, Mission,
+    MissionStatus, OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse,
+    RuntimeControlAuthorization, RuntimeControlReceipt, WorkItem, WorkItemStatus,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -31,6 +36,8 @@ pub const BOOTSTRAP_MAGIC: &[u8] = b"OPENOPEN_BOOTSTRAP_V1\0";
 const ISSUER_ID: &str = "openopen-local-owner";
 const APP_SUPPORT_COMPONENT: &str = "com.thesongzhu.OpenOpen";
 const CORE_LEASE_INSTALL_WINDOW_MS: i64 = 60_000;
+const DEFAULT_REMINDERS_LIST_ID: &str = "openopen.default-reminders";
+const REMINDER_WRITE_PAYLOAD_PREFIX: &[u8] = b"OPENOPEN_REMINDER_WRITE_V2\0";
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -363,6 +370,10 @@ impl Host {
             "account.login.await" => self.await_login(&request, responses),
             "models.list" => self.start_model_list(&request, responses),
             "outcome.propose" => self.start_outcome(&request, responses),
+            "mission.confirm" => self.confirm_mission(&request, responses),
+            "mission.reminders.begin" => self.begin_reminder_dispatch(&request, responses),
+            "mission.reminders.record" => self.record_reminder_mirror(&request, responses),
+            "mission.reminders.complete" => self.complete_reminders(&request, responses),
             method if is_public_family(method) => {
                 let _ = responses.send(not_ready(request.id));
             }
@@ -689,25 +700,54 @@ impl Host {
             let _ = responses.send(invalid_params(request.id));
             return;
         }
-        let response = self.store.runtime_control().map_or_else(
-            |error| host_failure(request.id, &error),
-            |runtime| {
-                let suggestion = self
-                    .operations
-                    .suggestion
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                RpcResponse::success(
-                    request.id,
-                    json!({
-                        "activeCards": [],
-                        "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
-                        "runtime": runtime,
-                        "suggestion": suggestion
-                    }),
-                )
-            },
+        let result = (|| -> Result<Value, HostCallError> {
+            let runtime = self.store.runtime_control()?;
+            let suggestion = self
+                .operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+                return Ok(json!({
+                    "activeCards": [],
+                    "confirmedMission": null,
+                    "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+                    "receipt": null,
+                    "runtime": runtime,
+                    "suggestion": suggestion
+                }));
+            };
+            let mut confirmed = Vec::new();
+            for mission in self.store.list_missions(&anchor)? {
+                if let Some(value) = confirmed_mission_from_mission(
+                    &mission,
+                    &self.authority,
+                    ReminderWriteDisposition::RecoverOnly,
+                )? {
+                    confirmed.push(value);
+                }
+            }
+            let receipt = self.store.list_receipts(&anchor)?.into_iter().next();
+            let active_cards = confirmed
+                .iter()
+                .take(3)
+                .map(|mission| {
+                    json!({"id": mission.mission_id, "state": "working", "title": mission.title})
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "activeCards": active_cards,
+                "confirmedMission": confirmed.first(),
+                "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+                "receipt": receipt,
+                "runtime": runtime,
+                "suggestion": suggestion
+            }))
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |dashboard| success(request.id, dashboard),
         );
         let _ = responses.send(response);
     }
@@ -856,9 +896,14 @@ impl Host {
                 if token.load(Ordering::Acquire) {
                     return Err(HostCallError::Codex(CodexError::Cancelled));
                 }
-                let encoded = serde_json::to_vec(&value).map_err(|_| HostCallError::Internal)?;
+                let mut suggestion_nonce = [0_u8; 16];
+                getrandom::fill(&mut suggestion_nonce).map_err(|_| HostCallError::Internal)?;
+                let suggested_at_ms = now_ms()?;
                 let suggestion = OutcomeSuggestion {
-                    id: format!("suggestion-{}", &hex::encode(Sha256::digest(encoded))[..24]),
+                    id: format!(
+                        "suggestion-{suggested_at_ms}-{}",
+                        hex::encode(suggestion_nonce)
+                    ),
                     title: value.title,
                     why_now: value.why_now,
                     proposed_steps: value.proposed_steps,
@@ -875,6 +920,571 @@ impl Host {
                 |value| success(request_id, value),
             ));
         });
+    }
+
+    fn confirm_mission(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ConfirmMission>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !valid_suggestion_id(&params.suggestion_id)
+            || !valid_reminder_target(&params.reminder_target)
+        {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let existing = self.confirmed_mission_for_suggestion_id(&params.suggestion_id);
+        let result = match existing {
+            Ok(Some(confirmed))
+                if confirmed.reminder_authorization.target == params.reminder_target =>
+            {
+                Ok(confirmed)
+            }
+            Ok(Some(_)) => {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+            Ok(None) => {
+                let suggestion = self
+                    .operations
+                    .suggestion
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .filter(|suggestion| {
+                        suggestion.id == params.suggestion_id
+                            && valid_outcome_suggestion(suggestion)
+                    })
+                    .cloned();
+                let Some(suggestion) = suggestion else {
+                    let _ = responses.send(invalid_params(request.id));
+                    return;
+                };
+                now_ms().and_then(|clicked_at_ms| {
+                    self.persist_confirmed_mission(
+                        &suggestion,
+                        &params.reminder_target,
+                        clicked_at_ms,
+                    )
+                })
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            let mut slot = self
+                .operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|suggestion| suggestion.id == params.suggestion_id)
+            {
+                *slot = None;
+            }
+        }
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |confirmed| success(request.id, confirmed),
+        );
+        let _ = responses.send(response);
+    }
+
+    fn confirmed_mission_for_suggestion_id(
+        &self,
+        suggestion_id: &str,
+    ) -> Result<Option<ConfirmedMission>, HostCallError> {
+        let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+            return Ok(None);
+        };
+        let mission_id = mission_id_for_suggestion_id(suggestion_id)?;
+        self.store
+            .get_mission(&mission_id, &anchor)?
+            .map(|mission| {
+                confirmed_mission_from_mission(
+                    &mission,
+                    &self.authority,
+                    ReminderWriteDisposition::RecoverOnly,
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn persist_confirmed_mission(
+        &mut self,
+        suggestion: &OutcomeSuggestion,
+        reminder_target: &ReminderTarget,
+        clicked_at_ms: i64,
+    ) -> Result<ConfirmedMission, HostCallError> {
+        if !valid_reminder_target(reminder_target) {
+            return Err(HostCallError::Internal);
+        }
+        let mission_id = mission_id_for_suggestion_id(&suggestion.id)?;
+        let scope_digest = serialized_sha256(suggestion)?;
+        let scope_approval_id = hashed_identifier(
+            "approval",
+            &json!({"missionId": mission_id, "scopeDigest": scope_digest}),
+        )?;
+        let work_items = suggestion
+            .proposed_steps
+            .iter()
+            .enumerate()
+            .map(|(index, title)| {
+                Ok(CreateWorkItem {
+                    id: hashed_identifier(
+                        "work",
+                        &json!({"index": index, "missionId": mission_id, "title": title}),
+                    )?,
+                    title: title.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, HostCallError>>()?;
+        let reminder_payload = reminder_write_payload(
+            &mission_id,
+            reminder_target,
+            work_items
+                .iter()
+                .map(|item| (item.id.as_str(), item.title.as_str())),
+        )?;
+        let reminder_proposal = reminder_write_proposal(&mission_id, &scope_digest);
+        let reminder_digest = reminder_proposal
+            .approval_digest(ApprovalKind::NewExternalWrite, Some(&reminder_payload))
+            .map_err(|_| HostCallError::Internal)?;
+        let reminder_approval_id = hashed_identifier(
+            "approval",
+            &json!({"digest": reminder_digest, "missionId": mission_id}),
+        )?;
+        let needs_me_id = hashed_identifier(
+            "needsme",
+            &json!({"approvalId": reminder_approval_id, "missionId": mission_id}),
+        )?;
+        let commands = vec![
+            MissionCommand::Create {
+                input: CreateMission {
+                    mission_id: mission_id.clone(),
+                    title: suggestion.title.clone(),
+                    outcome: suggestion.why_now.clone(),
+                    owner_id: ISSUER_ID.to_owned(),
+                    scope_digest: scope_digest.clone(),
+                    scope_approval_id: scope_approval_id.clone(),
+                    scope_approval_prompt: format!(
+                        "Confirm this Mission and create its steps in OpenOpen Reminders: {}",
+                        suggestion.title
+                    ),
+                    work_items,
+                    now_ms: clicked_at_ms,
+                },
+            },
+            MissionCommand::BeginConfirmation {
+                mission_id: mission_id.clone(),
+                now_ms: clicked_at_ms,
+            },
+            MissionCommand::DecideApproval {
+                mission_id: mission_id.clone(),
+                approval_id: scope_approval_id,
+                actor_id: ISSUER_ID.to_owned(),
+                decision: ApprovalDecision::Approve,
+                now_ms: clicked_at_ms,
+            },
+            MissionCommand::Activate {
+                mission_id: mission_id.clone(),
+                now_ms: clicked_at_ms,
+            },
+            MissionCommand::RequestScopeChange {
+                mission_id: mission_id.clone(),
+                approval: NewBoundaryApproval {
+                    id: reminder_approval_id.clone(),
+                    kind: ApprovalKind::NewExternalWrite,
+                    prompt: format!(
+                        "Create {} steps in the OpenOpen Reminders list.",
+                        suggestion.proposed_steps.len()
+                    ),
+                    scope_digest: reminder_digest,
+                    target: Some(reminder_target.approval_target()),
+                },
+                needs_me_id,
+                now_ms: clicked_at_ms,
+            },
+            MissionCommand::DecideApproval {
+                mission_id: mission_id.clone(),
+                approval_id: reminder_approval_id,
+                actor_id: ISSUER_ID.to_owned(),
+                decision: ApprovalDecision::Approve,
+                now_ms: clicked_at_ms,
+            },
+            MissionCommand::Resume {
+                mission_id: mission_id.clone(),
+                now_ms: clicked_at_ms,
+            },
+        ];
+        let expected_anchor = self.store.current_verified_audit_anchor()?;
+        let envelopes = mission_command_batch(expected_anchor.as_ref(), &mission_id, commands)?;
+        let mission = self
+            .store
+            .execute_mission_command_batch(&envelopes)?
+            .pop()
+            .ok_or(HostCallError::Internal)?
+            .mission;
+        confirmed_mission_from_mission(
+            &mission,
+            &self.authority,
+            ReminderWriteDisposition::CreateOnce,
+        )?
+        .ok_or(HostCallError::Internal)
+    }
+
+    fn record_reminder_mirror(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<RecordReminderMirror>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let result = (|| -> Result<Option<ConfirmedMission>, HostCallError> {
+            let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+                return Ok(None);
+            };
+            let Some(mission) = self.store.get_mission(&params.mission_id, &anchor)? else {
+                return Ok(None);
+            };
+            if mission.status != MissionStatus::Active {
+                return Ok(None);
+            }
+            let Some(confirmed) = confirmed_mission_from_mission(
+                &mission,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(links) = validated_reminder_links(
+                &mission,
+                &confirmed.reminder_authorization.target,
+                &confirmed.reminder_dispatch,
+                params.links,
+            ) else {
+                return Ok(None);
+            };
+            if !confirmed.reminder_links.is_empty() {
+                return Ok((confirmed.reminder_links == links).then_some(confirmed));
+            }
+            let observed_at_ms = now_ms()?;
+            let mut commands = Vec::with_capacity(links.len());
+            for link in &links {
+                let sha256 =
+                    reminder_mirror_digest(&confirmed.reminder_authorization.target, link)?;
+                commands.push(MissionCommand::AttachEvidence {
+                    mission_id: mission.id.clone(),
+                    evidence: self.authority.sign_evidence(EvidenceClaims {
+                        id: hashed_identifier(
+                            "evidence",
+                            &json!({
+                                "kind": "reminderMirrored",
+                                "missionId": mission.id,
+                                "sha256": sha256,
+                                "sourceId": link.calendar_item_identifier,
+                                "workItemId": link.work_item_id,
+                            }),
+                        )?,
+                        mission_id: mission.id.clone(),
+                        work_item_id: link.work_item_id.clone(),
+                        kind: EvidenceKind::ReminderMirrored,
+                        source_id: link.calendar_item_identifier.clone(),
+                        sha256: Some(sha256),
+                        observed_at_ms,
+                    }),
+                    now_ms: observed_at_ms,
+                });
+            }
+            let envelopes = mission_command_batch(Some(&anchor), &mission.id, commands)?;
+            let persisted = self
+                .store
+                .execute_mission_command_batch(&envelopes)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            confirmed_mission_from_mission(
+                &persisted,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )
+        })();
+        let response = match result {
+            Ok(Some(confirmed)) => success(request.id, confirmed),
+            Ok(None) => invalid_params(request.id),
+            Err(error) => call_failure(request.id, &error),
+        };
+        let _ = responses.send(response);
+    }
+
+    fn begin_reminder_dispatch(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<BeginReminderDispatch>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let result = (|| -> Result<Option<ReminderDispatchStart>, HostCallError> {
+            let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+                return Ok(None);
+            };
+            let Some(mission) = self.store.get_mission(&params.mission_id, &anchor)? else {
+                return Ok(None);
+            };
+            let Some(confirmed) = confirmed_mission_from_mission(
+                &mission,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            else {
+                return Ok(None);
+            };
+            if !confirmed.reminder_links.is_empty() {
+                return Ok(Some(ReminderDispatchStart {
+                    mission: confirmed,
+                    execute_now: false,
+                }));
+            }
+            if !confirmed.reminder_dispatch.is_empty() {
+                return Ok(Some(ReminderDispatchStart {
+                    mission: confirmed,
+                    execute_now: false,
+                }));
+            }
+            let observed_at_ms = now_ms()?;
+            let mut commands = Vec::with_capacity(mission.work_items.len());
+            for item in &mission.work_items {
+                let (token, sha256) =
+                    reminder_dispatch_claim(&mission, item, &confirmed.reminder_authorization)?;
+                commands.push(MissionCommand::AttachEvidence {
+                    mission_id: mission.id.clone(),
+                    evidence: self.authority.sign_evidence(EvidenceClaims {
+                        id: hashed_identifier(
+                            "evidence",
+                            &json!({
+                                "kind": "reminderDispatchStarted",
+                                "missionId": mission.id,
+                                "sha256": sha256,
+                                "sourceId": token,
+                                "workItemId": item.id,
+                            }),
+                        )?,
+                        mission_id: mission.id.clone(),
+                        work_item_id: item.id.clone(),
+                        kind: EvidenceKind::ReminderDispatchStarted,
+                        source_id: token,
+                        sha256: Some(sha256),
+                        observed_at_ms,
+                    }),
+                    now_ms: observed_at_ms,
+                });
+            }
+            let envelopes = mission_command_batch(Some(&anchor), &mission.id, commands)?;
+            let persisted = self
+                .store
+                .execute_mission_command_batch(&envelopes)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            let mission = confirmed_mission_from_mission(
+                &persisted,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            if mission.reminder_dispatch.len() != mission.work_items.len() {
+                return Err(HostCallError::Internal);
+            }
+            Ok(Some(ReminderDispatchStart {
+                mission,
+                execute_now: true,
+            }))
+        })();
+        let response = match result {
+            Ok(Some(start)) => success(request.id, start),
+            Ok(None) => invalid_params(request.id),
+            Err(error) => call_failure(request.id, &error),
+        };
+        let _ = responses.send(response);
+    }
+
+    fn complete_reminders(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<CompleteReminders>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let anchor = match self.store.current_verified_audit_anchor() {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let mission = match self.store.get_mission(&params.mission_id, &anchor) {
+            Ok(Some(mission)) => mission,
+            Ok(None) => {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let observed_now = match now_ms() {
+            Ok(now) => now,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(completions) = validated_reminder_completions(
+            &mission,
+            &self.authority,
+            params.completions,
+            observed_now,
+            mission.status == MissionStatus::Active,
+        ) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let result = match mission.status {
+            MissionStatus::Active => {
+                self.persist_reminder_completion(&mission, &anchor, &completions, observed_now)
+            }
+            MissionStatus::Completed => {
+                match self.existing_receipt_for_completions(&mission, &anchor, &completions) {
+                    Ok(Some(receipt)) => Ok(receipt),
+                    Ok(None) => {
+                        let _ = responses.send(invalid_params(request.id));
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+        };
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |receipt| success(request.id, receipt),
+        );
+        let _ = responses.send(response);
+    }
+
+    fn persist_reminder_completion(
+        &mut self,
+        mission: &Mission,
+        anchor: &AuditAnchor,
+        completions: &BTreeMap<String, ReminderCompletion>,
+        completed_at_ms: i64,
+    ) -> Result<Receipt, HostCallError> {
+        let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 1);
+        let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
+        for item in &mission.work_items {
+            let completion = completions
+                .get(&item.id)
+                .expect("validated completion covers every WorkItem");
+            commands.push(MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: item.id.clone(),
+                next: WorkItemStatus::Active,
+                evidence_ids: Vec::new(),
+                now_ms: completed_at_ms,
+            });
+            let evidence_id = reminder_evidence_id(&mission.id, &item.id, completion)?;
+            commands.push(MissionCommand::AttachEvidence {
+                mission_id: mission.id.clone(),
+                evidence: self.authority.sign_evidence(EvidenceClaims {
+                    id: evidence_id.clone(),
+                    mission_id: mission.id.clone(),
+                    work_item_id: item.id.clone(),
+                    kind: EvidenceKind::ReminderCompleted,
+                    source_id: completion.source_id.clone(),
+                    sha256: None,
+                    observed_at_ms: completion.completed_at_ms,
+                }),
+                now_ms: completed_at_ms,
+            });
+            commands.push(MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: item.id.clone(),
+                next: WorkItemStatus::Completed,
+                evidence_ids: vec![evidence_id.clone()],
+                now_ms: completed_at_ms,
+            });
+            evidence_ids.push(evidence_id);
+        }
+        let receipt_id = hashed_identifier(
+            "receipt",
+            &json!({"evidenceIds": evidence_ids, "missionId": mission.id}),
+        )?;
+        commands.push(MissionCommand::Complete {
+            mission_id: mission.id.clone(),
+            receipt: NewReceipt {
+                id: receipt_id,
+                summary: format!(
+                    "Completed {} with {} verified Reminders.",
+                    mission.title,
+                    mission.work_items.len()
+                ),
+                actual_model: REQUIRED_MODEL.to_owned(),
+                output_hashes: Vec::new(),
+                completed_at_ms,
+            },
+            now_ms: completed_at_ms,
+        });
+        let envelopes = mission_command_batch(Some(anchor), &mission.id, commands)?;
+        self.store
+            .execute_mission_command_batch(&envelopes)?
+            .pop()
+            .and_then(|result| result.receipt)
+            .ok_or(HostCallError::Internal)
+    }
+
+    fn existing_receipt_for_completions(
+        &self,
+        mission: &Mission,
+        anchor: &AuditAnchor,
+        completions: &BTreeMap<String, ReminderCompletion>,
+    ) -> Result<Option<Receipt>, HostCallError> {
+        let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
+        for item in &mission.work_items {
+            let completion = completions
+                .get(&item.id)
+                .expect("validated completion covers every WorkItem");
+            let evidence_id = reminder_evidence_id(&mission.id, &item.id, completion)?;
+            let Some(evidence) = mission
+                .evidence
+                .iter()
+                .find(|evidence| evidence.id == evidence_id)
+            else {
+                return Ok(None);
+            };
+            if item.evidence_ids != [evidence_id.clone()]
+                || evidence.mission_id != mission.id
+                || evidence.work_item_id != item.id
+                || evidence.kind != EvidenceKind::ReminderCompleted
+                || evidence.source_id != completion.source_id
+                || evidence.observed_at_ms != completion.completed_at_ms
+                || self.authority.verify_evidence(evidence).is_err()
+            {
+                return Ok(None);
+            }
+            evidence_ids.push(evidence_id);
+        }
+        let receipt_id = hashed_identifier(
+            "receipt",
+            &json!({"evidenceIds": evidence_ids, "missionId": mission.id}),
+        )?;
+        self.store
+            .get_receipt(&receipt_id, anchor)
+            .map_err(HostCallError::Store)
     }
 
     fn begin_operation(
@@ -1123,6 +1733,121 @@ impl OutcomeWithProof {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmMission {
+    suggestion_id: String,
+    reminder_target: ReminderTarget,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReminderTarget {
+    source_identifier: String,
+    calendar_identifier: String,
+}
+
+impl ReminderTarget {
+    fn approval_target(&self) -> ApprovalTarget {
+        ApprovalTarget::ReminderList {
+            logical_list_id: DEFAULT_REMINDERS_LIST_ID.to_owned(),
+            source_identifier: self.source_identifier.clone(),
+            calendar_identifier: self.calendar_identifier.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReminderCompletion {
+    work_item_id: String,
+    source_id: String,
+    completed_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompleteReminders {
+    mission_id: String,
+    completions: Vec<ReminderCompletion>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BeginReminderDispatch {
+    mission_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordReminderMirror {
+    mission_id: String,
+    links: Vec<ConfirmedReminderLink>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmedReminderLink {
+    mission_id: String,
+    work_item_id: String,
+    source_identifier: String,
+    calendar_identifier: String,
+    calendar_item_identifier: String,
+    dispatch_token: String,
+    title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmedReminderDispatch {
+    work_item_id: String,
+    token: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ReminderWriteDisposition {
+    CreateOnce,
+    RecoverOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReminderAuthorization {
+    mission_id: String,
+    list_id: String,
+    payload_sha256: String,
+    approval_id: String,
+    approval_digest: String,
+    target: ReminderTarget,
+    write_disposition: ReminderWriteDisposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmedWorkItem {
+    id: String,
+    title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmedMission {
+    mission_id: String,
+    title: String,
+    work_items: Vec<ConfirmedWorkItem>,
+    reminder_authorization: ReminderAuthorization,
+    reminder_dispatch: Vec<ConfirmedReminderDispatch>,
+    reminder_links: Vec<ConfirmedReminderLink>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReminderDispatchStart {
+    mission: ConfirmedMission,
+    execute_now: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoParams {}
 
@@ -1255,6 +1980,486 @@ fn now_ms() -> Result<i64, HostCallError> {
     i64::try_from(duration.as_millis()).map_err(|_| HostCallError::Internal)
 }
 
+fn valid_outcome_suggestion(suggestion: &OutcomeSuggestion) -> bool {
+    let mut source_refs = HashSet::new();
+    valid_suggestion_id(&suggestion.id)
+        && !suggestion.title.trim().is_empty()
+        && suggestion.title.chars().count() <= 120
+        && !suggestion.why_now.trim().is_empty()
+        && suggestion.why_now.chars().count() <= 300
+        && !suggestion.proposed_steps.is_empty()
+        && suggestion.proposed_steps.len() <= 8
+        && suggestion
+            .proposed_steps
+            .iter()
+            .all(|step| !step.trim().is_empty() && step.chars().count() <= 240)
+        && suggestion.source_refs.iter().all(|source_ref| {
+            !source_ref.is_empty()
+                && source_ref.len() <= 128
+                && source_ref.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_' | b':' | b'.')
+                })
+                && source_refs.insert(source_ref)
+        })
+}
+
+fn valid_suggestion_id(suggestion_id: &str) -> bool {
+    let Some((timestamp, nonce)) = suggestion_id
+        .strip_prefix("suggestion-")
+        .and_then(|value| value.split_once('-'))
+    else {
+        return false;
+    };
+    let Ok(timestamp) = timestamp.parse::<i64>() else {
+        return false;
+    };
+    timestamp >= 0
+        && nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn mission_id_for_suggestion_id(suggestion_id: &str) -> Result<String, HostCallError> {
+    if !valid_suggestion_id(suggestion_id) {
+        return Err(HostCallError::Internal);
+    }
+    hashed_identifier("mission", &suggestion_id)
+}
+
+fn validated_reminder_links(
+    mission: &Mission,
+    target: &ReminderTarget,
+    dispatch: &[ConfirmedReminderDispatch],
+    links: Vec<ConfirmedReminderLink>,
+) -> Option<Vec<ConfirmedReminderLink>> {
+    if links.len() != mission.work_items.len() || dispatch.len() != mission.work_items.len() {
+        return None;
+    }
+    let dispatch_by_work_item = dispatch
+        .iter()
+        .map(|item| (item.work_item_id.as_str(), item.token.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut by_work_item = links
+        .into_iter()
+        .map(|link| (link.work_item_id.clone(), link))
+        .collect::<BTreeMap<_, _>>();
+    if by_work_item.len() != mission.work_items.len() {
+        return None;
+    }
+    let mut reminder_ids = HashSet::new();
+    mission
+        .work_items
+        .iter()
+        .map(|item| {
+            let link = by_work_item.remove(&item.id)?;
+            (link.mission_id == mission.id
+                && link.title == item.title
+                && link.source_identifier == target.source_identifier
+                && link.calendar_identifier == target.calendar_identifier
+                && dispatch_by_work_item.get(item.id.as_str())
+                    == Some(&link.dispatch_token.as_str())
+                && !link.calendar_item_identifier.trim().is_empty()
+                && link.calendar_item_identifier.len() <= 512
+                && reminder_ids.insert(link.calendar_item_identifier.clone()))
+            .then_some(link)
+        })
+        .collect()
+}
+
+fn reminder_dispatch_claim(
+    mission: &Mission,
+    item: &WorkItem,
+    authorization: &ReminderAuthorization,
+) -> Result<(String, String), HostCallError> {
+    let value = json!({
+        "approvalDigest": authorization.approval_digest,
+        "approvalId": authorization.approval_id,
+        "calendarIdentifier": authorization.target.calendar_identifier,
+        "missionId": mission.id,
+        "payloadSha256": authorization.payload_sha256,
+        "sourceIdentifier": authorization.target.source_identifier,
+        "title": item.title,
+        "version": 1,
+        "workItemId": item.id,
+    });
+    let sha256 = serialized_sha256(&value)?;
+    Ok((format!("dispatch-{}", &sha256[..24]), sha256))
+}
+
+fn reminder_dispatch_tokens(
+    mission: &Mission,
+    authorization: &ReminderAuthorization,
+    authority: &LocalAuthority,
+) -> Result<Vec<ConfirmedReminderDispatch>, HostCallError> {
+    let dispatch = mission
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.kind == EvidenceKind::ReminderDispatchStarted)
+        .collect::<Vec<_>>();
+    if dispatch.is_empty() {
+        return Ok(Vec::new());
+    }
+    if dispatch.len() != mission.work_items.len() {
+        return Err(HostCallError::Internal);
+    }
+    mission
+        .work_items
+        .iter()
+        .map(|item| {
+            let matching = dispatch
+                .iter()
+                .filter(|evidence| evidence.work_item_id == item.id)
+                .collect::<Vec<_>>();
+            let [evidence] = matching.as_slice() else {
+                return Err(HostCallError::Internal);
+            };
+            authority
+                .verify_evidence(evidence)
+                .map_err(|_| HostCallError::Internal)?;
+            let (token, digest) = reminder_dispatch_claim(mission, item, authorization)?;
+            if evidence.source_id != token || evidence.sha256.as_deref() != Some(digest.as_str()) {
+                return Err(HostCallError::Internal);
+            }
+            Ok(ConfirmedReminderDispatch {
+                work_item_id: item.id.clone(),
+                token,
+            })
+        })
+        .collect()
+}
+
+fn reminder_mirror_digest(
+    target: &ReminderTarget,
+    link: &ConfirmedReminderLink,
+) -> Result<String, HostCallError> {
+    serialized_sha256(&json!({
+        "calendarIdentifier": target.calendar_identifier,
+        "calendarItemIdentifier": link.calendar_item_identifier,
+        "dispatchToken": link.dispatch_token,
+        "missionId": link.mission_id,
+        "sourceIdentifier": target.source_identifier,
+        "title": link.title,
+        "version": 2,
+        "workItemId": link.work_item_id,
+    }))
+}
+
+fn reminder_mirror_links(
+    mission: &Mission,
+    target: &ReminderTarget,
+    dispatch: &[ConfirmedReminderDispatch],
+    authority: &LocalAuthority,
+) -> Result<Vec<ConfirmedReminderLink>, HostCallError> {
+    let mirrored = mission
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.kind == EvidenceKind::ReminderMirrored)
+        .collect::<Vec<_>>();
+    if mirrored.is_empty() {
+        return Ok(Vec::new());
+    }
+    if mirrored.len() != mission.work_items.len() {
+        return Err(HostCallError::Internal);
+    }
+    let dispatch_by_work_item = dispatch
+        .iter()
+        .map(|item| (item.work_item_id.as_str(), item.token.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    if dispatch_by_work_item.len() != mission.work_items.len() {
+        return Err(HostCallError::Internal);
+    }
+    mission
+        .work_items
+        .iter()
+        .map(|item| {
+            let matching = mirrored
+                .iter()
+                .filter(|evidence| evidence.work_item_id == item.id)
+                .collect::<Vec<_>>();
+            let [evidence] = matching.as_slice() else {
+                return Err(HostCallError::Internal);
+            };
+            authority
+                .verify_evidence(evidence)
+                .map_err(|_| HostCallError::Internal)?;
+            let link = ConfirmedReminderLink {
+                mission_id: mission.id.clone(),
+                work_item_id: item.id.clone(),
+                source_identifier: target.source_identifier.clone(),
+                calendar_identifier: target.calendar_identifier.clone(),
+                calendar_item_identifier: evidence.source_id.clone(),
+                dispatch_token: dispatch_by_work_item
+                    .get(item.id.as_str())
+                    .ok_or(HostCallError::Internal)?
+                    .to_string(),
+                title: item.title.clone(),
+            };
+            let digest = reminder_mirror_digest(target, &link)?;
+            if evidence.sha256.as_deref() != Some(digest.as_str()) {
+                return Err(HostCallError::Internal);
+            }
+            Ok(link)
+        })
+        .collect()
+}
+
+fn validated_reminder_completions(
+    mission: &Mission,
+    authority: &LocalAuthority,
+    completions: Vec<ReminderCompletion>,
+    observed_now_ms: i64,
+    require_pending: bool,
+) -> Option<BTreeMap<String, ReminderCompletion>> {
+    let expected_status = if require_pending {
+        WorkItemStatus::Pending
+    } else {
+        WorkItemStatus::Completed
+    };
+    if mission
+        .work_items
+        .iter()
+        .any(|item| item.status != expected_status)
+        || completions.len() != mission.work_items.len()
+    {
+        return None;
+    }
+    let authorization =
+        reminder_authorization_from_mission(mission, ReminderWriteDisposition::RecoverOnly)
+            .ok()??;
+    let dispatch = reminder_dispatch_tokens(mission, &authorization, authority).ok()?;
+    let mirror_links =
+        reminder_mirror_links(mission, &authorization.target, &dispatch, authority).ok()?;
+    if mirror_links.len() != mission.work_items.len() {
+        return None;
+    }
+    let expected_sources = mirror_links
+        .into_iter()
+        .map(|link| (link.work_item_id, link.calendar_item_identifier))
+        .collect::<BTreeMap<_, _>>();
+    let mut source_ids = HashSet::new();
+    let mut validated = BTreeMap::new();
+    for completion in completions {
+        if expected_sources.get(&completion.work_item_id) != Some(&completion.source_id)
+            || completion.source_id.trim().is_empty()
+            || completion.source_id.len() > 512
+            || (require_pending && completion.completed_at_ms < mission.updated_at_ms)
+            || completion.completed_at_ms < mission.created_at_ms
+            || completion.completed_at_ms > observed_now_ms
+            || !source_ids.insert(completion.source_id.clone())
+            || validated
+                .insert(completion.work_item_id.clone(), completion)
+                .is_some()
+        {
+            return None;
+        }
+    }
+    (validated.len() == mission.work_items.len()).then_some(validated)
+}
+
+fn mission_command_batch(
+    expected_anchor: Option<&AuditAnchor>,
+    mission_id: &str,
+    commands: Vec<MissionCommand>,
+) -> Result<Vec<MissionCommandEnvelope>, HostCallError> {
+    commands
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| {
+            Ok(MissionCommandEnvelope {
+                command_id: hashed_identifier(
+                    "command",
+                    &json!({"command": &command, "missionId": mission_id}),
+                )?,
+                expected_anchor: (index == 0).then(|| expected_anchor.cloned()).flatten(),
+                command,
+            })
+        })
+        .collect()
+}
+
+fn reminder_write_proposal(mission_id: &str, scope_digest: &str) -> ActionProposal {
+    ActionProposal {
+        effect: EffectKind::ReminderWrite,
+        mission_id: mission_id.to_owned(),
+        mission_scope_digest: scope_digest.to_owned(),
+        target: ActionTarget::ReminderList {
+            list_id: DEFAULT_REMINDERS_LIST_ID.to_owned(),
+        },
+        estimated_cost_micros: None,
+    }
+}
+
+fn reminder_write_payload<'a>(
+    mission_id: &str,
+    target: &ReminderTarget,
+    work_items: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<Vec<u8>, HostCallError> {
+    let mut payload = REMINDER_WRITE_PAYLOAD_PREFIX.to_vec();
+    append_framed_field(&mut payload, mission_id)?;
+    append_framed_field(&mut payload, DEFAULT_REMINDERS_LIST_ID)?;
+    append_framed_field(&mut payload, &target.source_identifier)?;
+    append_framed_field(&mut payload, &target.calendar_identifier)?;
+    for (id, title) in work_items {
+        append_framed_field(&mut payload, id)?;
+        append_framed_field(&mut payload, title)?;
+    }
+    Ok(payload)
+}
+
+fn append_framed_field(payload: &mut Vec<u8>, value: &str) -> Result<(), HostCallError> {
+    let length = u64::try_from(value.len()).map_err(|_| HostCallError::Internal)?;
+    payload.extend(length.to_be_bytes());
+    payload.extend(value.as_bytes());
+    Ok(())
+}
+
+fn confirmed_mission_from_mission(
+    mission: &Mission,
+    authority: &LocalAuthority,
+    write_disposition: ReminderWriteDisposition,
+) -> Result<Option<ConfirmedMission>, HostCallError> {
+    if mission.status != MissionStatus::Active {
+        return Ok(None);
+    }
+    let Some(reminder_authorization) =
+        reminder_authorization_from_mission(mission, write_disposition)?
+    else {
+        return Ok(None);
+    };
+    let payload = reminder_write_payload(
+        &mission.id,
+        &reminder_authorization.target,
+        mission
+            .work_items
+            .iter()
+            .map(|item| (item.id.as_str(), item.title.as_str())),
+    )?;
+    let proposal = reminder_write_proposal(&mission.id, &mission.scope_digest);
+    if ActionGate.authorize(mission, &proposal, Some(&payload)) != GateDecision::Allowed {
+        return Ok(None);
+    }
+    let reminder_dispatch = reminder_dispatch_tokens(mission, &reminder_authorization, authority)?;
+    let reminder_links = reminder_mirror_links(
+        mission,
+        &reminder_authorization.target,
+        &reminder_dispatch,
+        authority,
+    )?;
+    Ok(Some(ConfirmedMission {
+        mission_id: mission.id.clone(),
+        title: mission.title.clone(),
+        work_items: mission
+            .work_items
+            .iter()
+            .map(|item| ConfirmedWorkItem {
+                id: item.id.clone(),
+                title: item.title.clone(),
+            })
+            .collect(),
+        reminder_authorization,
+        reminder_dispatch,
+        reminder_links,
+    }))
+}
+
+fn reminder_authorization_from_mission(
+    mission: &Mission,
+    write_disposition: ReminderWriteDisposition,
+) -> Result<Option<ReminderAuthorization>, HostCallError> {
+    let candidates = mission
+        .approvals
+        .iter()
+        .filter(|approval| {
+            approval.kind == ApprovalKind::NewExternalWrite
+                && approval.work_item_id.is_none()
+                && approval.status == ApprovalStatus::Approved
+                && approval.decided_by_id.as_deref() == Some(mission.owner_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [approval] = candidates.as_slice() else {
+        return Ok(None);
+    };
+    let Some(ApprovalTarget::ReminderList {
+        logical_list_id,
+        source_identifier,
+        calendar_identifier,
+    }) = approval.target.as_ref()
+    else {
+        return Ok(None);
+    };
+    if logical_list_id != DEFAULT_REMINDERS_LIST_ID {
+        return Ok(None);
+    }
+    let target = ReminderTarget {
+        source_identifier: source_identifier.clone(),
+        calendar_identifier: calendar_identifier.clone(),
+    };
+    if !valid_reminder_target(&target) {
+        return Err(HostCallError::Internal);
+    }
+    let payload = reminder_write_payload(
+        &mission.id,
+        &target,
+        mission
+            .work_items
+            .iter()
+            .map(|item| (item.id.as_str(), item.title.as_str())),
+    )?;
+    let proposal = reminder_write_proposal(&mission.id, &mission.scope_digest);
+    let approval_digest = proposal
+        .approval_digest(ApprovalKind::NewExternalWrite, Some(&payload))
+        .map_err(|_| HostCallError::Internal)?;
+    if approval.scope_digest != approval_digest {
+        return Ok(None);
+    }
+    Ok(Some(ReminderAuthorization {
+        mission_id: mission.id.clone(),
+        list_id: DEFAULT_REMINDERS_LIST_ID.to_owned(),
+        payload_sha256: format!("{:x}", Sha256::digest(&payload)),
+        approval_id: approval.id.clone(),
+        approval_digest,
+        target: target.clone(),
+        write_disposition,
+    }))
+}
+
+fn valid_reminder_target(target: &ReminderTarget) -> bool {
+    !target.source_identifier.trim().is_empty()
+        && target.source_identifier.len() <= 512
+        && target.source_identifier == target.source_identifier.trim()
+        && !target.calendar_identifier.trim().is_empty()
+        && target.calendar_identifier.len() <= 512
+        && target.calendar_identifier == target.calendar_identifier.trim()
+}
+
+fn reminder_evidence_id(
+    mission_id: &str,
+    work_item_id: &str,
+    completion: &ReminderCompletion,
+) -> Result<String, HostCallError> {
+    hashed_identifier(
+        "evidence",
+        &json!({
+            "completedAtMs": completion.completed_at_ms,
+            "missionId": mission_id,
+            "sourceId": completion.source_id,
+            "workItemId": work_item_id
+        }),
+    )
+}
+
+fn hashed_identifier(prefix: &str, value: &impl serde::Serialize) -> Result<String, HostCallError> {
+    Ok(format!("{prefix}-{}", &serialized_sha256(value)?[..24]))
+}
+
+fn serialized_sha256(value: &impl serde::Serialize) -> Result<String, HostCallError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| HostCallError::Internal)?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
 fn success<T: serde::Serialize>(id: u64, value: T) -> RpcResponse {
     match serde_json::to_value(value) {
         Ok(value) => RpcResponse::success(id, value),
@@ -1322,14 +2527,19 @@ mod tests {
     use super::{BOOTSTRAP_MAGIC, ChatGptLogin, Host, HostPaths, OperationState, read_bootstrap};
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_core::{
-        BrokerEnrollmentRecord, TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
+        ActionGate, ActionProposal, ActionTarget, BrokerEnrollmentRecord, CreateMission,
+        CreateWorkItem, EffectKind, GateDecision, MissionCommand, TrustedBrokerEnrollment,
+        broker_enrollment_signing_bytes,
     };
     use openopen_protocol::{
-        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, RpcResponse, RuntimeControlAuthorization,
-        RuntimeControlReceipt, core_instance_lease_signing_bytes,
-        runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
+        ApprovalKind, ApprovalStatus, ApprovalTarget, CoreInstanceLease, EFFECT_PROTOCOL_VERSION,
+        EvidenceKind, MissionStatus, OutcomeSuggestion, Receipt, RpcResponse,
+        RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
+        core_instance_lease_signing_bytes, runtime_control_authorization_hash,
+        runtime_control_receipt_signing_bytes,
     };
     use rusqlite::Connection;
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
@@ -1360,6 +2570,79 @@ mod tests {
         let (send, receive) = mpsc::sync_channel(32);
         host.handle_line(line, &send);
         receive.recv().unwrap()
+    }
+
+    fn hero_suggestion() -> OutcomeSuggestion {
+        hero_suggestion_with_id("suggestion-1700000000000-0123456789abcdef0123456789abcdef")
+    }
+
+    fn hero_suggestion_with_id(id: &str) -> OutcomeSuggestion {
+        OutcomeSuggestion {
+            id: id.to_owned(),
+            title: "Prepare the client follow-up".to_owned(),
+            why_now: "Close the loop while the meeting is fresh.".to_owned(),
+            proposed_steps: vec![
+                "Draft the follow-up summary".to_owned(),
+                "Send the agreed next steps".to_owned(),
+            ],
+            source_refs: Vec::new(),
+        }
+    }
+
+    fn confirm_hero_mission(host: &mut Host) -> Value {
+        *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion());
+        request(
+            host,
+            r#"{"jsonrpc":"2.0","id":300,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-0123456789abcdef0123456789abcdef","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+        )
+        .result
+        .unwrap()
+    }
+
+    fn record_hero_mirror(host: &mut Host, confirmed: &Value, prefix: &str) -> Value {
+        let mission_id = confirmed["missionId"].as_str().unwrap();
+        let started = request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 398,
+                "method": "mission.reminders.begin",
+                "params": {"missionId": mission_id}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap();
+        let mission = &started["mission"];
+        let links = mission["workItems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                json!({
+                    "missionId": mission_id,
+                    "workItemId": item["id"],
+                    "sourceIdentifier": "source-1",
+                    "calendarIdentifier": "calendar-1",
+                    "calendarItemIdentifier": format!("{prefix}-{index}"),
+                    "dispatchToken": mission["reminderDispatch"][index]["token"],
+                    "title": item["title"],
+                })
+            })
+            .collect::<Vec<_>>();
+        request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 399,
+                "method": "mission.reminders.record",
+                "params": {"missionId": mission_id, "links": links}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap()
     }
 
     #[test]
@@ -1560,6 +2843,690 @@ mod tests {
         assert!(dashboard["suggestion"].is_null());
         assert!(dashboard["activeCards"].as_array().unwrap().len() <= 3);
         assert_eq!(dashboard["microphone"]["available"], false);
+    }
+
+    #[test]
+    fn mission_confirm_accepts_only_the_exact_in_memory_suggestion_id() {
+        let (_root, mut host) = fixture();
+        *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion());
+        let injected = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":301,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-0123456789abcdef0123456789abcdef","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"},"title":"Injected","workItems":[],"status":"completed"}}"#,
+        );
+        assert_eq!(injected.error.unwrap().code, -32_602);
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.operations.suggestion.lock().unwrap().is_some());
+
+        let wrong = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":302,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-ffffffffffffffffffffffffffffffff","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+        );
+        assert_eq!(wrong.error.unwrap().code, -32_602);
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.operations.suggestion.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn mission_confirm_persists_the_exact_confirmation_lifecycle() {
+        let (_root, mut host) = fixture();
+        let before_click = super::now_ms().unwrap();
+        let confirmed = confirm_hero_mission(&mut host);
+        let after_click = super::now_ms().unwrap();
+        assert_eq!(confirmed["title"], hero_suggestion().title);
+        assert_eq!(confirmed["workItems"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            confirmed["reminderAuthorization"]["listId"],
+            "openopen.default-reminders"
+        );
+        assert!(host.operations.suggestion.lock().unwrap().is_none());
+
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let mission = host
+            .store
+            .get_mission(confirmed["missionId"].as_str().unwrap(), &anchor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mission.status, MissionStatus::Active);
+        assert!(mission.created_at_ms >= before_click);
+        assert!(mission.created_at_ms <= after_click);
+        assert_ne!(mission.created_at_ms, 1_700_000_000_000);
+        assert!(
+            mission
+                .work_items
+                .iter()
+                .all(|item| item.status == WorkItemStatus::Pending)
+        );
+        assert_eq!(mission.approvals.len(), 2);
+        assert!(mission.approvals.iter().all(|approval| {
+            approval.status == ApprovalStatus::Approved
+                && approval.decided_by_id.as_deref() == Some("openopen-local-owner")
+                && approval.decided_at_ms == Some(mission.created_at_ms)
+        }));
+        let reminder_approval = mission
+            .approvals
+            .iter()
+            .find(|approval| approval.kind == ApprovalKind::NewExternalWrite)
+            .unwrap();
+        assert_eq!(
+            reminder_approval.target,
+            Some(ApprovalTarget::ReminderList {
+                logical_list_id: "openopen.default-reminders".to_owned(),
+                source_identifier: "source-1".to_owned(),
+                calendar_identifier: "calendar-1".to_owned(),
+            })
+        );
+        let payload = super::reminder_write_payload(
+            &mission.id,
+            &super::ReminderTarget {
+                source_identifier: "source-1".to_owned(),
+                calendar_identifier: "calendar-1".to_owned(),
+            },
+            mission
+                .work_items
+                .iter()
+                .map(|item| (item.id.as_str(), item.title.as_str())),
+        )
+        .unwrap();
+        let proposal = ActionProposal {
+            effect: EffectKind::ReminderWrite,
+            mission_id: mission.id.clone(),
+            mission_scope_digest: mission.scope_digest.clone(),
+            target: ActionTarget::ReminderList {
+                list_id: "openopen.default-reminders".to_owned(),
+            },
+            estimated_cost_micros: None,
+        };
+        assert_eq!(
+            ActionGate.authorize(&mission, &proposal, Some(&payload)),
+            GateDecision::Allowed
+        );
+
+        let connection = Connection::open(&host.paths.store).unwrap();
+        let states = connection
+            .prepare("SELECT state_kind FROM audit_ledger ORDER BY sequence")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                "mission:\"proposed\"",
+                "mission:\"awaitingConfirmation\"",
+                "mission:\"awaitingConfirmation\"",
+                "mission:\"active\"",
+                "mission:\"needsMe\"",
+                "mission:\"needsMe\"",
+                "mission:\"active\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn reminder_write_payload_has_the_cross_language_fixed_hash() {
+        let payload = super::reminder_write_payload(
+            "mission-1",
+            &super::ReminderTarget {
+                source_identifier: "source-1".to_owned(),
+                calendar_identifier: "calendar-1".to_owned(),
+            },
+            [("work-1", "Pick one priority")],
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(payload)),
+            "188605fc48e5a3bc42efee3820582cb016a84685869bfbb6688daf79b055fab0"
+        );
+    }
+
+    #[test]
+    fn confirmation_retry_cannot_change_the_bound_physical_reminders_target() {
+        let (_root, mut host) = fixture();
+        let confirmed = confirm_hero_mission(&mut host);
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let changed = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":304,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-0123456789abcdef0123456789abcdef","reminderTarget":{"sourceIdentifier":"source-2","calendarIdentifier":"calendar-2"}}}"#,
+        );
+        assert_eq!(changed.error.unwrap().code, -32_602);
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            anchor
+        );
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":305,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            dashboard["confirmedMission"]["missionId"],
+            confirmed["missionId"]
+        );
+        assert_eq!(
+            dashboard["confirmedMission"]["reminderAuthorization"]["writeDisposition"],
+            "recoverOnly"
+        );
+    }
+
+    #[test]
+    fn reminder_dispatch_is_durable_at_most_once_across_response_loss_and_restart() {
+        let (_root, mut host) = fixture();
+        let paths = host.paths.clone();
+        let confirmed = confirm_hero_mission(&mut host);
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "id": 306,
+            "method": "mission.reminders.begin",
+            "params": {"missionId": confirmed["missionId"]}
+        });
+        let started = request(&mut host, &begin.to_string()).result.unwrap();
+        assert_eq!(started["executeNow"], true);
+        assert_eq!(
+            started["mission"]["reminderDispatch"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            started["mission"]["reminderLinks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        drop(host);
+
+        let mut reopened = Host::open(paths, [7_u8; 32]).unwrap();
+        let recovered = request(&mut reopened, &begin.to_string()).result.unwrap();
+        assert_eq!(recovered["executeNow"], false);
+        assert_eq!(
+            recovered["mission"]["reminderDispatch"],
+            started["mission"]["reminderDispatch"]
+        );
+        assert_eq!(
+            reopened
+                .store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .unwrap(),
+            anchor
+        );
+    }
+
+    #[test]
+    fn reminder_mirror_record_is_durable_exactly_idempotent_and_changed_retry_fails() {
+        let (_root, mut host) = fixture();
+        let confirmed = confirm_hero_mission(&mut host);
+        let recorded = record_hero_mirror(&mut host, &confirmed, "eventkit-mirror");
+        assert_eq!(recorded["reminderLinks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            recorded["reminderAuthorization"]["writeDisposition"],
+            "recoverOnly"
+        );
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let retry = record_hero_mirror(&mut host, &confirmed, "eventkit-mirror");
+        assert_eq!(retry, recorded);
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            anchor
+        );
+
+        let mut links = recorded["reminderLinks"].as_array().unwrap().clone();
+        links[0]["calendarItemIdentifier"] = json!("changed-reminder");
+        let changed = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 398,
+                "method": "mission.reminders.record",
+                "params": {"missionId": recorded["missionId"], "links": links}
+            })
+            .to_string(),
+        );
+        assert_eq!(changed.error.unwrap().code, -32_602);
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            anchor
+        );
+    }
+
+    #[test]
+    fn composite_confirmation_and_completion_failures_rollback_every_write() {
+        let (_root, mut host) = fixture();
+        let mission_id = "mission-atomic-confirm";
+        let commands = vec![
+            MissionCommand::Create {
+                input: CreateMission {
+                    mission_id: mission_id.to_owned(),
+                    title: "Atomic confirmation".to_owned(),
+                    outcome: "Prove rollback".to_owned(),
+                    owner_id: "openopen-local-owner".to_owned(),
+                    scope_digest: "scope-atomic".to_owned(),
+                    scope_approval_id: "approval-atomic".to_owned(),
+                    scope_approval_prompt: "Confirm".to_owned(),
+                    work_items: vec![CreateWorkItem {
+                        id: "work-atomic".to_owned(),
+                        title: "One step".to_owned(),
+                    }],
+                    now_ms: 1,
+                },
+            },
+            MissionCommand::Activate {
+                mission_id: mission_id.to_owned(),
+                now_ms: 1,
+            },
+        ];
+        let batch = super::mission_command_batch(None, mission_id, commands).unwrap();
+        assert!(host.store.execute_mission_command_batch(&batch).is_err());
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .is_none()
+        );
+
+        let confirmed = confirm_hero_mission(&mut host);
+        let mission_id = confirmed["missionId"].as_str().unwrap();
+        let original_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let mission = host
+            .store
+            .get_mission(mission_id, &original_anchor)
+            .unwrap()
+            .unwrap();
+        let commands = vec![
+            MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: mission.work_items[0].id.clone(),
+                next: WorkItemStatus::Active,
+                evidence_ids: Vec::new(),
+                now_ms: mission.updated_at_ms,
+            },
+            MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: mission.work_items[1].id.clone(),
+                next: WorkItemStatus::Completed,
+                evidence_ids: Vec::new(),
+                now_ms: mission.updated_at_ms,
+            },
+        ];
+        let batch =
+            super::mission_command_batch(Some(&original_anchor), &mission.id, commands).unwrap();
+        assert!(host.store.execute_mission_command_batch(&batch).is_err());
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            original_anchor
+        );
+        let unchanged = host
+            .store
+            .get_mission(&mission.id, &original_anchor)
+            .unwrap()
+            .unwrap();
+        assert!(
+            unchanged
+                .work_items
+                .iter()
+                .all(|item| item.status == WorkItemStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn identical_outcomes_create_distinct_missions_but_exact_suggestion_retry_is_idempotent() {
+        let (_root, mut host) = fixture();
+        let first = confirm_hero_mission(&mut host);
+        let first_mission_id = first["missionId"].as_str().unwrap().to_owned();
+        let first_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+
+        *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion());
+        let retry = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":305,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-0123456789abcdef0123456789abcdef","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(retry["missionId"], first_mission_id);
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            first_anchor
+        );
+
+        let second_id = "suggestion-1700000000000-89abcdef0123456789abcdef01234567";
+        *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion_with_id(second_id));
+        let second = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 306,
+                "method": "mission.confirm",
+                "params": {"suggestionId": second_id, "reminderTarget": {"sourceIdentifier": "source-1", "calendarIdentifier": "calendar-1"}}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap();
+        assert_ne!(second["missionId"], first_mission_id);
+    }
+
+    #[test]
+    fn confirmation_response_loss_recovers_exactly_after_restart_without_volatile_state() {
+        let (_root, mut host) = fixture();
+        let paths = host.paths.clone();
+        let confirmed = confirm_hero_mission(&mut host);
+        let committed_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        drop(host);
+
+        let mut reopened = Host::open(paths, [7_u8; 32]).unwrap();
+        assert!(reopened.operations.suggestion.lock().unwrap().is_none());
+        let retry = request(
+            &mut reopened,
+            r#"{"jsonrpc":"2.0","id":307,"method":"mission.confirm","params":{"suggestionId":"suggestion-1700000000000-0123456789abcdef0123456789abcdef","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(retry["missionId"], confirmed["missionId"]);
+        assert_eq!(
+            retry["reminderAuthorization"]["writeDisposition"],
+            "recoverOnly"
+        );
+        assert_eq!(
+            reopened
+                .store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .unwrap(),
+            committed_anchor
+        );
+        let dashboard = request(
+            &mut reopened,
+            r#"{"jsonrpc":"2.0","id":308,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(dashboard["confirmedMission"], retry);
+        assert_eq!(dashboard["activeCards"].as_array().unwrap().len(), 1);
+        assert!(dashboard["receipt"].is_null());
+    }
+
+    #[test]
+    fn reminder_completion_rejects_incomplete_mismatched_and_duplicate_batches() {
+        let (_root, mut host) = fixture();
+        let confirmed = confirm_hero_mission(&mut host);
+        let confirmed = record_hero_mirror(&mut host, &confirmed, "eventkit-reminder");
+        let mission_id = confirmed["missionId"].as_str().unwrap();
+        let work_items = confirmed["workItems"].as_array().unwrap();
+        let completed_at_ms = host
+            .store
+            .get_mission(
+                mission_id,
+                &host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .updated_at_ms;
+        let original_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+
+        for completions in [
+            json!([{
+                "workItemId": work_items[0]["id"],
+                "sourceId": "reminder-1",
+                "completedAtMs": completed_at_ms
+            }]),
+            json!([
+                {
+                    "workItemId": work_items[0]["id"],
+                    "sourceId": "reminder-1",
+                    "completedAtMs": completed_at_ms
+                },
+                {
+                    "workItemId": "work-not-persisted",
+                    "sourceId": "reminder-2",
+                    "completedAtMs": completed_at_ms
+                }
+            ]),
+            json!([
+                {
+                    "workItemId": work_items[0]["id"],
+                    "sourceId": "reminder-1",
+                    "completedAtMs": completed_at_ms
+                },
+                {
+                    "workItemId": work_items[0]["id"],
+                    "sourceId": "reminder-2",
+                    "completedAtMs": completed_at_ms
+                }
+            ]),
+        ] {
+            let response = request(
+                &mut host,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 303,
+                    "method": "mission.reminders.complete",
+                    "params": {"missionId": mission_id, "completions": completions}
+                })
+                .to_string(),
+            );
+            assert_eq!(response.error.unwrap().code, -32_602);
+            assert_eq!(
+                host.store.current_verified_audit_anchor().unwrap().unwrap(),
+                original_anchor
+            );
+        }
+    }
+
+    #[test]
+    fn verified_reminder_readback_issues_an_evidence_backed_receipt() {
+        let (_root, mut host) = fixture();
+        let confirmed = confirm_hero_mission(&mut host);
+        let confirmed = record_hero_mirror(&mut host, &confirmed, "eventkit-reminder");
+        let mission_id = confirmed["missionId"].as_str().unwrap().to_owned();
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let mission = host
+            .store
+            .get_mission(&mission_id, &anchor)
+            .unwrap()
+            .unwrap();
+        let completions = mission
+            .work_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                json!({
+                    "workItemId": item.id,
+                    "sourceId": confirmed["reminderLinks"][index]["calendarItemIdentifier"],
+                    "completedAtMs": mission.updated_at_ms
+                })
+            })
+            .collect::<Vec<_>>();
+        let decoded =
+            serde_json::from_value::<Vec<super::ReminderCompletion>>(json!(completions)).unwrap();
+        assert!(
+            super::validated_reminder_completions(
+                &mission,
+                &host.authority,
+                decoded,
+                super::now_ms().unwrap(),
+                true,
+            )
+            .is_some()
+        );
+        let response = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 304,
+                "method": "mission.reminders.complete",
+                "params": {"missionId": mission_id, "completions": completions}
+            })
+            .to_string(),
+        );
+        let receipt: Receipt = serde_json::from_value(
+            response
+                .result
+                .unwrap_or_else(|| panic!("completion failed: {:?}", response.error)),
+        )
+        .unwrap();
+        assert_eq!(receipt.actual_model, "gpt-5.6-sol");
+        assert_eq!(receipt.evidence_ids.len(), mission.work_items.len());
+
+        let completed_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let completed = host
+            .store
+            .get_mission(&mission_id, &completed_anchor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, MissionStatus::Completed);
+        assert!(
+            completed
+                .work_items
+                .iter()
+                .all(|item| item.status == WorkItemStatus::Completed)
+        );
+        assert_eq!(completed.evidence.len(), completed.work_items.len() * 3);
+        for evidence in &completed.evidence {
+            host.authority.verify_evidence(evidence).unwrap();
+        }
+        assert_eq!(
+            completed
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.kind == EvidenceKind::ReminderCompleted)
+                .count(),
+            completed.work_items.len()
+        );
+        assert_eq!(
+            host.store
+                .get_receipt(&receipt.id, &completed_anchor)
+                .unwrap(),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn completion_response_loss_retries_exactly_after_restart_and_dashboard_recovers() {
+        let (_root, mut host) = fixture();
+        let paths = host.paths.clone();
+        let confirmed = confirm_hero_mission(&mut host);
+        let confirmed = record_hero_mirror(&mut host, &confirmed, "eventkit-restart");
+        let mission_id = confirmed["missionId"].as_str().unwrap().to_owned();
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let mission = host
+            .store
+            .get_mission(&mission_id, &anchor)
+            .unwrap()
+            .unwrap();
+        let completions = mission
+            .work_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                json!({
+                    "workItemId": item.id,
+                    "sourceId": confirmed["reminderLinks"][index]["calendarItemIdentifier"],
+                    "completedAtMs": mission.updated_at_ms
+                })
+            })
+            .collect::<Vec<_>>();
+        let complete_request = json!({
+            "jsonrpc": "2.0",
+            "id": 309,
+            "method": "mission.reminders.complete",
+            "params": {"missionId": mission_id, "completions": completions}
+        });
+        let receipt = request(&mut host, &complete_request.to_string())
+            .result
+            .unwrap();
+        let completed_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        drop(host);
+
+        let mut reopened = Host::open(paths, [7_u8; 32]).unwrap();
+        let retry = request(&mut reopened, &complete_request.to_string())
+            .result
+            .unwrap();
+        assert_eq!(retry, receipt);
+        assert_eq!(
+            reopened
+                .store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .unwrap(),
+            completed_anchor
+        );
+        let mut changed = complete_request;
+        changed["params"]["completions"][0]["sourceId"] = json!("changed-source");
+        assert_eq!(
+            request(&mut reopened, &changed.to_string())
+                .error
+                .unwrap()
+                .code,
+            -32_602
+        );
+        assert_eq!(
+            reopened
+                .store
+                .current_verified_audit_anchor()
+                .unwrap()
+                .unwrap(),
+            completed_anchor
+        );
+        let dashboard = request(
+            &mut reopened,
+            r#"{"jsonrpc":"2.0","id":310,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert!(dashboard["confirmedMission"].is_null());
+        assert!(dashboard["activeCards"].as_array().unwrap().is_empty());
+        assert_eq!(dashboard["receipt"], receipt);
+
+        assert_dashboard_recovers_receipt_and_new_mission(&mut reopened, &receipt);
+    }
+
+    fn assert_dashboard_recovers_receipt_and_new_mission(reopened: &mut Host, receipt: &Value) {
+        let second_id = "suggestion-1700000000000-89abcdef0123456789abcdef01234567";
+        *reopened.operations.suggestion.lock().unwrap() = Some(hero_suggestion_with_id(second_id));
+        let second = request(
+            reopened,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 311,
+                "method": "mission.confirm",
+                "params": {"suggestionId": second_id, "reminderTarget": {"sourceIdentifier": "source-1", "calendarIdentifier": "calendar-1"}}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap();
+        let dashboard = request(
+            reopened,
+            r#"{"jsonrpc":"2.0","id":312,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            dashboard["confirmedMission"]["missionId"],
+            second["missionId"]
+        );
+        assert_eq!(
+            dashboard["confirmedMission"]["reminderAuthorization"]["writeDisposition"],
+            "recoverOnly"
+        );
+        assert_eq!(&dashboard["receipt"], receipt);
+        assert_eq!(dashboard["activeCards"].as_array().unwrap().len(), 1);
+        assert_eq!(dashboard["activeCards"][0]["id"], second["missionId"]);
+        assert_eq!(dashboard["activeCards"][0]["state"], "working");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{CryptoError, LocalAuthority};
 use openopen_protocol::{
-    ApprovalKind, ApprovalRequest, ApprovalStatus, EvidenceKind, EvidenceRef, Mission,
-    MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
+    ApprovalKind, ApprovalRequest, ApprovalStatus, ApprovalTarget, EvidenceKind, EvidenceRef,
+    Mission, MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -44,6 +44,7 @@ pub struct NewBoundaryApproval {
     pub kind: ApprovalKind,
     pub prompt: String,
     pub scope_digest: String,
+    pub target: Option<ApprovalTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +302,7 @@ fn create_mission(input: &CreateMission) -> Result<Mission, MissionError> {
             kind: ApprovalKind::MissionScope,
             prompt: input.scope_approval_prompt.clone(),
             scope_digest: input.scope_digest.clone(),
+            target: None,
             status: ApprovalStatus::Pending,
             requested_by_id: input.owner_id.clone(),
             decided_by_id: None,
@@ -446,6 +448,7 @@ fn new_approval(
         kind: input.kind,
         prompt: input.prompt.clone(),
         scope_digest: input.scope_digest.clone(),
+        target: input.target.clone(),
         status: ApprovalStatus::Pending,
         requested_by_id: mission.owner_id.clone(),
         decided_by_id: None,
@@ -920,6 +923,7 @@ fn validate_snapshot_approvals(mission: &Mission) -> Result<(), MissionError> {
             || approval.prompt.trim().is_empty()
             || approval.scope_digest.trim().is_empty()
             || approval.requested_by_id != mission.owner_id
+            || !valid_approval_target(approval)
             || !decision_is_valid
             || approval.work_item_id.as_ref().is_some_and(|work_item_id| {
                 !mission
@@ -933,6 +937,30 @@ fn validate_snapshot_approvals(mission: &Mission) -> Result<(), MissionError> {
         }
     }
     Ok(())
+}
+
+fn valid_approval_target(approval: &ApprovalRequest) -> bool {
+    let Some(target) = approval.target.as_ref() else {
+        return true;
+    };
+    if approval.kind != ApprovalKind::NewExternalWrite {
+        return false;
+    }
+    match target {
+        ApprovalTarget::ReminderList {
+            logical_list_id,
+            source_identifier,
+            calendar_identifier,
+        } => {
+            valid_target_component(logical_list_id)
+                && valid_target_component(source_identifier)
+                && valid_target_component(calendar_identifier)
+        }
+    }
+}
+
+fn valid_target_component(value: &str) -> bool {
+    !value.trim().is_empty() && value == value.trim() && value.len() <= 512
 }
 
 fn validate_snapshot_evidence(

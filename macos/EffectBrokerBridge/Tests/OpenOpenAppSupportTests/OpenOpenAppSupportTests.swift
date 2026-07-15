@@ -5,6 +5,41 @@ import Testing
 
 @testable import OpenOpenAppSupport
 
+private func testConfirmedMission(
+  missionId: String = "mission-1",
+  title: String = "Plan the day",
+  workItems: [MissionWorkItem] = [
+    MissionWorkItem(id: "work-1", title: "Pick one priority")
+  ],
+  validAuthorization: Bool = true,
+  writeDisposition: ReminderWriteDisposition = .createOnce,
+  reminderDispatch: [ConfirmedReminderDispatch] = [],
+  reminderLinks: [ReminderLink] = []
+) -> ConfirmedMission {
+  let target = ReminderTarget(
+    sourceIdentifier: "source-1", calendarIdentifier: "calendar-1"
+  )
+  let payloadSha256 = ReminderWriteAuthorization.payloadSha256(
+    missionId: missionId, target: target, workItems: workItems
+  )
+  return ConfirmedMission(
+    missionId: missionId,
+    title: title,
+    workItems: workItems,
+    reminderAuthorization: ReminderWriteAuthorization(
+      missionId: missionId,
+      listId: ReminderWriteAuthorization.logicalListId,
+      payloadSha256: validAuthorization ? payloadSha256 : String(repeating: "0", count: 64),
+      approvalId: "approval-reminders-1",
+      approvalDigest: String(repeating: "a", count: 64),
+      target: target,
+      writeDisposition: writeDisposition
+    ),
+    reminderDispatch: reminderDispatch,
+    reminderLinks: reminderLinks
+  )
+}
+
 private actor MockCore: CoreServing {
   var control = RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0)
   let dashboardDelay: Duration
@@ -12,6 +47,9 @@ private actor MockCore: CoreServing {
   var challengesIssued = 0
   var proofNonces: [String] = []
   var proposalCount = 0
+  var confirmationCount = 0
+  var dispatchBeginCount = 0
+  var reminderCompletionPayloads: [[ReminderCompletionInput]] = []
   var leaseInstalled = false
   var codexInitialized = false
   var codexInitializeCount = 0
@@ -21,6 +59,11 @@ private actor MockCore: CoreServing {
   var coreInstanceNonce = String(repeating: "a", count: 64)
   var rejectNextOffPreparation = false
   var mismatchRecoveryTimestamp = false
+  var invalidReminderAuthorization = false
+  var dashboardConfirmedMission: ConfirmedMission?
+  var dashboardReceipt: MissionReceipt?
+  var dispatchedMissions: [String: ConfirmedMission] = [:]
+  var loseNextDispatchResponse = false
 
   init(dashboardDelay: Duration = .zero, dashboardFails: Bool = false) {
     self.dashboardDelay = dashboardDelay
@@ -46,6 +89,8 @@ private actor MockCore: CoreServing {
       }
       offPrepareCount += 1
       activeOperation = false
+      codexInitialized = false
+      leaseInstalled = false
     }
     return RuntimeControlAuthorization(
       protocolVersion: 1,
@@ -101,6 +146,18 @@ private actor MockCore: CoreServing {
   func rotateCoreInstance() { coreInstanceNonce = String(repeating: "b", count: 64) }
   func failNextOffPreparation() { rejectNextOffPreparation = true }
   func returnMismatchedRecoveryTimestamp() { mismatchRecoveryTimestamp = true }
+  func returnInvalidReminderAuthorization() { invalidReminderAuthorization = true }
+  func restoreFromDashboard(
+    mission: ConfirmedMission?, receipt: MissionReceipt?
+  ) {
+    dashboardConfirmedMission = mission
+    dashboardReceipt = receipt
+    if let mission, !mission.reminderDispatch.isEmpty {
+      dispatchedMissions[mission.missionId] = mission
+    }
+  }
+
+  func loseNextReminderDispatchResponse() { loseNextDispatchResponse = true }
 
   func dashboard() async throws -> DashboardState {
     if dashboardDelay > .zero { try await Task.sleep(for: dashboardDelay) }
@@ -114,7 +171,9 @@ private actor MockCore: CoreServing {
         reason: "Microphone unavailable until Voice setup"
       ),
       runtime: control,
-      suggestion: nil
+      suggestion: nil,
+      confirmedMission: dashboardConfirmedMission,
+      receipt: dashboardReceipt
     )
   }
 
@@ -138,13 +197,122 @@ private actor MockCore: CoreServing {
 
   func propose(prompt _: String, proof _: BrokerRuntimeState) -> OutcomeSuggestion {
     proposalCount += 1
+    let isFirst = proposalCount == 1
     return OutcomeSuggestion(
-      id: "suggestion-1",
-      title: "Plan the day",
+      id: isFirst ? "suggestion-1" : "suggestion-2",
+      title: isFirst ? "Plan the day" : "Plan tomorrow",
       whyNow: "It is morning",
-      proposedSteps: ["Pick one priority"],
+      proposedSteps: [isFirst ? "Pick one priority" : "Choose tomorrow's priority"],
       sourceRefs: []
     )
+  }
+
+  func confirmSuggestion(
+    identifier: String, reminderTarget: ReminderTarget
+  ) throws -> ConfirmedMission {
+    guard identifier == "suggestion-1" || identifier == "suggestion-2" else {
+      throw CoreClientError.contractViolation("Unexpected suggestion identifier.")
+    }
+    confirmationCount += 1
+    guard
+      reminderTarget
+        == ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1")
+    else {
+      throw CoreClientError.contractViolation("Unexpected Reminder target.")
+    }
+    let isFirst = identifier == "suggestion-1"
+    return testConfirmedMission(
+      missionId: isFirst ? "mission-1" : "mission-2",
+      title: isFirst ? "Plan the day" : "Plan tomorrow",
+      workItems: [
+        MissionWorkItem(
+          id: isFirst ? "work-1" : "work-2",
+          title: isFirst ? "Pick one priority" : "Choose tomorrow's priority"
+        )
+      ],
+      validAuthorization: !invalidReminderAuthorization
+    )
+  }
+
+  func completeReminderMission(
+    identifier: String, completions: [ReminderCompletionInput]
+  ) throws -> MissionReceipt {
+    guard identifier == "mission-1" || identifier == "mission-2" else {
+      throw CoreClientError.contractViolation("Unexpected Mission identifier.")
+    }
+    reminderCompletionPayloads.append(completions)
+    return MissionReceipt(
+      id: identifier == "mission-1" ? "receipt-1" : "receipt-2",
+      missionId: identifier,
+      summary: "Completed Plan the day",
+      actualModel: "gpt-5.6-sol",
+      evidenceIds: completions.map { "evidence-\($0.workItemId)" },
+      outputHashes: [],
+      completedAtMs: 10
+    )
+  }
+
+  func beginReminderDispatch(identifier: String) throws -> ReminderDispatchStart {
+    dispatchBeginCount += 1
+    if let mission = dispatchedMissions[identifier] {
+      return ReminderDispatchStart(mission: mission, executeNow: false)
+    }
+    let base: ConfirmedMission
+    if let dashboardConfirmedMission, dashboardConfirmedMission.missionId == identifier {
+      base = dashboardConfirmedMission
+    } else {
+      let isFirst = identifier == "mission-1"
+      base = testConfirmedMission(
+        missionId: identifier,
+        title: isFirst ? "Plan the day" : "Plan tomorrow",
+        workItems: [
+          MissionWorkItem(
+            id: isFirst ? "work-1" : "work-2",
+            title: isFirst ? "Pick one priority" : "Choose tomorrow's priority"
+          )
+        ]
+      )
+    }
+    let dispatch = base.workItems.map {
+      ConfirmedReminderDispatch(
+        workItemId: $0.id,
+        token: "dispatch-\($0.id)"
+      )
+    }
+    let mission = ConfirmedMission(
+      missionId: base.missionId,
+      title: base.title,
+      workItems: base.workItems,
+      reminderAuthorization: base.recoveryOnly().reminderAuthorization,
+      reminderDispatch: dispatch,
+      reminderLinks: base.reminderLinks
+    )
+    dispatchedMissions[identifier] = mission
+    dashboardConfirmedMission = mission
+    if loseNextDispatchResponse {
+      loseNextDispatchResponse = false
+      throw CoreClientError.contractViolation("Core dispatch response was lost.")
+    }
+    return ReminderDispatchStart(mission: mission, executeNow: true)
+  }
+
+  func recordReminderMirror(
+    identifier: String, links: [ReminderLink]
+  ) throws -> ConfirmedMission {
+    guard let dispatched = dispatchedMissions[identifier] else {
+      throw CoreClientError.contractViolation("Reminder dispatch was not persisted.")
+    }
+    let mission = ConfirmedMission(
+      missionId: dispatched.missionId,
+      title: dispatched.title,
+      workItems: dispatched.workItems,
+      reminderAuthorization: dispatched.reminderAuthorization,
+      reminderDispatch: dispatched.reminderDispatch,
+      reminderLinks: links
+    )
+    dispatchedMissions[identifier] = mission
+    dashboardConfirmedMission = mission
+    return mission
   }
 }
 
@@ -221,6 +389,24 @@ private actor FailClosedOffCore: CoreServing {
       proposedSteps: ["One"],
       sourceRefs: []
     )
+  }
+  func confirmSuggestion(
+    identifier _: String, reminderTarget _: ReminderTarget
+  ) throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Unexpected Mission confirmation.")
+  }
+  func completeReminderMission(
+    identifier _: String, completions _: [ReminderCompletionInput]
+  ) throws -> MissionReceipt {
+    throw CoreClientError.contractViolation("Unexpected Mission completion.")
+  }
+  func recordReminderMirror(
+    identifier _: String, links _: [ReminderLink]
+  ) throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Unexpected Reminder mirror.")
+  }
+  func beginReminderDispatch(identifier _: String) throws -> ReminderDispatchStart {
+    throw CoreClientError.contractViolation("Unexpected Reminder dispatch.")
   }
 }
 
@@ -396,7 +582,7 @@ private actor DelayedProofBroker: BrokerRuntimeServing {
         requestNonce: challenge,
         brokerKeyId: capturedReceipt.brokerKeyId,
         brokerSignatureHex: capturedReceipt.brokerSignatureHex
-      )
+      ),
     )
   }
 
@@ -461,6 +647,126 @@ extension DelayedSwitchCore {
   func initializeCodexRuntime() {}
   func abortCodexCandidate() {}
   func installCoreLease(_: Data) {}
+  func confirmSuggestion(
+    identifier _: String, reminderTarget _: ReminderTarget
+  ) throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Unexpected Mission confirmation.")
+  }
+  func completeReminderMission(
+    identifier _: String, completions _: [ReminderCompletionInput]
+  ) throws -> MissionReceipt {
+    throw CoreClientError.contractViolation("Unexpected Mission completion.")
+  }
+  func recordReminderMirror(
+    identifier _: String, links _: [ReminderLink]
+  ) throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Unexpected Reminder mirror.")
+  }
+  func beginReminderDispatch(identifier _: String) throws -> ReminderDispatchStart {
+    throw CoreClientError.contractViolation("Unexpected Reminder dispatch.")
+  }
+}
+
+@MainActor
+private final class MockReminders: RemindersServing {
+  enum Mode {
+    case complete
+    case partial
+    case failBeforeCommit
+    case commitThenFailReadback
+    case commitThenDelay
+  }
+
+  var mode: Mode
+  private(set) var executeCount = 0
+  private(set) var recoverCount = 0
+  private var storedLinks: [String: [ReminderLink]] = [:]
+
+  init(mode: Mode = .complete) {
+    self.mode = mode
+  }
+
+  func prepareTarget() async throws -> ReminderTarget {
+    ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1")
+  }
+
+  func executeInitialMirror(_ start: ReminderDispatchStart) async throws -> [ReminderLink] {
+    let mission = start.mission
+    executeCount += 1
+    if mode == .failBeforeCommit {
+      throw CoreClientError.contractViolation("Reminders access was denied.")
+    }
+    let dispatchByWorkItem = Dictionary(
+      uniqueKeysWithValues: mission.reminderDispatch.map { ($0.workItemId, $0.token) }
+    )
+    let links = mission.workItems.map {
+      ReminderLink(
+        missionId: mission.missionId,
+        workItemId: $0.id,
+        sourceIdentifier: mission.reminderAuthorization.target.sourceIdentifier,
+        calendarIdentifier: mission.reminderAuthorization.target.calendarIdentifier,
+        calendarItemIdentifier: "reminder-\($0.id)",
+        dispatchToken: dispatchByWorkItem[$0.id] ?? "",
+        title: $0.title
+      )
+    }
+    storedLinks[mission.missionId] = links
+    if mode == .commitThenFailReadback {
+      throw CoreClientError.contractViolation("Reminders readback failed after commit.")
+    }
+    if mode == .commitThenDelay {
+      try await Task.sleep(for: .milliseconds(150))
+    }
+    return links
+  }
+
+  func recoverMirror(for mission: ConfirmedMission) async throws -> [ReminderLink] {
+    recoverCount += 1
+    guard let links = storedLinks[mission.missionId] else {
+      throw RemindersClientError.incompleteMirror(mission.title)
+    }
+    return links
+  }
+
+  func completedReminders(
+    for links: [ReminderLink]
+  ) async throws -> [ReminderCompletionInput] {
+    let completed = mode == .partial ? links.dropLast() : links[...]
+    return completed.map {
+      ReminderCompletionInput(
+        workItemId: $0.workItemId,
+        sourceId: $0.calendarItemIdentifier,
+        completedAtMs: 9
+      )
+    }
+  }
+}
+
+@Test
+func heroAInitialEventKitAuthorityIsConsumedBeforeAnyExternalBoundary() throws {
+  let mission = testConfirmedMission(
+    writeDisposition: .recoverOnly,
+    reminderDispatch: [
+      ConfirmedReminderDispatch(workItemId: "work-1", token: "dispatch-work-1")
+    ]
+  )
+  let start = ReminderDispatchStart(mission: mission, executeNow: true)
+  var claims = ReminderExecutionClaims()
+
+  try claims.consume(start)
+  #expect(throws: RemindersClientError.incompleteMirror("Plan the day")) {
+    try claims.consume(start)
+  }
+  var noAuthority = ReminderExecutionClaims()
+  #expect(
+    throws: RemindersClientError.invalidMission(
+      "Core did not issue initial execution authority"
+    )
+  ) {
+    try noAuthority.consume(
+      ReminderDispatchStart(mission: mission, executeNow: false)
+    )
+  }
 }
 
 extension MockBroker {
@@ -865,6 +1171,361 @@ func dashboardRejectsMoreThanThreeActiveCards() {
   #expect(throws: CoreClientError.self) {
     try dashboard.validated()
   }
+}
+
+@MainActor
+@Test
+func heroAConfirmCreatesRemindersAndCompletedReadbackProducesReceipt() async {
+  let core = MockCore()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 1)
+  #expect(model.suggestion == nil)
+  #expect(model.confirmedMission?.missionId == "mission-1")
+  #expect(model.reminderLinks.map(\.calendarItemIdentifier) == ["reminder-work-1"])
+  #expect(model.activeCards.count == 1)
+
+  await model.checkMissionProgress()
+  #expect(model.receipt?.missionId == "mission-1")
+  #expect(model.receipt?.actualModel == "gpt-5.6-sol")
+  #expect(model.activeCards.isEmpty)
+  #expect(model.confirmedMission == nil)
+  #expect(model.reminderLinks.isEmpty)
+  let payloads = await core.reminderCompletionPayloads
+  #expect(payloads.count == 1)
+  #expect(
+    payloads[0] == [
+      ReminderCompletionInput(
+        workItemId: "work-1",
+        sourceId: "reminder-work-1",
+        completedAtMs: 9
+      )
+    ])
+}
+
+@MainActor
+@Test
+func heroASecondOutcomeCannotReuseTheCompletedMission() async {
+  let core = MockCore()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+  await model.checkMissionProgress()
+
+  model.prompt = "Help me plan tomorrow"
+  await model.submitPrompt()
+  #expect(model.suggestion?.id == "suggestion-2")
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 2)
+  #expect(model.confirmedMission?.missionId == "mission-2")
+  #expect(model.reminderLinks.map(\.workItemId) == ["work-2"])
+  #expect(model.receipt == nil)
+}
+
+@MainActor
+@Test
+func heroAInvalidCoreReminderAuthorizationCannotReachTheExternalWriter() async {
+  let core = MockCore()
+  await core.returnInvalidReminderAuthorization()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+
+  #expect(reminders.executeCount == 0)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(model.errorMessage?.contains("exact Reminder write") == true)
+}
+
+@Test
+func heroAReminderAuthorizationPayloadHasTheRustContractVector() {
+  #expect(
+    ReminderWriteAuthorization.payloadSha256(
+      missionId: "mission-1",
+      target: ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1"),
+      workItems: [MissionWorkItem(id: "work-1", title: "Pick one priority")]
+    ) == "188605fc48e5a3bc42efee3820582cb016a84685869bfbb6688daf79b055fab0"
+  )
+}
+
+@Test
+func heroARenamedOwnedCalendarBeatsDefaultAccountDrift() throws {
+  let target = try selectReminderTarget(
+    candidates: [
+      ReminderCalendarCandidate(
+        sourceIdentifier: "original-source",
+        calendarIdentifier: "original-calendar",
+        title: "Renamed by the owner",
+        containsOpenOpenMarker: true
+      ),
+      ReminderCalendarCandidate(
+        sourceIdentifier: "new-default-source",
+        calendarIdentifier: "unrelated-calendar",
+        title: "Personal",
+        containsOpenOpenMarker: false
+      ),
+    ]
+  )
+  #expect(
+    target
+      == ReminderTarget(
+        sourceIdentifier: "original-source", calendarIdentifier: "original-calendar"
+      ))
+}
+
+@Test
+func heroAAmbiguousPhysicalReminderTargetsFailClosed() {
+  #expect(throws: RemindersClientError.ambiguousCalendar) {
+    try selectReminderTarget(
+      candidates: [
+        ReminderCalendarCandidate(
+          sourceIdentifier: "source-1",
+          calendarIdentifier: "calendar-1",
+          title: "OpenOpen",
+          containsOpenOpenMarker: true
+        ),
+        ReminderCalendarCandidate(
+          sourceIdentifier: "source-2",
+          calendarIdentifier: "calendar-2",
+          title: "OpenOpen old",
+          containsOpenOpenMarker: true
+        ),
+      ]
+    )
+  }
+}
+
+@Test
+func heroARequiresAnExistingPhysicalOpenOpenListBeforeConfirmation() {
+  #expect(throws: RemindersClientError.targetUnavailable) {
+    try selectReminderTarget(
+      candidates: [
+        ReminderCalendarCandidate(
+          sourceIdentifier: "source-1",
+          calendarIdentifier: "calendar-1",
+          title: "Personal",
+          containsOpenOpenMarker: false
+        )
+      ]
+    )
+  }
+}
+
+@Test
+func heroADashboardDecodesTheExactRustRecoveryShape() throws {
+  let data = Data(
+    #"{"activeCards":[{"id":"mission-1","state":"working","title":"Plan the day"}],"confirmedMission":{"missionId":"mission-1","reminderAuthorization":{"approvalDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","approvalId":"approval-reminders-1","listId":"openopen.default-reminders","missionId":"mission-1","payloadSha256":"188605fc48e5a3bc42efee3820582cb016a84685869bfbb6688daf79b055fab0","target":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"},"writeDisposition":"recoverOnly"},"reminderDispatch":[{"token":"dispatch-work-1","workItemId":"work-1"}],"reminderLinks":[],"title":"Plan the day","workItems":[{"id":"work-1","title":"Pick one priority"}]},"microphone":{"available":false,"reason":"Microphone unavailable until Voice setup"},"receipt":null,"runtime":{"enabled":true,"revision":1,"updatedAtMs":2},"suggestion":null}"#
+      .utf8
+  )
+  let dashboard = try JSONDecoder().decode(DashboardState.self, from: data)
+  #expect(try dashboard.validated() == dashboard)
+  #expect(
+    dashboard.confirmedMission?.reminderAuthorization.validates(
+      missionId: "mission-1",
+      workItems: [MissionWorkItem(id: "work-1", title: "Pick one priority")]
+    ) == true
+  )
+}
+
+@MainActor
+@Test
+func heroADashboardRestoresARecoverableMissionOrReceiptAfterRestart() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: MockReminders()) {}
+  await model.updateEnabled(true)
+  let mission = testConfirmedMission()
+  await core.restoreFromDashboard(mission: mission, receipt: nil)
+  await model.refreshDashboard()
+  #expect(model.confirmedMission == mission)
+  #expect(model.receipt == nil)
+  await model.confirmSuggestion()
+  #expect(await core.confirmationCount == 0)
+  #expect(model.reminderLinks.map(\.calendarItemIdentifier) == ["reminder-work-1"])
+
+  let receipt = MissionReceipt(
+    id: "receipt-1",
+    missionId: "mission-1",
+    summary: "Completed Plan the day",
+    actualModel: "gpt-5.6-sol",
+    evidenceIds: ["evidence-work-1"],
+    outputHashes: [],
+    completedAtMs: 10
+  )
+  await core.restoreFromDashboard(mission: nil, receipt: receipt)
+  await model.refreshDashboard()
+  #expect(model.confirmedMission == nil)
+  #expect(model.receipt == receipt)
+}
+
+@MainActor
+@Test
+func heroAPersistedReminderLinksNeverRepeatTheExternalWriteAfterRestart() async {
+  let core = MockCore()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  let link = ReminderLink(
+    missionId: "mission-1",
+    workItemId: "work-1",
+    sourceIdentifier: "source-1",
+    calendarIdentifier: "calendar-1",
+    calendarItemIdentifier: "reminder-work-1",
+    dispatchToken: "dispatch-work-1",
+    title: "Pick one priority"
+  )
+  let mission = testConfirmedMission(
+    writeDisposition: .recoverOnly,
+    reminderDispatch: [
+      ConfirmedReminderDispatch(workItemId: "work-1", token: "dispatch-work-1")
+    ],
+    reminderLinks: [link]
+  )
+  await core.restoreFromDashboard(mission: mission, receipt: nil)
+
+  await model.refreshDashboard()
+  await model.confirmSuggestion()
+
+  #expect(model.confirmedMission == mission)
+  #expect(model.reminderLinks == [link])
+  #expect(reminders.executeCount == 0)
+  #expect(await core.confirmationCount == 0)
+}
+
+@MainActor
+@Test
+func heroAPartialReminderReadbackCannotFabricateReceipt() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .partial)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+  await model.checkMissionProgress()
+
+  #expect(model.receipt == nil)
+  #expect(model.errorMessage?.contains("Finish every OpenOpen reminder") == true)
+  #expect(await core.reminderCompletionPayloads.isEmpty)
+}
+
+@MainActor
+@Test
+func heroAPostCommitReadbackFailureRetriesWithReadOnlyRecoveryAndNoSecondWrite() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .commitThenFailReadback)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 1)
+  #expect(model.confirmedMission?.missionId == "mission-1")
+  #expect(model.suggestion?.id == "suggestion-1")
+  #expect(model.receipt == nil)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 0)
+
+  reminders.mode = .complete
+  await model.confirmSuggestion()
+  #expect(await core.confirmationCount == 1)
+  #expect(await core.dispatchBeginCount == 2)
+  #expect(model.suggestion == nil)
+  #expect(model.reminderLinks.count == 1)
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 1)
+}
+
+@MainActor
+@Test
+func heroAPrecommitFailureNeverIssuesASecondExternalWrite() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .failBeforeCommit)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+
+  reminders.mode = .complete
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 1)
+  #expect(await core.dispatchBeginCount == 2)
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 1)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(model.errorMessage?.contains("exactly match") == true)
+}
+
+@MainActor
+@Test
+func heroADispatchResponseLossFailsClosedWithoutAnyExternalWrite() async {
+  let core = MockCore()
+  await core.loseNextReminderDispatchResponse()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 1)
+  #expect(await core.dispatchBeginCount == 2)
+  #expect(reminders.executeCount == 0)
+  #expect(reminders.recoverCount == 1)
+  #expect(model.reminderLinks.isEmpty)
+}
+
+@MainActor
+@Test
+func heroAOffAfterEventKitCommitStillPermitsOnlyReadOnlyRecovery() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .commitThenDelay)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  model.requestSuggestionConfirmation()
+
+  for _ in 0..<20 where reminders.executeCount == 0 {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 1)
+  await model.updateEnabled(false)
+  for _ in 0..<30 where model.isBusy {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+
+  #expect(model.confirmedMission?.reminderDispatch.count == 1)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(reminders.executeCount == 1)
+  #expect(!model.isBusy)
+
+  reminders.mode = .complete
+  await model.updateEnabled(true)
+  #expect(model.modelEntryEnabled)
+  await model.confirmSuggestion()
+
+  #expect(await core.confirmationCount == 1)
+  #expect(await core.dispatchBeginCount == 2)
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 1)
+  #expect(model.reminderLinks.count == 1)
 }
 
 @Test

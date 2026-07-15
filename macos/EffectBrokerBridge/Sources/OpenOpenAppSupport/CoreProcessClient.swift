@@ -270,6 +270,45 @@ public final class CoreProcessClient: @unchecked Sendable {
     )
   }
 
+  public func confirmSuggestion(
+    identifier: String, reminderTarget: ReminderTarget
+  ) async throws -> ConfirmedMission {
+    try await call(
+      method: "mission.confirm",
+      parameters: ConfirmSuggestionParameters(
+        suggestionId: identifier, reminderTarget: reminderTarget
+      )
+    )
+  }
+
+  public func beginReminderDispatch(identifier: String) async throws -> ReminderDispatchStart {
+    try await call(
+      method: "mission.reminders.begin",
+      parameters: BeginReminderDispatchParameters(missionId: identifier)
+    )
+  }
+
+  public func recordReminderMirror(
+    identifier: String, links: [ReminderLink]
+  ) async throws -> ConfirmedMission {
+    try await call(
+      method: "mission.reminders.record",
+      parameters: RecordReminderMirrorParameters(missionId: identifier, links: links)
+    )
+  }
+
+  public func completeReminderMission(
+    identifier: String, completions: [ReminderCompletionInput]
+  ) async throws -> MissionReceipt {
+    try await call(
+      method: "mission.reminders.complete",
+      parameters: CompleteReminderMissionParameters(
+        missionId: identifier,
+        completions: completions
+      )
+    )
+  }
+
   public func shutdown() {
     shutdown(generation: nil, error: .processTerminated)
   }

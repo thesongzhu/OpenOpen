@@ -1549,6 +1549,7 @@ fn approve_core_write(
                 kind: ApprovalKind::NewExternalWrite,
                 prompt: "Write exact file?".into(),
                 scope_digest: action_digest,
+                target: None,
             },
             needs_me_id: "write-needs-me".into(),
             now_ms: 6,

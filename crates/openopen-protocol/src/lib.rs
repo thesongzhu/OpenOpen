@@ -82,6 +82,16 @@ pub enum ApprovalStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum ApprovalTarget {
+    ReminderList {
+        logical_list_id: String,
+        source_identifier: String,
+        calendar_identifier: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
     pub id: String,
@@ -89,6 +99,8 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     pub prompt: String,
     pub scope_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ApprovalTarget>,
     pub status: ApprovalStatus,
     pub requested_by_id: String,
     pub decided_by_id: Option<String>,
@@ -99,6 +111,8 @@ pub struct ApprovalRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EvidenceKind {
+    ReminderDispatchStarted,
+    ReminderMirrored,
     ReminderCompleted,
     ParticipantReply,
     OwnerFinalApproval,
