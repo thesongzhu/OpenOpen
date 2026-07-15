@@ -431,15 +431,17 @@ does not spawn or reacquire it. App/Core retain no numeric process-signal
 authority, and each root worker token remains bound to a stable exact identity
 before any request bytes. Hero A Repair5 is reviewed and pushed as
 `774789ca4a5eeadb8fa57688e79f823dec4da65b`; current Actions run
-`29393462659` passes at pull-request integration-tree tier. The immediate
-resume point is the reusable `ChannelEnvelope` authorization/dedupe/recovery
-boundary, then the real imsg and Discord adapters that close
-`FRIDAY_ALPHA_READY`. The reviewed shell/security architecture and Hero A
-Mission/Receipt route are frozen. Focused tests run during implementation,
-followed by one full parallel Rust/Swift verification and two fresh isolated
-reviewers at complete alpha-slice closure. If the requested model is
-unavailable, the task records a blocker and asks for direction; it does not
-fall back. Final demo production remains excluded.
+`29393462659` passes at pull-request integration-tree tier. The shared
+`ChannelEnvelope` boundary plus real imsg and Discord adapters are now reviewed
+and pushed as `2685b572715dff3e1360de66ab4c2ab6c013730b`; PR #2 Actions run
+`29440208503` passes at equal-tree integration tier. The immediate resume point
+is the real GPT/Reminders/iMessage/Discord, signed/admin, and restart evidence
+needed to earn `FRIDAY_ALPHA_READY`. The reviewed shell/security architecture,
+Hero A Mission/Receipt route, and channel implementation remain frozen. If the
+requested model, credentials, macOS permissions, administrator approval, or
+signing authority is unavailable, the task records that external gate and asks
+for direction; it does not fall back or claim the milestone. Final demo
+production remains excluded.
 
 1. Repository, governance, master plan, provenance, Rust workspace, original
    state-machine tests.
@@ -589,6 +591,7 @@ mock-only route, secret, or unfinished claimed route.
 | 2026-07-15 | First Repair3 closure review: fresh functional Reviewer PASS, fresh governance Reviewer FAIL on unchanged fingerprint `11d34c594ec1f1f2988d763a25a76244f477cc854254b390d20db5b88290499a`. Governance finds one P2: the Discord provenance paragraph still called historical Repair2 187-Rust/91-Swift data “current,” contradicting the Repair3 190-Rust/93-Swift ledger; no product, security, provider, or packaging boundary finding | functional reruns full Rust/focused Swift/pinned patch/notices/package checks; governance reruns full Swift/focused Rust/static/package/remote checks; both preserve the fingerprint | the functional PASS is historical after the evidence edit. Fix is limited to labeling Repair2 historical and Repair3 current, followed by a fresh two-reviewer cycle |
 | 2026-07-15 | Repair3 evidence-only fix labels the Discord Repair2 verification historical and the 190-Rust/93-Swift Repair3 tree current; no product code, gate, or provider claim changes. A replacement package embeds the corrected provenance | `/private/tmp/OpenOpen-FridayAlpha-Repair3-Final2.app` passes deep ad-hoc verification and staged RPC with the same signed imsg/runtime receipts; its read-only mount/copy/signature-tested DMG SHA is `bff4d18b…`; Team remains `not set` | evidence/package repair PASS locally; two entirely fresh replacement reviewers pending. Package remains `STAGED_AD_HOC_NOT_RELEASE_PROOF`; no push or `FRIDAY_ALPHA_READY` claim |
 | 2026-07-15 | Repair3 evidence-fix replacement review: two entirely fresh isolated reviewers PASS unchanged fingerprint `3e2015475d98b74d88a3de4c36e3a1aa4e8bcd1659a3356c5f36f7bd68103ae3` with zero P0/P1/P2 | both verify the prior P2 is closed, current/historical evidence is consistent, Final2 embeds byte-identical provenance, remote still points to historical `774789c…`, and focused Host/imsg/Swift/pinned-patch/static/package checks pass | Friday-alpha Repair3 Stage 5 PASS; exact commit/push and current-SHA CI pending. Real provider, Developer-ID/notarization, admin/cross-UID, and `FRIDAY_ALPHA_READY` remain pending |
+| 2026-07-15 | Reviewed Friday-alpha implementation commit `2685b572715dff3e1360de66ab4c2ab6c013730b` was pushed to draft PR #2 and Actions run `29440208503` passed every strict workflow step | live ref/PR/run/job inspection; synthesized merge `99ee2b10efb388ea6bb61ee88afe3092f2301a71` and exact head share tree `730bce09952c5c63374ffef7b3578aa723294323`; the run record names head `2685b57…`, and the integration job passes Rust/Swift test, release, lint, format, metadata, script, and clean-diff steps | Friday-alpha Repair3 Stage 6 and PR integration-tree Stage 7 plumbing PASS. PR #2 remains draft/unmerged; real GPT/Reminders/iMessage/Discord traffic, Developer-ID/notarization, administrator/cross-UID proof, and `FRIDAY_ALPHA_READY` remain pending |
 
 ## Current blockers
 
@@ -639,8 +642,11 @@ mock-only route, secret, or unfinished claimed route.
   approved blockers; its current 190-Rust/93-Swift suite, fresh pinned imsg v4
   build, two Codex diagnostics, independent notice closure, and ad-hoc App/DMG
   install verification pass. Two entirely fresh replacement reviewers PASS
-  frozen fingerprint `3e201547…` with zero P0/P1/P2. Exact commit/push and
-  current-SHA CI remain pending. Real bidirectional iMessage/Discord plus
+  frozen fingerprint `3e201547…` with zero P0/P1/P2. Reviewed commit
+  `2685b572715dff3e1360de66ab4c2ab6c013730b` is pushed to draft PR #2;
+  Actions run `29440208503` passes on synthesized merge `99ee2b10…`, whose
+  tree `730bce09…` equals the exact head tree. This is integration plumbing,
+  not provider or release proof. Real bidirectional iMessage/Discord plus
   GPT/Reminders traffic, Developer-ID signing, notarization, administrator
   approval, and real channel credentials are external-authority gates and will
   not be fabricated.

@@ -68,6 +68,16 @@
   `29393462659` passes the complete strict suite on synthesized merge
   `bccdf360…`, whose tree `e8f3605…` equals the head tree. This remains
   plumbing evidence, not real provider/Reminders or release proof.
+- Friday-alpha implementation commit
+  `2685b572715dff3e1360de66ab4c2ab6c013730b` adds the reviewed shared channel
+  boundary plus exact imsg and Discord entry/readback adapters to draft PR #2.
+  Two fresh reviewers PASS fingerprint `3e201547…` with zero P0/P1/P2, and
+  Actions run `29440208503` passes the complete strict workflow on synthesized
+  merge `99ee2b10…`; its tree `730bce09…` equals the exact head tree. This is
+  reviewed implementation and PR integration-tree plumbing evidence only.
+  Real GPT/Reminders/iMessage/Discord traffic, Developer-ID signing,
+  notarization, administrator/cross-UID proof, and `FRIDAY_ALPHA_READY` remain
+  pending.
 
 ## Planned Build Week additions (not yet claimed)
 
@@ -181,8 +191,11 @@
   with zero P0/P1/P2. They independently confirm the current/historical
   provenance distinction, byte-identical embedded Final2 provenance, focused
   Host/imsg/Swift/pinned-patch checks, ad-hoc package facts, and honest remote/
-  external-gate wording. This closes local Stage 5 only; exact commit/push and
-  current-SHA CI remain pending, and no provider or release proof is implied.
+  external-gate wording. Reviewed commit `2685b572715dff3e1360de66ab4c2ab6c013730b`
+  is now pushed to draft PR #2, and Actions run `29440208503` passes on
+  equal-tree synthesized merge `99ee2b10…`. This closes Stage 6 and PR
+  integration-tree Stage 7 plumbing only; no provider or release proof is
+  implied.
 
 - Hero A now connects explicit text input to the protected pinned GPT-5.6
   structured Outcome route, command-owned Mission confirmation, real EventKit

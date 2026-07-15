@@ -53,7 +53,10 @@ later upstream changes.
   candidate binding, bot/DM/code rejection, identity drift, operational
   traffic, reconnect, dedupe, and recovery. The historical Repair2 local suite
   passed 187 Rust and 91 Swift tests before its replacement-review failure;
-  the current Repair3 tree passes 190 Rust and 93 Swift tests. Real Discord
+  the current Repair3 tree passes 190 Rust and 93 Swift tests. Two fresh
+  reviewers PASS fingerprint `3e201547…`; implementation commit `2685b57…`
+  is pushed, and PR #2 Actions run `29440208503` passes on synthesized merge
+  `99ee2b10…`, whose tree equals the exact head tree. Real Discord
   roundtrip/restart proof remains pending.
 
 ### imsg (implemented basic-RPC adaptation; provider proof pending)
@@ -125,9 +128,11 @@ later upstream changes.
   ordinary Rust tests with one explicit environment-gated Codex test, 40
   broker/signing plus 53 App Swift tests, release/strict lint/format checks,
   two explicit pinned Codex diagnostics, and an independent 597-text notice
-  closure check. Two fresh replacement reviewers, Full Disk Access, Messages
-  Automation, real bidirectional traffic, Developer-ID signing, notarization,
-  and release proof remain pending.
+  closure check. Two fresh replacement reviewers PASS fingerprint
+  `3e201547…`; implementation commit `2685b57…` is pushed, and PR #2 Actions
+  run `29440208503` passes on equal-tree synthesized merge `99ee2b10…`.
+  Full Disk Access, Messages Automation, real bidirectional traffic,
+  Developer-ID signing, notarization, and release proof remain pending.
 
 ### serenity (implemented exact direct dependency; provider proof pending)
 

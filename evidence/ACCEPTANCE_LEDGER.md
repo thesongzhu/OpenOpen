@@ -7,9 +7,9 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Local Friday-alpha Repair3 tree based on pushed Hero A commit `774789c…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test, release build, workspace strict Clippy, fmt, focused Host/imsg regressions, five pinned upstream imsg tests, and two explicit pinned-runtime sandbox diagnostics. Two fresh Repair3 reviewers and current pushed-SHA CI remain pending; this is not provider or release proof |
+| Rust domain and security tests | Current-SHA test log | Exact Friday-alpha commit `2685b57…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test, release build, workspace strict Clippy, fmt, focused Host/imsg regressions, five pinned upstream imsg tests, and two explicit pinned-runtime sandbox diagnostics locally. Two fresh reviewers PASS fingerprint `3e201547…`; PR #2 Actions `29440208503` passes the strict workflow on equal-tree synthesized merge `99ee2b10…`. This is not provider or release proof |
 | SwiftUI build and tests | Current-SHA build/test log | Local Friday-alpha Repair3 tree passes 40 broker/signing tests plus 53 App tests, warnings-as-errors debug/release build, strict format, both plists, script syntax, and diff checks. New tests cover product chat selection plus activation and prepare-response-loss cleanup/retry. Corrected-provenance `/private/tmp/OpenOpen-FridayAlpha-Repair3-Final2.app` and DMG pass deep ad-hoc and read-only mount/copy/signature install verification at DMG SHA `bff4d18b…`; Team is `not set`, so signed/admin and cross-UID release proof remain pending |
-| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the Repair3 tree. Hero A PR #2 CI remains historical integration-tree plumbing. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
+| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the Repair3 tree. Current PR #2 run `29440208503` passes integration-tree plumbing for head `2685b57…`. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
 | Discord bidirectional route | Signed-build bot/channel message IDs | pending |
@@ -19,7 +19,7 @@ different commit/build.
 | Stress suite | Nonzero all-pass scenario artifact | pending |
 | Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | pending |
 | Three external users | Consent-safe aggregate and 48-hour reuse | pending |
-| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Repair3 replacement reviewers PASS local fingerprint `3e201547…` with zero P0/P1/P2. Exact commit SHA, current CI, provider proof, and final release-SHA review remain pending |
+| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Repair3 replacement reviewers PASS fingerprint `3e201547…` with zero P0/P1/P2; the reviewed tree is exact commit `2685b57…`, now pushed with equal-tree PR CI PASS. Provider proof and final release-SHA review remain pending |
 
 ## Review history
 
@@ -1018,3 +1018,16 @@ different commit/build.
   This closes local Friday-alpha Repair3 Stage 5 only. Exact commit/push,
   current-SHA CI, real provider evidence, signing/notarization, and the final
   product gates remain pending.
+- 2026-07-15 Friday-alpha Repair3 Stage 6/7: reviewed commit
+  `2685b572715dff3e1360de66ab4c2ab6c013730b` is pushed to
+  `agent/product-shell` and draft PR #2. Actions run `29440208503` passes every
+  strict workflow step: 190 ordinary Rust tests pass with one explicit
+  environment-gated test ignored, all 40 broker/signing plus 53 App Swift tests
+  pass, and release, strict lint, format, metadata, script, and clean-diff
+  checks pass. The pull-request integration ref is synthesized
+  merge `99ee2b10efb388ea6bb61ee88afe3092f2301a71`; its tree
+  `730bce09952c5c63374ffef7b3578aa723294323` equals the exact head tree. This
+  is integration-tree plumbing evidence only. PR #2 remains draft/unmerged;
+  real GPT/Reminders/iMessage/Discord traffic, Developer-ID/notarization,
+  administrator/cross-UID proof, `FRIDAY_ALPHA_READY`, and release proof remain
+  pending.
