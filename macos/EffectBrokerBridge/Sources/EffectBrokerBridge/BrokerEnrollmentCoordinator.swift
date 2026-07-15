@@ -334,12 +334,16 @@ final class KeychainDataStore {
     }
   }
 
-  private func baseQuery(account: KeychainAccount) -> [String: Any] {
+  func baseQuery(account: KeychainAccount) -> [String: Any] {
+    // OpenOpen is distributed directly with Developer ID. Opting into the
+    // data-protection Keychain requires a provisioning profile and otherwise
+    // fails closed with errSecMissingEntitlement (-34018). Use the single
+    // native macOS login Keychain backend explicitly; never retry against a
+    // second backend after an error.
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: account.rawValue,
-      kSecUseDataProtectionKeychain as String: true,
     ]
   }
 }
