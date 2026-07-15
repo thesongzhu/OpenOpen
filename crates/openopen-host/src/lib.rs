@@ -1,5 +1,11 @@
 //! Production Rust host for `OpenOpen`'s local JSON-RPC surface.
 
+mod channels;
+
+use channels::{
+    ChannelConnectionStatus, ChannelRuntime, ChannelSendResult, TransportEvent, TransportInbound,
+};
+
 use openopen_codex_client::{
     ChatGptLogin, CodexClient, CodexError, CodexRuntimeConfig, OutcomeRequest, REQUIRED_MODEL,
 };
@@ -8,10 +14,14 @@ use openopen_core::{
     BrokerEnrollmentRecord, CreateMission, CreateWorkItem, EffectKind, EvidenceClaims,
     GateDecision, LocalAuthority, MissionCommand, MissionCommandEnvelope, NewBoundaryApproval,
     NewReceipt, Store, StoreError, TrustedBrokerEnrollment, authorize_broker_enrollment,
+    channel_message_payload, channel_need_you_content, channel_receipt_content,
     verify_core_instance_lease,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, CoreInstanceLease, EvidenceKind, Mission,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelDeliveryReceipt, ChannelEnvelope,
+    ChannelInboundDecision, ChannelKind, ChannelMessageKind, ChannelModelDisposition,
+    ChannelModelStart, ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent,
+    ChannelPairing, CoreInstanceLease, DiscordPairingMetadata, EvidenceKind, Mission,
     MissionStatus, OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse,
     RuntimeControlAuthorization, RuntimeControlReceipt, WorkItem, WorkItemStatus,
 };
@@ -51,6 +61,8 @@ pub enum HostError {
     Io(#[from] io::Error),
     #[error("persistent Store failed")]
     Store(#[from] StoreError),
+    #[error("channel runtime failed to initialize")]
+    ChannelRuntime,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +72,7 @@ pub struct HostPaths {
     pub codex_home: PathBuf,
     pub synthetic_home: PathBuf,
     pub model_input_root: PathBuf,
+    pub imsg_runtime: PathBuf,
 }
 
 impl HostPaths {
@@ -96,6 +109,7 @@ impl HostPaths {
             codex_home: support.join("CodexHome"),
             synthetic_home: support.join("CodexSyntheticHome"),
             model_input_root: support.join("ModelInput"),
+            imsg_runtime: contents.join("Resources/iMessage/0.13.0/bin/imsg"),
         })
     }
 }
@@ -306,6 +320,7 @@ pub struct Host {
     operations: OperationState,
     instance_nonce: String,
     instance_lease: Arc<Mutex<Option<CoreInstanceLease>>>,
+    channels: Mutex<ChannelRuntime>,
 }
 
 impl Host {
@@ -334,6 +349,7 @@ impl Host {
             operations: OperationState::default(),
             instance_nonce: hex::encode(nonce),
             instance_lease: Arc::new(Mutex::new(None)),
+            channels: Mutex::new(ChannelRuntime::new().map_err(|_| HostError::ChannelRuntime)?),
         })
     }
 
@@ -365,6 +381,22 @@ impl Host {
             "broker.codex.abort" => self.abort_codex_candidate(&request, responses),
             "broker.lease.install" => self.install_core_lease(&request, responses),
             "mission.dashboard.read" => self.read_dashboard(&request, responses),
+            "channel.pair" => self.pair_channel(&request, responses),
+            "channel.pairing.read" => self.read_channel_pairing(&request, responses),
+            "channel.discord.setup.start" => self.start_discord_setup(&request, responses),
+            "channel.discord.setup.poll" => self.poll_discord_setup(&request, responses),
+            "channel.discord.setup.confirm" => self.confirm_discord_setup(&request, responses),
+            "channel.discord.start" => self.start_discord(&request, responses),
+            "channel.imessage.chats.prepare" => {
+                self.prepare_imessage_chat_discovery(&request, responses);
+            }
+            "channel.imessage.chats.list" => self.list_imessage_chat_discovery(&request, responses),
+            "channel.imessage.prepare" => self.prepare_imessage(&request, responses),
+            "channel.imessage.activate" => self.activate_imessage(&request, responses),
+            "channel.poll" => self.poll_channel(&request, responses),
+            "channel.status" => self.channel_status(&request, responses),
+            "channel.stop" => self.stop_channel(&request, responses),
+            "channel.outbound.send" => self.send_channel_message(&request, responses),
             "account.read" => self.start_account_read(&request, responses),
             "account.login.start" => self.start_login(&request, responses),
             "account.login.await" => self.await_login(&request, responses),
@@ -401,6 +433,10 @@ impl Host {
             return;
         }
         if !params.enabled {
+            self.channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_all();
             *self
                 .operations
                 .runtime_challenge
@@ -702,44 +738,88 @@ impl Host {
         }
         let result = (|| -> Result<Value, HostCallError> {
             let runtime = self.store.runtime_control()?;
-            let suggestion = self
+            let memory_suggestion = self
                 .operations
                 .suggestion
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let mut suggestion = memory_suggestion.or(self.store.latest_channel_suggestion()?);
             let Some(anchor) = self.store.current_verified_audit_anchor()? else {
                 return Ok(json!({
                     "activeCards": [],
+                    "channelOrigin": null,
                     "confirmedMission": null,
                     "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+                    "needsYou": null,
                     "receipt": null,
                     "runtime": runtime,
                     "suggestion": suggestion
                 }));
             };
+            let missions = self.store.list_missions(&anchor)?;
             let mut confirmed = Vec::new();
-            for mission in self.store.list_missions(&anchor)? {
+            for mission in &missions {
                 if let Some(value) = confirmed_mission_from_mission(
-                    &mission,
+                    mission,
                     &self.authority,
                     ReminderWriteDisposition::RecoverOnly,
                 )? {
                     confirmed.push(value);
                 }
             }
+            let needs_you = missions.iter().find_map(|mission| {
+                (mission.status == MissionStatus::NeedsMe)
+                    .then_some(mission.needs_me.as_ref())
+                    .flatten()
+                    .map(|needs_me| MissionNeedsYou {
+                        mission_id: mission.id.clone(),
+                        title: mission.title.clone(),
+                        prompt: needs_me.prompt.clone(),
+                        created_at_ms: needs_me.created_at_ms,
+                    })
+            });
             let receipt = self.store.list_receipts(&anchor)?.into_iter().next();
-            let active_cards = confirmed
+            if suggestion.as_ref().is_some_and(|candidate| {
+                mission_id_for_suggestion_id(&candidate.id).is_ok_and(|mission_id| {
+                    confirmed
+                        .iter()
+                        .any(|mission| mission.mission_id == mission_id)
+                })
+            }) {
+                suggestion = None;
+            }
+            let mut active_cards = confirmed
                 .iter()
                 .take(3)
                 .map(|mission| {
                     json!({"id": mission.mission_id, "state": "working", "title": mission.title})
                 })
                 .collect::<Vec<_>>();
+            if active_cards.len() < 3
+                && let Some(needs_you) = &needs_you
+            {
+                active_cards.push(json!({
+                    "id": needs_you.mission_id,
+                    "state": "Need you",
+                    "title": needs_you.title,
+                }));
+            }
+            let origin_mission_id = confirmed
+                .first()
+                .map(|mission| mission.mission_id.as_str())
+                .or_else(|| needs_you.as_ref().map(|value| value.mission_id.as_str()))
+                .or_else(|| receipt.as_ref().map(|value| value.mission_id.as_str()));
+            let channel_origin = origin_mission_id
+                .map(|mission_id| self.store.channel_mission_origin(mission_id))
+                .transpose()?
+                .flatten();
             Ok(json!({
                 "activeCards": active_cards,
+                "channelOrigin": channel_origin,
                 "confirmedMission": confirmed.first(),
                 "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+                "needsYou": needs_you,
                 "receipt": receipt,
                 "runtime": runtime,
                 "suggestion": suggestion
@@ -750,6 +830,710 @@ impl Host {
             |dashboard| success(request.id, dashboard),
         );
         let _ = responses.send(response);
+    }
+
+    fn pair_channel(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<PairChannel>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let result = if params.pairing.channel != ChannelKind::IMessage
+            || params.pairing.discord.is_some()
+        {
+            Err(StoreError::ChannelPairingConflict)
+        } else {
+            self.store
+                .require_runtime_checkpoint(&params.authorization, &params.broker_receipt)
+                .and_then(|()| self.store.pair_channel(&params.pairing))
+        };
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |()| success(request.id, json!({"status": "paired"})),
+        ));
+    }
+
+    fn start_discord_setup(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(mut params) = decode_params::<StartDiscord>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            params.bot_token.zeroize();
+            return;
+        };
+        let token = Zeroizing::new(std::mem::take(&mut params.bot_token));
+        let result = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .start_discord_setup(&token)
+            .map_err(|_| HostCallError::Internal);
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |start| success(request.id, start),
+        ));
+    }
+
+    fn poll_discord_setup(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poll_discord_setup()
+            .map(|(status, candidate)| json!({"status": status, "candidate": candidate}))
+            .map_err(|_| HostCallError::Internal);
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        ));
+    }
+
+    fn confirm_discord_setup(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ConfirmDiscordSetup>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let proof = params.proof();
+        let Some(operation) = self.begin_operation(request.id, &proof, responses) else {
+            return;
+        };
+        let result = (|| -> Result<(), HostCallError> {
+            let now = now_ms()?;
+            let candidate = self
+                .channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .confirm_discord_setup(&params.candidate_id)
+                .map_err(|_| HostCallError::Internal)?;
+            if params.confirmed_at_ms < candidate.received_at_ms || params.confirmed_at_ms > now {
+                return Err(HostCallError::Internal);
+            }
+            self.store
+                .require_runtime_checkpoint(&params.authorization, &params.broker_receipt)?;
+            self.store.pair_channel(&ChannelPairing {
+                channel: ChannelKind::Discord,
+                owner_sender_id: candidate.owner_user_id,
+                conversation_id: candidate.channel_id,
+                require_explicit_address: true,
+                discord: Some(DiscordPairingMetadata {
+                    guild_id: candidate.guild_id,
+                    bot_user_id: candidate.bot_user_id,
+                    application_id: candidate.application_id,
+                    setup_source_message_id: candidate.source_message_id,
+                    setup_candidate_id: candidate.candidate_id,
+                }),
+                paired_at_ms: params.confirmed_at_ms,
+            })?;
+            self.channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_discord_setup();
+            Ok(())
+        })();
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |()| success(request.id, json!({"status": "paired"})),
+        ));
+    }
+
+    fn read_channel_pairing(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ReadChannelPairing>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let _ = responses.send(self.store.channel_pairing(params.channel).map_or_else(
+            |error| host_failure(request.id, &error),
+            |value| success(request.id, value),
+        ));
+    }
+
+    fn start_discord(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(mut params) = decode_params::<StartDiscord>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            params.bot_token.zeroize();
+            return;
+        };
+        let token = Zeroizing::new(std::mem::take(&mut params.bot_token));
+        let result = (|| -> Result<ChannelConnectionStatus, HostCallError> {
+            let pairing = self
+                .store
+                .channel_pairing(ChannelKind::Discord)?
+                .ok_or(HostCallError::Internal)?;
+            let cursor = self
+                .store
+                .channel_cursor(ChannelKind::Discord, &pairing.conversation_id)?;
+            self.channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .start_discord(&pairing, token, cursor.as_ref())
+                .map_err(|_| HostCallError::Internal)
+        })();
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |status| success(request.id, json!({"status": status})),
+        ));
+    }
+
+    fn prepare_imessage(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = (|| -> Result<u32, HostCallError> {
+            let pairing = self
+                .store
+                .channel_pairing(ChannelKind::IMessage)?
+                .ok_or(HostCallError::Internal)?;
+            let cursor = self
+                .store
+                .channel_cursor(ChannelKind::IMessage, &pairing.conversation_id)?;
+            self.channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .prepare_imessage(&self.paths.imsg_runtime, &pairing, cursor.as_ref())
+                .map_err(|_| HostCallError::Internal)
+        })();
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |process_identifier| {
+                success(request.id, json!({"processIdentifier": process_identifier}))
+            },
+        ));
+    }
+
+    fn prepare_imessage_chat_discovery(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prepare_imessage_discovery(&self.paths.imsg_runtime)
+            .map_err(|_| HostCallError::Internal);
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |process_identifier| {
+                success(request.id, json!({"processIdentifier": process_identifier}))
+            },
+        ));
+    }
+
+    fn list_imessage_chat_discovery(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_imessage_chats()
+            .map_err(|_| HostCallError::Internal);
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |chats| success(request.id, json!({"chats": chats})),
+        ));
+    }
+
+    fn activate_imessage(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activate_imessage()
+            .map_err(|_| HostCallError::Internal);
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |status| success(request.id, json!({"status": status})),
+        ));
+    }
+
+    fn channel_status(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ChannelSelection>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let status = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status(params.channel);
+        let _ = responses.send(success(request.id, json!({"status": status})));
+    }
+
+    fn stop_channel(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ChannelSelection>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        self.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop(params.channel);
+        let _ = responses.send(success(
+            request.id,
+            json!({"status": ChannelConnectionStatus::Disconnected}),
+        ));
+    }
+
+    fn send_channel_message(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<SendChannelMessage>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if params.content.is_empty()
+            || params.content.trim() != params.content
+            || params.content.as_bytes().contains(&0)
+            || params.content.chars().count() > 2_000
+            || params.approved_at_ms < 0
+        {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            return;
+        };
+        let prepared = self.prepare_channel_send(&params);
+        let (start, message_body, handle) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        if start.disposition == ChannelOutboundDisposition::AlreadySent {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                json!({
+                    "status": "sent",
+                    "providerMessageId": start.provider_message_id,
+                }),
+            ));
+            return;
+        }
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let transport_result = match start.disposition {
+                ChannelOutboundDisposition::ExecuteNow => {
+                    handle.send(&start.intent.outbound_id, &message_body)
+                }
+                ChannelOutboundDisposition::RecoverOnly => start
+                    .intent
+                    .recovery_cursor
+                    .as_ref()
+                    .map_or(ChannelSendResult::Uncertain, |cursor| {
+                        handle.recover(&start.intent.outbound_id, &message_body, cursor)
+                    }),
+                ChannelOutboundDisposition::AlreadySent => unreachable!(),
+            };
+            let result = match transport_result {
+                ChannelSendResult::Accepted {
+                    provider_message_id,
+                } => (|| -> Result<Value, HostCallError> {
+                    let broker = context
+                        .trusted_broker
+                        .clone()
+                        .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+                    let mut store = Store::open_with_trusted_broker(
+                        &context.paths.store,
+                        context.authority.clone(),
+                        broker,
+                    )?;
+                    let reconciled = store.record_channel_delivery(&ChannelDeliveryReceipt {
+                        outbound_id: start.intent.outbound_id.clone(),
+                        provider_message_id,
+                        delivered_at_ms: now_ms()?,
+                    })?;
+                    Ok(json!({
+                        "status": "sent",
+                        "providerMessageId": reconciled.provider_message_id,
+                    }))
+                })(),
+                ChannelSendResult::Uncertain => Ok(json!({
+                    "status": "needYou",
+                    "providerMessageId": null,
+                })),
+            };
+            context.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |value| success(request_id, value),
+            ));
+        });
+    }
+
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn prepare_channel_send(
+        &mut self,
+        params: &SendChannelMessage,
+    ) -> Result<
+        (
+            openopen_protocol::ChannelOutboundStart,
+            String,
+            channels::ChannelSendHandle,
+        ),
+        HostCallError,
+    > {
+        let anchor = self
+            .store
+            .current_verified_audit_anchor()?
+            .ok_or(HostCallError::Internal)?;
+        let mission = self
+            .store
+            .get_mission(&params.mission_id, &anchor)?
+            .ok_or(HostCallError::Internal)?;
+        let origin = self
+            .store
+            .channel_mission_origin(&params.mission_id)?
+            .ok_or(HostCallError::Internal)?;
+        let payload = external_channel_payload(origin.channel, &params.content)?;
+        let proposal = ActionProposal {
+            effect: EffectKind::ChannelSend,
+            mission_id: mission.id.clone(),
+            mission_scope_digest: mission.scope_digest.clone(),
+            target: ActionTarget::Channel {
+                channel: origin.channel,
+                conversation_id: origin.conversation_id.clone(),
+                recipient_ids: vec![origin.owner_sender_id.clone()],
+            },
+            estimated_cost_micros: None,
+        };
+        let outbound_id = hashed_identifier(
+            "channel-send",
+            &json!({
+                "channel": origin.channel,
+                "contentSha256": format!("{:x}", Sha256::digest(&payload)),
+                "kind": params.kind,
+                "missionId": mission.id,
+            }),
+        )?;
+        match params.kind {
+            ChannelMessageKind::Progress => {
+                if mission.status != MissionStatus::Active
+                    || params.approved_at_ms < mission.updated_at_ms
+                {
+                    return Err(HostCallError::Internal);
+                }
+                let commands = channel_send_approval_commands(
+                    &mission,
+                    &proposal,
+                    &payload,
+                    &outbound_id,
+                    params.approved_at_ms,
+                )?;
+                let envelopes = mission_command_batch(Some(&anchor), &mission.id, commands)?;
+                self.store.execute_mission_command_batch(&envelopes)?;
+            }
+            ChannelMessageKind::NeedYou => {
+                let needs_me = mission.needs_me.as_ref().ok_or(HostCallError::Internal)?;
+                if mission.status != MissionStatus::NeedsMe
+                    || params.approved_at_ms < needs_me.created_at_ms
+                    || params.content != channel_need_you_content(needs_me)
+                {
+                    return Err(HostCallError::Internal);
+                }
+            }
+            ChannelMessageKind::Receipt => {
+                let receipt = self
+                    .store
+                    .list_receipts(&anchor)?
+                    .into_iter()
+                    .find(|receipt| receipt.mission_id == mission.id)
+                    .ok_or(HostCallError::Internal)?;
+                if mission.status != MissionStatus::Completed
+                    || params.approved_at_ms < receipt.completed_at_ms
+                    || params.content != channel_receipt_content(&receipt)
+                {
+                    return Err(HostCallError::Internal);
+                }
+            }
+        }
+        let recovery_cursor = self
+            .store
+            .channel_cursor(origin.channel, &origin.conversation_id)?;
+        let intent = ChannelOutboundIntent {
+            outbound_id,
+            mission_id: mission.id,
+            channel: origin.channel,
+            conversation_id: origin.conversation_id,
+            recipient_id: origin.owner_sender_id,
+            kind: params.kind,
+            content_sha256: format!("{:x}", Sha256::digest(&payload)),
+            created_at_ms: params.approved_at_ms,
+            recovery_cursor,
+        };
+        let start = self.store.begin_channel_outbound(&intent, &payload)?;
+        let handle = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_handle(origin.channel)
+            .ok_or(HostCallError::Internal)?;
+        let message_body = String::from_utf8(payload).map_err(|_| HostCallError::Internal)?;
+        Ok((start, message_body, handle))
+    }
+
+    fn poll_channel(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<PollChannel>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            return;
+        };
+        let observed_at_ms = match now_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        match self.store.next_queued_channel_model(params.channel) {
+            Ok(Some(source_message_id)) => {
+                match self
+                    .store
+                    .begin_channel_model(params.channel, &source_message_id)
+                {
+                    Ok(start) => {
+                        self.process_channel_model_start(
+                            request, responses, &params, operation, start,
+                        );
+                    }
+                    Err(error) => {
+                        self.finish_operation(&operation);
+                        let _ = responses.send(host_failure(request.id, &error));
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        }
+        let event = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poll(params.channel, observed_at_ms);
+        let Ok(event) = event else {
+            self.finish_operation(&operation);
+            let _ = responses.send(failure(
+                Some(request.id),
+                -32_000,
+                "Channel transport failed closed",
+            ));
+            return;
+        };
+        let Some(event) = event else {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                self.channel_poll_value(params.channel, "idle", None),
+            ));
+            return;
+        };
+        if let TransportEvent::Cursor(cursor) = event {
+            let result = self.store.advance_channel_cursor(&cursor);
+            self.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| host_failure(request.id, &error),
+                |()| {
+                    success(
+                        request.id,
+                        self.channel_poll_value(params.channel, "recovered", None),
+                    )
+                },
+            ));
+            return;
+        }
+        let TransportEvent::Inbound(inbound) = event else {
+            unreachable!();
+        };
+        self.process_channel_inbound(request, responses, &params, operation, &inbound);
+    }
+
+    fn process_channel_inbound(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: Arc<AtomicBool>,
+        inbound: &TransportInbound,
+    ) {
+        let observation = channel_observation(inbound);
+        let result = self
+            .store
+            .ingest_channel_message(&observation, &inbound.content)
+            .and_then(|ingested| {
+                if ingested.decision == ChannelInboundDecision::Accepted {
+                    self.store
+                        .begin_channel_model(
+                            observation.envelope.channel,
+                            &observation.envelope.source_message_id,
+                        )
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            });
+        let start = match result {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "ignored", None),
+                ));
+                return;
+            }
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        self.process_channel_model_start(request, responses, params, operation, start);
+    }
+
+    fn process_channel_model_start(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: Arc<AtomicBool>,
+        start: openopen_protocol::ChannelModelStart,
+    ) {
+        match start.disposition {
+            ChannelModelDisposition::SuggestionReady => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "ready", start.suggestion.as_ref()),
+                ));
+            }
+            ChannelModelDisposition::RecoverOnly => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "needYou", None),
+                ));
+            }
+            ChannelModelDisposition::ExecuteNow => {
+                let connection_status = self
+                    .channels
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .status(params.channel);
+                let context = self.background_context(params.proof());
+                let suggestion_slot = self.operations.suggestion.clone();
+                let responses = responses.clone();
+                let request_id = request.id;
+                std::thread::spawn(move || {
+                    let result = run_channel_outcome(&context, &start).and_then(|suggestion| {
+                        let broker = context
+                            .trusted_broker
+                            .clone()
+                            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+                        let mut store = Store::open_with_trusted_broker(
+                            &context.paths.store,
+                            context.authority.clone(),
+                            broker,
+                        )?;
+                        store.record_channel_suggestion(
+                            start.envelope.channel,
+                            &start.envelope.source_message_id,
+                            &suggestion,
+                            now_ms()?,
+                        )?;
+                        *suggestion_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(suggestion.clone());
+                        Ok(suggestion)
+                    });
+                    context.finish_operation(&operation);
+                    let _ = responses.send(result.map_or_else(
+                        |error| call_failure(request_id, &error),
+                        |suggestion| {
+                            success(
+                                request_id,
+                                json!({
+                                    "connectionStatus": connection_status,
+                                    "eventStatus": "ready",
+                                    "suggestion": suggestion,
+                                }),
+                            )
+                        },
+                    ));
+                });
+            }
+        }
+    }
+
+    fn channel_poll_value(
+        &self,
+        channel: ChannelKind,
+        event_status: &str,
+        suggestion: Option<&OutcomeSuggestion>,
+    ) -> Value {
+        let connection_status = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status(channel);
+        json!({
+            "connectionStatus": connection_status,
+            "eventStatus": event_status,
+            "suggestion": suggestion,
+        })
     }
 
     fn start_account_read(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -1119,14 +1903,22 @@ impl Host {
                 now_ms: clicked_at_ms,
             },
         ];
+        let channel_source = self.store.channel_source_for_suggestion(&suggestion.id)?;
         let expected_anchor = self.store.current_verified_audit_anchor()?;
         let envelopes = mission_command_batch(expected_anchor.as_ref(), &mission_id, commands)?;
-        let mission = self
-            .store
-            .execute_mission_command_batch(&envelopes)?
-            .pop()
-            .ok_or(HostCallError::Internal)?
-            .mission;
+        let mut results = if let Some(source) = channel_source {
+            self.store
+                .execute_mission_command_batch_with_channel_origin(
+                    &envelopes,
+                    source.channel,
+                    &source.source_message_id,
+                    &suggestion.id,
+                    clicked_at_ms,
+                )?
+        } else {
+            self.store.execute_mission_command_batch(&envelopes)?
+        };
+        let mission = results.pop().ok_or(HostCallError::Internal)?.mission;
         confirmed_mission_from_mission(
             &mission,
             &self.authority,
@@ -1341,20 +2133,47 @@ impl Host {
                 return;
             }
         };
+        let channel_origin = match self.store.channel_mission_origin(&mission.id) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let completion_time = match (
+            channel_origin.as_ref(),
+            params.receipt_return_approved_at_ms,
+            mission.status,
+        ) {
+            (Some(_), Some(approved_at_ms), MissionStatus::Active)
+                if approved_at_ms >= mission.updated_at_ms && approved_at_ms <= observed_now =>
+            {
+                approved_at_ms
+            }
+            (Some(_), Some(_), MissionStatus::Completed) | (None, None, _) => observed_now,
+            _ => {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+        };
         let Some(completions) = validated_reminder_completions(
             &mission,
             &self.authority,
             params.completions,
-            observed_now,
+            completion_time,
             mission.status == MissionStatus::Active,
         ) else {
             let _ = responses.send(invalid_params(request.id));
             return;
         };
         let result = match mission.status {
-            MissionStatus::Active => {
-                self.persist_reminder_completion(&mission, &anchor, &completions, observed_now)
-            }
+            MissionStatus::Active => self.persist_reminder_completion(
+                &mission,
+                &anchor,
+                &completions,
+                completion_time,
+                channel_origin.as_ref(),
+            ),
             MissionStatus::Completed => {
                 match self.existing_receipt_for_completions(&mission, &anchor, &completions) {
                     Ok(Some(receipt)) => Ok(receipt),
@@ -1383,8 +2202,9 @@ impl Host {
         anchor: &AuditAnchor,
         completions: &BTreeMap<String, ReminderCompletion>,
         completed_at_ms: i64,
+        channel_origin: Option<&openopen_protocol::ChannelMissionOrigin>,
     ) -> Result<Receipt, HostCallError> {
-        let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 1);
+        let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 7);
         let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
         for item in &mission.work_items {
             let completion = completions
@@ -1420,24 +2240,56 @@ impl Host {
             });
             evidence_ids.push(evidence_id);
         }
-        let receipt_id = hashed_identifier(
-            "receipt",
-            &json!({"evidenceIds": evidence_ids, "missionId": mission.id}),
-        )?;
+        let mut receipt_completed_at_ms = completed_at_ms;
+        let mut receipt = new_reminder_receipt(mission, &evidence_ids, completed_at_ms)?;
+        if let Some(origin) = channel_origin {
+            receipt_completed_at_ms = completed_at_ms
+                .checked_add(6)
+                .ok_or(HostCallError::Internal)?;
+            receipt.completed_at_ms = receipt_completed_at_ms;
+            let receipt_value = Receipt {
+                id: receipt.id.clone(),
+                mission_id: mission.id.clone(),
+                summary: receipt.summary.clone(),
+                actual_model: receipt.actual_model.clone(),
+                evidence_ids: evidence_ids.clone(),
+                output_hashes: receipt.output_hashes.clone(),
+                completed_at_ms: receipt_completed_at_ms,
+            };
+            let content = channel_receipt_content(&receipt_value);
+            let payload = external_channel_payload(origin.channel, &content)?;
+            let proposal = ActionProposal {
+                effect: EffectKind::ChannelSend,
+                mission_id: mission.id.clone(),
+                mission_scope_digest: mission.scope_digest.clone(),
+                target: ActionTarget::Channel {
+                    channel: origin.channel,
+                    conversation_id: origin.conversation_id.clone(),
+                    recipient_ids: vec![origin.owner_sender_id.clone()],
+                },
+                estimated_cost_micros: None,
+            };
+            let outbound_id = hashed_identifier(
+                "channel-send",
+                &json!({
+                    "channel": origin.channel,
+                    "contentSha256": format!("{:x}", Sha256::digest(&payload)),
+                    "kind": ChannelMessageKind::Receipt,
+                    "missionId": mission.id,
+                }),
+            )?;
+            commands.extend(channel_send_approval_commands(
+                mission,
+                &proposal,
+                &payload,
+                &outbound_id,
+                completed_at_ms,
+            )?);
+        }
         commands.push(MissionCommand::Complete {
             mission_id: mission.id.clone(),
-            receipt: NewReceipt {
-                id: receipt_id,
-                summary: format!(
-                    "Completed {} with {} verified Reminders.",
-                    mission.title,
-                    mission.work_items.len()
-                ),
-                actual_model: REQUIRED_MODEL.to_owned(),
-                output_hashes: Vec::new(),
-                completed_at_ms,
-            },
-            now_ms: completed_at_ms,
+            receipt,
+            now_ms: receipt_completed_at_ms,
         });
         let envelopes = mission_command_batch(Some(anchor), &mission.id, commands)?;
         self.store
@@ -1562,6 +2414,10 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
+        self.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop_all();
         self.cancel_active();
     }
 }
@@ -1709,6 +2565,98 @@ struct RuntimeProof {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartDiscord {
+    bot_token: String,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmDiscordSetup {
+    candidate_id: String,
+    confirmed_at_ms: i64,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl ConfirmDiscordSetup {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+impl StartDiscord {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChannelSelection {
+    channel: ChannelKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PollChannel {
+    channel: ChannelKind,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl PollChannel {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SendChannelMessage {
+    mission_id: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approved_at_ms: i64,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl SendChannelMessage {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairChannel {
+    pairing: ChannelPairing,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadChannelPairing {
+    channel: ChannelKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OutcomeWithProof {
     prompt: String,
     allowed_source_refs: Vec<String>,
@@ -1769,6 +2717,7 @@ struct ReminderCompletion {
 struct CompleteReminders {
     mission_id: String,
     completions: Vec<ReminderCompletion>,
+    receipt_return_approved_at_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1827,6 +2776,15 @@ struct ReminderAuthorization {
 struct ConfirmedWorkItem {
     id: String,
     title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionNeedsYou {
+    mission_id: String,
+    title: String,
+    prompt: String,
+    created_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1978,6 +2936,69 @@ fn now_ms() -> Result<i64, HostCallError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HostCallError::Internal)?;
     i64::try_from(duration.as_millis()).map_err(|_| HostCallError::Internal)
+}
+
+fn channel_observation(inbound: &TransportInbound) -> ChannelObservation {
+    ChannelObservation {
+        envelope: ChannelEnvelope {
+            channel: inbound.channel,
+            source_message_id: inbound.source_message_id.clone(),
+            sender_id: inbound.sender_id.clone(),
+            conversation_id: inbound.conversation_id.clone(),
+            content_sha256: format!("{:x}", Sha256::digest(inbound.content.as_bytes())),
+            received_at_ms: inbound.received_at_ms,
+        },
+        cursor: openopen_protocol::ChannelCursor {
+            channel: inbound.channel,
+            conversation_id: inbound.conversation_id.clone(),
+            opaque_value: inbound.cursor_opaque_value.clone(),
+            order: inbound.cursor_order,
+            observed_at_ms: inbound.received_at_ms,
+        },
+        is_bot: false,
+        explicitly_addressed: true,
+    }
+}
+
+fn external_channel_payload(channel: ChannelKind, content: &str) -> Result<Vec<u8>, HostCallError> {
+    let value = channel_message_payload(channel, content);
+    if value.is_empty() || value.contains(&0) {
+        return Err(HostCallError::Internal);
+    }
+    Ok(value)
+}
+
+fn run_channel_outcome(
+    context: &BackgroundContext,
+    start: &ChannelModelStart,
+) -> Result<OutcomeSuggestion, HostCallError> {
+    let source_digest = serialized_sha256(&start.envelope)?;
+    let source_ref = format!("channel:{}", &source_digest[..24]);
+    let outcome = OutcomeRequest {
+        prompt: start.content.clone(),
+        allowed_source_refs: vec![source_ref],
+    };
+    outcome.validate()?;
+    let workspace = ModelWorkspace::create(&context.paths.model_input_root)?;
+    let value = context.with_client(|client| {
+        client.run_structured_outcome_in_workspace(&outcome, &workspace.path)
+    })?;
+    let nonce = &serialized_sha256(&json!({
+        "channel": start.envelope.channel,
+        "sourceMessageId": start.envelope.source_message_id,
+        "contentSha256": start.envelope.content_sha256,
+    }))?[..32];
+    let suggestion = OutcomeSuggestion {
+        id: format!("suggestion-{}-{nonce}", start.envelope.received_at_ms),
+        title: value.title,
+        why_now: value.why_now,
+        proposed_steps: value.proposed_steps,
+        source_refs: value.source_refs,
+    };
+    if !valid_outcome_suggestion(&suggestion) {
+        return Err(HostCallError::Internal);
+    }
+    Ok(suggestion)
 }
 
 fn valid_outcome_suggestion(suggestion: &OutcomeSuggestion) -> bool {
@@ -2280,6 +3301,79 @@ fn mission_command_batch(
         .collect()
 }
 
+fn channel_send_approval_commands(
+    mission: &Mission,
+    proposal: &ActionProposal,
+    payload: &[u8],
+    outbound_id: &str,
+    approved_at_ms: i64,
+) -> Result<Vec<MissionCommand>, HostCallError> {
+    let recipient_approval = hashed_identifier(
+        "approval",
+        &json!({"kind": "newRecipient", "outboundId": outbound_id}),
+    )?;
+    let disclosure_approval = hashed_identifier(
+        "approval",
+        &json!({"kind": "newDataShare", "outboundId": outbound_id}),
+    )?;
+    let times = (0_i64..6)
+        .map(|offset| approved_at_ms.checked_add(offset))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(HostCallError::Internal)?;
+    Ok(vec![
+        MissionCommand::RequestScopeChange {
+            mission_id: mission.id.clone(),
+            approval: NewBoundaryApproval {
+                id: recipient_approval.clone(),
+                kind: ApprovalKind::NewRecipient,
+                prompt: "Return this exact update to the originating conversation?".into(),
+                scope_digest: proposal
+                    .approval_digest(ApprovalKind::NewRecipient, Some(payload))
+                    .map_err(|_| HostCallError::Internal)?,
+                target: None,
+            },
+            needs_me_id: hashed_identifier("needs-me", &recipient_approval)?,
+            now_ms: times[0],
+        },
+        MissionCommand::DecideApproval {
+            mission_id: mission.id.clone(),
+            approval_id: recipient_approval,
+            actor_id: mission.owner_id.clone(),
+            decision: ApprovalDecision::Approve,
+            now_ms: times[1],
+        },
+        MissionCommand::Resume {
+            mission_id: mission.id.clone(),
+            now_ms: times[2],
+        },
+        MissionCommand::RequestScopeChange {
+            mission_id: mission.id.clone(),
+            approval: NewBoundaryApproval {
+                id: disclosure_approval.clone(),
+                kind: ApprovalKind::NewDataShare,
+                prompt: "Share these exact bytes with the originating conversation?".into(),
+                scope_digest: proposal
+                    .approval_digest(ApprovalKind::NewDataShare, Some(payload))
+                    .map_err(|_| HostCallError::Internal)?,
+                target: None,
+            },
+            needs_me_id: hashed_identifier("needs-me", &disclosure_approval)?,
+            now_ms: times[3],
+        },
+        MissionCommand::DecideApproval {
+            mission_id: mission.id.clone(),
+            approval_id: disclosure_approval,
+            actor_id: mission.owner_id.clone(),
+            decision: ApprovalDecision::Approve,
+            now_ms: times[4],
+        },
+        MissionCommand::Resume {
+            mission_id: mission.id.clone(),
+            now_ms: times[5],
+        },
+    ])
+}
+
 fn reminder_write_proposal(mission_id: &str, scope_digest: &str) -> ActionProposal {
     ActionProposal {
         effect: EffectKind::ReminderWrite,
@@ -2435,6 +3529,27 @@ fn valid_reminder_target(target: &ReminderTarget) -> bool {
         && target.calendar_identifier == target.calendar_identifier.trim()
 }
 
+fn new_reminder_receipt(
+    mission: &Mission,
+    evidence_ids: &[String],
+    completed_at_ms: i64,
+) -> Result<NewReceipt, HostCallError> {
+    Ok(NewReceipt {
+        id: hashed_identifier(
+            "receipt",
+            &json!({"evidenceIds": evidence_ids, "missionId": mission.id}),
+        )?,
+        summary: format!(
+            "Completed {} with {} verified Reminders.",
+            mission.title,
+            mission.work_items.len()
+        ),
+        actual_model: REQUIRED_MODEL.to_owned(),
+        output_hashes: Vec::new(),
+        completed_at_ms,
+    })
+}
+
 fn reminder_evidence_id(
     mission_id: &str,
     work_item_id: &str,
@@ -2524,7 +3639,10 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{BOOTSTRAP_MAGIC, ChatGptLogin, Host, HostPaths, OperationState, read_bootstrap};
+    use super::{
+        BOOTSTRAP_MAGIC, ChannelConnectionStatus, ChatGptLogin, Host, HostPaths, OperationState,
+        read_bootstrap,
+    };
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_core::{
         ActionGate, ActionProposal, ActionTarget, BrokerEnrollmentRecord, CreateMission,
@@ -2532,9 +3650,9 @@ mod tests {
         broker_enrollment_signing_bytes,
     };
     use openopen_protocol::{
-        ApprovalKind, ApprovalStatus, ApprovalTarget, CoreInstanceLease, EFFECT_PROTOCOL_VERSION,
-        EvidenceKind, MissionStatus, OutcomeSuggestion, Receipt, RpcResponse,
-        RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
+        ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelKind, CoreInstanceLease,
+        EFFECT_PROTOCOL_VERSION, EvidenceKind, MissionStatus, OutcomeSuggestion, Receipt,
+        RpcResponse, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
         core_instance_lease_signing_bytes, runtime_control_authorization_hash,
         runtime_control_receipt_signing_bytes,
     };
@@ -2543,6 +3661,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc};
 
@@ -2559,11 +3678,35 @@ mod tests {
                 codex_home: support.join("codex-home"),
                 synthetic_home: support.join("synthetic-home"),
                 model_input_root: support.join("model-input"),
+                imsg_runtime: root_path.join("missing-imsg"),
             },
             [7_u8; 32],
         )
         .unwrap();
         (root, host)
+    }
+
+    fn fake_imsg_runtime(root: &std::path::Path) -> PathBuf {
+        let executable = std::fs::canonicalize(root).unwrap().join("imsg-route-fake");
+        std::fs::write(
+            &executable,
+            r"#!/usr/bin/env python3
+import json
+import sys
+
+if len(sys.argv) != 2 or sys.argv[1] != 'rpc':
+    sys.exit(7)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'chats.list':
+        result = {'chats':[{'id':42,'identifier':'owner','guid':'iMessage;+;owner','name':'Owner','service':'iMessage','last_message_at':'2026-07-15T00:00:00Z','participants':['+15550000001'],'is_group':False}]}
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}, separators=(',', ':')) + '\n')
+        sys.stdout.flush()
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        executable
     }
 
     fn request(host: &mut Host, line: &str) -> RpcResponse {
@@ -3699,6 +4842,167 @@ mod tests {
             .unwrap()
             .code,
             -32_015
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end proof-consumption/child-lifecycle route.
+    fn imessage_chat_discovery_requires_two_fresh_proofs_and_clears_the_child() {
+        let (root, mut host) = fixture();
+        host.paths.imsg_runtime = fake_imsg_runtime(root.path());
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let broker_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let mut lease = CoreInstanceLease {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            audit_euid: rustix::process::geteuid().as_raw(),
+            app_pid: 1,
+            app_start_time_us: 1,
+            core_pid: i32::try_from(std::process::id()).unwrap(),
+            core_start_time_us: 1,
+            core_audit_token_hex: "aa".repeat(32),
+            codex_pid: 42,
+            codex_start_time_us: 2,
+            codex_audit_token_hex: "bb".repeat(32),
+            core_instance_nonce: host.instance_nonce.clone(),
+            issued_at_ms: super::now_ms().unwrap(),
+            broker_key_id: format!(
+                "{:x}",
+                Sha256::digest(broker_key.verifying_key().to_bytes())
+            ),
+            broker_signature_hex: String::new(),
+        };
+        lease.broker_signature_hex = hex::encode(
+            broker_key
+                .sign(&core_instance_lease_signing_bytes(&lease).unwrap())
+                .to_bytes(),
+        );
+        *host
+            .operations
+            .codex_pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(42);
+        assert_eq!(
+            request(
+                &mut host,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 500,
+                    "method": "broker.lease.install",
+                    "params": {"lease": lease}
+                })
+                .to_string(),
+            )
+            .result
+            .unwrap()["status"],
+            "installed"
+        );
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+
+        let challenge = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":501,"method":"mission.runtime.challenge","params":{}}"#,
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let prepare_request = json!({
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "channel.imessage.chats.prepare",
+            "params": {
+                "authorization": on,
+                "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+            }
+        })
+        .to_string();
+        let prepared = request(&mut host, &prepare_request);
+        assert!(prepared.error.is_none(), "{prepared:?}");
+        assert!(
+            prepared.result.unwrap()["processIdentifier"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0)
+        );
+        assert_eq!(
+            request(&mut host, &prepare_request).error.unwrap().code,
+            -32_602
+        );
+
+        let challenge = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":503,"method":"mission.runtime.challenge","params":{}}"#,
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let listed = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 504,
+                "method": "channel.imessage.chats.list",
+                "params": {
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                }
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            listed,
+            json!({
+                "chats": [{
+                    "chatId": "42",
+                    "name": "Owner",
+                    "service": "iMessage",
+                    "participants": ["+15550000001"],
+                }]
+            })
+        );
+        assert_eq!(
+            host.channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status(ChannelKind::IMessage),
+            ChannelConnectionStatus::Disconnected
+        );
+
+        let challenge = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":505,"method":"mission.runtime.challenge","params":{}}"#,
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            request(
+                &mut host,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 506,
+                    "method": "channel.imessage.chats.list",
+                    "params": {
+                        "authorization": on,
+                        "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                    }
+                })
+                .to_string(),
+            )
+            .error
+            .is_some()
         );
     }
 

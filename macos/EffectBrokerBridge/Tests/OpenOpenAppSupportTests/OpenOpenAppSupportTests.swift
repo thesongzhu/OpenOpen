@@ -40,6 +40,13 @@ private func testConfirmedMission(
   )
 }
 
+private struct TestChannelSend: Equatable, Sendable {
+  let missionId: String
+  let kind: ChannelMessageKind
+  let content: String
+  let approvedAtMs: Int64
+}
+
 private actor MockCore: CoreServing {
   var control = RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0)
   let dashboardDelay: Duration
@@ -50,6 +57,7 @@ private actor MockCore: CoreServing {
   var confirmationCount = 0
   var dispatchBeginCount = 0
   var reminderCompletionPayloads: [[ReminderCompletionInput]] = []
+  var receiptReturnApprovals: [Int64?] = []
   var leaseInstalled = false
   var codexInitialized = false
   var codexInitializeCount = 0
@@ -62,8 +70,26 @@ private actor MockCore: CoreServing {
   var invalidReminderAuthorization = false
   var dashboardConfirmedMission: ConfirmedMission?
   var dashboardReceipt: MissionReceipt?
+  var dashboardChannelOrigin: ChannelMissionOrigin?
+  var dashboardNeedsYou: MissionNeedsYou?
   var dispatchedMissions: [String: ConfirmedMission] = [:]
   var loseNextDispatchResponse = false
+  var channelPairings: [ChannelKind: ChannelPairing] = [:]
+  var pairChannelCount = 0
+  var discordSetupStartCount = 0
+  var discordSetupConfirmCount = 0
+  var discordStartTokens: [String] = []
+  var stoppedChannels: [ChannelKind] = []
+  var rejectNextIMessageActivation = false
+  var rejectNextIMessagePrepareAfterCommit = false
+  var iMessagePrepareCount = 0
+  var iMessageDiscoveryPrepareCount = 0
+  var iMessageChatsListCount = 0
+  var iMessageDiscoveryPrepared = false
+  var iMessageStartCount = 0
+  var channelPollCount = 0
+  var queuedChannelSuggestion: OutcomeSuggestion?
+  var channelSends: [TestChannelSend] = []
 
   init(dashboardDelay: Duration = .zero, dashboardFails: Bool = false) {
     self.dashboardDelay = dashboardDelay
@@ -148,16 +174,32 @@ private actor MockCore: CoreServing {
   func returnMismatchedRecoveryTimestamp() { mismatchRecoveryTimestamp = true }
   func returnInvalidReminderAuthorization() { invalidReminderAuthorization = true }
   func restoreFromDashboard(
-    mission: ConfirmedMission?, receipt: MissionReceipt?
+    mission: ConfirmedMission?, receipt: MissionReceipt?,
+    channelOrigin: ChannelMissionOrigin? = nil,
+    needsYou: MissionNeedsYou? = nil
   ) {
     dashboardConfirmedMission = mission
     dashboardReceipt = receipt
+    dashboardChannelOrigin = channelOrigin
+    dashboardNeedsYou = needsYou
     if let mission, !mission.reminderDispatch.isEmpty {
       dispatchedMissions[mission.missionId] = mission
     }
   }
 
   func loseNextReminderDispatchResponse() { loseNextDispatchResponse = true }
+
+  func setChannelPairing(_ pairing: ChannelPairing) {
+    channelPairings[pairing.channel] = pairing
+  }
+
+  func pairedDiscordApplicationId() -> String? {
+    channelPairings[.discord]?.discord?.applicationId
+  }
+
+  func queueChannelSuggestion(_ suggestion: OutcomeSuggestion) {
+    queuedChannelSuggestion = suggestion
+  }
 
   func dashboard() async throws -> DashboardState {
     if dashboardDelay > .zero { try await Task.sleep(for: dashboardDelay) }
@@ -166,6 +208,7 @@ private actor MockCore: CoreServing {
     }
     return DashboardState(
       activeCards: [],
+      channelOrigin: dashboardChannelOrigin,
       microphone: MicrophoneState(
         available: false,
         reason: "Microphone unavailable until Voice setup"
@@ -173,8 +216,169 @@ private actor MockCore: CoreServing {
       runtime: control,
       suggestion: nil,
       confirmedMission: dashboardConfirmedMission,
+      needsYou: dashboardNeedsYou,
       receipt: dashboardReceipt
     )
+  }
+
+  func pairChannel(_ pairing: ChannelPairing, proof _: BrokerRuntimeState) {
+    pairChannelCount += 1
+    channelPairings[pairing.channel] = pairing
+  }
+
+  func channelPairing(_ channel: ChannelKind) -> ChannelPairing? {
+    channelPairings[channel]
+  }
+
+  func startDiscordSetup(
+    token _: String, proof _: BrokerRuntimeState
+  ) -> DiscordSetupStart {
+    discordSetupStartCount += 1
+    return DiscordSetupStart(
+      identity: DiscordBotIdentity(botUserId: 3003, applicationId: 4004, botName: "OpenOpen"),
+      installUrl:
+        "https://discord.com/api/oauth2/authorize?client_id=4004&scope=bot&permissions=101376",
+      pairingCode: String(repeating: "a", count: 32),
+      status: "connecting"
+    )
+  }
+
+  func pollDiscordSetup(proof _: BrokerRuntimeState) -> DiscordSetupPollResponse {
+    DiscordSetupPollResponse(
+      status: "connected",
+      candidate: DiscordPairingCandidate(
+        candidateId: "discord-pair-" + String(repeating: "b", count: 64),
+        sourceMessageId: "5005",
+        guildId: "6006",
+        guildName: "OpenOpen Test",
+        channelId: "2002",
+        channelName: "outcomes",
+        ownerUserId: "1001",
+        ownerName: "Owner",
+        botUserId: "3003",
+        applicationId: "4004",
+        receivedAtMs: 1,
+        messageContentIntentReady: true,
+        permissions: DiscordPermissionProbe(
+          viewChannel: "passed",
+          sendMessages: "passed",
+          readMessageHistory: "passed",
+          attachFiles: "passed",
+          historyReadback: "passed",
+          effectivePermissionBits: 101_376
+        )
+      )
+    )
+  }
+
+  func confirmDiscordSetup(
+    candidateId: String, confirmedAtMs: Int64, proof _: BrokerRuntimeState
+  ) {
+    discordSetupConfirmCount += 1
+    channelPairings[.discord] = ChannelPairing(
+      channel: .discord,
+      ownerSenderId: "1001",
+      conversationId: "2002",
+      discord: DiscordPairingMetadata(
+        guildId: "6006",
+        botUserId: "3003",
+        applicationId: "4004",
+        setupSourceMessageId: "5005",
+        setupCandidateId: candidateId
+      ),
+      pairedAtMs: confirmedAtMs
+    )
+  }
+
+  func startDiscord(
+    token: String, proof _: BrokerRuntimeState
+  ) -> ChannelStatusResponse {
+    discordStartTokens.append(token)
+    return ChannelStatusResponse(status: "connected")
+  }
+
+  func failNextIMessageActivation() { rejectNextIMessageActivation = true }
+
+  func loseNextIMessagePrepareResponse() { rejectNextIMessagePrepareAfterCommit = true }
+
+  func prepareIMessage(proof _: BrokerRuntimeState) throws {
+    iMessagePrepareCount += 1
+    if rejectNextIMessagePrepareAfterCommit {
+      rejectNextIMessagePrepareAfterCommit = false
+      throw CoreClientError.contractViolation("iMessage prepare response was lost.")
+    }
+  }
+
+  func prepareIMessageChatDiscovery(proof _: BrokerRuntimeState) {
+    iMessageDiscoveryPrepareCount += 1
+    iMessageDiscoveryPrepared = true
+  }
+
+  func listPreparedIMessageChats(proof _: BrokerRuntimeState) throws -> [IMessageChat] {
+    guard iMessageDiscoveryPrepared else {
+      throw CoreClientError.contractViolation("iMessage discovery was not prepared.")
+    }
+    iMessageChatsListCount += 1
+    iMessageDiscoveryPrepared = false
+    return [
+      IMessageChat(
+        chatId: "42",
+        name: "Owner",
+        service: "iMessage",
+        participants: ["owner@example.invalid"]
+      ),
+      IMessageChat(
+        chatId: "84",
+        name: "Family",
+        service: "iMessage",
+        participants: ["owner@example.invalid", "family@example.invalid"]
+      ),
+    ]
+  }
+
+  func activateIMessage(proof _: BrokerRuntimeState) throws -> ChannelStatusResponse {
+    if rejectNextIMessageActivation {
+      rejectNextIMessageActivation = false
+      throw CoreClientError.contractViolation("iMessage activation failed.")
+    }
+    iMessageStartCount += 1
+    return ChannelStatusResponse(status: "connected")
+  }
+
+  func channelStatus(_ channel: ChannelKind) -> ChannelStatusResponse {
+    ChannelStatusResponse(status: channelPairings[channel] == nil ? "disconnected" : "connected")
+  }
+
+  func stopChannel(_ channel: ChannelKind) -> ChannelStatusResponse {
+    stoppedChannels.append(channel)
+    if channel == .iMessage { iMessageDiscoveryPrepared = false }
+    return ChannelStatusResponse(status: "disconnected")
+  }
+
+  func pollChannel(
+    _: ChannelKind, proof _: BrokerRuntimeState
+  ) -> ChannelPollResponse {
+    channelPollCount += 1
+    defer { queuedChannelSuggestion = nil }
+    return ChannelPollResponse(
+      connectionStatus: "connected", eventStatus: "ready", suggestion: queuedChannelSuggestion)
+  }
+
+  func sendChannelMessage(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    proof _: BrokerRuntimeState
+  ) -> ChannelSendResponse {
+    channelSends.append(
+      TestChannelSend(
+        missionId: missionId,
+        kind: kind,
+        content: content,
+        approvedAtMs: approvedAtMs
+      ))
+    return ChannelSendResponse(status: "sent", providerMessageId: "provider-message-1")
   }
 
   func account(proof: BrokerRuntimeState) -> AccountState {
@@ -235,12 +439,15 @@ private actor MockCore: CoreServing {
   }
 
   func completeReminderMission(
-    identifier: String, completions: [ReminderCompletionInput]
+    identifier: String,
+    completions: [ReminderCompletionInput],
+    receiptReturnApprovedAtMs: Int64?
   ) throws -> MissionReceipt {
     guard identifier == "mission-1" || identifier == "mission-2" else {
       throw CoreClientError.contractViolation("Unexpected Mission identifier.")
     }
     reminderCompletionPayloads.append(completions)
+    receiptReturnApprovals.append(receiptReturnApprovedAtMs)
     return MissionReceipt(
       id: identifier == "mission-1" ? "receipt-1" : "receipt-2",
       missionId: identifier,
@@ -396,7 +603,9 @@ private actor FailClosedOffCore: CoreServing {
     throw CoreClientError.contractViolation("Unexpected Mission confirmation.")
   }
   func completeReminderMission(
-    identifier _: String, completions _: [ReminderCompletionInput]
+    identifier _: String,
+    completions _: [ReminderCompletionInput],
+    receiptReturnApprovedAtMs _: Int64?
   ) throws -> MissionReceipt {
     throw CoreClientError.contractViolation("Unexpected Mission completion.")
   }
@@ -653,7 +862,9 @@ extension DelayedSwitchCore {
     throw CoreClientError.contractViolation("Unexpected Mission confirmation.")
   }
   func completeReminderMission(
-    identifier _: String, completions _: [ReminderCompletionInput]
+    identifier _: String,
+    completions _: [ReminderCompletionInput],
+    receiptReturnApprovedAtMs _: Int64?
   ) throws -> MissionReceipt {
     throw CoreClientError.contractViolation("Unexpected Mission completion.")
   }
@@ -807,6 +1018,21 @@ private func testBrokerAnchor() throws -> EnrolledBrokerTrustAnchor {
     helperDesignatedRequirementDigest: String(repeating: "6", count: 64),
     installedAtMilliseconds: 1
   )
+}
+
+private final class MockDiscordTokenStore: DiscordTokenStoring, @unchecked Sendable {
+  private let token = LockIsolated<String?>(nil)
+
+  func save(_ value: String) throws {
+    guard !value.isEmpty, value == value.trimmingCharacters(in: .whitespacesAndNewlines) else {
+      throw CoreClientError.contractViolation("Discord rejected an invalid bot token.")
+    }
+    token.withLock { $0 = value }
+  }
+
+  func load() throws -> String? { token.value }
+
+  func delete() throws { token.withLock { $0 = nil } }
 }
 
 @MainActor
@@ -1121,6 +1347,318 @@ func accountAndModelsConsumeDistinctFreshRuntimeChallenges() async {
   #expect(nonces.count == 2)
   #expect(Set(nonces).count == 2)
   #expect(await core.codexInitializeCount == 1)
+}
+
+@MainActor
+@Test
+func discordConnectionUsesKeychainTokenAndAnExistingExactPairing() async {
+  let core = MockCore()
+  let tokenStore = MockDiscordTokenStore()
+  let pairing = ChannelPairing(
+    channel: .discord,
+    ownerSenderId: "1001",
+    conversationId: "2002",
+    discord: DiscordPairingMetadata(
+      guildId: "6006",
+      botUserId: "3003",
+      applicationId: "4004",
+      setupSourceMessageId: "5005",
+      setupCandidateId: "discord-pair-" + String(repeating: "b", count: 64)
+    ),
+    pairedAtMs: 1
+  )
+  await core.setChannelPairing(pairing)
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    discordTokenStore: tokenStore
+  ) {}
+  await model.updateEnabled(true)
+  model.discordTokenDraft = "test-only-discord-token"
+
+  await model.connectDiscord()
+
+  #expect(model.discordTokenDraft.isEmpty)
+  #expect(model.discordStatus == "connected")
+  #expect(model.errorMessage == nil)
+  #expect(await core.pairChannelCount == 0)
+  #expect(await core.discordStartTokens == ["test-only-discord-token"])
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func discordWizardInfersIdsProbesPermissionsAndRequiresCandidateConfirmation() async {
+  let core = MockCore()
+  let tokenStore = MockDiscordTokenStore()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    discordTokenStore: tokenStore
+  ) {}
+  await model.updateEnabled(true)
+  model.discordTokenDraft = "test-only-discord-token"
+
+  await model.connectDiscord()
+  #expect(model.discordSetup?.identity.botUserId == 3003)
+  #expect(model.discordSetup?.installUrl.contains("permissions=101376") == true)
+  #expect(model.discordPairingCandidate == nil)
+  #expect(await core.pairedDiscordApplicationId() == nil)
+  #expect(await core.stoppedChannels == [.discord])
+
+  await model.checkDiscordPairingMessage()
+  #expect(model.discordPairingCandidate?.ownerUserId == "1001")
+  #expect(model.discordPairingCandidate?.channelId == "2002")
+  #expect(await core.pairedDiscordApplicationId() == nil)
+
+  await model.confirmDiscordPairing()
+
+  #expect(model.discordStatus == "connected")
+  #expect(model.errorMessage == nil)
+  #expect(await core.discordSetupStartCount == 1)
+  #expect(await core.discordSetupConfirmCount == 1)
+  #expect(await core.pairedDiscordApplicationId() == "4004")
+  #expect(await core.discordStartTokens == ["test-only-discord-token"])
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func discordWizardRestartStopsThePriorSetupBeforeStartingAnother() async {
+  let core = MockCore()
+  let tokenStore = MockDiscordTokenStore()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    discordTokenStore: tokenStore
+  ) {}
+  await model.updateEnabled(true)
+  model.discordTokenDraft = "test-only-discord-token"
+
+  await model.connectDiscord()
+  await model.connectDiscord()
+
+  #expect(model.discordStatus == "connecting")
+  #expect(model.errorMessage == nil)
+  #expect(await core.discordSetupStartCount == 2)
+  #expect(await core.stoppedChannels == [.discord, .discord])
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func iMessageDiscoveryListsApprovedChatsWithoutManualDatabaseIds() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+
+  await model.refreshIMessageChats()
+
+  #expect(model.errorMessage == nil)
+  #expect(model.iMessageChats.map(\.chatId) == ["42", "84"])
+  #expect(model.iMessageChatId.isEmpty)
+  #expect(model.iMessageOwnerOptions.isEmpty)
+  #expect(await core.iMessageDiscoveryPrepareCount == 1)
+  #expect(await core.iMessageChatsListCount == 1)
+  #expect(await core.stoppedChannels == [.iMessage])
+
+  model.selectIMessageChat("84")
+  #expect(model.iMessageOwnerOptions == ["owner@example.invalid", "family@example.invalid"])
+  model.iMessageOwnerSender = "family@example.invalid"
+  #expect(model.iMessageOwnerSender == "family@example.invalid")
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func iMessageConnectionPairsPollsOneSuggestionAndOffStopsPolling() async {
+  let core = MockCore()
+  await core.queueChannelSuggestion(
+    OutcomeSuggestion(
+      id: "channel-suggestion-1",
+      title: "Prepare the update",
+      whyNow: "The owner explicitly asked in Messages",
+      proposedSteps: ["Draft the concise update"],
+      sourceRefs: ["imessage:message-1"]
+    ))
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  model.iMessageChatId = "42"
+  model.iMessageOwnerSender = "owner@example.invalid"
+
+  await model.connectIMessage()
+  for _ in 0..<50 where model.suggestion == nil {
+    try? await Task.sleep(for: .milliseconds(20))
+  }
+
+  #expect(model.iMessageStatus == "connected")
+  #expect(model.suggestion?.id == "channel-suggestion-1")
+  #expect(await core.pairChannelCount == 1)
+  #expect(await core.iMessageStartCount == 1)
+  #expect(await core.channelPollCount >= 1)
+  await model.updateEnabled(false)
+  let pollsAfterOff = await core.channelPollCount
+  try? await Task.sleep(for: .milliseconds(1_100))
+  #expect(await core.channelPollCount == pollsAfterOff)
+  #expect(model.iMessageStatus == "disconnected")
+}
+
+@MainActor
+@Test
+func iMessageActivationFailureStopsPreparedChildAndRetryConnects() async {
+  let core = MockCore()
+  await core.failNextIMessageActivation()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  model.iMessageChatId = "42"
+  model.iMessageOwnerSender = "owner@example.invalid"
+
+  await model.connectIMessage()
+  #expect(model.iMessageStatus == "faulted")
+  #expect(await core.stoppedChannels == [.iMessage, .iMessage])
+
+  await model.connectIMessage()
+  #expect(model.iMessageStatus == "connected")
+  #expect(model.errorMessage == nil)
+  #expect(await core.stoppedChannels == [.iMessage, .iMessage, .iMessage])
+  #expect(await core.iMessagePrepareCount == 2)
+  #expect(await core.iMessageStartCount == 1)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func iMessagePrepareResponseLossStopsPreparedChildAndRetryConnects() async {
+  let core = MockCore()
+  await core.loseNextIMessagePrepareResponse()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  model.iMessageChatId = "42"
+  model.iMessageOwnerSender = "owner@example.invalid"
+
+  await model.connectIMessage()
+  #expect(model.iMessageStatus == "faulted")
+  #expect(await core.stoppedChannels == [.iMessage, .iMessage])
+
+  await model.connectIMessage()
+  #expect(model.iMessageStatus == "connected")
+  #expect(model.errorMessage == nil)
+  #expect(await core.stoppedChannels == [.iMessage, .iMessage, .iMessage])
+  #expect(await core.iMessagePrepareCount == 2)
+  #expect(await core.iMessageStartCount == 1)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func channelProgressSendBindsTheRestoredMissionAndFreshApprovalTime() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await core.restoreFromDashboard(
+    mission: testConfirmedMission(),
+    receipt: nil,
+    channelOrigin: ChannelMissionOrigin(
+      missionId: "mission-1",
+      channel: .discord,
+      conversationId: "2002",
+      ownerSenderId: "1001",
+      sourceMessageId: "source-message-1",
+      boundAtMs: 1
+    )
+  )
+  await model.refreshDashboard()
+  model.channelMessageDraft = "Working on it — the bounded Mission is active."
+  let earliestApproval = Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+
+  await model.sendChannelProgress()
+
+  let latestApproval = Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+  let sends = await core.channelSends
+  #expect(sends.count == 1)
+  #expect(sends.first?.missionId == "mission-1")
+  #expect(sends.first?.kind == .progress)
+  #expect(sends.first?.content == "Working on it — the bounded Mission is active.")
+  #expect((sends.first?.approvedAtMs ?? 0) >= earliestApproval)
+  #expect((sends.first?.approvedAtMs ?? 0) <= latestApproval)
+  #expect(model.errorMessage == nil)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func channelNeedYouSendUsesOnlyTheExactRestoredPrompt() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await core.restoreFromDashboard(
+    mission: nil,
+    receipt: nil,
+    channelOrigin: ChannelMissionOrigin(
+      missionId: "mission-1",
+      channel: .discord,
+      conversationId: "2002",
+      ownerSenderId: "1001",
+      sourceMessageId: "source-message-1",
+      boundAtMs: 1
+    ),
+    needsYou: MissionNeedsYou(
+      missionId: "mission-1",
+      title: "Plan the day",
+      prompt: "Choose the one approved destination.",
+      createdAtMs: 2
+    )
+  )
+  await model.refreshDashboard()
+
+  await model.sendChannelNeedYou()
+
+  let sends = await core.channelSends
+  #expect(sends.count == 1)
+  #expect(sends.first?.kind == .needYou)
+  #expect(sends.first?.content == "Need you: Choose the one approved destination.")
+  #expect(model.errorMessage == nil)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func channelMissionCompletionAuthorizesAndReturnsTheExactEvidenceReceipt() async {
+  let core = MockCore()
+  let reminders = MockReminders()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await core.restoreFromDashboard(
+    mission: nil,
+    receipt: nil,
+    channelOrigin: ChannelMissionOrigin(
+      missionId: "mission-1",
+      channel: .iMessage,
+      conversationId: "42",
+      ownerSenderId: "owner@example.invalid",
+      sourceMessageId: "source-message-1",
+      boundAtMs: 1
+    )
+  )
+  await model.updateEnabled(true)
+  model.prompt = "Help me plan today"
+  await model.submitPrompt()
+  await model.confirmSuggestion()
+  await model.checkMissionProgress()
+
+  let approvals = await core.receiptReturnApprovals
+  let sends = await core.channelSends
+  #expect(approvals.count == 1)
+  #expect(approvals[0] != nil)
+  #expect(sends.count == 1)
+  #expect(sends.first?.kind == .receipt)
+  #expect(
+    sends.first?.content
+      == "Done: Completed Plan the day\nEvidence: 1 verified completion\nModel: gpt-5.6-sol"
+  )
+  #expect(model.receipt?.missionId == "mission-1")
+  #expect(model.channelOrigin?.missionId == "mission-1")
+  #expect(model.errorMessage == nil)
+  await model.updateEnabled(false)
 }
 
 @MainActor

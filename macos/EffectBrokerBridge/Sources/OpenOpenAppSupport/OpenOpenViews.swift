@@ -164,14 +164,48 @@ private struct DashboardView: View {
                 }
                 .disabled(model.isBusy || !model.modelEntryEnabled)
               } else if model.confirmedMission != nil {
-                Button("Check progress") {
+                Button(model.channelOrigin == nil ? "Check progress" : "Finish & Return Receipt") {
                   model.requestMissionProgressCheck()
                 }
                 .disabled(model.isBusy || !model.modelEntryEnabled)
               }
+              if model.channelOrigin != nil {
+                TextField("Exact progress message", text: $model.channelMessageDraft)
+                  .textFieldStyle(.roundedBorder)
+                Text(
+                  "Send requires a fresh confirmation for this exact recipient and these exact bytes."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Button("Approve & Send Progress") {
+                  Task { await model.sendChannelProgress() }
+                }
+                .disabled(
+                  model.isBusy || !model.modelEntryEnabled
+                    || model.channelMessageDraft.trimmingCharacters(
+                      in: .whitespacesAndNewlines
+                    ).isEmpty
+                )
+              }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
           }
+        }
+      }
+      if let needsYou = model.needsYou {
+        GroupBox("Need you") {
+          VStack(alignment: .leading, spacing: 8) {
+            Text(needsYou.title).font(.headline)
+            Text(needsYou.prompt)
+            if model.channelOrigin != nil {
+              Button("Approve & Send Need you") {
+                Task { await model.sendChannelNeedYou() }
+              }
+              .disabled(model.isBusy || !model.modelEntryEnabled)
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(4)
         }
       }
       if let receipt = model.receipt {
@@ -183,6 +217,12 @@ private struct DashboardView: View {
             Text("Model: \(receipt.actualModel)")
               .font(.caption)
               .foregroundStyle(.secondary)
+            if model.channelOrigin != nil {
+              Button("Return Receipt") {
+                Task { await model.sendChannelReceipt() }
+              }
+              .disabled(model.isBusy || !model.modelEntryEnabled)
+            }
           }
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(4)
@@ -217,11 +257,8 @@ private struct SettingsView: View {
           .tabItem { Label("Account", systemImage: "person.crop.circle") }
         models
           .tabItem { Label("Models", systemImage: "cpu") }
-        honestEmpty(
-          title: "No connections configured",
-          detail: "iMessage and Discord adapters are not available in this build yet."
-        )
-        .tabItem { Label("Connections", systemImage: "link") }
+        connections
+          .tabItem { Label("Connections", systemImage: "link") }
         honestEmpty(
           title: "No Skills installed",
           detail: "Only reviewed and explicitly promoted Skills will appear here."
@@ -274,6 +311,109 @@ private struct SettingsView: View {
           }
         }
       }
+    }
+  }
+
+  private var connections: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 20) {
+        Text("Connections").font(.title.bold())
+        GroupBox("iMessage — \(model.iMessageStatus)") {
+          VStack(alignment: .leading, spacing: 10) {
+            Text(
+              "Choose one Messages conversation and its approved owner. Inbound work must begin with @OpenOpen."
+            )
+            .foregroundStyle(.secondary)
+            Button("Load Messages conversations") {
+              Task { await model.refreshIMessageChats() }
+            }
+            .disabled(!model.modelEntryEnabled || model.isBusy)
+            Picker(
+              "Approved conversation",
+              selection: Binding(
+                get: { model.iMessageChatId },
+                set: { model.selectIMessageChat($0) }
+              )
+            ) {
+              Text("Choose a conversation").tag("")
+              ForEach(model.iMessageChats) { chat in
+                Text("\(chat.displayName) · \(chat.service)").tag(chat.chatId)
+              }
+            }
+            .disabled(model.iMessageChats.isEmpty)
+            Picker("Approved owner", selection: $model.iMessageOwnerSender) {
+              Text("Choose the owner").tag("")
+              ForEach(model.iMessageOwnerOptions, id: \.self) { participant in
+                Text(participant).tag(participant)
+              }
+            }
+            .disabled(model.iMessageOwnerOptions.isEmpty)
+            Text(
+              "macOS must grant Full Disk Access to read chat history and Messages Automation to send. OpenOpen does not change SIP or use private IMCore helpers."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Button("Pair & Connect iMessage") { Task { await model.connectIMessage() } }
+              .disabled(!model.modelEntryEnabled || model.isBusy)
+          }
+          .padding(4)
+        }
+        GroupBox("Discord — \(model.discordStatus)") {
+          VStack(alignment: .leading, spacing: 10) {
+            Text(
+              "Use an official Bot Gateway token. V1 accepts one paired owner in one approved channel and requires @OpenOpen."
+            )
+            .foregroundStyle(.secondary)
+            SecureField("Bot token (stored only in Keychain)", text: $model.discordTokenDraft)
+              .textFieldStyle(.roundedBorder)
+            Text(
+              "1. Create a bot in Discord's Developer Portal and enable Message Content. OpenOpen derives its IDs from the token; IDs cannot be typed manually."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Button(model.discordSetup == nil ? "Start official setup" : "Restart setup") {
+              Task { await model.connectDiscord() }
+            }
+            .disabled(!model.modelEntryEnabled || model.isBusy)
+            if let setup = model.discordSetup {
+              Text(
+                "2. Install \(setup.identity.botName) with exactly View Channel, Send Messages, Read Message History, and Attach Files."
+              )
+              .font(.caption)
+              if let installURL = URL(string: setup.installUrl) {
+                Link("Open official Discord install page", destination: installURL)
+              }
+              Text("3. In the intended channel, the owner sends exactly:")
+                .font(.caption)
+              Text("<@\(setup.identity.botUserId)> pair \(setup.pairingCode)")
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+              Button("Check pairing message & permissions") {
+                Task { await model.checkDiscordPairingMessage() }
+              }
+              .disabled(model.isBusy)
+            }
+            if let candidate = model.discordPairingCandidate {
+              Text(
+                "Confirm owner \(candidate.ownerName) in #\(candidate.channelName), \(candidate.guildName). Live intents, permissions, and history readback passed."
+              )
+              .font(.caption)
+              Button("Confirm this owner & channel") {
+                Task { await model.confirmDiscordPairing() }
+              }
+              .disabled(model.isBusy)
+            }
+            Text(
+              "Outbound Discord messages suppress all mentions. The token remains Keychain-only."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          }
+          .padding(4)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding()
     }
   }
 

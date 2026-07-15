@@ -1,11 +1,14 @@
 //! Local, fail-closed `OpenOpen` product core.
 
+mod channel;
 mod crypto;
 mod effect;
 mod gate;
 mod mission;
 mod store;
 
+pub use channel::ChannelError;
+pub use channel::{channel_message_payload, channel_need_you_content, channel_receipt_content};
 pub use crypto::{CryptoError, EvidenceClaims, LocalAuthority};
 pub use effect::{
     BrokerEnrollmentRecord, EffectProtocolError, TrustedBrokerEnrollment,
@@ -19,6 +22,5 @@ pub use mission::{
     request_scope_change, transition_mission, transition_work_item,
 };
 pub use store::{
-    AuditAnchor, EnvelopeInsert, MissionCommandEnvelope, MissionCommandResult, RuntimeControl,
-    Store, StoreError,
+    AuditAnchor, MissionCommandEnvelope, MissionCommandResult, RuntimeControl, Store, StoreError,
 };

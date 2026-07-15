@@ -1,96 +1,24 @@
-# Third-party notices
+# Third-Party Notices
 
-This file records direct dependencies or substantially adapted implementation
-portions. Transitive dependency notices will be generated from lockfiles before
-release.
+This file describes the deterministic notice payload for the current OpenOpen Friday-alpha distribution target. It is implementation and attribution evidence; it is not signing, notarization, provider, or release proof.
 
-## Friday
+The content-addressed payload is in `third_party/notices/manifest.json` and `third_party/notices/texts/<sha256>.txt`. Regenerate or verify it with `scripts/generate_third_party_notices.sh`; verification is offline and rejects closure drift, empty source/license fields, missing texts, hash mismatches, and duplicate package identities.
 
-- Upstream: https://github.com/thesongzhu/Friday
-- Source commit: `4870f31fa088bef7eb9f4f256ec62993b02eda80`
-- License: MIT
-- Copyright: Copyright (c) 2026 Friday contributors
+## Generated closure
 
-The Friday MIT license is reproduced below.
+- Target: `aarch64-apple-darwin`; dependency kinds: normal and build (development-only dependencies excluded).
+- OpenOpen roots: `openopen-host` and `openopen-effect-broker`; 190 transitive third-party Rust package identities.
+- Codex roots: `codex-cli` and `codex-code-mode-host`; 924 transitive third-party Rust package identities.
+- Notice documents: 1888 references resolving to 597 unique SHA-256-addressed text files.
 
-```text
-MIT License
+## Exact runtime and source pins
 
-Copyright (c) 2026 Friday contributors
+- OpenAI Codex app-server `0.144.0`: official source commit `767822446c7a594caa19609ca435281a9ec67e0d`, Apache-2.0. The OpenOpen protocol manifest maps the distributed package hashes to this exact source commit; the upstream `codex-package.json` does not itself record the source commit. The payload includes the root Apache-2.0 license, root NOTICE (including Ratatui attribution), and the normal/build closure for `codex-cli` plus `codex-code-mode-host`.
+- Bundled ripgrep `15.1.0`: source commit `af60c2de9d85e7f3d81c78601669468cf02dabab`, MIT OR Unlicense; `COPYING`, `LICENSE-MIT`, and `UNLICENSE` are included.
+- imsg `0.13.0`: dereferenced commit `fa2f82d7dbda4c802d91c1d41bb6c53564ed2fdc`, MIT, copyright 2026 Peter Steinberger. Its exact Swift pins and notices are Commander 0.2.4 at `bd219c4ee9032fee3e009856f81fcc6ec09a85f4`, PhoneNumberKit 5.0.4 at `ab06a8333394f4a4fb6eecca447dae0aa06c1eca`, and SQLite.swift 0.16.0 at `964c300fb0736699ce945c9edb56ecd62eba27a3` (all MIT).
+- serenity `0.12.5`: exact commit `1809beb0fc24f3942c500058ad4fa47e6a97d3f9`, ISC, present exactly once in the OpenOpen Rust closure.
+- Friday contract source: immutable MIT commit `4870f31fa088bef7eb9f4f256ec62993b02eda80`; its license text is included. OpenOpen ports the contract/test semantics and does not distribute Friday's TypeScript/Node runtime.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+## Planned but not distributed
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## Current direct Rust dependencies
-
-Versions below are the versions resolved by `Cargo.lock` on 2026-07-14. This
-is a direct-dependency inventory, not the final transitive distribution report.
-
-| Package | Version | License |
-| --- | --- | --- |
-| aes-gcm | 0.10.3 | Apache-2.0 OR MIT |
-| ed25519-dalek | 2.2.0 | BSD-3-Clause |
-| getrandom | 0.3.4 | MIT OR Apache-2.0 |
-| hex | 0.4.3 | MIT OR Apache-2.0 |
-| rusqlite | 0.38.0 | MIT |
-| rustix | 1.1.4 | Apache-2.0 OR MIT |
-| serde | 1.0.228 | MIT OR Apache-2.0 |
-| serde_json | 1.0.150 | MIT OR Apache-2.0 |
-| sha2 | 0.10.9 | MIT OR Apache-2.0 |
-| thiserror | 2.0.18 | MIT OR Apache-2.0 |
-| tempfile (development only) | 3.27.0 | MIT OR Apache-2.0 |
-| zeroize | 1.9.0 | Apache-2.0 OR MIT |
-
-## Pinned Codex component under implementation
-
-- Upstream: https://github.com/openai/codex
-- Runtime version: `0.144.0`
-- Source commit recorded by the package: `767822446c7a594caa19609ca435281a9ec67e0d`
-- License: Apache-2.0
-
-Generated app-server schemas and a component-hash manifest are tracked. The
-runtime binary is not stored in Git; the local staging script accepts only an
-explicit package root matching all pinned hashes. The Apache-2.0 license text
-and complete runtime/transitive notice set remain required before signed
-distribution.
-
-## Planned dependencies not yet present
-
-The following components are fixed by the product plan but are not currently
-in the source tree or distribution. They must move into the current inventory,
-with locked artifacts and full notices, when implemented.
-
-### imsg
-
-- Upstream: https://github.com/openclaw/imsg
-- Version: v0.13.0
-- License: MIT
-- Copyright: Copyright (c) 2026 Peter Steinberger
-
-The release package must reproduce the imsg MIT license. OpenOpen will bundle
-only the basic CLI and required resources; the private bridge helper is
-excluded.
-
-### Rust crates
-
-- `serenity` 0.12.5
-- `rust_xlsxwriter` 0.96.0
-
-Their license texts and the complete transitive inventory must be generated and
-verified before distribution.
+`rust_xlsxwriter` for Hero C is planned after `FRIDAY_ALPHA_READY`; it is not part of this payload or current distribution closure. Its future notices must be generated from the then-locked closure before distribution.

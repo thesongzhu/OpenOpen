@@ -63,6 +63,216 @@ public struct RuntimeProofParameters: Codable, Sendable {
   }
 }
 
+public enum ChannelKind: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
+  case iMessage
+  case discord
+}
+
+public struct ChannelPairing: Codable, Equatable, Sendable {
+  public let channel: ChannelKind
+  public let ownerSenderId: String
+  public let conversationId: String
+  public let requireExplicitAddress: Bool
+  public let discord: DiscordPairingMetadata?
+  public let pairedAtMs: Int64
+
+  public init(
+    channel: ChannelKind,
+    ownerSenderId: String,
+    conversationId: String,
+    discord: DiscordPairingMetadata? = nil,
+    pairedAtMs: Int64
+  ) {
+    self.channel = channel
+    self.ownerSenderId = ownerSenderId
+    self.conversationId = conversationId
+    requireExplicitAddress = true
+    self.discord = discord
+    self.pairedAtMs = pairedAtMs
+  }
+}
+
+public struct DiscordPairingMetadata: Codable, Equatable, Sendable {
+  public let guildId: String
+  public let botUserId: String
+  public let applicationId: String
+  public let setupSourceMessageId: String
+  public let setupCandidateId: String
+}
+
+public struct ChannelMissionOrigin: Codable, Equatable, Sendable {
+  public let missionId: String
+  public let channel: ChannelKind
+  public let conversationId: String
+  public let ownerSenderId: String
+  public let sourceMessageId: String
+  public let boundAtMs: Int64
+}
+
+public struct PairChannelParameters: Codable, Sendable {
+  public let pairing: ChannelPairing
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(pairing: ChannelPairing, proof: BrokerRuntimeState) {
+    self.pairing = pairing
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChannelSelectionParameters: Codable, Sendable {
+  public let channel: ChannelKind
+}
+
+public struct PollChannelParameters: Codable, Sendable {
+  public let channel: ChannelKind
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(channel: ChannelKind, proof: BrokerRuntimeState) {
+    self.channel = channel
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct StartDiscordParameters: Codable, Sendable {
+  public let botToken: String
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(botToken: String, proof: BrokerRuntimeState) {
+    self.botToken = botToken
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ConfirmDiscordSetupParameters: Codable, Sendable {
+  public let candidateId: String
+  public let confirmedAtMs: Int64
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(candidateId: String, confirmedAtMs: Int64, proof: BrokerRuntimeState) {
+    self.candidateId = candidateId
+    self.confirmedAtMs = confirmedAtMs
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct DiscordBotIdentity: Codable, Equatable, Sendable {
+  public let botUserId: UInt64
+  public let applicationId: UInt64
+  public let botName: String
+}
+
+public struct DiscordPermissionProbe: Codable, Equatable, Sendable {
+  public let viewChannel: String
+  public let sendMessages: String
+  public let readMessageHistory: String
+  public let attachFiles: String
+  public let historyReadback: String
+  public let effectivePermissionBits: UInt64
+}
+
+public struct DiscordPairingCandidate: Codable, Equatable, Sendable {
+  public let candidateId: String
+  public let sourceMessageId: String
+  public let guildId: String
+  public let guildName: String
+  public let channelId: String
+  public let channelName: String
+  public let ownerUserId: String
+  public let ownerName: String
+  public let botUserId: String
+  public let applicationId: String
+  public let receivedAtMs: Int64
+  public let messageContentIntentReady: Bool
+  public let permissions: DiscordPermissionProbe
+}
+
+public struct DiscordSetupStart: Codable, Equatable, Sendable {
+  public let identity: DiscordBotIdentity
+  public let installUrl: String
+  public let pairingCode: String
+  public let status: String
+}
+
+public struct DiscordSetupPollResponse: Codable, Equatable, Sendable {
+  public let status: String
+  public let candidate: DiscordPairingCandidate?
+}
+
+public enum ChannelMessageKind: String, Codable, Equatable, Sendable {
+  case needYou
+  case progress
+  case receipt
+}
+
+public struct SendChannelMessageParameters: Codable, Sendable {
+  public let missionId: String
+  public let kind: ChannelMessageKind
+  public let content: String
+  public let approvedAtMs: Int64
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    proof: BrokerRuntimeState
+  ) {
+    self.missionId = missionId
+    self.kind = kind
+    self.content = content
+    self.approvedAtMs = approvedAtMs
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChannelStatusResponse: Codable, Equatable, Sendable {
+  public let status: String
+}
+
+public struct IMessagePrepareResponse: Codable, Equatable, Sendable {
+  public let processIdentifier: Int32
+}
+
+public struct IMessageChat: Codable, Equatable, Identifiable, Sendable {
+  public let chatId: String
+  public let name: String
+  public let service: String
+  public let participants: [String]
+
+  public var id: String { chatId }
+
+  public var displayName: String {
+    if !name.isEmpty { return name }
+    return participants.joined(separator: ", ")
+  }
+}
+
+public struct IMessageChatsResponse: Codable, Equatable, Sendable {
+  public let chats: [IMessageChat]
+}
+
+public struct ChannelPollResponse: Codable, Equatable, Sendable {
+  public let connectionStatus: String
+  public let eventStatus: String
+  public let suggestion: OutcomeSuggestion?
+}
+
+public struct ChannelSendResponse: Codable, Equatable, Sendable {
+  public let status: String
+  public let providerMessageId: String?
+}
+
 public struct BrokerEnrollmentRecord: Codable, Equatable, Sendable {
   public let version: UInt32
   public let brokerKeyId: String
@@ -297,6 +507,14 @@ public struct ConfirmSuggestionParameters: Codable, Sendable {
 public struct CompleteReminderMissionParameters: Codable, Sendable {
   public let missionId: String
   public let completions: [ReminderCompletionInput]
+  public let receiptReturnApprovedAtMs: Int64?
+}
+
+public struct MissionNeedsYou: Codable, Equatable, Sendable {
+  public let missionId: String
+  public let title: String
+  public let prompt: String
+  public let createdAtMs: Int64
 }
 
 public struct RecordReminderMirrorParameters: Codable, Sendable {
@@ -310,25 +528,31 @@ public struct BeginReminderDispatchParameters: Codable, Sendable {
 
 public struct DashboardState: Codable, Equatable, Sendable {
   public let activeCards: [ActiveOutcomeCard]
+  public let channelOrigin: ChannelMissionOrigin?
   public let microphone: MicrophoneState
   public let runtime: RuntimeControl
   public let suggestion: OutcomeSuggestion?
   public let confirmedMission: ConfirmedMission?
+  public let needsYou: MissionNeedsYou?
   public let receipt: MissionReceipt?
 
   public init(
     activeCards: [ActiveOutcomeCard],
+    channelOrigin: ChannelMissionOrigin? = nil,
     microphone: MicrophoneState,
     runtime: RuntimeControl,
     suggestion: OutcomeSuggestion?,
     confirmedMission: ConfirmedMission? = nil,
+    needsYou: MissionNeedsYou? = nil,
     receipt: MissionReceipt? = nil
   ) {
     self.activeCards = activeCards
+    self.channelOrigin = channelOrigin
     self.microphone = microphone
     self.runtime = runtime
     self.suggestion = suggestion
     self.confirmedMission = confirmedMission
+    self.needsYou = needsYou
     self.receipt = receipt
   }
 

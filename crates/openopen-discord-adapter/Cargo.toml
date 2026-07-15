@@ -1,0 +1,22 @@
+[package]
+name = "openopen-discord-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serenity = { git = "https://github.com/serenity-rs/serenity", rev = "1809beb0fc24f3942c500058ad4fa47e6a97d3f9", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

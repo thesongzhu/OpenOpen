@@ -23,6 +23,33 @@ public protocol CoreServing: Sendable {
   func installBrokerEnrollment(_ recordJSON: Data) async throws
   func installCoreLease(_ leaseJSON: Data) async throws
   func dashboard() async throws -> DashboardState
+  func pairChannel(_ pairing: ChannelPairing, proof: BrokerRuntimeState) async throws
+  func channelPairing(_ channel: ChannelKind) async throws -> ChannelPairing?
+  func startDiscordSetup(token: String, proof: BrokerRuntimeState) async throws
+    -> DiscordSetupStart
+  func pollDiscordSetup(proof: BrokerRuntimeState) async throws -> DiscordSetupPollResponse
+  func confirmDiscordSetup(
+    candidateId: String, confirmedAtMs: Int64, proof: BrokerRuntimeState
+  ) async throws
+  func startDiscord(
+    token: String, proof: BrokerRuntimeState
+  ) async throws -> ChannelStatusResponse
+  func prepareIMessageChatDiscovery(proof: BrokerRuntimeState) async throws
+  func listPreparedIMessageChats(proof: BrokerRuntimeState) async throws -> [IMessageChat]
+  func prepareIMessage(proof: BrokerRuntimeState) async throws
+  func activateIMessage(proof: BrokerRuntimeState) async throws -> ChannelStatusResponse
+  func channelStatus(_ channel: ChannelKind) async throws -> ChannelStatusResponse
+  func stopChannel(_ channel: ChannelKind) async throws -> ChannelStatusResponse
+  func pollChannel(
+    _ channel: ChannelKind, proof: BrokerRuntimeState
+  ) async throws -> ChannelPollResponse
+  func sendChannelMessage(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    proof: BrokerRuntimeState
+  ) async throws -> ChannelSendResponse
   func account(proof: BrokerRuntimeState) async throws -> AccountState
   func beginLogin(proof: BrokerRuntimeState) async throws -> ChatGptLogin
   func awaitLogin(identifier: String, proof: BrokerRuntimeState) async throws -> AccountState
@@ -36,8 +63,82 @@ public protocol CoreServing: Sendable {
     identifier: String, links: [ReminderLink]
   ) async throws -> ConfirmedMission
   func completeReminderMission(
-    identifier: String, completions: [ReminderCompletionInput]
+    identifier: String,
+    completions: [ReminderCompletionInput],
+    receiptReturnApprovedAtMs: Int64?
   ) async throws -> MissionReceipt
+}
+
+extension CoreServing {
+  public func pairChannel(_ pairing: ChannelPairing, proof: BrokerRuntimeState) async throws {
+    throw CoreClientError.contractViolation("Channel pairing is unavailable in this test client.")
+  }
+
+  public func channelPairing(_ channel: ChannelKind) async throws -> ChannelPairing? { nil }
+
+  public func startDiscordSetup(
+    token: String, proof: BrokerRuntimeState
+  ) async throws -> DiscordSetupStart {
+    throw CoreClientError.contractViolation("Discord setup is unavailable in this test client.")
+  }
+
+  public func pollDiscordSetup(proof: BrokerRuntimeState) async throws -> DiscordSetupPollResponse {
+    throw CoreClientError.contractViolation("Discord setup is unavailable in this test client.")
+  }
+
+  public func confirmDiscordSetup(
+    candidateId: String, confirmedAtMs: Int64, proof: BrokerRuntimeState
+  ) async throws {
+    throw CoreClientError.contractViolation("Discord setup is unavailable in this test client.")
+  }
+
+  public func startDiscord(
+    token: String, proof: BrokerRuntimeState
+  ) async throws -> ChannelStatusResponse {
+    throw CoreClientError.contractViolation("Discord is unavailable in this test client.")
+  }
+
+  public func prepareIMessage(proof: BrokerRuntimeState) async throws {
+    throw CoreClientError.contractViolation("iMessage is unavailable in this test client.")
+  }
+
+  public func prepareIMessageChatDiscovery(proof: BrokerRuntimeState) async throws {
+    throw CoreClientError.contractViolation(
+      "iMessage discovery is unavailable in this test client.")
+  }
+
+  public func listPreparedIMessageChats(proof: BrokerRuntimeState) async throws -> [IMessageChat] {
+    throw CoreClientError.contractViolation(
+      "iMessage discovery is unavailable in this test client.")
+  }
+
+  public func activateIMessage(proof: BrokerRuntimeState) async throws -> ChannelStatusResponse {
+    throw CoreClientError.contractViolation("iMessage is unavailable in this test client.")
+  }
+
+  public func channelStatus(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
+    throw CoreClientError.contractViolation("Channel status is unavailable in this test client.")
+  }
+
+  public func stopChannel(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
+    throw CoreClientError.contractViolation("Channel stop is unavailable in this test client.")
+  }
+
+  public func pollChannel(
+    _ channel: ChannelKind, proof: BrokerRuntimeState
+  ) async throws -> ChannelPollResponse {
+    throw CoreClientError.contractViolation("Channel polling is unavailable in this test client.")
+  }
+
+  public func sendChannelMessage(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    proof: BrokerRuntimeState
+  ) async throws -> ChannelSendResponse {
+    throw CoreClientError.contractViolation("Channel sending is unavailable in this test client.")
+  }
 }
 
 public protocol BrokerRuntimeServing: Sendable {
@@ -93,6 +194,18 @@ public final class AppModel: ObservableObject {
   @Published public private(set) var confirmedMission: ConfirmedMission?
   @Published public private(set) var reminderLinks: [ReminderLink] = []
   @Published public private(set) var receipt: MissionReceipt?
+  @Published public private(set) var needsYou: MissionNeedsYou?
+  @Published public private(set) var channelOrigin: ChannelMissionOrigin?
+  @Published public private(set) var iMessageStatus = "disconnected"
+  @Published public private(set) var discordStatus = "disconnected"
+  @Published public private(set) var iMessageChats: [IMessageChat] = []
+  @Published public var iMessageChatId = ""
+  @Published public var iMessageOwnerSender = ""
+  @Published public var discordTokenDraft = ""
+  @Published public private(set) var discordSetup: DiscordSetupStart?
+  @Published public private(set) var discordPairingCandidate: DiscordPairingCandidate?
+  @Published public var channelMessageDraft =
+    "Working on it — I’ll return when the Reminders evidence is complete."
   @Published public private(set) var microphone = MicrophoneState(
     available: false,
     reason: "Microphone unavailable until Voice setup"
@@ -106,12 +219,15 @@ public final class AppModel: ObservableObject {
   private let core: any CoreServing
   private let broker: any BrokerRuntimeServing
   private let reminders: any RemindersServing
+  private let discordTokenStore: any DiscordTokenStoring
   private let registerLoginItem: @Sendable () throws -> Void
   private var confirmedEnabled = false
   private var desiredEnabled = false
   private var pendingRuntimeIntent: Bool?
   private var switchTask: Task<Void, Never>?
   private var heroTask: Task<Void, Never>?
+  private var channelTask: Task<Void, Never>?
+  private var connectedChannels: Set<ChannelKind> = []
   private var loginItemRegistered = false
   private var runtimeGeneration: UInt64 = 0
   private var protectedRuntime: BrokerRuntimeState?
@@ -123,10 +239,15 @@ public final class AppModel: ObservableObject {
     enabled && desiredEnabled && runtimeDisplayState == .on
   }
 
+  public var iMessageOwnerOptions: [String] {
+    iMessageChats.first(where: { $0.chatId == iMessageChatId })?.participants ?? []
+  }
+
   public init(core: any CoreServing = CoreProcessClient()) {
     self.core = core
     broker = PrivilegedBrokerRuntimeClient()
     reminders = RemindersClient()
+    discordTokenStore = DiscordTokenKeychain()
     registerLoginItem = { try LoginItemController.registerAfterOnboarding() }
   }
 
@@ -134,11 +255,13 @@ public final class AppModel: ObservableObject {
     core: any CoreServing,
     broker: any BrokerRuntimeServing = PrivilegedBrokerRuntimeClient(),
     reminders: any RemindersServing = RemindersClient(),
+    discordTokenStore: any DiscordTokenStoring = DiscordTokenKeychain(),
     registerLoginItem: @escaping @Sendable () throws -> Void
   ) {
     self.core = core
     self.broker = broker
     self.reminders = reminders
+    self.discordTokenStore = discordTokenStore
     self.registerLoginItem = registerLoginItem
   }
 
@@ -166,6 +289,8 @@ public final class AppModel: ObservableObject {
       confirmedMission = dashboard.confirmedMission
       reminderLinks = dashboard.confirmedMission?.reminderLinks ?? []
       receipt = dashboard.receipt
+      needsYou = dashboard.needsYou
+      channelOrigin = dashboard.channelOrigin
       microphone = dashboard.microphone
       protectedRuntime = protected
       let protectedMatchesRuntime =
@@ -208,6 +333,13 @@ public final class AppModel: ObservableObject {
     if !requested {
       heroTask?.cancel()
       heroTask = nil
+      channelTask?.cancel()
+      channelTask = nil
+      connectedChannels.removeAll()
+      iMessageStatus = "disconnected"
+      discordStatus = "disconnected"
+      discordSetup = nil
+      discordPairingCandidate = nil
     }
     desiredEnabled = requested
     pendingRuntimeIntent = requested
@@ -469,6 +601,327 @@ public final class AppModel: ObservableObject {
     }
   }
 
+  public func connectIMessage() async {
+    guard modelEntryEnabled, !isBusy,
+      let chatId = Int64(iMessageChatId), chatId > 0
+    else {
+      errorMessage = "Load and choose a Messages conversation first."
+      return
+    }
+    let owner = iMessageOwnerSender.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !owner.isEmpty, owner == iMessageOwnerSender else {
+      errorMessage = "Choose the approved owner for this Messages conversation."
+      return
+    }
+    await connectChannel(
+      ChannelPairing(
+        channel: .iMessage,
+        ownerSenderId: owner,
+        conversationId: String(chatId),
+        pairedAtMs: Self.currentMilliseconds()
+      )
+    )
+  }
+
+  public func refreshIMessageChats() async {
+    guard modelEntryEnabled, !isBusy else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      _ = try await core.stopChannel(.iMessage)
+      try requireCurrentOnGeneration(generation)
+      let prepareProof = try await currentEnabledProof(expectedGeneration: generation)
+      try await core.prepareIMessageChatDiscovery(proof: prepareProof)
+      try requireCurrentOnGeneration(generation)
+      let listProof = try await currentEnabledProof(expectedGeneration: generation)
+      let chats = try await core.listPreparedIMessageChats(proof: listProof)
+      try requireCurrentOnGeneration(generation)
+      iMessageChats = chats
+      if !chats.contains(where: { $0.chatId == iMessageChatId }) {
+        iMessageChatId = ""
+        iMessageOwnerSender = ""
+      } else if !iMessageOwnerOptions.contains(iMessageOwnerSender) {
+        iMessageOwnerSender = ""
+      }
+      errorMessage = nil
+    } catch {
+      _ = try? await core.stopChannel(.iMessage)
+      guard generation == runtimeGeneration else { return }
+      iMessageStatus = "faulted"
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func selectIMessageChat(_ chatId: String) {
+    iMessageChatId = chatId
+    if !iMessageOwnerOptions.contains(iMessageOwnerSender) {
+      iMessageOwnerSender = ""
+    }
+  }
+
+  public func connectDiscord() async {
+    guard modelEntryEnabled, !isBusy else { return }
+    let token = discordTokenDraft
+    discordTokenDraft = ""
+    do {
+      if !token.isEmpty { try discordTokenStore.save(token) }
+      guard let storedToken = try discordTokenStore.load() else {
+        throw CoreClientError.contractViolation("Paste the official Discord bot token once.")
+      }
+      isBusy = true
+      defer { isBusy = false }
+      let generation = runtimeGeneration
+      if try await core.channelPairing(.discord) != nil {
+        let proof = try await currentEnabledProof(expectedGeneration: generation)
+        let status = try await core.startDiscord(token: storedToken, proof: proof)
+        try requireCurrentOnGeneration(generation)
+        discordStatus = status.status
+        connectedChannels.insert(.discord)
+        startChannelPolling()
+      } else {
+        _ = try await core.stopChannel(.discord)
+        try requireCurrentOnGeneration(generation)
+        let proof = try await currentEnabledProof(expectedGeneration: generation)
+        let setup = try await core.startDiscordSetup(token: storedToken, proof: proof)
+        try requireCurrentOnGeneration(generation)
+        discordSetup = setup
+        discordPairingCandidate = nil
+        discordStatus = setup.status
+      }
+      errorMessage = nil
+    } catch {
+      discordStatus = "faulted"
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func checkDiscordPairingMessage() async {
+    guard modelEntryEnabled, !isBusy, discordSetup != nil else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let result = try await core.pollDiscordSetup(proof: proof)
+      try requireCurrentOnGeneration(generation)
+      discordStatus = result.status
+      discordPairingCandidate = result.candidate
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      discordStatus = "faulted"
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func confirmDiscordPairing() async {
+    guard modelEntryEnabled, !isBusy, let candidate = discordPairingCandidate else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      try await core.confirmDiscordSetup(
+        candidateId: candidate.candidateId,
+        confirmedAtMs: Self.currentMilliseconds(),
+        proof: proof
+      )
+      guard let token = try discordTokenStore.load() else {
+        throw CoreClientError.contractViolation("Discord Keychain setup is incomplete.")
+      }
+      let startProof = try await currentEnabledProof(expectedGeneration: generation)
+      let status = try await core.startDiscord(token: token, proof: startProof)
+      try requireCurrentOnGeneration(generation)
+      discordSetup = nil
+      discordPairingCandidate = nil
+      discordStatus = status.status
+      connectedChannels.insert(.discord)
+      startChannelPolling()
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      discordStatus = "faulted"
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  private func connectChannel(_ requested: ChannelPairing) async {
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      guard requested.channel == .iMessage else {
+        throw CoreClientError.contractViolation("Discord pairing requires the setup wizard.")
+      }
+      _ = try await core.stopChannel(.iMessage)
+      try requireCurrentOnGeneration(generation)
+      let pairing: ChannelPairing
+      if let existing = try await core.channelPairing(requested.channel) {
+        guard existing.channel == requested.channel,
+          existing.ownerSenderId == requested.ownerSenderId,
+          existing.conversationId == requested.conversationId,
+          existing.requireExplicitAddress
+        else {
+          throw CoreClientError.contractViolation(
+            "This channel is already paired to a different owner or conversation."
+          )
+        }
+        pairing = existing
+      } else {
+        let proof = try await currentEnabledProof(expectedGeneration: generation)
+        try await core.pairChannel(requested, proof: proof)
+        pairing = requested
+      }
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      try await core.prepareIMessage(proof: proof)
+      let activationProof = try await currentEnabledProof(expectedGeneration: generation)
+      let status = try await core.activateIMessage(proof: activationProof)
+      iMessageStatus = status.status
+      try requireCurrentOnGeneration(generation)
+      connectedChannels.insert(pairing.channel)
+      startChannelPolling()
+      errorMessage = nil
+    } catch {
+      _ = try? await core.stopChannel(.iMessage)
+      guard generation == runtimeGeneration else { return }
+      iMessageStatus = "faulted"
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  private func startChannelPolling() {
+    guard channelTask == nil else { return }
+    channelTask = Task { [weak self] in
+      guard let self else { return }
+      while !Task.isCancelled {
+        if modelEntryEnabled, !isBusy, confirmedMission == nil {
+          let channels = connectedChannels
+          for channel in channels where !Task.isCancelled {
+            do {
+              let proof = try await currentEnabledProof(expectedGeneration: runtimeGeneration)
+              let result = try await core.pollChannel(channel, proof: proof)
+              if channel == .iMessage { iMessageStatus = result.connectionStatus }
+              if channel == .discord { discordStatus = result.connectionStatus }
+              if let proposed = result.suggestion, suggestion == nil {
+                suggestion = proposed
+                receipt = nil
+              }
+            } catch CoreClientError.remote(let code, _) where code == -32_011 {
+              // Another explicitly initiated operation owns the single model slot.
+            } catch {
+              guard !Task.isCancelled else { return }
+              if channel == .iMessage { iMessageStatus = "faulted" }
+              if channel == .discord { discordStatus = "faulted" }
+              errorMessage = userMessage(for: error)
+              connectedChannels.remove(channel)
+            }
+          }
+        }
+        try? await Task.sleep(for: .seconds(1))
+      }
+    }
+  }
+
+  public func sendChannelProgress() async {
+    let value = channelMessageDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard modelEntryEnabled, !isBusy, let mission = confirmedMission, channelOrigin != nil,
+      !value.isEmpty, value == channelMessageDraft
+    else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      try await deliverChannelMessage(
+        missionId: mission.missionId,
+        kind: .progress,
+        content: value,
+        approvedAtMs: Self.currentMilliseconds(),
+        generation: generation
+      )
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func sendChannelNeedYou() async {
+    guard modelEntryEnabled, !isBusy, let needsYou, channelOrigin != nil else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      try await deliverChannelMessage(
+        missionId: needsYou.missionId,
+        kind: .needYou,
+        content: "Need you: \(needsYou.prompt)",
+        approvedAtMs: max(Self.currentMilliseconds(), needsYou.createdAtMs),
+        generation: generation
+      )
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public func sendChannelReceipt() async {
+    guard modelEntryEnabled, !isBusy, let receipt, channelOrigin != nil else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      try await deliverChannelMessage(
+        missionId: receipt.missionId,
+        kind: .receipt,
+        content: Self.channelReceiptContent(receipt),
+        approvedAtMs: max(Self.currentMilliseconds(), receipt.completedAtMs),
+        generation: generation
+      )
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  private func deliverChannelMessage(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    generation: UInt64
+  ) async throws {
+    let proof = try await currentEnabledProof(expectedGeneration: generation)
+    let result = try await core.sendChannelMessage(
+      missionId: missionId,
+      kind: kind,
+      content: content,
+      approvedAtMs: approvedAtMs,
+      proof: proof
+    )
+    try requireCurrentOnGeneration(generation)
+    if result.status == "needYou" {
+      throw CoreClientError.contractViolation(
+        "Delivery is uncertain. OpenOpen will not resend it automatically."
+      )
+    }
+    guard result.status == "sent", result.providerMessageId != nil else {
+      throw CoreClientError.contractViolation("The channel did not confirm this send.")
+    }
+  }
+
+  private static func channelReceiptContent(_ receipt: MissionReceipt) -> String {
+    let count = receipt.evidenceIds.count
+    return
+      "Done: \(receipt.summary)\nEvidence: \(count) verified completion\(count == 1 ? "" : "s")\nModel: \(receipt.actualModel)"
+  }
+
+  private static func currentMilliseconds() -> Int64 {
+    Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+  }
+
   public func confirmSuggestion() async {
     guard modelEntryEnabled, !isBusy, suggestion != nil || confirmedMission != nil else { return }
     isBusy = true
@@ -501,6 +954,7 @@ public final class AppModel: ObservableObject {
           )
         }
         confirmedMission = mission
+        channelOrigin = try await core.dashboard().channelOrigin
       }
       try Task.checkCancellation()
       try requireCurrentOnGeneration(generation)
@@ -644,7 +1098,8 @@ public final class AppModel: ObservableObject {
       }
       let receipt = try await core.completeReminderMission(
         identifier: mission.missionId,
-        completions: completed
+        completions: completed,
+        receiptReturnApprovedAtMs: channelOrigin == nil ? nil : Self.currentMilliseconds()
       )
       try requireCurrentOnGeneration(generation)
       guard receipt.missionId == mission.missionId else {
@@ -653,8 +1108,18 @@ public final class AppModel: ObservableObject {
       self.receipt = receipt
       activeCards = []
       confirmedMission = nil
+      needsYou = nil
       reminderLinks = []
       suggestion = nil
+      if channelOrigin != nil {
+        try await deliverChannelMessage(
+          missionId: receipt.missionId,
+          kind: .receipt,
+          content: Self.channelReceiptContent(receipt),
+          approvedAtMs: max(Self.currentMilliseconds(), receipt.completedAtMs),
+          generation: generation
+        )
+      }
       errorMessage = nil
     } catch {
       guard generation == runtimeGeneration else { return }

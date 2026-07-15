@@ -1,0 +1,44 @@
+[package]
+name = "rama-utils"
+description = "utilities crate for rama"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = ["rama"]
+categories = ["asynchronous", "network-programming", "web-programming"]
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.cargo-public-api-crates]
+allowed = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+const_format = { workspace = true }
+parking_lot = { workspace = true }
+pin-project-lite = { workspace = true }
+rama-macros = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true, features = ["write", "serde", "const_generics", "const_new"] }
+smol_str = { workspace = true }
+tokio = { workspace = true, features = ["time", "macros"] }
+wildcard = { workspace = true }
+
+[dev-dependencies]
+ahash = { workspace = true }
+quickcheck = { workspace = true }
+serde_json = { workspace = true }
+serde_test = { workspace = true }
+tokio-test = { workspace = true }
+trybuild = { workspace = true }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true

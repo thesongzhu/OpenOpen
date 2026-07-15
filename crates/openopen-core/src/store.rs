@@ -1,14 +1,22 @@
+use crate::channel::{
+    channel_message_payload, channel_need_you_content, channel_receipt_content, validate_cursor,
+    validate_delivery, validate_observation, validate_origin, validate_outbound, validate_pairing,
+};
 use crate::mission::{apply_mission_command, validate_mission_snapshot, validate_receipt};
 use crate::{
     ActionGate, ActionProposal, ActionTarget, CryptoError, EffectKind, GateDecision,
     LocalAuthority, MissionCommand, MissionError, TrustedBrokerEnrollment,
 };
 use openopen_protocol::{
-    ApprovalKind, ChannelEnvelope, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectBrokerSession,
-    EffectCommand, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
-    MAX_EFFECT_APPROVAL_IDS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECT_SCOPE_DIGEST_BYTES, Mission,
-    MissionFileEffect, PayloadDescriptor, Receipt, RuntimeControlAuthorization,
-    RuntimeControlReceipt, is_canonical_effect_identifier,
+    ApprovalKind, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision,
+    ChannelInboundResult, ChannelKind, ChannelMessageKind, ChannelMissionOrigin,
+    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
+    ChannelOutboundIntent, ChannelOutboundStart, ChannelPairing, EFFECT_PROTOCOL_VERSION,
+    EffectAuditAnchor, EffectBrokerSession, EffectCommand, EffectNonCommit, EffectPermit,
+    EffectPermitPurpose, EffectReceipt, MAX_EFFECT_APPROVAL_IDS, MAX_EFFECT_PAYLOAD_BYTES,
+    MAX_EFFECT_SCOPE_DIGEST_BYTES, Mission, MissionFileEffect, OutcomeSuggestion,
+    PayloadDescriptor, Receipt, RuntimeControlAuthorization, RuntimeControlReceipt,
+    is_canonical_effect_identifier,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -23,6 +31,16 @@ const RECEIPT_COMMIT_ACTION: &str = "receipt.created";
 const EFFECT_AUTHORIZATION_ACTION: &str = "effect.authorized";
 const EFFECT_RECEIPT_ACTION: &str = "effect.committed";
 const EFFECT_NONCOMMIT_ACTION: &str = "effect.not_committed";
+const CHANNEL_PAIRING_ACTION: &str = "channel.paired";
+const CHANNEL_OBSERVATION_ACTION: &str = "channel.observed";
+const CHANNEL_CURSOR_ACTION: &str = "channel.cursor_advanced";
+const CHANNEL_MODEL_QUEUED_ACTION: &str = "channel.model_queued";
+const CHANNEL_MODEL_ACTION: &str = "channel.model_started";
+const CHANNEL_SUGGESTION_ACTION: &str = "channel.suggestion_ready";
+const CHANNEL_ORIGIN_ACTION: &str = "channel.mission_origin_bound";
+const CHANNEL_OUTBOUND_ACTION: &str = "channel.outbound_started";
+const CHANNEL_DELIVERY_ACTION: &str = "channel.outbound_delivered";
+const MAX_CHANNEL_CONTENT_BYTES: usize = 16 * 1024;
 const RUNTIME_CONTROL_ID: i64 = 1;
 const STORE_SCHEMA: &str = "PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS runtime_control (
@@ -54,10 +72,38 @@ CREATE TABLE IF NOT EXISTS receipt_state (
  receipt_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, encrypted_blob BLOB NOT NULL,
  completed_at_ms INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS channel_envelope (
- channel_json TEXT NOT NULL, source_message_id TEXT NOT NULL, sender_id TEXT NOT NULL,
- conversation_id TEXT NOT NULL, content_sha256 TEXT NOT NULL, received_at_ms INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS channel_pairing (
+ channel_json TEXT PRIMARY KEY, encrypted_blob BLOB NOT NULL,
+ paired_at_ms INTEGER NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS channel_observation (
+ channel_json TEXT NOT NULL, source_message_id TEXT NOT NULL, entity_id TEXT NOT NULL UNIQUE,
+ conversation_id TEXT NOT NULL, cursor_order INTEGER NOT NULL,
+ decision_json TEXT NOT NULL, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
  PRIMARY KEY(channel_json, source_message_id)
+);
+CREATE TABLE IF NOT EXISTS channel_cursor (
+ channel_json TEXT NOT NULL, conversation_id TEXT NOT NULL, entity_id TEXT NOT NULL UNIQUE,
+ cursor_order INTEGER NOT NULL, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ PRIMARY KEY(channel_json, conversation_id)
+);
+CREATE TABLE IF NOT EXISTS channel_model_dispatch (
+ entity_id TEXT PRIMARY KEY, channel_json TEXT NOT NULL, source_message_id TEXT NOT NULL,
+ status_json TEXT NOT NULL, suggestion_id TEXT,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ UNIQUE(channel_json, source_message_id), UNIQUE(suggestion_id)
+);
+CREATE TABLE IF NOT EXISTS channel_mission_origin (
+ mission_id TEXT PRIMARY KEY, channel_json TEXT NOT NULL,
+ conversation_id TEXT NOT NULL, source_message_id TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS channel_outbound (
+ outbound_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, channel_json TEXT NOT NULL,
+ conversation_id TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+ status_json TEXT NOT NULL, provider_message_id TEXT,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ UNIQUE(channel_json, provider_message_id)
 );
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
@@ -102,8 +148,20 @@ pub enum StoreError {
     Crypto(#[from] CryptoError),
     #[error("Mission or Receipt invariant failed: {0}")]
     Domain(#[from] MissionError),
-    #[error("channel message id was reused with different authorization provenance")]
-    EnvelopeConflict,
+    #[error("channel invariant failed: {0}")]
+    Channel(#[from] crate::ChannelError),
+    #[error("channel pairing conflicts with the immutable owner-confirmed pairing")]
+    ChannelPairingConflict,
+    #[error("channel cursor or observation conflicts with durable recovery state")]
+    ChannelObservationConflict,
+    #[error("Mission channel origin conflicts with the accepted originating message")]
+    ChannelOriginConflict,
+    #[error("channel outbound id was reused with a different typed message")]
+    ChannelOutboundConflict,
+    #[error("channel outbound action failed authorization: {0:?}")]
+    ChannelAuthorization(GateDecision),
+    #[error("stored channel state does not match its signed encrypted record: {0}")]
+    ChannelStateMismatch(String),
     #[error("audit chain mismatch at sequence {0}")]
     AuditChainMismatch(i64),
     #[error("audit tail does not match the Keychain-owned anchor")]
@@ -166,12 +224,6 @@ pub enum StoreError {
     RuntimeControlMismatch,
     #[error("OpenOpen is off")]
     RuntimeDisabled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnvelopeInsert {
-    Inserted,
-    Duplicate,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +345,38 @@ struct StoredEffectNonCommit {
     record_hash: String,
     anchor: AuditAnchor,
     local_signature_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredChannelObservation {
+    observation: ChannelObservation,
+    decision: ChannelInboundDecision,
+    accepted_content: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredChannelOutbound {
+    intent: ChannelOutboundIntent,
+    delivery: Option<ChannelDeliveryReceipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredChannelModelDispatch {
+    channel: ChannelKind,
+    source_message_id: String,
+    state: StoredChannelModelState,
+    suggestion: Option<OutcomeSuggestion>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum StoredChannelModelState {
+    Queued,
+    Started,
+    Ready,
 }
 
 pub struct Store {
@@ -789,20 +873,8 @@ impl Store {
         &mut self,
         envelopes: &[MissionCommandEnvelope],
     ) -> Result<Vec<MissionCommandResult>, StoreError> {
-        let Some(first) = envelopes.first() else {
-            return Err(StoreError::InvalidCommandBatch);
-        };
-        let mission_id = first.command.mission_id();
-        let mut command_ids = HashSet::new();
-        for (index, envelope) in envelopes.iter().enumerate() {
-            validate_command_id(&envelope.command_id)?;
-            if envelope.command.mission_id() != mission_id
-                || !command_ids.insert(envelope.command_id.as_str())
-                || (index > 0 && envelope.expected_anchor.is_some())
-            {
-                return Err(StoreError::InvalidCommandBatch);
-            }
-        }
+        validate_mission_command_batch(envelopes)?;
+        let first = envelopes.first().ok_or(StoreError::InvalidCommandBatch)?;
         let transaction = self.connection.transaction()?;
         let mut expected_anchor = first.expected_anchor.clone();
         let mut results = Vec::with_capacity(envelopes.len());
@@ -817,6 +889,94 @@ impl Store {
             expected_anchor = Some(result.anchor.clone());
             results.push(result);
         }
+        transaction.commit()?;
+        Ok(results)
+    }
+
+    /// Applies an initial Mission-confirmation batch and binds its accepted
+    /// channel origin in the same transaction. This is the only channel-input
+    /// genesis route; an arbitrary conversation cannot be attached later by a
+    /// caller racing Mission creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a write for an invalid command batch, missing
+    /// ready suggestion, mismatched pairing/source, or any Store invariant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_mission_command_batch_with_channel_origin(
+        &mut self,
+        envelopes: &[MissionCommandEnvelope],
+        channel: ChannelKind,
+        source_message_id: &str,
+        suggestion_id: &str,
+        bound_at_ms: i64,
+    ) -> Result<Vec<MissionCommandResult>, StoreError> {
+        validate_mission_command_batch(envelopes)?;
+        if bound_at_ms < 0
+            || !matches!(
+                envelopes.first().map(|envelope| &envelope.command),
+                Some(MissionCommand::Create { .. })
+            )
+        {
+            return Err(StoreError::ChannelOriginConflict);
+        }
+        let first = envelopes.first().ok_or(StoreError::InvalidCommandBatch)?;
+        let transaction = self.connection.transaction()?;
+        let mut expected_anchor = first.expected_anchor.clone();
+        let mut results = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            let result = execute_mission_command_in_transaction(
+                &transaction,
+                &self.authority,
+                self.trusted_broker.as_ref(),
+                envelope,
+                expected_anchor.as_ref(),
+            )?;
+            expected_anchor = Some(result.anchor.clone());
+            results.push(result);
+        }
+        let mission = &results
+            .last()
+            .ok_or(StoreError::InvalidCommandBatch)?
+            .mission;
+        let dispatch =
+            load_channel_model_dispatch(&transaction, &self.authority, channel, source_message_id)?
+                .filter(|value| {
+                    value
+                        .suggestion
+                        .as_ref()
+                        .is_some_and(|suggestion| suggestion.id == suggestion_id)
+                })
+                .ok_or(StoreError::ChannelOriginConflict)?;
+        let observed = load_channel_observation(
+            &transaction,
+            &self.authority,
+            dispatch.channel,
+            &dispatch.source_message_id,
+        )?
+        .filter(|value| value.decision == ChannelInboundDecision::Accepted)
+        .ok_or(StoreError::ChannelOriginConflict)?;
+        let pairing = load_channel_pairing(&transaction, &self.authority, channel)?
+            .ok_or(StoreError::ChannelOriginConflict)?;
+        let envelope = observed.observation.envelope;
+        if envelope.conversation_id != pairing.conversation_id
+            || envelope.sender_id != pairing.owner_sender_id
+        {
+            return Err(StoreError::ChannelOriginConflict);
+        }
+        write_channel_origin(
+            &transaction,
+            &self.authority,
+            &ChannelMissionOrigin {
+                mission_id: mission.id.clone(),
+                channel,
+                conversation_id: envelope.conversation_id,
+                owner_sender_id: envelope.sender_id,
+                source_message_id: envelope.source_message_id,
+                bound_at_ms,
+            },
+            &mission.owner_id,
+        )?;
         transaction.commit()?;
         Ok(results)
     }
@@ -1183,53 +1343,647 @@ impl Store {
         .transpose()
     }
 
-    /// Records a channel envelope once with its full authorization provenance.
+    /// Persists the one owner-confirmed V1 pairing for a channel. Exact retries
+    /// are idempotent; changing either owner or conversation requires a future
+    /// explicit disconnect flow and never rotates this boundary implicitly.
     ///
     /// # Errors
     ///
-    /// Returns `EnvelopeConflict` for changed provenance under the same source id.
-    pub fn record_envelope(
-        &self,
-        envelope: &ChannelEnvelope,
-    ) -> Result<EnvelopeInsert, StoreError> {
-        let channel = serde_json::to_string(&envelope.channel)
-            .map_err(|error| CryptoError::Serialization(error.to_string()))?;
-        let existing: Option<(String, String, String)> = self
+    /// Returns an error for invalid, conflicting, fenced, or tampered state.
+    pub fn pair_channel(&mut self, pairing: &ChannelPairing) -> Result<(), StoreError> {
+        validate_pairing(pairing)?;
+        let transaction = self
             .connection
-            .query_row(
-                "SELECT sender_id, conversation_id, content_sha256 FROM channel_envelope
-                 WHERE channel_json = ?1 AND source_message_id = ?2",
-                params![channel, envelope.source_message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((sender, conversation, hash))
-                if sender == envelope.sender_id
-                    && conversation == envelope.conversation_id
-                    && hash == envelope.content_sha256 =>
-            {
-                Ok(EnvelopeInsert::Duplicate)
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) =
+            load_channel_pairing(&transaction, &self.authority, pairing.channel)?
+        {
+            if existing == *pairing {
+                return Ok(());
             }
-            Some(_) => Err(StoreError::EnvelopeConflict),
-            None => {
-                self.connection.execute(
-                    "INSERT INTO channel_envelope
-                        (channel_json, source_message_id, sender_id, conversation_id,
-                         content_sha256, received_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        channel,
-                        envelope.source_message_id,
-                        envelope.sender_id,
-                        envelope.conversation_id,
-                        envelope.content_sha256,
-                        envelope.received_at_ms,
-                    ],
-                )?;
-                Ok(EnvelopeInsert::Inserted)
+            return Err(StoreError::ChannelPairingConflict);
+        }
+        let channel = channel_json(pairing.channel)?;
+        let blob = self
+            .authority
+            .encrypt_json(pairing, channel_pairing_aad(&channel).as_bytes())?;
+        let state_hash = blob_hash(&blob);
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("channel:{channel}:pairing"),
+                command_id: &format!("channel-pair-{channel}"),
+                command_hash: &state_hash,
+                actor: &pairing.owner_sender_id,
+                action: CHANNEL_PAIRING_ACTION,
+                entity_id: &channel,
+                created_at_ms: pairing.paired_at_ms,
+                state_kind: "channelPairing",
+                state_hash: &state_hash,
+            },
+        )?;
+        transaction.execute(
+            "INSERT INTO channel_pairing
+                (channel_json, encrypted_blob, paired_at_ms, blob_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![channel, blob, pairing.paired_at_ms, state_hash],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns the verified pairing for one channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signed audit chain or encrypted pairing is invalid.
+    pub fn channel_pairing(
+        &self,
+        channel: ChannelKind,
+    ) -> Result<Option<ChannelPairing>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_channel_pairing(&self.connection, &self.authority, channel)
+    }
+
+    /// Returns the newest verified durable recovery cursor for one paired conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel state or the audit chain is invalid.
+    pub fn channel_cursor(
+        &self,
+        channel: ChannelKind,
+        conversation_id: &str,
+    ) -> Result<Option<ChannelCursor>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_channel_cursor(&self.connection, &self.authority, channel, conversation_id)
+    }
+
+    /// Advances a paired channel's durable recovery high-water mark without
+    /// inventing a message observation. This is used only for a provider's
+    /// bounded recovery result after every accepted envelope in that result
+    /// has been ingested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Off, an unpaired conversation, a changed cursor at
+    /// the same order, or invalid durable state.
+    pub fn advance_channel_cursor(&mut self, cursor: &ChannelCursor) -> Result<(), StoreError> {
+        validate_cursor(cursor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let pairing = load_channel_pairing(&transaction, &self.authority, cursor.channel)?
+            .ok_or(StoreError::ChannelObservationConflict)?;
+        if pairing.conversation_id != cursor.conversation_id {
+            return Err(StoreError::ChannelObservationConflict);
+        }
+        if let Some(current) = load_channel_cursor(
+            &transaction,
+            &self.authority,
+            cursor.channel,
+            &cursor.conversation_id,
+        )? {
+            if current.channel == cursor.channel
+                && current.conversation_id == cursor.conversation_id
+                && current.opaque_value == cursor.opaque_value
+                && current.order == cursor.order
+            {
+                return Ok(());
+            }
+            if cursor.order <= current.order {
+                return Err(StoreError::ChannelObservationConflict);
             }
         }
+        write_channel_cursor(&transaction, &self.authority, cursor)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically filters one adapter observation before its body can reach a
+    /// model, records durable dedupe provenance, and advances only the paired
+    /// conversation's monotonic recovery cursor. Global Off rejects the whole
+    /// operation before any channel state moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Off, malformed/conflicting input, or invalid durable state.
+    pub fn ingest_channel_message(
+        &mut self,
+        observation: &ChannelObservation,
+        content: &str,
+    ) -> Result<ChannelInboundResult, StoreError> {
+        validate_observation(observation)?;
+        if content.is_empty()
+            || content.trim() != content
+            || content.len() > MAX_CHANNEL_CONTENT_BYTES
+            || content.as_bytes().contains(&0)
+            || format!("{:x}", Sha256::digest(content.as_bytes()))
+                != observation.envelope.content_sha256
+        {
+            return Err(StoreError::ChannelObservationConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let Some(pairing) =
+            load_channel_pairing(&transaction, &self.authority, observation.envelope.channel)?
+        else {
+            return Ok(ChannelInboundResult {
+                decision: ChannelInboundDecision::IgnoredUnpaired,
+                cursor: observation.cursor.clone(),
+            });
+        };
+        if pairing.conversation_id != observation.envelope.conversation_id {
+            return Ok(ChannelInboundResult {
+                decision: ChannelInboundDecision::IgnoredConversation,
+                cursor: observation.cursor.clone(),
+            });
+        }
+        if let Some(existing) = load_channel_observation(
+            &transaction,
+            &self.authority,
+            observation.envelope.channel,
+            &observation.envelope.source_message_id,
+        )? {
+            if existing.observation == *observation {
+                return Ok(ChannelInboundResult {
+                    decision: ChannelInboundDecision::Duplicate,
+                    cursor: existing.observation.cursor,
+                });
+            }
+            return Err(StoreError::ChannelObservationConflict);
+        }
+        if let Some(current) = load_channel_cursor(
+            &transaction,
+            &self.authority,
+            observation.cursor.channel,
+            &observation.cursor.conversation_id,
+        )? && observation.cursor.order <= current.order
+        {
+            return Ok(ChannelInboundResult {
+                decision: ChannelInboundDecision::IgnoredStaleCursor,
+                cursor: current,
+            });
+        }
+        let decision = if observation.is_bot {
+            ChannelInboundDecision::IgnoredBot
+        } else if observation.envelope.sender_id != pairing.owner_sender_id {
+            ChannelInboundDecision::IgnoredSender
+        } else if pairing.require_explicit_address && !observation.explicitly_addressed {
+            ChannelInboundDecision::IgnoredNotAddressed
+        } else {
+            ChannelInboundDecision::Accepted
+        };
+        write_channel_observation(
+            &transaction,
+            &self.authority,
+            observation,
+            decision,
+            content,
+        )?;
+        if decision == ChannelInboundDecision::Accepted {
+            write_channel_model_dispatch(
+                &transaction,
+                &self.authority,
+                &StoredChannelModelDispatch {
+                    channel: observation.envelope.channel,
+                    source_message_id: observation.envelope.source_message_id.clone(),
+                    state: StoredChannelModelState::Queued,
+                    suggestion: None,
+                },
+                observation.envelope.received_at_ms,
+            )?;
+        }
+        write_channel_cursor(&transaction, &self.authority, &observation.cursor)?;
+        transaction.commit()?;
+        Ok(ChannelInboundResult {
+            decision,
+            cursor: observation.cursor.clone(),
+        })
+    }
+
+    /// Consumes model-dispatch authority for one accepted channel message.
+    /// Exact retries become recovery-only, while a persisted result is returned
+    /// without another model call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Off, a non-accepted source, or invalid durable state.
+    pub fn begin_channel_model(
+        &mut self,
+        channel: ChannelKind,
+        source_message_id: &str,
+    ) -> Result<ChannelModelStart, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let observed =
+            load_channel_observation(&transaction, &self.authority, channel, source_message_id)?
+                .filter(|value| value.decision == ChannelInboundDecision::Accepted)
+                .ok_or(StoreError::ChannelObservationConflict)?;
+        let content = observed
+            .accepted_content
+            .clone()
+            .ok_or(StoreError::ChannelObservationConflict)?;
+        if let Some(existing) =
+            load_channel_model_dispatch(&transaction, &self.authority, channel, source_message_id)?
+        {
+            match existing.state {
+                StoredChannelModelState::Queued => {
+                    update_channel_model_started(
+                        &transaction,
+                        &self.authority,
+                        &StoredChannelModelDispatch {
+                            state: StoredChannelModelState::Started,
+                            ..existing
+                        },
+                        observed.observation.envelope.received_at_ms,
+                    )?;
+                    transaction.commit()?;
+                    return Ok(ChannelModelStart {
+                        envelope: observed.observation.envelope,
+                        content,
+                        disposition: ChannelModelDisposition::ExecuteNow,
+                        suggestion: None,
+                    });
+                }
+                StoredChannelModelState::Started | StoredChannelModelState::Ready => {}
+            }
+            return Ok(ChannelModelStart {
+                envelope: observed.observation.envelope,
+                content,
+                disposition: match existing.state {
+                    StoredChannelModelState::Started => ChannelModelDisposition::RecoverOnly,
+                    StoredChannelModelState::Ready => ChannelModelDisposition::SuggestionReady,
+                    StoredChannelModelState::Queued => unreachable!(),
+                },
+                suggestion: existing.suggestion,
+            });
+        }
+        Err(StoreError::ChannelObservationConflict)
+    }
+
+    /// Returns the oldest accepted model task whose one-shot execution
+    /// authority has not yet been consumed. The observation, cursor, and this
+    /// durable queue entry are created in one transaction, so a Host restart
+    /// can claim it before polling beyond the persisted cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Off or invalid durable channel state.
+    pub fn next_queued_channel_model(
+        &self,
+        channel: ChannelKind,
+    ) -> Result<Option<String>, StoreError> {
+        require_runtime_enabled(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let encoded_channel = channel_json(channel)?;
+        let source_message_id = self
+            .connection
+            .query_row(
+                "SELECT dispatch.source_message_id
+                 FROM channel_model_dispatch AS dispatch
+                 JOIN channel_observation AS observation
+                   ON observation.channel_json = dispatch.channel_json
+                  AND observation.source_message_id = dispatch.source_message_id
+                 WHERE dispatch.channel_json = ?1 AND dispatch.status_json = 'queued'
+                 ORDER BY observation.cursor_order ASC, dispatch.source_message_id ASC
+                 LIMIT 1",
+                [encoded_channel],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        source_message_id
+            .map(|source_message_id| {
+                let dispatch = load_channel_model_dispatch(
+                    &self.connection,
+                    &self.authority,
+                    channel,
+                    &source_message_id,
+                )?
+                .ok_or_else(|| StoreError::ChannelStateMismatch(source_message_id.clone()))?;
+                if dispatch.state != StoredChannelModelState::Queued {
+                    return Err(StoreError::ChannelStateMismatch(source_message_id));
+                }
+                Ok(dispatch.source_message_id)
+            })
+            .transpose()
+    }
+
+    /// Persists the exact structured result for a consumed channel model call.
+    /// This reconciliation remains valid after Off and never grants a new call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown dispatch, changed result, or invalid state.
+    pub fn record_channel_suggestion(
+        &mut self,
+        channel: ChannelKind,
+        source_message_id: &str,
+        suggestion: &OutcomeSuggestion,
+        observed_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        if !valid_channel_suggestion(suggestion) || observed_at_ms < 0 {
+            return Err(StoreError::ChannelObservationConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let existing =
+            load_channel_model_dispatch(&transaction, &self.authority, channel, source_message_id)?
+                .ok_or(StoreError::ChannelObservationConflict)?;
+        if let Some(current) = existing.suggestion {
+            if current == *suggestion {
+                return Ok(());
+            }
+            return Err(StoreError::ChannelObservationConflict);
+        }
+        update_channel_model_suggestion(
+            &transaction,
+            &self.authority,
+            &StoredChannelModelDispatch {
+                channel,
+                source_message_id: source_message_id.to_owned(),
+                state: StoredChannelModelState::Ready,
+                suggestion: Some(suggestion.clone()),
+            },
+            observed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Resolves a persisted suggestion to its accepted originating message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel state or the audit chain is invalid.
+    pub fn channel_source_for_suggestion(
+        &self,
+        suggestion_id: &str,
+    ) -> Result<Option<ChannelEnvelope>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let source = self
+            .connection
+            .query_row(
+                "SELECT channel_json, source_message_id FROM channel_model_dispatch
+                 WHERE suggestion_id = ?1 AND status_json = 'ready'",
+                [suggestion_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        source
+            .map(|(encoded, source_message_id)| {
+                let channel: ChannelKind = serde_json::from_str(&encoded)
+                    .map_err(|_| StoreError::ChannelStateMismatch(source_message_id.clone()))?;
+                load_channel_observation(
+                    &self.connection,
+                    &self.authority,
+                    channel,
+                    &source_message_id,
+                )?
+                .filter(|value| value.decision == ChannelInboundDecision::Accepted)
+                .map(|value| value.observation.envelope)
+                .ok_or(StoreError::ChannelObservationConflict)
+            })
+            .transpose()
+    }
+
+    /// Returns the newest verified channel-origin suggestion, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel state or the audit chain is invalid.
+    pub fn latest_channel_suggestion(&self) -> Result<Option<OutcomeSuggestion>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let source = self
+            .connection
+            .query_row(
+                "SELECT dispatch.channel_json, dispatch.source_message_id
+                 FROM channel_model_dispatch AS dispatch
+                 JOIN audit_ledger AS audit ON audit.entity_id = dispatch.entity_id
+                    AND audit.action = ?1
+                 WHERE dispatch.status_json = 'ready'
+                 ORDER BY audit.sequence DESC LIMIT 1",
+                [CHANNEL_SUGGESTION_ACTION],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        source
+            .map(|(encoded, source_message_id)| {
+                let channel: ChannelKind = serde_json::from_str(&encoded)
+                    .map_err(|_| StoreError::ChannelStateMismatch(source_message_id.clone()))?;
+                load_channel_model_dispatch(
+                    &self.connection,
+                    &self.authority,
+                    channel,
+                    &source_message_id,
+                )?
+                .and_then(|value| value.suggestion)
+                .ok_or(StoreError::ChannelObservationConflict)
+            })
+            .transpose()
+    }
+
+    /// Returns the verified originating channel for one confirmed Mission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel state or the audit chain is invalid.
+    pub fn channel_mission_origin(
+        &self,
+        mission_id: &str,
+    ) -> Result<Option<ChannelMissionOrigin>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_channel_origin(&self.connection, &self.authority, mission_id)
+    }
+
+    /// Durably consumes outbound execution authority before an adapter may
+    /// perform a send. After response loss or restart the same intent is
+    /// recovery-only and is never authorized for a second external write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Off, missing exact approvals, changed bytes, or invalid state.
+    pub fn begin_channel_outbound(
+        &mut self,
+        intent: &ChannelOutboundIntent,
+        content: &[u8],
+    ) -> Result<ChannelOutboundStart, StoreError> {
+        validate_outbound(intent)?;
+        if format!("{:x}", Sha256::digest(content)) != intent.content_sha256 {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) =
+            load_channel_outbound(&transaction, &self.authority, &intent.outbound_id)?
+        {
+            if existing.intent != *intent {
+                return Err(StoreError::ChannelOutboundConflict);
+            }
+            return Ok(ChannelOutboundStart {
+                intent: existing.intent,
+                disposition: if existing.delivery.is_some() {
+                    ChannelOutboundDisposition::AlreadySent
+                } else {
+                    ChannelOutboundDisposition::RecoverOnly
+                },
+                provider_message_id: existing
+                    .delivery
+                    .map(|delivery| delivery.provider_message_id),
+            });
+        }
+        let mission = load_mission_for_update(&transaction, &self.authority, &intent.mission_id)?
+            .ok_or(StoreError::MissionNotFound)?;
+        let origin = load_channel_origin(&transaction, &self.authority, &intent.mission_id)?
+            .ok_or(StoreError::ChannelOriginConflict)?;
+        let pairing = load_channel_pairing(&transaction, &self.authority, intent.channel)?
+            .ok_or(StoreError::ChannelOriginConflict)?;
+        if origin.channel != intent.channel
+            || origin.conversation_id != intent.conversation_id
+            || origin.owner_sender_id != intent.recipient_id
+            || pairing.conversation_id != intent.conversation_id
+            || pairing.owner_sender_id != intent.recipient_id
+        {
+            return Err(StoreError::ChannelOriginConflict);
+        }
+        let proposal = ActionProposal {
+            effect: EffectKind::ChannelSend,
+            mission_id: mission.id.clone(),
+            mission_scope_digest: mission.scope_digest.clone(),
+            target: ActionTarget::Channel {
+                channel: intent.channel,
+                conversation_id: intent.conversation_id.clone(),
+                recipient_ids: vec![intent.recipient_id.clone()],
+            },
+            estimated_cost_micros: None,
+        };
+        let decision = authorize_channel_outbound(
+            &transaction,
+            &self.authority,
+            &mission,
+            &proposal,
+            intent,
+            content,
+        )?;
+        if decision != GateDecision::Allowed {
+            return Err(StoreError::ChannelAuthorization(decision));
+        }
+        let stored = StoredChannelOutbound {
+            intent: intent.clone(),
+            delivery: None,
+        };
+        write_channel_outbound(&transaction, &self.authority, &stored)?;
+        transaction.commit()?;
+        Ok(ChannelOutboundStart {
+            intent: intent.clone(),
+            disposition: ChannelOutboundDisposition::ExecuteNow,
+            provider_message_id: None,
+        })
+    }
+
+    /// Reconciles the immutable provider result for a previously consumed
+    /// outbound intent. This remains allowed after Off because it grants no
+    /// new send authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/conflicting result or invalid durable state.
+    pub fn record_channel_delivery(
+        &mut self,
+        receipt: &ChannelDeliveryReceipt,
+    ) -> Result<ChannelOutboundStart, StoreError> {
+        validate_delivery(receipt)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut stored =
+            load_channel_outbound(&transaction, &self.authority, &receipt.outbound_id)?
+                .ok_or(StoreError::ChannelOutboundConflict)?;
+        if let Some(existing) = &stored.delivery {
+            if existing == receipt {
+                return Ok(ChannelOutboundStart {
+                    intent: stored.intent,
+                    disposition: ChannelOutboundDisposition::AlreadySent,
+                    provider_message_id: Some(existing.provider_message_id.clone()),
+                });
+            }
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        if receipt.delivered_at_ms < stored.intent.created_at_ms {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        stored.delivery = Some(receipt.clone());
+        update_channel_outbound_delivery(&transaction, &self.authority, &stored)?;
+        transaction.commit()?;
+        Ok(ChannelOutboundStart {
+            intent: stored.intent,
+            disposition: ChannelOutboundDisposition::AlreadySent,
+            provider_message_id: Some(receipt.provider_message_id.clone()),
+        })
     }
 
     /// Lists all verified Missions newest-first after checking the complete
@@ -1322,6 +2076,71 @@ impl Store {
     }
 }
 
+fn authorize_channel_outbound(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    mission: &Mission,
+    proposal: &ActionProposal,
+    intent: &ChannelOutboundIntent,
+    content: &[u8],
+) -> Result<GateDecision, StoreError> {
+    let decision = match intent.kind {
+        ChannelMessageKind::Progress => ActionGate.authorize(mission, proposal, Some(content)),
+        ChannelMessageKind::NeedYou => {
+            let exact = mission.needs_me.as_ref().is_some_and(|needs_me| {
+                mission.status == openopen_protocol::MissionStatus::NeedsMe
+                    && intent.created_at_ms >= needs_me.created_at_ms
+                    && channel_message_payload(intent.channel, &channel_need_you_content(needs_me))
+                        == content
+            });
+            if exact {
+                GateDecision::Allowed
+            } else {
+                GateDecision::Denied("Need-you send does not match current Mission boundary")
+            }
+        }
+        ChannelMessageKind::Receipt => {
+            let receipt = load_receipt_for_mission(transaction, authority, mission)?;
+            let exact = receipt.as_ref().is_some_and(|receipt| {
+                mission.status == openopen_protocol::MissionStatus::Completed
+                    && intent.created_at_ms >= receipt.completed_at_ms
+                    && channel_message_payload(intent.channel, &channel_receipt_content(receipt))
+                        == content
+            });
+            if exact {
+                let recipient = proposal
+                    .approval_digest(ApprovalKind::NewRecipient, Some(content))
+                    .ok()
+                    .and_then(|digest| {
+                        crate::gate::approved_owner_approval_id(
+                            mission,
+                            ApprovalKind::NewRecipient,
+                            &digest,
+                        )
+                    });
+                let disclosure = proposal
+                    .approval_digest(ApprovalKind::NewDataShare, Some(content))
+                    .ok()
+                    .and_then(|digest| {
+                        crate::gate::approved_owner_approval_id(
+                            mission,
+                            ApprovalKind::NewDataShare,
+                            &digest,
+                        )
+                    });
+                if recipient.is_some() && disclosure.is_some() {
+                    GateDecision::Allowed
+                } else {
+                    GateDecision::NeedsMe(ApprovalKind::NewDataShare)
+                }
+            } else {
+                GateDecision::Denied("Receipt send does not match completed Mission Receipt")
+            }
+        }
+    };
+    Ok(decision)
+}
+
 fn execute_mission_command_in_transaction(
     transaction: &Transaction<'_>,
     authority: &LocalAuthority,
@@ -1390,6 +2209,24 @@ fn validate_command_id(command_id: &str) -> Result<(), StoreError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_mission_command_batch(envelopes: &[MissionCommandEnvelope]) -> Result<(), StoreError> {
+    let Some(first) = envelopes.first() else {
+        return Err(StoreError::InvalidCommandBatch);
+    };
+    let mission_id = first.command.mission_id();
+    let mut command_ids = HashSet::new();
+    for (index, envelope) in envelopes.iter().enumerate() {
+        validate_command_id(&envelope.command_id)?;
+        if envelope.command.mission_id() != mission_id
+            || !command_ids.insert(envelope.command_id.as_str())
+            || (index > 0 && envelope.expected_anchor.is_some())
+        {
+            return Err(StoreError::InvalidCommandBatch);
+        }
+    }
+    Ok(())
 }
 
 fn command_hash(envelope: &MissionCommandEnvelope) -> Result<String, StoreError> {
@@ -1768,6 +2605,53 @@ fn write_receipt(
             state_hash: &blob_hash(&encrypted),
         },
     )
+}
+
+fn load_receipt_for_mission(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    mission: &Mission,
+) -> Result<Option<Receipt>, StoreError> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT receipt_id, encrypted_blob, completed_at_ms
+             FROM receipt_state WHERE mission_id = ?1",
+        )?;
+        statement
+            .query_map([&mission.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.len() > 1 {
+        return Err(StoreError::StateBindingMismatch(mission.id.clone()));
+    }
+    rows.into_iter()
+        .next()
+        .map(|(receipt_id, blob, completed_at_ms)| {
+            verify_blob_binding(
+                connection,
+                RECEIPT_COMMIT_ACTION,
+                &receipt_id,
+                "receipt",
+                &blob,
+            )?;
+            let receipt: Receipt =
+                authority.decrypt_json(&blob, receipt_aad(&receipt_id, &mission.id).as_bytes())?;
+            if receipt.id != receipt_id
+                || receipt.mission_id != mission.id
+                || receipt.completed_at_ms != completed_at_ms
+            {
+                return Err(StoreError::StateBindingMismatch(receipt_id));
+            }
+            validate_receipt(mission, &receipt, authority)?;
+            Ok(receipt)
+        })
+        .transpose()
 }
 
 fn write_command_result(
@@ -2540,11 +3424,21 @@ fn verify_all_bindings(
     verify_audited_entities_exist(connection, EFFECT_AUTHORIZATION_ACTION)?;
     verify_audited_entities_exist(connection, EFFECT_RECEIPT_ACTION)?;
     verify_audited_entities_exist(connection, EFFECT_NONCOMMIT_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_PAIRING_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_OBSERVATION_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_CURSOR_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_MODEL_QUEUED_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_MODEL_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_SUGGESTION_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_ORIGIN_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_OUTBOUND_ACTION)?;
+    verify_audited_entities_exist(connection, CHANNEL_DELIVERY_ACTION)?;
     verify_command_audit_reconciliation(connection, authority)?;
     verify_effect_authorization_bindings(connection, authority)?;
     verify_effect_receipt_bindings(connection, authority, trusted_broker)?;
     verify_effect_noncommit_bindings(connection, authority, trusted_broker)?;
     verify_effect_resolution_bindings(connection)?;
+    verify_channel_bindings(connection, authority)?;
     let missions = {
         let mut statement = connection.prepare(
             "SELECT mission_id, status_json, scope_digest, encrypted_blob,
@@ -2898,6 +3792,80 @@ fn verify_effect_resolution_bindings(connection: &Connection) -> Result<(), Stor
     Ok(())
 }
 
+fn verify_channel_bindings(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<(), StoreError> {
+    let pairing_channels = connection
+        .prepare("SELECT channel_json FROM channel_pairing")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for encoded in pairing_channels {
+        let channel: ChannelKind = serde_json::from_str(&encoded)
+            .map_err(|_| StoreError::ChannelStateMismatch(encoded.clone()))?;
+        load_channel_pairing(connection, authority, channel)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(encoded))?;
+    }
+
+    let observations = connection
+        .prepare("SELECT channel_json, source_message_id FROM channel_observation")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (encoded, source_message_id) in observations {
+        let channel: ChannelKind = serde_json::from_str(&encoded)
+            .map_err(|_| StoreError::ChannelStateMismatch(encoded.clone()))?;
+        load_channel_observation(connection, authority, channel, &source_message_id)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(source_message_id))?;
+    }
+
+    let cursors = connection
+        .prepare("SELECT channel_json, conversation_id FROM channel_cursor")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (encoded, conversation_id) in cursors {
+        let channel: ChannelKind = serde_json::from_str(&encoded)
+            .map_err(|_| StoreError::ChannelStateMismatch(encoded.clone()))?;
+        load_channel_cursor(connection, authority, channel, &conversation_id)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(conversation_id))?;
+    }
+
+    let model_dispatches = connection
+        .prepare("SELECT channel_json, source_message_id FROM channel_model_dispatch")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (encoded, source_message_id) in model_dispatches {
+        let channel: ChannelKind = serde_json::from_str(&encoded)
+            .map_err(|_| StoreError::ChannelStateMismatch(encoded.clone()))?;
+        load_channel_model_dispatch(connection, authority, channel, &source_message_id)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(source_message_id))?;
+    }
+
+    let origins = connection
+        .prepare("SELECT mission_id FROM channel_mission_origin")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for mission_id in origins {
+        load_channel_origin(connection, authority, &mission_id)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(mission_id))?;
+    }
+
+    let outbounds = connection
+        .prepare("SELECT outbound_id FROM channel_outbound")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for outbound_id in outbounds {
+        load_channel_outbound(connection, authority, &outbound_id)?
+            .ok_or_else(|| StoreError::ChannelStateMismatch(outbound_id))?;
+    }
+    Ok(())
+}
+
 fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Result<(), StoreError> {
     let lookup = match action {
         MISSION_COMMAND_ACTION => "SELECT 1 FROM mission_state WHERE mission_id = ?1",
@@ -2905,6 +3873,16 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
         EFFECT_AUTHORIZATION_ACTION => "SELECT 1 FROM effect_authorization WHERE effect_id = ?1",
         EFFECT_RECEIPT_ACTION => "SELECT 1 FROM effect_receipt WHERE effect_id = ?1",
         EFFECT_NONCOMMIT_ACTION => "SELECT 1 FROM effect_noncommit WHERE effect_id = ?1",
+        CHANNEL_PAIRING_ACTION => "SELECT 1 FROM channel_pairing WHERE channel_json = ?1",
+        CHANNEL_OBSERVATION_ACTION => "SELECT 1 FROM channel_observation WHERE entity_id = ?1",
+        CHANNEL_CURSOR_ACTION => "SELECT 1 FROM channel_cursor WHERE entity_id = ?1",
+        CHANNEL_MODEL_QUEUED_ACTION | CHANNEL_MODEL_ACTION | CHANNEL_SUGGESTION_ACTION => {
+            "SELECT 1 FROM channel_model_dispatch WHERE entity_id = ?1"
+        }
+        CHANNEL_ORIGIN_ACTION => "SELECT 1 FROM channel_mission_origin WHERE mission_id = ?1",
+        CHANNEL_OUTBOUND_ACTION | CHANNEL_DELIVERY_ACTION => {
+            "SELECT 1 FROM channel_outbound WHERE outbound_id = ?1"
+        }
         _ => return Err(StoreError::StateBindingMismatch(action.to_owned())),
     };
     let entities = {
@@ -3110,6 +4088,813 @@ fn verify_blob_binding(
         return Err(StoreError::StateBindingMismatch(entity_id.to_owned()));
     }
     Ok(())
+}
+
+fn channel_json(channel: ChannelKind) -> Result<String, StoreError> {
+    serde_json::to_string(&channel)
+        .map_err(|error| CryptoError::Serialization(error.to_string()).into())
+}
+
+fn channel_observation_entity(channel: ChannelKind, source_message_id: &str) -> String {
+    format!(
+        "channel-observation-{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "channel": channel,
+                "sourceMessageId": source_message_id,
+                "version": 1,
+            }))
+            .expect("channel observation identity is infallibly serializable")
+        )
+    )
+}
+
+fn channel_cursor_entity(channel: ChannelKind, conversation_id: &str) -> String {
+    format!(
+        "channel-cursor-{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "channel": channel,
+                "conversationId": conversation_id,
+                "version": 1,
+            }))
+            .expect("channel cursor identity is infallibly serializable")
+        )
+    )
+}
+
+fn load_channel_pairing(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    channel: ChannelKind,
+) -> Result<Option<ChannelPairing>, StoreError> {
+    let channel_json = channel_json(channel)?;
+    let row = connection
+        .query_row(
+            "SELECT encrypted_blob, paired_at_ms, blob_hash
+             FROM channel_pairing WHERE channel_json = ?1",
+            [&channel_json],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(blob, paired_at_ms, stored_hash)| {
+        let mismatch = || StoreError::ChannelStateMismatch(channel_json.clone());
+        if blob_hash(&blob) != stored_hash {
+            return Err(mismatch());
+        }
+        verify_blob_binding(
+            connection,
+            CHANNEL_PAIRING_ACTION,
+            &channel_json,
+            "channelPairing",
+            &blob,
+        )
+        .map_err(|_| mismatch())?;
+        let pairing: ChannelPairing = authority
+            .decrypt_json(&blob, channel_pairing_aad(&channel_json).as_bytes())
+            .map_err(|_| mismatch())?;
+        validate_pairing(&pairing).map_err(|_| mismatch())?;
+        if pairing.channel != channel || pairing.paired_at_ms != paired_at_ms {
+            return Err(mismatch());
+        }
+        Ok(pairing)
+    })
+    .transpose()
+}
+
+fn load_channel_cursor(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    channel: ChannelKind,
+    conversation_id: &str,
+) -> Result<Option<ChannelCursor>, StoreError> {
+    let channel_json = channel_json(channel)?;
+    let entity_id = channel_cursor_entity(channel, conversation_id);
+    let row = connection
+        .query_row(
+            "SELECT cursor_order, encrypted_blob, blob_hash, entity_id
+             FROM channel_cursor WHERE channel_json = ?1 AND conversation_id = ?2",
+            params![channel_json, conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(order, blob, stored_hash, stored_entity)| {
+        let mismatch = || StoreError::ChannelStateMismatch(entity_id.clone());
+        if order < 0 || stored_entity != entity_id || blob_hash(&blob) != stored_hash {
+            return Err(mismatch());
+        }
+        verify_blob_binding(
+            connection,
+            CHANNEL_CURSOR_ACTION,
+            &entity_id,
+            "channelCursor",
+            &blob,
+        )
+        .map_err(|_| mismatch())?;
+        let cursor: ChannelCursor = authority
+            .decrypt_json(&blob, channel_cursor_aad(&entity_id).as_bytes())
+            .map_err(|_| mismatch())?;
+        validate_cursor(&cursor).map_err(|_| mismatch())?;
+        if cursor.channel != channel
+            || cursor.conversation_id != conversation_id
+            || cursor.order != u64::try_from(order).map_err(|_| mismatch())?
+        {
+            return Err(mismatch());
+        }
+        Ok(cursor)
+    })
+    .transpose()
+}
+
+fn load_channel_observation(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    channel: ChannelKind,
+    source_message_id: &str,
+) -> Result<Option<StoredChannelObservation>, StoreError> {
+    let channel_json = channel_json(channel)?;
+    let entity_id = channel_observation_entity(channel, source_message_id);
+    let row = connection
+        .query_row(
+            "SELECT conversation_id, cursor_order, decision_json, encrypted_blob,
+                    blob_hash, entity_id
+             FROM channel_observation
+             WHERE channel_json = ?1 AND source_message_id = ?2",
+            params![channel_json, source_message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(conversation, cursor_order, decision_json, blob, stored_hash, stored_entity)| {
+            let mismatch = || StoreError::ChannelStateMismatch(entity_id.clone());
+            if cursor_order < 0 || stored_entity != entity_id || blob_hash(&blob) != stored_hash {
+                return Err(mismatch());
+            }
+            verify_blob_binding(
+                connection,
+                CHANNEL_OBSERVATION_ACTION,
+                &entity_id,
+                "channelObservation",
+                &blob,
+            )
+            .map_err(|_| mismatch())?;
+            let stored: StoredChannelObservation = authority
+                .decrypt_json(&blob, channel_observation_aad(&entity_id).as_bytes())
+                .map_err(|_| mismatch())?;
+            validate_observation(&stored.observation).map_err(|_| mismatch())?;
+            let encoded_decision =
+                serde_json::to_string(&stored.decision).map_err(|_| mismatch())?;
+            let accepted_content_is_valid = if stored.decision == ChannelInboundDecision::Accepted {
+                stored.accepted_content.as_ref().is_some_and(|content| {
+                    !content.is_empty()
+                        && content.trim() == content
+                        && content.len() <= MAX_CHANNEL_CONTENT_BYTES
+                        && !content.as_bytes().contains(&0)
+                        && format!("{:x}", Sha256::digest(content.as_bytes()))
+                            == stored.observation.envelope.content_sha256
+                })
+            } else {
+                stored.accepted_content.is_none()
+            };
+            if stored.observation.envelope.channel != channel
+                || stored.observation.envelope.source_message_id != source_message_id
+                || stored.observation.envelope.conversation_id != conversation
+                || stored.observation.cursor.order
+                    != u64::try_from(cursor_order).map_err(|_| mismatch())?
+                || encoded_decision != decision_json
+                || !accepted_content_is_valid
+            {
+                return Err(mismatch());
+            }
+            Ok(stored)
+        },
+    )
+    .transpose()
+}
+
+fn write_channel_observation(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    observation: &ChannelObservation,
+    decision: ChannelInboundDecision,
+    content: &str,
+) -> Result<(), StoreError> {
+    let channel = channel_json(observation.envelope.channel)?;
+    let entity_id = channel_observation_entity(
+        observation.envelope.channel,
+        &observation.envelope.source_message_id,
+    );
+    let stored = StoredChannelObservation {
+        observation: observation.clone(),
+        decision,
+        accepted_content: (decision == ChannelInboundDecision::Accepted)
+            .then(|| content.to_owned()),
+    };
+    let blob = authority.encrypt_json(&stored, channel_observation_aad(&entity_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    let decision_json = serde_json::to_string(&decision)
+        .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{entity_id}:observed"),
+            command_id: &entity_id,
+            command_hash: &state_hash,
+            actor: &observation.envelope.sender_id,
+            action: CHANNEL_OBSERVATION_ACTION,
+            entity_id: &entity_id,
+            created_at_ms: observation.envelope.received_at_ms,
+            state_kind: "channelObservation",
+            state_hash: &state_hash,
+        },
+    )?;
+    let cursor_order = i64::try_from(observation.cursor.order)
+        .map_err(|_| StoreError::ChannelObservationConflict)?;
+    transaction.execute(
+        "INSERT INTO channel_observation
+            (channel_json, source_message_id, entity_id, conversation_id,
+             cursor_order, decision_json, encrypted_blob, blob_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            channel,
+            observation.envelope.source_message_id,
+            entity_id,
+            observation.envelope.conversation_id,
+            cursor_order,
+            decision_json,
+            blob,
+            state_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_channel_cursor(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    cursor: &ChannelCursor,
+) -> Result<(), StoreError> {
+    let channel = channel_json(cursor.channel)?;
+    let entity_id = channel_cursor_entity(cursor.channel, &cursor.conversation_id);
+    let blob = authority.encrypt_json(cursor, channel_cursor_aad(&entity_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{entity_id}:{}", cursor.order),
+            command_id: &format!("{entity_id}-{}", cursor.order),
+            command_hash: &state_hash,
+            actor: "channel-adapter",
+            action: CHANNEL_CURSOR_ACTION,
+            entity_id: &entity_id,
+            created_at_ms: cursor.observed_at_ms,
+            state_kind: "channelCursor",
+            state_hash: &state_hash,
+        },
+    )?;
+    let cursor_order =
+        i64::try_from(cursor.order).map_err(|_| StoreError::ChannelObservationConflict)?;
+    transaction.execute(
+        "INSERT INTO channel_cursor
+            (channel_json, conversation_id, entity_id, cursor_order, encrypted_blob, blob_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(channel_json, conversation_id) DO UPDATE SET
+            entity_id = excluded.entity_id,
+            cursor_order = excluded.cursor_order,
+            encrypted_blob = excluded.encrypted_blob,
+            blob_hash = excluded.blob_hash",
+        params![
+            channel,
+            cursor.conversation_id,
+            entity_id,
+            cursor_order,
+            blob,
+            state_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_channel_model_dispatch(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    channel: ChannelKind,
+    source_message_id: &str,
+) -> Result<Option<StoredChannelModelDispatch>, StoreError> {
+    let encoded_channel = channel_json(channel)?;
+    let entity_id = channel_observation_entity(channel, source_message_id);
+    let row = connection
+        .query_row(
+            "SELECT entity_id, status_json, suggestion_id, encrypted_blob, blob_hash
+             FROM channel_model_dispatch
+             WHERE channel_json = ?1 AND source_message_id = ?2",
+            params![encoded_channel, source_message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(stored_entity, status, suggestion_id, blob, stored_hash)| {
+            let mismatch = || StoreError::ChannelStateMismatch(entity_id.clone());
+            if stored_entity != entity_id || blob_hash(&blob) != stored_hash {
+                return Err(mismatch());
+            }
+            let (action, state_kind, state) = match status.as_str() {
+                "queued" if suggestion_id.is_none() => (
+                    CHANNEL_MODEL_QUEUED_ACTION,
+                    "channelModelQueued",
+                    StoredChannelModelState::Queued,
+                ),
+                "started" if suggestion_id.is_none() => (
+                    CHANNEL_MODEL_ACTION,
+                    "channelModelStarted",
+                    StoredChannelModelState::Started,
+                ),
+                "ready" if suggestion_id.is_some() => (
+                    CHANNEL_SUGGESTION_ACTION,
+                    "channelSuggestionReady",
+                    StoredChannelModelState::Ready,
+                ),
+                _ => return Err(mismatch()),
+            };
+            verify_blob_binding(connection, action, &entity_id, state_kind, &blob)
+                .map_err(|_| mismatch())?;
+            let stored: StoredChannelModelDispatch = authority
+                .decrypt_json(&blob, channel_model_aad(&entity_id).as_bytes())
+                .map_err(|_| mismatch())?;
+            if stored.channel != channel
+                || stored.source_message_id != source_message_id
+                || stored.state != state
+                || stored.suggestion.as_ref().map(|value| &value.id) != suggestion_id.as_ref()
+                || stored
+                    .suggestion
+                    .as_ref()
+                    .is_some_and(|value| !valid_channel_suggestion(value))
+            {
+                return Err(mismatch());
+            }
+            Ok(stored)
+        },
+    )
+    .transpose()
+}
+
+fn write_channel_model_dispatch(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    stored: &StoredChannelModelDispatch,
+    observed_at_ms: i64,
+) -> Result<(), StoreError> {
+    if stored.state != StoredChannelModelState::Queued || stored.suggestion.is_some() {
+        return Err(StoreError::ChannelObservationConflict);
+    }
+    let entity_id = channel_observation_entity(stored.channel, &stored.source_message_id);
+    let blob = authority.encrypt_json(stored, channel_model_aad(&entity_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{entity_id}:model-queued"),
+            command_id: &format!("{entity_id}-model-queued"),
+            command_hash: &state_hash,
+            actor: "channel-adapter",
+            action: CHANNEL_MODEL_QUEUED_ACTION,
+            entity_id: &entity_id,
+            created_at_ms: observed_at_ms,
+            state_kind: "channelModelQueued",
+            state_hash: &state_hash,
+        },
+    )?;
+    transaction.execute(
+        "INSERT INTO channel_model_dispatch
+            (entity_id, channel_json, source_message_id, status_json,
+             suggestion_id, encrypted_blob, blob_hash)
+         VALUES (?1, ?2, ?3, 'queued', NULL, ?4, ?5)",
+        params![
+            entity_id,
+            channel_json(stored.channel)?,
+            stored.source_message_id,
+            blob,
+            state_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_channel_model_started(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    stored: &StoredChannelModelDispatch,
+    observed_at_ms: i64,
+) -> Result<(), StoreError> {
+    if stored.state != StoredChannelModelState::Started || stored.suggestion.is_some() {
+        return Err(StoreError::ChannelObservationConflict);
+    }
+    let entity_id = channel_observation_entity(stored.channel, &stored.source_message_id);
+    let blob = authority.encrypt_json(stored, channel_model_aad(&entity_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{entity_id}:model-started"),
+            command_id: &format!("{entity_id}-model-started"),
+            command_hash: &state_hash,
+            actor: "channel-adapter",
+            action: CHANNEL_MODEL_ACTION,
+            entity_id: &entity_id,
+            created_at_ms: observed_at_ms,
+            state_kind: "channelModelStarted",
+            state_hash: &state_hash,
+        },
+    )?;
+    if transaction.execute(
+        "UPDATE channel_model_dispatch
+         SET status_json = 'started', encrypted_blob = ?1, blob_hash = ?2
+         WHERE entity_id = ?3 AND status_json = 'queued' AND suggestion_id IS NULL",
+        params![blob, state_hash, entity_id],
+    )? != 1
+    {
+        return Err(StoreError::ChannelObservationConflict);
+    }
+    Ok(())
+}
+
+fn update_channel_model_suggestion(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    stored: &StoredChannelModelDispatch,
+    observed_at_ms: i64,
+) -> Result<(), StoreError> {
+    let suggestion = stored
+        .suggestion
+        .as_ref()
+        .ok_or(StoreError::ChannelObservationConflict)?;
+    if stored.state != StoredChannelModelState::Ready {
+        return Err(StoreError::ChannelObservationConflict);
+    }
+    let entity_id = channel_observation_entity(stored.channel, &stored.source_message_id);
+    let blob = authority.encrypt_json(stored, channel_model_aad(&entity_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{entity_id}:suggestion-ready"),
+            command_id: &format!("{entity_id}-suggestion-ready"),
+            command_hash: &state_hash,
+            actor: "openopen-local-owner",
+            action: CHANNEL_SUGGESTION_ACTION,
+            entity_id: &entity_id,
+            created_at_ms: observed_at_ms,
+            state_kind: "channelSuggestionReady",
+            state_hash: &state_hash,
+        },
+    )?;
+    if transaction.execute(
+        "UPDATE channel_model_dispatch
+         SET status_json = 'ready', suggestion_id = ?1,
+             encrypted_blob = ?2, blob_hash = ?3
+         WHERE entity_id = ?4 AND status_json = 'started' AND suggestion_id IS NULL",
+        params![suggestion.id, blob, state_hash, entity_id],
+    )? != 1
+    {
+        return Err(StoreError::ChannelObservationConflict);
+    }
+    Ok(())
+}
+
+fn valid_channel_suggestion(suggestion: &OutcomeSuggestion) -> bool {
+    !suggestion.id.is_empty()
+        && suggestion.id.len() <= 256
+        && !suggestion.title.trim().is_empty()
+        && suggestion.title.trim() == suggestion.title
+        && suggestion.title.len() <= 1_024
+        && !suggestion.why_now.trim().is_empty()
+        && suggestion.why_now.trim() == suggestion.why_now
+        && suggestion.why_now.len() <= 4_096
+        && !suggestion.proposed_steps.is_empty()
+        && suggestion.proposed_steps.len() <= 16
+        && suggestion
+            .proposed_steps
+            .iter()
+            .all(|step| !step.trim().is_empty() && step.trim() == step && step.len() <= 1_024)
+        && suggestion.source_refs.len() <= 32
+        && suggestion
+            .source_refs
+            .iter()
+            .all(|value| !value.trim().is_empty() && value.trim() == value && value.len() <= 2_048)
+}
+
+fn write_channel_origin(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    origin: &ChannelMissionOrigin,
+    actor: &str,
+) -> Result<(), StoreError> {
+    validate_origin(origin)?;
+    if load_channel_origin(transaction, authority, &origin.mission_id)?.is_some() {
+        return Err(StoreError::ChannelOriginConflict);
+    }
+    let blob = authority.encrypt_json(origin, channel_origin_aad(&origin.mission_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("channel:{}:origin", origin.mission_id),
+            command_id: &format!("channel-origin-{}", origin.mission_id),
+            command_hash: &state_hash,
+            actor,
+            action: CHANNEL_ORIGIN_ACTION,
+            entity_id: &origin.mission_id,
+            created_at_ms: origin.bound_at_ms,
+            state_kind: "channelMissionOrigin",
+            state_hash: &state_hash,
+        },
+    )?;
+    transaction.execute(
+        "INSERT INTO channel_mission_origin
+            (mission_id, channel_json, conversation_id, source_message_id,
+             encrypted_blob, blob_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            origin.mission_id,
+            channel_json(origin.channel)?,
+            origin.conversation_id,
+            origin.source_message_id,
+            blob,
+            state_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_channel_origin(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    mission_id: &str,
+) -> Result<Option<ChannelMissionOrigin>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT channel_json, conversation_id, source_message_id,
+                    encrypted_blob, blob_hash
+             FROM channel_mission_origin WHERE mission_id = ?1",
+            [mission_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(channel, conversation, source_message, blob, stored_hash)| {
+            let mismatch = || StoreError::ChannelStateMismatch(mission_id.to_owned());
+            if blob_hash(&blob) != stored_hash {
+                return Err(mismatch());
+            }
+            verify_blob_binding(
+                connection,
+                CHANNEL_ORIGIN_ACTION,
+                mission_id,
+                "channelMissionOrigin",
+                &blob,
+            )
+            .map_err(|_| mismatch())?;
+            let origin: ChannelMissionOrigin = authority
+                .decrypt_json(&blob, channel_origin_aad(mission_id).as_bytes())
+                .map_err(|_| mismatch())?;
+            validate_origin(&origin).map_err(|_| mismatch())?;
+            if origin.mission_id != mission_id
+                || channel_json(origin.channel).map_err(|_| mismatch())? != channel
+                || origin.conversation_id != conversation
+                || origin.source_message_id != source_message
+            {
+                return Err(mismatch());
+            }
+            Ok(origin)
+        },
+    )
+    .transpose()
+}
+
+fn load_channel_outbound(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    outbound_id: &str,
+) -> Result<Option<StoredChannelOutbound>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT mission_id, channel_json, conversation_id, content_sha256,
+                    status_json, provider_message_id, encrypted_blob, blob_hash
+             FROM channel_outbound WHERE outbound_id = ?1",
+            [outbound_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(mission, channel, conversation, content_hash, status, provider, blob, stored_hash)| {
+            let mismatch = || StoreError::ChannelStateMismatch(outbound_id.to_owned());
+            if blob_hash(&blob) != stored_hash {
+                return Err(mismatch());
+            }
+            let (action, state_kind) = match status.as_str() {
+                "started" if provider.is_none() => {
+                    (CHANNEL_OUTBOUND_ACTION, "channelOutboundStarted")
+                }
+                "delivered" if provider.is_some() => {
+                    (CHANNEL_DELIVERY_ACTION, "channelOutboundDelivered")
+                }
+                _ => return Err(mismatch()),
+            };
+            verify_blob_binding(connection, action, outbound_id, state_kind, &blob)
+                .map_err(|_| mismatch())?;
+            let stored: StoredChannelOutbound = authority
+                .decrypt_json(&blob, channel_outbound_aad(outbound_id).as_bytes())
+                .map_err(|_| mismatch())?;
+            validate_outbound(&stored.intent).map_err(|_| mismatch())?;
+            if let Some(delivery) = &stored.delivery {
+                validate_delivery(delivery).map_err(|_| mismatch())?;
+            }
+            if stored.intent.outbound_id != outbound_id
+                || stored.intent.mission_id != mission
+                || channel_json(stored.intent.channel).map_err(|_| mismatch())? != channel
+                || stored.intent.conversation_id != conversation
+                || stored.intent.content_sha256 != content_hash
+                || stored
+                    .delivery
+                    .as_ref()
+                    .map(|value| &value.provider_message_id)
+                    != provider.as_ref()
+                || (stored.delivery.is_some()) != (status == "delivered")
+            {
+                return Err(mismatch());
+            }
+            Ok(stored)
+        },
+    )
+    .transpose()
+}
+
+fn write_channel_outbound(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    stored: &StoredChannelOutbound,
+) -> Result<(), StoreError> {
+    let intent = &stored.intent;
+    let blob =
+        authority.encrypt_json(stored, channel_outbound_aad(&intent.outbound_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("channel:{}:started", intent.outbound_id),
+            command_id: &intent.outbound_id,
+            command_hash: &state_hash,
+            actor: &intent.recipient_id,
+            action: CHANNEL_OUTBOUND_ACTION,
+            entity_id: &intent.outbound_id,
+            created_at_ms: intent.created_at_ms,
+            state_kind: "channelOutboundStarted",
+            state_hash: &state_hash,
+        },
+    )?;
+    transaction.execute(
+        "INSERT INTO channel_outbound
+            (outbound_id, mission_id, channel_json, conversation_id, content_sha256,
+             status_json, provider_message_id, encrypted_blob, blob_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'started', NULL, ?6, ?7)",
+        params![
+            intent.outbound_id,
+            intent.mission_id,
+            channel_json(intent.channel)?,
+            intent.conversation_id,
+            intent.content_sha256,
+            blob,
+            state_hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_channel_outbound_delivery(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    stored: &StoredChannelOutbound,
+) -> Result<(), StoreError> {
+    let delivery = stored
+        .delivery
+        .as_ref()
+        .ok_or(StoreError::ChannelOutboundConflict)?;
+    let blob = authority.encrypt_json(
+        stored,
+        channel_outbound_aad(&stored.intent.outbound_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("channel:{}:delivered", stored.intent.outbound_id),
+            command_id: &stored.intent.outbound_id,
+            command_hash: &state_hash,
+            actor: "channel-adapter",
+            action: CHANNEL_DELIVERY_ACTION,
+            entity_id: &stored.intent.outbound_id,
+            created_at_ms: delivery.delivered_at_ms,
+            state_kind: "channelOutboundDelivered",
+            state_hash: &state_hash,
+        },
+    )?;
+    if transaction.execute(
+        "UPDATE channel_outbound
+         SET status_json = 'delivered', provider_message_id = ?1,
+             encrypted_blob = ?2, blob_hash = ?3
+         WHERE outbound_id = ?4 AND status_json = 'started' AND provider_message_id IS NULL",
+        params![
+            delivery.provider_message_id,
+            blob,
+            state_hash,
+            stored.intent.outbound_id,
+        ],
+    )? != 1
+    {
+        return Err(StoreError::ChannelOutboundConflict);
+    }
+    Ok(())
+}
+
+fn channel_pairing_aad(channel_json: &str) -> String {
+    format!("openopen:channel-pairing:v1:{channel_json}")
+}
+
+fn channel_observation_aad(entity_id: &str) -> String {
+    format!("openopen:channel-observation:v1:{entity_id}")
+}
+
+fn channel_cursor_aad(entity_id: &str) -> String {
+    format!("openopen:channel-cursor:v1:{entity_id}")
+}
+
+fn channel_model_aad(entity_id: &str) -> String {
+    format!("openopen:channel-model:v1:{entity_id}")
+}
+
+fn channel_origin_aad(mission_id: &str) -> String {
+    format!("openopen:channel-origin:v1:{mission_id}")
+}
+
+fn channel_outbound_aad(outbound_id: &str) -> String {
+    format!("openopen:channel-outbound:v1:{outbound_id}")
 }
 
 fn mission_aad(mission_id: &str) -> String {

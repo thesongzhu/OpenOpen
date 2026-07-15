@@ -7,9 +7,9 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Product-shell commit `e2313fe…` passes 134 ordinary Rust tests, release build, strict Clippy, fmt, and the explicit pinned-runtime sandbox diagnostic twice locally. Two fresh Repair20 reviewers PASS fingerprint `29a00413…`. PR #2 Actions run `29386477267` passes the full strict suite on synthesized merge `487dae1…`, whose tree `2cae9eb…` equals the head tree; this is integration-tree plumbing, not exact-head or release proof |
-| SwiftUI build and tests | Current-SHA build/test log | Product-shell commit `e2313fe…` passes 40 broker/signing tests plus 27 App tests, warnings-as-errors debug/release build, strict format, both plists, staging syntax, and diff checks locally and in PR #2 run `29386477267`. Exclusive `/private/tmp/OpenOpen-Stage-Repair20.app` passes deep strict ad-hoc verification with exact identifiers and pinned Codex identity/four hashes. Signed/admin and cross-UID runtime proof remain pending |
-| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; local outer-sandbox initialize plus account/read diagnostic passes. Two reviewers and product-shell PR CI pass at the stated tiers. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
+| Rust domain and security tests | Current-SHA test log | Local Friday-alpha Repair3 tree based on pushed Hero A commit `774789c…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test, release build, workspace strict Clippy, fmt, focused Host/imsg regressions, five pinned upstream imsg tests, and two explicit pinned-runtime sandbox diagnostics. Two fresh Repair3 reviewers and current pushed-SHA CI remain pending; this is not provider or release proof |
+| SwiftUI build and tests | Current-SHA build/test log | Local Friday-alpha Repair3 tree passes 40 broker/signing tests plus 53 App tests, warnings-as-errors debug/release build, strict format, both plists, script syntax, and diff checks. New tests cover product chat selection plus activation and prepare-response-loss cleanup/retry. Corrected-provenance `/private/tmp/OpenOpen-FridayAlpha-Repair3-Final2.app` and DMG pass deep ad-hoc and read-only mount/copy/signature install verification at DMG SHA `bff4d18b…`; Team is `not set`, so signed/admin and cross-UID release proof remain pending |
+| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the Repair3 tree. Hero A PR #2 CI remains historical integration-tree plumbing. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
 | Discord bidirectional route | Signed-build bot/channel message IDs | pending |
@@ -19,7 +19,7 @@ different commit/build.
 | Stress suite | Nonzero all-pass scenario artifact | pending |
 | Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | pending |
 | Three external users | Consent-safe aggregate and 48-hour reuse | pending |
-| Two isolated reviewers | PASS reports for release SHA | pending |
+| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Repair3 replacement reviewers PASS local fingerprint `3e201547…` with zero P0/P1/P2. Exact commit SHA, current CI, provider proof, and final release-SHA review remain pending |
 
 ## Review history
 
@@ -825,3 +825,196 @@ different commit/build.
   commit/push and current Actions remain pending. No real ChatGPT output, user
   Reminders mutation/readback, signed/admin, cross-UID, notarization, clean
   install, product E2E, external-user, or release proof is claimed.
+- 2026-07-14 Hero A Stage 6/7: reviewed commit
+  `774789ca4a5eeadb8fa57688e79f823dec4da65b` is pushed to
+  `agent/product-shell` and draft PR #2. Current Actions run `29393462659`
+  passes all strict Rust/Swift test, release, lint, format, plist, script, and
+  clean-diff steps. The pull-request run used synthesized merge
+  `bccdf360d8ad1b97b56eaf4e9603007bd0584a01`; its tree
+  `e8f3605e0644e23d6f2cd5f6557b2ca6d917077c` equals the exact head tree.
+  This is integration-tree plumbing evidence, not real ChatGPT/Reminders,
+  exact-head, signed/admin, cross-UID, notarized, clean-install, product-E2E,
+  external-user, or release proof. PR #2 remains draft and unmerged.
+- 2026-07-14 owner decision: the accelerated intermediate milestone is named
+  `FRIDAY_ALPHA_READY` and targets July 16–17, 2026
+  `America/Los_Angeles`. It requires the reviewed Hero A loop plus real
+  bidirectional iMessage and Discord entry/readback for that same bounded
+  Mission; allowlisting/pairing, durable dedupe/cursor recovery, restart without
+  duplicate send, and global Off listener/model/outbound shutdown are
+  mandatory. A sent message is never completion Evidence. Hero B and Hero C
+  move after this milestone but remain in the final plan. Two similar
+  Evidence-complete Hero A successes may then propose one Workflow Candidate,
+  but that slice must not delay the first installable alpha.
+- 2026-07-14 alpha provenance verification: `openclaw/imsg` annotated v0.13.0
+  tag object `1677a9fe…` dereferences to exact commit `fa2f82d…`; its MIT text
+  names copyright 2026 Peter Steinberger. `serenity-rs/serenity` v0.12.5
+  resolves to exact commit `1809beb…`; its manifest and license declare ISC,
+  copyright 2016 Serenity Contributors. Friday Discord adapter contract/test
+  semantics remain pinned to MIT commit `4870f31…`; no Friday TypeScript/Node
+  runtime is imported.
+- 2026-07-15 Friday implementation checkpoint: shared channel records and the
+  encrypted Store now own exact pairing, message-ID/cursor dedupe, once-only
+  model/outbound start, Mission origin, delivery reconciliation, and Off
+  behavior. The imsg adapter uses one child and a tracked exact-commit patch
+  reducing CLI/RPC/send to the approved surface; `Package.resolved` locks its
+  three Swift dependencies and the build receipt binds the produced artifact.
+  The Discord adapter uses the exact serenity Git commit and official bot
+  Gateway/HTTP only; Swift stores the token in a device-only Keychain item.
+  Complete current-tree verification passes 175 Rust tests with one explicit
+  environment-gated pinned-runtime test plus 40 broker/signing and 47 App Swift
+  tests, release builds, strict Clippy/warnings/format, plist/script/diff, and
+  two pinned imsg boundary tests. `/private/tmp/OpenOpen-FridayAlpha-Final.app`
+  completes receipt validation, nested imsg ad-hoc signing, and deep
+  verification with `STAGED_AD_HOC_NOT_RELEASE_PROOF`. Its ad-hoc, unnotarized
+  DMG passes read-only mount, isolated copy, and signature verification with
+  SHA-256 `0f9b7fd3ca54c27138c52fe42a0cb31a3a4a13260d0d945a954d608cab39bd15`.
+  This is local implementation/package evidence only. Two fresh reviewers and
+  real GPT-5.6/Reminders/iMessage/Discord message IDs remain pending;
+  `FRIDAY_ALPHA_READY` is not claimed.
+- 2026-07-15 first Friday-alpha closure review: functional and governance
+  reviewers both FAIL unchanged fingerprint
+  `136a42ba505d270f8d8ca3f26b99990d340deb0d8a48e3872cf9573f14df0d69`.
+  The accepted observation/cursor could commit before model work was durably
+  enqueued; Need-you and Receipt return kinds were unreachable; Discord still
+  required manual owner/channel/bot IDs and lacked the approved official
+  install, intent, permission, and attachment probe; imsg runtime validation
+  followed symlinks and bound only the pre-sign hash; private IMCore/SIP/bridge
+  sources still compiled into the Mach-O; the Connections status text was
+  literal/stale; a public Store method could bind an existing Mission to an
+  accepted message outside channel-origin genesis; and the DMG notices were
+  incomplete. Both reviewers independently reran the complete 175-Rust and
+  87-Swift suite and preserved the fingerprint, so the green suite does not
+  close the findings. A subsequent read-only packaging audit also proves the
+  staged imsg references a `PhoneNumberKit_PhoneNumberKit.bundle` under a
+  deleted temporary build root while the App/DMG contains no such bundle.
+  Therefore DMG `0f9b7fd3…` is retained only as historical ad-hoc mount/copy/
+  signature evidence, not as a runnable alpha candidate. Repair attempt 1 is
+  in progress; no Friday gate, push, provider proof, or release proof is
+  claimed.
+- 2026-07-15 Friday-alpha Repair1 local candidate closes the reported routes.
+  Accepted inbound content, its cursor, and a durable queued model dispatch now
+  share one Store transaction; restart claims only the oldest queued item.
+  Channel-origin Mission binding exists only in atomic `CreateMission` genesis.
+  Exact current Need-you and Evidence-backed Receipt payloads use typed
+  outbound authorization/readback, while UI connection status is separate from
+  poll event status. Discord now uses a token-derived official three-step bot
+  wizard, exact permission bits `101376`, a random 128-bit pairing code, live
+  intent/permission/history probes, explicit candidate confirmation, and
+  persisted bot/application/guild/source identity. iMessage compiles only a
+  positive source whitelist, carries the locked PhoneNumberKit resource tree,
+  and uses prepare → running Mach-identity validation → activate so no RPC
+  request bytes precede the signed-child check. The deterministic notice
+  payload covers 190 OpenOpen and 924 Codex dependency identities through 597
+  content-addressed texts. Current local verification passes 186 Rust tests
+  with one explicit environment-gated Codex runtime test, plus 40 broker/signing
+  and 49 App Swift tests. Fresh
+  `/private/tmp/OpenOpen-FridayAlpha-Repair1-Final.app` contains exactly four Codex
+  runtime files, the complete three-file imsg runtime, signed-runtime receipt
+  (`binarySha256=72242c5c…`, resource tree `7a5cb869…`), all notice texts, and
+  passes deep ad-hoc staging plus a real staged basic-RPC resource probe. Its
+  ad-hoc, unnotarized DMG passes read-only mount/copy/signature install testing
+  at SHA-256 `04f02c846f481b8a5604c260f600920f3e0b7660ab6829c45b77f356352f9091`.
+  It is
+  labeled `STAGED_AD_HOC_NOT_RELEASE_PROOF`; its Team is intentionally `not
+  set`, so it is not a Developer-ID runnable alpha or release artifact. Two
+  entirely fresh replacement reviewers remain pending, followed by real
+  GPT/Reminders/iMessage/Discord proof. No push or
+  `FRIDAY_ALPHA_READY` claim has occurred.
+- 2026-07-15 Friday-alpha Repair1 replacement review: two entirely fresh
+  isolated reviewers FAIL unchanged fingerprint
+  `10160bb13293036008479241224cc2f34c842bd5433c5c44468346ef4ca7d01d`.
+  Functional review proves the Host passed already-prefixed approved iMessage
+  wire bytes into an adapter that accepts only unprefixed content, so every
+  live iMessage send failed before RPC; it also proves the patched basic send
+  result returned no real GUID for durable `Sent`. Governance review proves a
+  failed iMessage activation/proof or repeated Discord setup could retain a
+  prepared session and wedge retry. The ledger also prematurely said two
+  reviewers had completed. Both reports preserve the fingerprint. Repair1 is
+  superseded; no prior local green result or ad-hoc package closes these routes.
+- 2026-07-15 Friday-alpha Repair2 preserves the exact Store-approved final
+  `OpenOpen · AI` wire body while the Host strips exactly one authorized prefix
+  before the adapter reconstructs it. The pinned basic sender records the
+  pre-send database high-water, sends once, and returns only a unique exact
+  same-chat/text local row's real GUID; zero or ambiguous results remain
+  uncertain. Restart scans are bounded, read-only, and never resend. Swift now
+  stops a prepared iMessage child after activation/proof failure and stops any
+  prior Discord setup before a new setup attempt. The tracked patch applies
+  cleanly with the 449-line server and 88-line test additions; four upstream
+  OpenOpen tests pass. Full local verification passes 187 ordinary Rust tests
+  with one explicitly environment-gated Codex runtime test, plus 40 broker/
+  signing and 51 App Swift tests, release builds, strict Clippy/warnings/
+  format, plist/script/notices/diff checks, and the fresh pinned imsg build.
+  During the first heavily parallel full run, one old Host cancellation timing
+  assertion failed once; it then passed 20/20 isolated repetitions and the
+  complete exact suite rerun. Fresh
+  `/private/tmp/OpenOpen-FridayAlpha-Repair2-Final.app` contains four Codex
+  runtime files, 597 notice texts, build receipt SHA-256 `9d867a84…`, resource
+  tree `7a5cb869…`, and signed imsg SHA-256 `0d109cbe…`; staged basic RPC and
+  deep ad-hoc verification pass. Its ad-hoc, unnotarized DMG passes read-only
+  mount/copy/signature install testing at SHA-256
+  `15c1429b0b05564b890d5766cd9e1df2aa6d291b5248cc252a11bb7ee2dc02ec`.
+  It remains `STAGED_AD_HOC_NOT_RELEASE_PROOF`, Team `not set`, not a
+  Developer-ID runnable alpha or release artifact. Two entirely fresh
+  replacement reviewers, real GPT/Reminders/iMessage/Discord traffic, signing,
+  and notarization remain pending; no push or `FRIDAY_ALPHA_READY` claim has
+  occurred.
+- 2026-07-15 Friday-alpha Repair2 replacement review: both entirely fresh
+  isolated reviewers FAIL unchanged fingerprint
+  `1a983c72ad9f70e7cd321c9782e4e127e42e006ba190daec5f76947831064494`.
+  Functional review proves a prior Mission's same-text GUID can be selected by
+  the restart history scan and incorrectly persisted as the current outbound's
+  delivery. Governance review proves prepare response loss can retain the
+  child and wedge retry, the product lacks a usable `chats.list` selection
+  route, and this ledger's top summary was stale. Both rerun the complete
+  187-Rust/91-Swift suite and preserve the tree. Repair2 is superseded; its
+  green suite and ad-hoc DMG are not closure proof.
+- 2026-07-15 Friday-alpha Repair3 closes only those approved blockers. Every
+  iMessage history recovery outcome remains `Uncertain`; only the exact
+  synchronous send RPC may bind a provider GUID, after a send-once complete
+  two-second candidate observation. Separate discovery prepare/list RPCs each
+  require a fresh proof; no request bytes precede exact running Mach identity
+  validation, and success, failure, stop, or Off clears the discovery child.
+  Only bounded exact-iMessage chats enter the Swift conversation/participant
+  pickers. App connection attempts pre-stop old state and all prepare failures
+  best-effort stop, including committed-prepare response loss. Fresh pinned v4
+  imsg tests pass 5/5 with binary SHA `635c9981…`, build receipt `c1769b40…`,
+  and resource tree `7a5cb869…`. The full local tree passes 190 ordinary Rust
+  tests plus one environment-gated test, 40 broker/signing plus 53 App Swift
+  tests, release/strict lint/format/plist/script/diff checks, two pinned Codex
+  diagnostics, and an independent notices check of 190 OpenOpen/924 Codex/
+  1888 documents/597 texts. Fresh
+  `/private/tmp/OpenOpen-FridayAlpha-Repair3-Final2.app` passes deep ad-hoc
+  verification and staged RPC with signed imsg SHA `04736f58…`, build receipt
+  `c1769b40…`, runtime receipt `de512e7b…`, resource tree `7a5cb869…`, and Team
+  `not set`. Its ad-hoc, unnotarized DMG passes read-only mount/copy/signature
+  install verification at SHA-256
+  `bff4d18b49e5fa6c01ec365fc3b2676dcb155733be4b6493870e203f21df099d`.
+  Two entirely fresh replacement reviewers remain pending. No push, provider,
+  Developer-ID, notarization, release, or `FRIDAY_ALPHA_READY` proof is
+  claimed.
+- 2026-07-15 first Repair3 closure review: fresh functional Reviewer PASS and
+  fresh governance Reviewer FAIL unchanged fingerprint
+  `11d34c594ec1f1f2988d763a25a76244f477cc854254b390d20db5b88290499a`.
+  Functional reports zero P0/P1/P2 after full Rust, focused Swift, patch,
+  notices, and package checks. Governance reports one P2 only: the Discord
+  provenance paragraph still described historical Repair2 187-Rust/91-Swift
+  evidence as “current,” contradicting the Repair3 190-Rust/93-Swift top
+  ledger. Its full Swift/focused Rust/static/package/remote checks find no
+  product or security blocker. The evidence-only fix now labels Repair2
+  historical and Repair3 current; Final2 embeds the corrected provenance and
+  passes the same ad-hoc package checks. Two entirely fresh replacement
+  reviewers remain required; no push or provider/release claim follows from
+  the first functional PASS.
+- 2026-07-15 Repair3 evidence-fix replacement review: two entirely fresh
+  isolated reviewers PASS unchanged fingerprint
+  `3e2015475d98b74d88a3de4c36e3a1aa4e8bcd1659a3356c5f36f7bd68103ae3`
+  with zero P0/P1/P2. Functional review confirms only evidence wording and
+  derived package signatures changed, while history-never-Sent, send-once
+  full-window observation, two-proof discovery cleanup, and UI selection remain
+  intact; focused Host/imsg/Swift and pinned upstream tests pass. Governance
+  confirms the prior current/historical contradiction is closed across
+  provenance, master plan, Build Week, and ledger; Final2 embeds byte-identical
+  provenance; ad-hoc/Team-not-set and remote/CI/provider gates remain honest.
+  This closes local Friday-alpha Repair3 Stage 5 only. Exact commit/push,
+  current-SHA CI, real provider evidence, signing/notarization, and the final
+  product gates remain pending.

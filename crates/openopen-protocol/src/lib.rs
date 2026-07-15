@@ -182,7 +182,7 @@ pub enum ChannelKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChannelEnvelope {
     pub channel: ChannelKind,
     pub source_message_id: String,
@@ -190,6 +190,150 @@ pub struct ChannelEnvelope {
     pub conversation_id: String,
     pub content_sha256: String,
     pub received_at_ms: i64,
+}
+
+/// One owner-confirmed channel boundary. V1 deliberately permits exactly one
+/// owner and one conversation per channel kind.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelPairing {
+    pub channel: ChannelKind,
+    pub owner_sender_id: String,
+    pub conversation_id: String,
+    pub require_explicit_address: bool,
+    pub discord: Option<DiscordPairingMetadata>,
+    pub paired_at_ms: i64,
+}
+
+/// Immutable setup facts proven by the official Discord bot flow before the
+/// common channel pairing can be persisted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscordPairingMetadata {
+    pub guild_id: String,
+    pub bot_user_id: String,
+    pub application_id: String,
+    pub setup_source_message_id: String,
+    pub setup_candidate_id: String,
+}
+
+/// Adapter-native recovery position plus a monotonically increasing ordering
+/// value. The opaque value is persisted for the adapter; Core compares only
+/// the numeric order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelCursor {
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub opaque_value: String,
+    pub order: u64,
+    pub observed_at_ms: i64,
+}
+
+/// Metadata observed by an adapter before any message body can reach a model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelObservation {
+    pub envelope: ChannelEnvelope,
+    pub cursor: ChannelCursor,
+    pub is_bot: bool,
+    pub explicitly_addressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelInboundDecision {
+    Accepted,
+    Duplicate,
+    IgnoredUnpaired,
+    IgnoredSender,
+    IgnoredConversation,
+    IgnoredBot,
+    IgnoredNotAddressed,
+    IgnoredStaleCursor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelInboundResult {
+    pub decision: ChannelInboundDecision,
+    pub cursor: ChannelCursor,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelModelDisposition {
+    ExecuteNow,
+    RecoverOnly,
+    SuggestionReady,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelModelStart {
+    pub envelope: ChannelEnvelope,
+    pub content: String,
+    pub disposition: ChannelModelDisposition,
+    pub suggestion: Option<OutcomeSuggestion>,
+}
+
+/// The exact approved conversation to which one Mission may return progress,
+/// Need-you prompts, and its Receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelMissionOrigin {
+    pub mission_id: String,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub owner_sender_id: String,
+    pub source_message_id: String,
+    pub bound_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelMessageKind {
+    NeedYou,
+    Progress,
+    Receipt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelOutboundIntent {
+    pub outbound_id: String,
+    pub mission_id: String,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub recipient_id: String,
+    pub kind: ChannelMessageKind,
+    pub content_sha256: String,
+    pub created_at_ms: i64,
+    pub recovery_cursor: Option<ChannelCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelOutboundDisposition {
+    ExecuteNow,
+    RecoverOnly,
+    AlreadySent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelOutboundStart {
+    pub intent: ChannelOutboundIntent,
+    pub disposition: ChannelOutboundDisposition,
+    pub provider_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelDeliveryReceipt {
+    pub outbound_id: String,
+    pub provider_message_id: String,
+    pub delivered_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

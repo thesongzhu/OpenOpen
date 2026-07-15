@@ -58,6 +58,40 @@ enum CoreExecutableAuthenticator {
   }
 }
 
+enum IMessageRuntimeAuthenticator {
+  private static let signingIdentifier = "com.thesongzhu.OpenOpen.imsg"
+
+  static func executable(bundleURL: URL = Bundle.main.bundleURL) throws -> URL {
+    let executable =
+      bundleURL.standardizedFileURL
+      .appendingPathComponent("Contents/Resources/iMessage/0.13.0/bin/imsg")
+      .standardizedFileURL
+    let values = try executable.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+    guard values.isRegularFile == true, values.isSymbolicLink != true,
+      executable.resolvingSymlinksInPath() == executable
+    else { throw CoreClientError.invalidBundleLayout }
+    return executable
+  }
+
+  static func validateStatic(_ executable: URL) throws {
+    let identity = try SecurityCodeSigningIdentityProvider().currentIdentity()
+    try StaticCodeSigningValidator.validate(
+      executableURL: executable,
+      expectedSigningIdentifier: signingIdentifier,
+      teamIdentifier: identity.teamIdentifier
+    )
+  }
+
+  static func validateRunning(_ processIdentifier: Int32) throws {
+    let identity = try SecurityCodeSigningIdentityProvider().currentIdentity()
+    try StaticCodeSigningValidator.validateRunningProcessIdentifier(
+      processIdentifier,
+      expectedSigningIdentifier: signingIdentifier,
+      teamIdentifier: identity.teamIdentifier
+    )
+  }
+}
+
 public final class CoreProcessClient: @unchecked Sendable {
   private static let bootstrapMagic = Data("OPENOPEN_BOOTSTRAP_V1\0".utf8)
   private static let maximumFrameBytes = 8 * 1024 * 1024
@@ -237,6 +271,158 @@ public final class CoreProcessClient: @unchecked Sendable {
     return try state.validated()
   }
 
+  public func pairChannel(_ pairing: ChannelPairing, proof: BrokerRuntimeState) async throws {
+    let result: InstallBrokerResult = try await call(
+      method: "channel.pair",
+      parameters: PairChannelParameters(pairing: pairing, proof: proof)
+    )
+    guard result.status == "paired" else {
+      throw CoreClientError.contractViolation("Core rejected the exact channel pairing.")
+    }
+  }
+
+  public func channelPairing(_ channel: ChannelKind) async throws -> ChannelPairing? {
+    try await call(
+      method: "channel.pairing.read",
+      parameters: ChannelSelectionParameters(channel: channel)
+    )
+  }
+
+  public func startDiscordSetup(
+    token: String, proof: BrokerRuntimeState
+  ) async throws -> DiscordSetupStart {
+    try await call(
+      method: "channel.discord.setup.start",
+      parameters: StartDiscordParameters(botToken: token, proof: proof),
+      deadline: .seconds(30)
+    )
+  }
+
+  public func pollDiscordSetup(proof: BrokerRuntimeState) async throws -> DiscordSetupPollResponse {
+    try await call(
+      method: "channel.discord.setup.poll", parameters: RuntimeProofParameters(proof))
+  }
+
+  public func confirmDiscordSetup(
+    candidateId: String, confirmedAtMs: Int64, proof: BrokerRuntimeState
+  ) async throws {
+    let result: InstallBrokerResult = try await call(
+      method: "channel.discord.setup.confirm",
+      parameters: ConfirmDiscordSetupParameters(
+        candidateId: candidateId, confirmedAtMs: confirmedAtMs, proof: proof)
+    )
+    guard result.status == "paired" else {
+      throw CoreClientError.contractViolation("Core rejected Discord setup confirmation.")
+    }
+  }
+
+  public func startDiscord(
+    token: String, proof: BrokerRuntimeState
+  ) async throws -> ChannelStatusResponse {
+    try await call(
+      method: "channel.discord.start",
+      parameters: StartDiscordParameters(botToken: token, proof: proof)
+    )
+  }
+
+  public func prepareIMessage(proof: BrokerRuntimeState) async throws {
+    let executable = try IMessageRuntimeAuthenticator.executable()
+    try IMessageRuntimeAuthenticator.validateStatic(executable)
+    let response: IMessagePrepareResponse = try await call(
+      method: "channel.imessage.prepare", parameters: RuntimeProofParameters(proof)
+    )
+    do {
+      try IMessageRuntimeAuthenticator.validateRunning(response.processIdentifier)
+    } catch {
+      _ = try? await stopChannel(.iMessage)
+      throw error
+    }
+  }
+
+  public func prepareIMessageChatDiscovery(proof: BrokerRuntimeState) async throws {
+    let executable = try IMessageRuntimeAuthenticator.executable()
+    try IMessageRuntimeAuthenticator.validateStatic(executable)
+    let response: IMessagePrepareResponse = try await call(
+      method: "channel.imessage.chats.prepare", parameters: RuntimeProofParameters(proof)
+    )
+    do {
+      try IMessageRuntimeAuthenticator.validateRunning(response.processIdentifier)
+    } catch {
+      _ = try? await stopChannel(.iMessage)
+      throw error
+    }
+  }
+
+  public func listPreparedIMessageChats(proof: BrokerRuntimeState) async throws -> [IMessageChat] {
+    let result: IMessageChatsResponse = try await call(
+      method: "channel.imessage.chats.list", parameters: RuntimeProofParameters(proof)
+    )
+    guard result.chats.count <= 200,
+      Set(result.chats.map(\.chatId)).count == result.chats.count,
+      result.chats.allSatisfy({ chat in
+        guard let chatId = Int64(chat.chatId), chatId > 0 else { return false }
+        return !chat.service.isEmpty
+          && !chat.participants.isEmpty
+          && Set(chat.participants).count == chat.participants.count
+          && chat.participants.allSatisfy({
+            !$0.isEmpty && $0 == $0.trimmingCharacters(in: .whitespacesAndNewlines)
+          })
+      })
+    else {
+      throw CoreClientError.contractViolation("Core returned invalid iMessage conversations.")
+    }
+    return result.chats
+  }
+
+  public func activateIMessage(proof: BrokerRuntimeState) async throws -> ChannelStatusResponse {
+    try await call(
+      method: "channel.imessage.activate", parameters: RuntimeProofParameters(proof)
+    )
+  }
+
+  public func channelStatus(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
+    try await call(
+      method: "channel.status",
+      parameters: ChannelSelectionParameters(channel: channel)
+    )
+  }
+
+  public func stopChannel(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
+    try await call(
+      method: "channel.stop",
+      parameters: ChannelSelectionParameters(channel: channel)
+    )
+  }
+
+  public func pollChannel(
+    _ channel: ChannelKind, proof: BrokerRuntimeState
+  ) async throws -> ChannelPollResponse {
+    try await call(
+      method: "channel.poll",
+      parameters: PollChannelParameters(channel: channel, proof: proof),
+      deadline: .seconds(210)
+    )
+  }
+
+  public func sendChannelMessage(
+    missionId: String,
+    kind: ChannelMessageKind,
+    content: String,
+    approvedAtMs: Int64,
+    proof: BrokerRuntimeState
+  ) async throws -> ChannelSendResponse {
+    try await call(
+      method: "channel.outbound.send",
+      parameters: SendChannelMessageParameters(
+        missionId: missionId,
+        kind: kind,
+        content: content,
+        approvedAtMs: approvedAtMs,
+        proof: proof
+      )
+    )
+  }
+
   public func account(proof: BrokerRuntimeState) async throws -> AccountState {
     try await call(method: "account.read", parameters: RuntimeProofParameters(proof))
   }
@@ -298,13 +484,16 @@ public final class CoreProcessClient: @unchecked Sendable {
   }
 
   public func completeReminderMission(
-    identifier: String, completions: [ReminderCompletionInput]
+    identifier: String,
+    completions: [ReminderCompletionInput],
+    receiptReturnApprovedAtMs: Int64?
   ) async throws -> MissionReceipt {
     try await call(
       method: "mission.reminders.complete",
       parameters: CompleteReminderMissionParameters(
         missionId: identifier,
-        completions: completions
+        completions: completions,
+        receiptReturnApprovedAtMs: receiptReturnApprovedAtMs
       )
     )
   }
