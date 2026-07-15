@@ -170,13 +170,15 @@ later upstream changes.
   focused contract. Fresh functional and governance reviewers both PASS frozen
   fingerprint `fdf5a00e8c0c4ca92ab4ff8e9cf33041c801bac5e74304bc484c613c35e33235`
   with zero P0/P1/P2 after independently checking the original, mounted, and
-  copied App plus the focused negative routes. A provenance-bound replacement
-  tree may be committed only after two fresh reviewers PASS its unchanged final
-  fingerprint; reviewer results are task/PR evidence and are not recursively
-  embedded into the already reviewed package. These focused packaging facts
-  are not a substitute for the recorded full suite.
-  Full Disk Access, Messages Automation, real bidirectional traffic, commit/CI,
-  notarization, and release proof also remain pending.
+  copied App plus the focused negative routes. That first closure was
+  historical; the provenance-bound Final2 replacement later received two
+  entirely fresh PASS reports on unchanged fingerprint `026b2b1f…`, was
+  committed and pushed as `5a461ef…`, and passed PR #2 Actions run
+  `29450863581` on equal-tree synthesized merge `da3d7d1…`. Reviewer results
+  remain task/PR evidence and are not recursively embedded into the reviewed
+  package. These focused packaging facts are not a substitute for the recorded
+  full suite. Full Disk Access, Messages Automation, real bidirectional
+  traffic, notarization, and release proof remain pending.
 
 ### serenity (implemented exact direct dependency; provider proof pending)
 
@@ -211,6 +213,7 @@ tracked `Package.resolved`; serenity is locked by `Cargo.lock`. The current
 Friday-alpha distribution notice closure contains 190 OpenOpen and 924 Codex
 third-party package identities, 1888 document references, and 597 unique
 content-addressed texts; manifest SHA-256 is `818495226dda3332…`. Hero C's
-future `rust_xlsxwriter` is not distributed and must extend this closure when
-implemented. Neither the ad-hoc history nor the current local Developer-ID
+future exact `rust_xlsxwriter 0.96.0` is not distributed and must extend this
+closure, provenance map, and notices when implemented. Neither the ad-hoc
+history nor the current local Developer-ID
 candidate is real provider, notarization, clean-install, or release proof.

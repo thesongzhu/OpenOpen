@@ -7,19 +7,21 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Exact Friday-alpha commit `2685b57…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test, release build, workspace strict Clippy, fmt, focused Host/imsg regressions, five pinned upstream imsg tests, and two explicit pinned-runtime sandbox diagnostics locally. Two fresh reviewers PASS fingerprint `3e201547…`; PR #2 Actions `29440208503` passes the strict workflow on equal-tree synthesized merge `99ee2b10…`. This is not provider or release proof |
-| SwiftUI build and tests | Current-SHA build/test log | The product tree passes all 40 broker/signing plus 53 App tests. Historical v3 and v4 failed review. Local v5 final-review candidate passes exact owner leaf, complete directory/file/type/mode/operational-metadata, pre/post/final unsigned-content, mounted/copied App, ad-hoc regression, and focused malicious negatives. Two fresh reviewers PASS fingerprint `fdf5a00e…`; evidence Final2 DMG SHA is `7c022b83…` and requires its own unchanged-fingerprint review plus current CI. No notarization or release PASS is claimed |
-| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the Repair3 tree. Current PR #2 run `29440208503` passes integration-tree plumbing for head `2685b57…`. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
+| Rust domain and security tests | Current-SHA test log | Reviewed commit `5a461ef…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test plus release, strict Clippy, format, metadata, script, and clean-diff checks. Two fresh Final2 reviewers PASS fingerprint `026b2b1f…`; PR #2 Actions `29450863581` passes on equal-tree synthesized merge `da3d7d1…`. This is plumbing evidence, not provider or release proof |
+| SwiftUI build and tests | Current-SHA build/test log | Reviewed commit `5a461ef…` passes 40 broker/signing plus 53 App tests. Final2 DMG SHA is `7c022b83…`; the reviewed package binds the exact owner leaf, layout, modes, content, signatures, and receipts. It remains unnotarized and has no provider, administrator/cross-UID, clean-install, or release PASS |
+| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the reviewed tree. PR #2 run `29450863581` passes integration-tree plumbing for head `5a461ef…`. Real managed login, required-model catalog, structured turn, signed-build provider proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
 | Discord bidirectional route | Signed-build bot/channel message IDs | pending |
+| Slack bidirectional and consent route | Signed-build Socket Mode IDs, durable consent/revocation, and doctor record | pending; planned for `JUDGE_SLICE_READY`, not implemented or claimed |
+| Quick Memory Passport and private recall | Signed-build reviewed import, retention cleanup, and one-use grant record | pending; planned for `JUDGE_SLICE_READY`, not implemented or claimed |
 | Receipt image → XLSX | Input/output hashes and workbook verification | pending |
 | Restart recovery and dedupe | Same-SHA runtime record | pending |
 | Skill lifecycle and containment | Security test report | pending |
 | Stress suite | Nonzero all-pass scenario artifact | pending |
-| Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | v4 is historical reviewer FAIL, not signing PASS. Its App and DMG were correctly rejected as `Unnotarized Developer ID`, which is expected negative evidence only. Replacement review, notarization, staple, Gatekeeper acceptance, administrator/cross-UID and clean-install evidence remain pending |
+| Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | Final2 signing/evidence review passes and exact commit `5a461ef…` is pushed, but DMG `7c022b83…` remains `Unnotarized Developer ID`. Notarization, staple, Gatekeeper acceptance, administrator/cross-UID and clean-install evidence remain pending; the current package is not release proof |
 | Three external users | Consent-safe aggregate and 48-hour reuse | pending |
-| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Repair3 replacement reviewers PASS fingerprint `3e201547…` with zero P0/P1/P2; the reviewed tree is exact commit `2685b57…`, now pushed with equal-tree PR CI PASS. Provider proof and final release-SHA review remain pending |
+| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Final2 reviewers PASS code/signing fingerprint `026b2b1f…`; exact commit `5a461ef…` is pushed with equal-tree PR CI PASS. This ledger does not self-certify review of its own current document fingerprint; only external same-fingerprint reports and a stage-bound Advisor handoff can do that. Provider proof and final release-SHA review remain pending |
 
 ## Review history
 
@@ -765,8 +767,10 @@ different commit/build.
   `createOnce` authority. If every marker is later deleted, moved, or mutated,
   retry can issue a second batch. The three repairs share this missing durable
   dispatch invariant; the supervisor returns `STUCK: same_root_cause`. The
-  owner's standing approval of recommended in-direction fixes selects strict
-  at-most-once dispatch. Repair3's green tests and stage are historical only.
+  authorization recorded at that historical checkpoint selected strict
+  at-most-once dispatch. It is not current standing authority; current work is
+  authorized only through the Owner→Primary Advisor→Implementation Task
+  contract. Repair3's green tests and stage are historical only.
 - 2026-07-14 Hero A Repair4: Core route `mission.reminders.begin` atomically
   persists signed deterministic `ReminderDispatchStarted` Evidence for every
   WorkItem before EventKit. The first committed call alone returns
@@ -1160,3 +1164,15 @@ different commit/build.
   Two entirely fresh reviewers must PASS the unchanged fingerprint before
   commit. The package remains unnotarized and is not provider,
   admin/cross-UID, `FRIDAY_ALPHA_READY`, or release proof.
+- 2026-07-15 Final2 replacement review and Stage 6/7: two entirely fresh
+  isolated reviewers PASS unchanged fingerprint `026b2b1f…` with zero
+  P0/P1/P2. The reviewed signing/evidence tree is committed and pushed as
+  `5a461efaba9997510544836b51a0ad1b851558d8`. Draft PR #2 Actions run
+  `29450863581` completes SUCCESS; job `87472696571` checks synthesized merge
+  `da3d7d1…`, whose tree `255f351b…` equals the exact head tree. Logs pass 190
+  Rust tests with one explicit environment-gated ignore, 40 broker/signing
+  Swift and 53 App Swift tests, release, strict lint/format, metadata/script,
+  and clean-diff checks. This closes review, branch push, and integration-tree
+  plumbing only. PR #2 remains draft/open; the package remains unnotarized and
+  is not provider, administrator/cross-UID, `FRIDAY_ALPHA_READY`, or release
+  proof.

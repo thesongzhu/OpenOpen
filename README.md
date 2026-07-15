@@ -16,6 +16,11 @@ The product must not be described as `PRODUCT_READY_FOR_DEMO` until every gate
 in [the master plan](docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md) passes on the same
 signed build and commit.
 
+Reviewed commit `5a461ef…` and PR Actions run `29450863581` close the current
+code/signing plumbing review only. PR #2 remains draft and unmerged; the
+Developer-ID package is unnotarized, and real GPT, Reminders, iMessage,
+Discord, Slack, clean-install, and external-user proof remain pending.
+
 ## Development
 
 Requirements:
@@ -111,8 +116,8 @@ The Developer-ID output remains `NOT_NOTARIZED_NOT_RELEASE_PROOF`. Apple
 notarization credentials, submission, stapling, Gatekeeper acceptance, and
 administrator/cross-UID installation are separate required gates.
 
-No credentials belong in this repository. ChatGPT and Discord credentials are
-stored at runtime in the macOS Keychain.
+No credentials belong in this repository. ChatGPT, Discord, and future Slack
+credentials are stored at runtime in the macOS Keychain.
 
 ## Scope
 
@@ -120,12 +125,18 @@ Build Week v1 contains three complete product routes:
 
 1. Voice to actions in Reminders and the selected chat.
 2. Availability collection across one approved iMessage conversation and one
-   approved Discord channel, with at most one follow-up and owner confirmation.
+   approved Slack channel, with at most one follow-up and owner confirmation.
 3. Receipt images from chat to a locally generated XLSX and a verifiable
    Receipt.
 
-Telegram, an OpenOpen cloud, ambient surveillance, self-bots, private iMessage
-APIs, payments, and silent model or Skill upgrades are intentionally excluded.
+The accelerated first milestone remains Hero A with real iMessage and Discord.
+The next judge slice adds the optional Quick Memory Passport, deterministic
+Auto model routing, direct-local Slack Socket Mode, and individually consented
+Slack/iMessage opportunity previews without granting execution authority.
+
+Telegram, an OpenOpen cloud, hidden or unapproved ambient surveillance,
+self-bots, private iMessage APIs, payments, and silent model or Skill upgrades
+are intentionally excluded.
 
 ## Provenance
 

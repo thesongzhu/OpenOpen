@@ -1,5 +1,10 @@
 # OpenAI Build Week Disclosure
 
+Current product scope, authority, privacy, milestone, and acceptance semantics
+come only from `docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md`. This disclosure is a
+chronological Build Week/provenance record and cannot authorize implementation
+or override that canonical contract.
+
 ## Pre-existing before July 13, 2026
 
 - Friday's general Mission, WorkItem, workflow, trust, storage, and Skill
@@ -107,8 +112,9 @@
   `494caddf…`. Fresh functional and governance reviewers both PASS unchanged
   fingerprint `fdf5a00e…` with zero P0/P1/P2. Gatekeeper correctly reports
   `Unnotarized Developer ID`; this is not `FRIDAY_ALPHA_READY` or release
-  proof. The provenance-bound replacement tree may be committed only after its
-  own two fresh reviewers PASS the unchanged final fingerprint. The rebuilt
+  proof. At that checkpoint the provenance-bound replacement tree still
+  required its own two fresh reviewers on an unchanged final fingerprint. The
+  rebuilt
   App `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v5-evidence-final.app`
   embeds provenance SHA `315deb30…`; its exactly verified signed DMG SHA is
   `b7f3e718…`. The first final-evidence governance reviewer rejects that
@@ -117,7 +123,12 @@
   interrupted and is not counted. The narrow replacement removes dynamic
   review status from embedded provenance; all package and proof gates remain
   unchanged. Final2 embeds provenance SHA `155aa65a…`; its exactly verified
-  signed DMG SHA is `7c022b83…`.
+  signed DMG SHA is `7c022b83…`. Two entirely fresh replacement reviewers PASS
+  unchanged fingerprint `026b2b1f…`; reviewed commit `5a461ef…` is pushed to
+  draft PR #2 and Actions run `29450863581` passes on equal-tree synthesized
+  merge `da3d7d1…`. This closes signing/evidence and integration plumbing only.
+  The package remains unnotarized, and no provider, administrator/cross-UID,
+  `FRIDAY_ALPHA_READY`, or release proof is claimed.
 
 ## Planned Build Week additions (not yet claimed)
 
@@ -126,6 +137,11 @@
 - Real-provider and restart proof needed to earn `FRIDAY_ALPHA_READY` for the
   implemented bounded iMessage and Discord entry/readback slice, targeted for
   July 16–17, 2026 `America/Los_Angeles`.
+- The `JUDGE_SLICE_READY` route: Quick Memory Passport, deterministic
+  subscription-aware Auto model routing, direct-local Slack Socket Mode,
+  participant-consented Slack/iMessage opportunity previews, and one confirmed
+  personalized Hero A outcome. None is claimed implemented by this row.
+- Deep ChatGPT/Claude ZIP import with fixed fail-closed resource limits.
 - Receipt-image extraction, local XLSX generation, and readback.
 - OpenOpen-specific workflow learning, GitHub Skill import, packaging, real
   runtime evidence, and user validation.
@@ -300,8 +316,8 @@ tier. Built does not imply signed-build or real-provider proof.
 - Friday as a whole was not built during Build Week.
 - A green CI run is not proof of a working user experience.
 - OpenOpen has no cloud service, mobile app, Telegram adapter, marketplace,
-  ambient monitoring, private iMessage bridge, payment execution, or silent
-  self-upgrade.
+  hidden or unconsented ambient monitoring, private iMessage bridge, payment
+  execution, or silent self-upgrade.
 - Demo video production is not part of this implementation phase.
 
 ## Required submission evidence

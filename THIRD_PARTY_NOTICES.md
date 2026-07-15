@@ -21,4 +21,4 @@ The content-addressed payload is in `third_party/notices/manifest.json` and `thi
 
 ## Planned but not distributed
 
-`rust_xlsxwriter` for Hero C is planned after `FRIDAY_ALPHA_READY`; it is not part of this payload or current distribution closure. Its future notices must be generated from the then-locked closure before distribution.
+Exact `rust_xlsxwriter 0.96.0` for Hero C is planned after `FRIDAY_ALPHA_READY`; it is not part of this payload or current distribution closure. Its future notices must be generated from the then-locked crate/source closure before distribution.
