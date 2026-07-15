@@ -1,16 +1,18 @@
 use ed25519_dalek::{Signer, SigningKey};
 use openopen_core::{
-    ActionGate, ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor,
-    BrokerEnrollmentRecord, CreateMission, CreateWorkItem, EffectKind, EnvelopeInsert,
-    EvidenceClaims, GateDecision, LocalAuthority, MissionCommand, MissionCommandEnvelope,
-    MissionCommandResult, MissionError, NewBoundaryApproval, NewReceipt, Store, StoreError,
-    TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
+    ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor, BrokerEnrollmentRecord,
+    CreateMission, CreateWorkItem, EffectKind, EnvelopeInsert, EvidenceClaims, GateDecision,
+    LocalAuthority, MissionCommand, MissionCommandEnvelope, MissionCommandResult, MissionError,
+    NewBoundaryApproval, NewReceipt, RuntimeControl, Store, StoreError, TrustedBrokerEnrollment,
+    broker_enrollment_signing_bytes,
 };
 use openopen_protocol::{
     ApprovalKind, ChannelEnvelope, ChannelKind, EFFECT_PROTOCOL_VERSION, EffectBrokerSession,
     EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt, EvidenceKind,
-    MissionFileEffect, MissionStatus, WorkItemStatus, effect_noncommit_signing_bytes,
-    effect_permit_hash, effect_receipt_signing_bytes,
+    MissionFileEffect, MissionStatus, RuntimeControlAuthorization, RuntimeControlReceipt,
+    WorkItemStatus, effect_noncommit_signing_bytes, effect_permit_hash,
+    effect_receipt_signing_bytes, runtime_control_authorization_hash,
+    runtime_control_receipt_signing_bytes,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -136,12 +138,6 @@ fn file_proposal(relative_path: &str) -> ActionProposal {
     }
 }
 
-fn enabled_gate() -> ActionGate {
-    let mut gate = ActionGate::default();
-    gate.set_enabled(true);
-    gate
-}
-
 fn broker_session() -> EffectBrokerSession {
     let verifying_key = broker_signing_key().verifying_key();
     let key_bytes = verifying_key.to_bytes();
@@ -189,7 +185,38 @@ fn broker_enrollment(authority: &LocalAuthority) -> TrustedBrokerEnrollment {
 
 fn effect_store_in_memory(authority: LocalAuthority) -> Store {
     let enrollment = broker_enrollment(&authority);
-    Store::open_in_memory_with_trusted_broker(authority, enrollment).unwrap()
+    let mut store = Store::open_in_memory_with_trusted_broker(authority, enrollment).unwrap();
+    commit_runtime(&mut store, true, 1);
+    store
+}
+
+fn commit_runtime(store: &mut Store, enabled: bool, updated_at_ms: i64) -> RuntimeControl {
+    let authorization = store
+        .prepare_runtime_control(enabled, updated_at_ms)
+        .unwrap();
+    let receipt = signed_runtime_control_receipt(&authorization);
+    store
+        .commit_runtime_control(&authorization, &receipt)
+        .unwrap()
+}
+
+fn signed_runtime_control_receipt(
+    authorization: &RuntimeControlAuthorization,
+) -> RuntimeControlReceipt {
+    let key = broker_signing_key();
+    let mut receipt = RuntimeControlReceipt {
+        protocol_version: EFFECT_PROTOCOL_VERSION,
+        authorization_hash: runtime_control_authorization_hash(authorization).unwrap(),
+        checkpoint_nonce: "90".repeat(32),
+        request_nonce: None,
+        broker_key_id: format!("{:x}", Sha256::digest(key.verifying_key().to_bytes())),
+        broker_signature_hex: String::new(),
+    };
+    receipt.broker_signature_hex = hex::encode(
+        key.sign(&runtime_control_receipt_signing_bytes(&receipt).unwrap())
+            .to_bytes(),
+    );
+    receipt
 }
 
 fn signed_effect_receipt(permit: &EffectPermit) -> EffectReceipt {
@@ -736,7 +763,8 @@ fn rewritten_command_hash_cannot_convert_a_conflict_into_a_retry() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let path = temp.path().to_path_buf();
     let security = authority();
-    let mut store = Store::open(&path, security.clone()).unwrap();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security.clone(), enrollment).unwrap();
     let original = MissionCommandEnvelope {
         command_id: "same-id".into(),
         expected_anchor: None,
@@ -765,7 +793,8 @@ fn rewritten_command_mission_id_fails_signed_audit_reconciliation() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let path = temp.path().to_path_buf();
     let security = authority();
-    let mut store = Store::open(&path, security.clone()).unwrap();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security.clone(), enrollment).unwrap();
     let created = execute(
         &mut store,
         "create-bound-mission",
@@ -1078,6 +1107,179 @@ fn changed_sender_conversation_or_content_fails_closed() {
 }
 
 #[test]
+fn runtime_control_defaults_off_persists_and_does_not_delete_mission_state() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security.clone(), enrollment).unwrap();
+    assert!(!store.runtime_control().unwrap().enabled);
+    assert!(matches!(
+        store.require_runtime_enabled(),
+        Err(StoreError::RuntimeDisabled)
+    ));
+
+    let active = persist_active(&mut store, "mission-1");
+    let on = commit_runtime(&mut store, true, 10);
+    assert!(on.enabled);
+    assert_eq!(on.revision, 1);
+    drop(store);
+
+    let enrollment = broker_enrollment(&security);
+    let mut reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert_eq!(reopened.runtime_control().unwrap(), on);
+    let off = commit_runtime(&mut reopened, false, 11);
+    assert!(!off.enabled);
+    assert_eq!(off.revision, 2);
+    assert!(
+        reopened
+            .get_mission("mission-1", &active.anchor)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn runtime_control_tamper_or_deletion_fails_closed_after_signed_history_exists() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security.clone(), enrollment).unwrap();
+    commit_runtime(&mut store, true, 10);
+    drop(store);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE runtime_control SET updated_at_ms = 11 WHERE singleton_id = 1",
+            [],
+        )
+        .unwrap();
+    let tampered = Store::open(&path, security.clone()).unwrap();
+    assert!(matches!(
+        tampered.runtime_control(),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+    assert!(matches!(
+        tampered.require_runtime_enabled(),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+    drop(tampered);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM runtime_control WHERE singleton_id = 1", [])
+        .unwrap();
+    let deleted = Store::open(&path, security).unwrap();
+    assert!(matches!(
+        deleted.runtime_control(),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+}
+
+#[test]
+fn valid_old_runtime_row_cannot_be_replayed_over_a_later_off_revision() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security.clone(), enrollment).unwrap();
+    commit_runtime(&mut store, true, 10);
+    let old: (i64, i64, i64, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT enabled, revision, updated_at_ms, signature_hex FROM runtime_control",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    commit_runtime(&mut store, false, 11);
+    drop(store);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE runtime_control SET enabled = ?1, revision = ?2,
+                    updated_at_ms = ?3, signature_hex = ?4",
+            rusqlite::params![old.0, old.1, old.2, old.3],
+        )
+        .unwrap();
+    let replayed = Store::open(&path, security).unwrap();
+    assert!(matches!(
+        replayed.runtime_control(),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+}
+
+#[test]
+fn full_database_rollback_recovers_from_broker_checkpoint_and_stays_off() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite3");
+    let snapshot = directory.path().join("revision-1.sqlite3");
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    commit_runtime(&mut store, true, 1);
+    drop(store);
+    std::fs::copy(&path, &snapshot).unwrap();
+
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    for revision in 2..=9 {
+        commit_runtime(&mut store, true, revision);
+    }
+    let off_authorization = store.prepare_runtime_control(false, 10).unwrap();
+    assert_eq!(off_authorization.revision, 10);
+    let off_receipt = signed_runtime_control_receipt(&off_authorization);
+    store
+        .commit_runtime_control(&off_authorization, &off_receipt)
+        .unwrap();
+    drop(store);
+
+    std::fs::copy(&snapshot, &path).unwrap();
+    let mut rolled_back =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    assert_eq!(rolled_back.runtime_control().unwrap().revision, 1);
+    assert!(matches!(
+        rolled_back.require_runtime_checkpoint(&off_authorization, &off_receipt),
+        Err(StoreError::RuntimeDisabled | StoreError::RuntimeControlMismatch)
+    ));
+    let recovered = rolled_back
+        .recover_runtime_control(&off_authorization, &off_receipt)
+        .unwrap();
+    assert_eq!(recovered.revision, 10);
+    assert!(!recovered.enabled);
+    assert!(matches!(
+        rolled_back.require_runtime_enabled(),
+        Err(StoreError::RuntimeDisabled)
+    ));
+    let next = rolled_back.prepare_runtime_control(true, 11).unwrap();
+    assert_eq!(next.revision, 11);
+    drop(rolled_back);
+
+    let reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert_eq!(reopened.runtime_control().unwrap(), recovered);
+    assert!(matches!(
+        reopened.require_runtime_enabled(),
+        Err(StoreError::RuntimeDisabled)
+    ));
+}
+
+#[test]
+fn invalid_runtime_timestamp_does_not_change_signed_state() {
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    assert!(matches!(
+        store.prepare_runtime_control(true, -1),
+        Err(StoreError::InvalidRuntimeControlTimestamp)
+    ));
+    assert!(!store.runtime_control().unwrap().enabled);
+}
+
+#[test]
 fn store_verified_state_issues_a_signed_exact_mission_file_permit() {
     let security = authority();
     let mut store = effect_store_in_memory(security.clone());
@@ -1087,7 +1289,6 @@ fn store_verified_state_issues_a_signed_exact_mission_file_permit() {
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1117,6 +1318,66 @@ fn store_verified_state_issues_a_signed_exact_mission_file_permit() {
 }
 
 #[test]
+fn store_owned_off_blocks_new_and_unresolved_effects_but_allows_read_only_reattestation() {
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    let active = persist_active(&mut store, "mission-1");
+    let proposal = file_proposal("output.xlsx");
+    let payload = b"runtime-owned switch";
+    let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
+    let session = broker_session();
+
+    assert!(matches!(
+        store.prepare_mission_file_put(
+            "effect-runtime-switch",
+            &approved.anchor,
+            &proposal,
+            payload,
+            &session,
+        ),
+        Err(StoreError::RuntimeDisabled)
+    ));
+
+    commit_runtime(&mut store, true, 20);
+    let permit = store
+        .prepare_mission_file_put(
+            "effect-runtime-switch",
+            &approved.anchor,
+            &proposal,
+            payload,
+            &session,
+        )
+        .unwrap();
+    commit_runtime(&mut store, false, 21);
+    assert!(matches!(
+        store.prepare_mission_file_put(
+            "effect-runtime-switch",
+            &permit_anchor(&permit),
+            &proposal,
+            payload,
+            &session,
+        ),
+        Err(StoreError::RuntimeDisabled)
+    ));
+
+    let receipt = signed_effect_receipt(&permit);
+    let receipt_anchor = store
+        .record_effect_receipt(&permit_anchor(&permit), &session, &permit, &receipt)
+        .unwrap();
+    let reattest = store
+        .prepare_mission_file_put(
+            "effect-runtime-switch",
+            &receipt_anchor,
+            &proposal,
+            payload,
+            &session,
+        )
+        .unwrap();
+    assert_eq!(reattest.purpose, EffectPermitPurpose::ReattestOnly);
+}
+
+#[test]
 fn missing_or_caller_selected_broker_trust_cannot_issue_a_permit() {
     let proposal = file_proposal("output.xlsx");
     let payload = b"xlsx";
@@ -1126,7 +1387,6 @@ fn missing_or_caller_selected_broker_trust_cannot_issue_a_permit() {
     let approved = persist_file_write_approval(&mut unconfigured, &active, &proposal, payload);
     assert!(matches!(
         unconfigured.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1147,7 +1407,6 @@ fn missing_or_caller_selected_broker_trust_cannot_issue_a_permit() {
     attacker_session.broker_verifying_key_hex = hex::encode(attacker_key_bytes);
     assert!(matches!(
         pinned.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1187,7 +1446,6 @@ fn missing_persisted_approval_or_non_broker_target_cannot_issue_a_permit() {
     let proposal = file_proposal("output.xlsx");
     assert!(matches!(
         store.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &active.anchor,
             &proposal,
@@ -1205,7 +1463,6 @@ fn missing_persisted_approval_or_non_broker_target_cannot_issue_a_permit() {
     };
     assert!(matches!(
         store.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-2",
             &active.anchor,
             &export,
@@ -1228,18 +1485,10 @@ fn exact_effect_retry_is_idempotent_and_fence_linearizes_receipt_before_pause() 
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let session = broker_session();
     let first = store
-        .prepare_mission_file_put(
-            &enabled_gate(),
-            "effect-1",
-            &approved.anchor,
-            &proposal,
-            payload,
-            &session,
-        )
+        .prepare_mission_file_put("effect-1", &approved.anchor, &proposal, payload, &session)
         .unwrap();
     let immediate_retry = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &permit_anchor(&first),
             &proposal,
@@ -1289,14 +1538,7 @@ fn exact_effect_retry_is_idempotent_and_fence_linearizes_receipt_before_pause() 
         },
     );
     let recovery_only = store
-        .prepare_mission_file_put(
-            &ActionGate::default(),
-            "effect-1",
-            &resumed.anchor,
-            &proposal,
-            payload,
-            &session,
-        )
+        .prepare_mission_file_put("effect-1", &resumed.anchor, &proposal, payload, &session)
         .unwrap();
     assert_eq!(recovery_only.purpose, EffectPermitPurpose::ReattestOnly);
     assert_eq!(
@@ -1305,7 +1547,6 @@ fn exact_effect_retry_is_idempotent_and_fence_linearizes_receipt_before_pause() 
     );
     assert!(matches!(
         store.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1324,13 +1565,13 @@ fn tampered_effect_authorization_fails_every_store_route_closed() {
     let mut store =
         Store::open_with_trusted_broker(&path, security.clone(), broker_enrollment(&security))
             .unwrap();
+    commit_runtime(&mut store, true, 1);
     let active = persist_active(&mut store, "mission-1");
     let proposal = file_proposal("output.xlsx");
     let payload = b"xlsx";
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1361,13 +1602,13 @@ fn deleting_effect_authorization_is_detected_by_its_signed_audit_row() {
     let mut store =
         Store::open_with_trusted_broker(&path, security.clone(), broker_enrollment(&security))
             .unwrap();
+    commit_runtime(&mut store, true, 1);
     let active = persist_active(&mut store, "mission-1");
     let proposal = file_proposal("output.xlsx");
     let payload = b"xlsx";
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &approved.anchor,
             &proposal,
@@ -1398,14 +1639,7 @@ fn broker_signed_effect_receipt_is_audited_and_exactly_idempotent() {
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let session = broker_session();
     let permit = store
-        .prepare_mission_file_put(
-            &enabled_gate(),
-            "effect-1",
-            &approved.anchor,
-            &proposal,
-            payload,
-            &session,
-        )
+        .prepare_mission_file_put("effect-1", &approved.anchor, &proposal, payload, &session)
         .unwrap();
     let mut receipt = signed_effect_receipt(&permit);
     receipt.broker_signature_hex = hex::encode(
@@ -1429,7 +1663,6 @@ fn broker_signed_effect_receipt_is_audited_and_exactly_idempotent() {
     next_session.session_nonce = "cd".repeat(32);
     let next_permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-1",
             &receipt_anchor,
             &proposal,
@@ -1475,7 +1708,6 @@ fn definitive_noncommit_clears_fence_and_makes_effect_terminal() {
     let session = broker_session();
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-noncommit",
             &approved.anchor,
             &proposal,
@@ -1535,7 +1767,6 @@ fn definitive_noncommit_clears_fence_and_makes_effect_terminal() {
     store.verify_audit_chain(&paused.anchor).unwrap();
     assert!(matches!(
         store.prepare_mission_file_put(
-            &enabled_gate(),
             "effect-noncommit",
             &paused.anchor,
             &proposal,
@@ -1556,7 +1787,6 @@ fn receipt_for_a_different_exact_permit_is_rejected_even_if_broker_signed() {
     let session = broker_session();
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-exact-permit",
             &approved.anchor,
             &proposal,
@@ -1589,14 +1819,7 @@ fn invalid_effect_receipt_rolls_back_without_advancing_audit() {
     let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
     let session = broker_session();
     let permit = store
-        .prepare_mission_file_put(
-            &enabled_gate(),
-            "effect-1",
-            &approved.anchor,
-            &proposal,
-            payload,
-            &session,
-        )
+        .prepare_mission_file_put("effect-1", &approved.anchor, &proposal, payload, &session)
         .unwrap();
     let mut receipt = signed_effect_receipt(&permit);
     receipt.broker_signature_hex = "00".repeat(64);
@@ -1617,6 +1840,7 @@ fn effect_outcome_audit_failure_rolls_back_fence_clear_and_retries_cleanly() {
     let mut store =
         Store::open_with_trusted_broker(&path, security.clone(), broker_enrollment(&security))
             .unwrap();
+    commit_runtime(&mut store, true, 1);
     let active = persist_active(&mut store, "mission-1");
     let proposal = file_proposal("output.xlsx");
     let payload = b"atomic fence outcome";
@@ -1624,7 +1848,6 @@ fn effect_outcome_audit_failure_rolls_back_fence_clear_and_retries_cleanly() {
     let session = broker_session();
     let permit = store
         .prepare_mission_file_put(
-            &enabled_gate(),
             "effect-atomic-outcome",
             &approved.anchor,
             &proposal,
@@ -1700,6 +1923,7 @@ fn deleting_fence_or_rewriting_noncommit_is_detected() {
         let enrollment = broker_enrollment(&security);
         let mut store =
             Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+        commit_runtime(&mut store, true, 1);
         let active = persist_active(&mut store, "mission-1");
         let proposal = file_proposal("output.xlsx");
         let payload = b"bound outcome";
@@ -1707,7 +1931,6 @@ fn deleting_fence_or_rewriting_noncommit_is_detected() {
         let session = broker_session();
         let permit = store
             .prepare_mission_file_put(
-                &enabled_gate(),
                 "effect-bound-outcome",
                 &approved.anchor,
                 &proposal,
@@ -1770,20 +1993,14 @@ fn tampered_effect_receipt_state_or_audit_fails_closed() {
         let mut store =
             Store::open_with_trusted_broker(&path, security.clone(), broker_enrollment(&security))
                 .unwrap();
+        commit_runtime(&mut store, true, 1);
         let active = persist_active(&mut store, "mission-1");
         let proposal = file_proposal("output.xlsx");
         let payload = b"xlsx";
         let approved = persist_file_write_approval(&mut store, &active, &proposal, payload);
         let session = broker_session();
         let permit = store
-            .prepare_mission_file_put(
-                &enabled_gate(),
-                "effect-1",
-                &approved.anchor,
-                &proposal,
-                payload,
-                &session,
-            )
+            .prepare_mission_file_put("effect-1", &approved.anchor, &proposal, payload, &session)
             .unwrap();
         let receipt = signed_effect_receipt(&permit);
         let receipt_anchor = store

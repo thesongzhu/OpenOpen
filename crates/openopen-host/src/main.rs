@@ -1,180 +1,144 @@
-use openopen_protocol::{RpcError, RpcRequest, RpcResponse};
-use serde_json::json;
+use openopen_host::{Host, HostPaths, read_bootstrap};
+use openopen_protocol::{RpcError, RpcResponse};
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc;
+use zeroize::Zeroize;
 
-fn main() -> io::Result<()> {
+const MAX_RPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const RESPONSE_QUEUE_CAPACITY: usize = 32;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A private process group remains a cooperative containment layer. The
+    // security boundary is the root broker's signed lease over the exact Core
+    // and persistent Codex audit tokens, not this mutable PGID.
+    rustix::process::setpgid(None, None)?;
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if let Some(response) = handle_line(&line) {
-            serde_json::to_writer(&mut stdout, &response)?;
+    let mut input = stdin.lock();
+    let paths = HostPaths::production()?;
+    let mut master = read_bootstrap(&mut input)?;
+    let host = Host::open(paths, master);
+    master.zeroize();
+    let mut host = host?;
+
+    let (responses, output) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
+    let writer = std::thread::spawn(move || -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        for response in output {
+            let encoded = encode_bounded_response(&response)?;
+            stdout.write_all(&encoded)?;
             writeln!(stdout)?;
             stdout.flush()?;
         }
+        Ok(())
+    });
+
+    let mut frame = Vec::new();
+    loop {
+        frame.clear();
+        if read_bounded_frame(&mut input, &mut frame)? == 0 {
+            break;
+        }
+        if frame.last() == Some(&b'\n') {
+            frame.pop();
+        }
+        if frame.last() == Some(&b'\r') {
+            frame.pop();
+        }
+        let line = std::str::from_utf8(&frame)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "RPC frame is not UTF-8"))?;
+        host.handle_line(line, &responses);
     }
+    drop(host);
+    drop(responses);
+    writer.join().map_err(|_| "response writer panicked")??;
     Ok(())
 }
 
-fn handle_line(line: &str) -> Option<RpcResponse> {
-    let value = match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(value) => value,
-        Err(error) => {
-            return Some(RpcResponse::failure(
-                None,
-                RpcError {
-                    code: -32_700,
-                    message: error.to_string(),
-                    data: None,
-                },
+fn encode_bounded_response(response: &RpcResponse) -> io::Result<Vec<u8>> {
+    let id = response.id;
+    let encoded = serde_json::to_vec(&response)?;
+    if encoded.len() <= MAX_RPC_FRAME_BYTES {
+        return Ok(encoded);
+    }
+    serde_json::to_vec(&RpcResponse::failure(
+        id,
+        RpcError {
+            code: -32_013,
+            message: "Core response exceeded the 8 MiB limit".to_owned(),
+            data: None,
+        },
+    ))
+    .map_err(io::Error::other)
+}
+
+fn read_bounded_frame(input: &mut impl BufRead, frame: &mut Vec<u8>) -> io::Result<usize> {
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok(frame.len());
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let content_take = take - usize::from(available.get(take - 1) == Some(&b'\n'));
+        if frame
+            .len()
+            .checked_add(content_take)
+            .is_none_or(|length| length > MAX_RPC_FRAME_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RPC frame exceeds the 8 MiB limit",
             ));
         }
-    };
-    match serde_json::from_value::<RpcRequest>(value.clone()) {
-        Ok(request) if params_are_structured(&request.params) => Some(dispatch(&request)),
-        Ok(request) => Some(RpcResponse::failure(
-            Some(request.id),
-            RpcError {
-                code: -32_602,
-                message: "Params must be an object, array, or null".into(),
-                data: None,
-            },
-        )),
-        Err(_) if is_valid_notification(&value) => None,
-        Err(_) => Some(RpcResponse::failure(
-            None,
-            RpcError {
-                code: -32_600,
-                message: "Invalid JSON-RPC request".into(),
-                data: None,
-            },
-        )),
+        frame.extend_from_slice(&available[..take]);
+        input.consume(take);
+        if frame.last() == Some(&b'\n') {
+            return Ok(frame.len());
+        }
     }
-}
-
-fn is_valid_notification(value: &serde_json::Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    object.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
-        && object
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|method| !method.is_empty())
-        && !object.contains_key("id")
-        && object.get("params").is_none_or(params_are_structured)
-}
-
-fn params_are_structured(params: &serde_json::Value) -> bool {
-    params.is_object() || params.is_array() || params.is_null()
-}
-
-fn dispatch(request: &RpcRequest) -> RpcResponse {
-    if request.jsonrpc != "2.0" {
-        return RpcResponse::failure(
-            Some(request.id),
-            RpcError {
-                code: -32_600,
-                message: "jsonrpc must be exactly 2.0".into(),
-                data: None,
-            },
-        );
-    }
-    match request.method.as_str() {
-        "account.read" => RpcResponse::success(
-            request.id,
-            json!({
-                "state": "notConnected",
-                "reason": "Codex App Server is not connected yet"
-            }),
-        ),
-        method if is_public_family(method) => RpcResponse::failure(
-            Some(request.id),
-            RpcError {
-                code: -32_001,
-                message: format!("{method} is not connected to its real implementation"),
-                data: Some(json!({ "state": "notReady" })),
-            },
-        ),
-        _ => RpcResponse::failure(
-            Some(request.id),
-            RpcError {
-                code: -32_601,
-                message: "Unknown OpenOpen RPC method".into(),
-                data: None,
-            },
-        ),
-    }
-}
-
-fn is_public_family(method: &str) -> bool {
-    [
-        "account.",
-        "outcome.",
-        "mission.",
-        "channel.",
-        "receipt.",
-        "workflow.",
-        "skill.",
-    ]
-    .iter()
-    .any(|prefix| method.starts_with(prefix))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, handle_line};
-    use openopen_protocol::RpcRequest;
-    use serde_json::json;
+    use super::*;
+    use std::io::Cursor;
 
     #[test]
-    fn unfinished_public_route_is_explicitly_not_ready() {
-        let response = dispatch(&RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 1,
-            method: "channel.send".into(),
-            params: json!({}),
-        });
-        assert_eq!(response.error.unwrap().code, -32_001);
+    fn bounded_frame_accepts_exact_limit_and_newline() {
+        let mut bytes = vec![b'x'; MAX_RPC_FRAME_BYTES];
+        bytes.push(b'\n');
+        let mut frame = Vec::new();
+        assert_eq!(
+            read_bounded_frame(&mut Cursor::new(bytes), &mut frame).unwrap(),
+            MAX_RPC_FRAME_BYTES + 1
+        );
     }
 
     #[test]
-    fn connected_account_is_never_fabricated() {
-        let response = dispatch(&RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 1,
-            method: "account.read".into(),
-            params: json!({}),
-        });
-        let result = response.result.unwrap();
-        assert_eq!(result["state"], "notConnected");
+    fn bounded_frame_rejects_limit_plus_one_with_or_without_newline() {
+        for newline in [false, true] {
+            let mut bytes = vec![b'x'; MAX_RPC_FRAME_BYTES + 1];
+            if newline {
+                bytes.push(b'\n');
+            }
+            let error = read_bounded_frame(&mut Cursor::new(bytes), &mut Vec::new()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
-    fn parse_error_uses_json_rpc_null_id() {
-        let response = handle_line("not-json").unwrap();
-        assert_eq!(response.id, None);
-        assert_eq!(response.error.unwrap().code, -32_700);
-    }
-
-    #[test]
-    fn valid_json_with_invalid_request_shape_uses_invalid_request() {
-        let response = handle_line("{}").unwrap();
-        assert_eq!(response.id, None);
-        assert_eq!(response.error.unwrap().code, -32_600);
-    }
-
-    #[test]
-    fn valid_notification_produces_no_response() {
-        assert!(handle_line(r#"{"jsonrpc":"2.0","method":"account.read"}"#).is_none());
-    }
-
-    #[test]
-    fn primitive_params_are_rejected() {
-        let response =
-            handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"account.read","params":"invalid"}"#)
-                .unwrap();
-        assert_eq!(response.id, Some(7));
-        assert_eq!(response.error.unwrap().code, -32_602);
+    fn oversized_outbound_response_is_replaced_by_bounded_failure() {
+        let response = RpcResponse::success(
+            9,
+            serde_json::Value::String("x".repeat(MAX_RPC_FRAME_BYTES)),
+        );
+        let encoded = encode_bounded_response(&response).unwrap();
+        assert!(encoded.len() < MAX_RPC_FRAME_BYTES);
+        let decoded: RpcResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.id, Some(9));
+        assert_eq!(decoded.error.unwrap().code, -32_013);
     }
 }

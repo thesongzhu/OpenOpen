@@ -15,6 +15,27 @@ final class CodeSigningIdentityTests: XCTestCase {
     )
   }
 
+  func testCoreRequirementBindsTheExactCoreIdentifier() throws {
+    let requirement = try ExactCodeSigningRequirement.make(
+      peerSigningIdentifier: EffectBrokerConstants.coreSigningIdentifier,
+      teamIdentifier: "A1B2C3D4E5"
+    )
+    XCTAssertEqual(
+      requirement,
+      "anchor apple generic and identifier \"com.thesongzhu.OpenOpen.Core\" "
+        + "and certificate leaf[subject.OU] = \"A1B2C3D4E5\""
+    )
+  }
+
+  func testCodexRequirementBindsExactIdentifierTeamAndCDHash() throws {
+    XCTAssertEqual(
+      try StaticCodeSigningValidator.pinnedCodexRequirementText(),
+      "identifier \"codex\" and anchor apple generic "
+        + "and certificate leaf[subject.OU] = \"2DC432GLL2\" "
+        + "and cdhash H\"cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e\""
+    )
+  }
+
   func testRequirementRejectsInvalidIdentityInput() {
     XCTAssertThrowsError(
       try ExactCodeSigningRequirement.make(

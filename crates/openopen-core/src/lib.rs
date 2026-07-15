@@ -9,7 +9,8 @@ mod store;
 pub use crypto::{CryptoError, EvidenceClaims, LocalAuthority};
 pub use effect::{
     BrokerEnrollmentRecord, EffectProtocolError, TrustedBrokerEnrollment,
-    broker_enrollment_signing_bytes, verify_effect_noncommit, verify_effect_receipt,
+    authorize_broker_enrollment, broker_enrollment_signing_bytes, verify_core_instance_lease,
+    verify_effect_noncommit, verify_effect_receipt,
 };
 pub use gate::{ActionGate, ActionProposal, ActionTarget, EffectKind, GateDecision};
 pub use mission::{
@@ -18,5 +19,6 @@ pub use mission::{
     request_scope_change, transition_mission, transition_work_item,
 };
 pub use store::{
-    AuditAnchor, EnvelopeInsert, MissionCommandEnvelope, MissionCommandResult, Store, StoreError,
+    AuditAnchor, EnvelopeInsert, MissionCommandEnvelope, MissionCommandResult, RuntimeControl,
+    Store, StoreError,
 };

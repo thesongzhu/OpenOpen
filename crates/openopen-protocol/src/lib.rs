@@ -230,6 +230,7 @@ pub struct SkillPackage {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcRequest {
     pub jsonrpc: String,
     pub id: u64,
@@ -345,6 +346,52 @@ pub struct EffectBrokerSession {
     pub expires_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeControlAuthorization {
+    pub protocol_version: u32,
+    pub enabled: bool,
+    pub revision: u64,
+    pub updated_at_ms: i64,
+    pub core_key_id: String,
+    pub authorization_signature_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeControlReceipt {
+    pub protocol_version: u32,
+    pub authorization_hash: String,
+    pub checkpoint_nonce: String,
+    pub request_nonce: Option<String>,
+    pub broker_key_id: String,
+    pub broker_signature_hex: String,
+}
+
+/// Root-broker authorization for exactly one Core process incarnation.
+///
+/// The protected broker persists at most one lease per audit EUID. Process
+/// start times prevent PID-reuse replay, while `core_instance_nonce` binds the
+/// lease to the freshly started Host rather than merely to its PID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CoreInstanceLease {
+    pub protocol_version: u32,
+    pub audit_euid: u32,
+    pub app_pid: i32,
+    pub app_start_time_us: u64,
+    pub core_pid: i32,
+    pub core_start_time_us: u64,
+    pub core_audit_token_hex: String,
+    pub codex_pid: i32,
+    pub codex_start_time_us: u64,
+    pub codex_audit_token_hex: String,
+    pub core_instance_nonce: String,
+    pub issued_at_ms: i64,
+    pub broker_key_id: String,
+    pub broker_signature_hex: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EffectPermitPurpose {
@@ -360,6 +407,7 @@ pub struct EffectPermit {
     pub stable_effect_hash: String,
     pub authorization_anchor: EffectAuditAnchor,
     pub purpose: EffectPermitPurpose,
+    pub runtime_revision: u64,
     pub broker_session_nonce: String,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
@@ -439,6 +487,7 @@ pub fn effect_permit_signing_bytes(permit: &EffectPermit) -> Result<Vec<u8>, ser
         "expiresAtMs": permit.expires_at_ms,
         "issuedAtMs": permit.issued_at_ms,
         "purpose": permit.purpose,
+        "runtimeRevision": permit.runtime_revision,
         "stableEffectHash": permit.stable_effect_hash,
         "version": 1,
     }))
@@ -463,10 +512,88 @@ pub fn effect_permit_hash(permit: &EffectPermit) -> Result<String, serde_json::E
         "expiresAtMs": permit.expires_at_ms,
         "issuedAtMs": permit.issued_at_ms,
         "purpose": permit.purpose,
+        "runtimeRevision": permit.runtime_revision,
         "stableEffectHash": permit.stable_effect_hash,
         "version": 1,
     }))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Produces the canonical bytes signed by Core for one global runtime-control
+/// transition. The protected broker persists the greatest accepted revision.
+///
+/// # Errors
+///
+/// Returns a serialization error if the typed authorization cannot be encoded.
+pub fn runtime_control_authorization_signing_bytes(
+    authorization: &RuntimeControlAuthorization,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "coreKeyId": authorization.core_key_id,
+        "enabled": authorization.enabled,
+        "protocolVersion": authorization.protocol_version,
+        "revision": authorization.revision,
+        "updatedAtMs": authorization.updated_at_ms,
+        "version": 1,
+    }))
+}
+
+/// Hashes the complete signed Core authorization accepted by the broker.
+///
+/// # Errors
+///
+/// Returns a serialization error if the authorization cannot be encoded.
+pub fn runtime_control_authorization_hash(
+    authorization: &RuntimeControlAuthorization,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(authorization)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Produces the canonical bytes signed by the protected broker after it has
+/// durably accepted a runtime-control authorization.
+///
+/// # Errors
+///
+/// Returns a serialization error if the receipt cannot be encoded.
+pub fn runtime_control_receipt_signing_bytes(
+    receipt: &RuntimeControlReceipt,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "authorizationHash": receipt.authorization_hash,
+        "brokerKeyId": receipt.broker_key_id,
+        "checkpointNonce": receipt.checkpoint_nonce,
+        "protocolVersion": receipt.protocol_version,
+        "requestNonce": receipt.request_nonce,
+        "version": 1,
+    }))
+}
+
+/// Produces the canonical bytes signed by the root effect broker for a Core
+/// instance lease. The signature itself is deliberately excluded.
+///
+/// # Errors
+///
+/// Returns a serialization error if the typed lease cannot be encoded.
+pub fn core_instance_lease_signing_bytes(
+    lease: &CoreInstanceLease,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "appPid": lease.app_pid,
+        "appStartTimeUs": lease.app_start_time_us,
+        "auditEuid": lease.audit_euid,
+        "brokerKeyId": lease.broker_key_id,
+        "coreInstanceNonce": lease.core_instance_nonce,
+        "coreAuditTokenHex": lease.core_audit_token_hex,
+        "corePid": lease.core_pid,
+        "coreStartTimeUs": lease.core_start_time_us,
+        "codexAuditTokenHex": lease.codex_audit_token_hex,
+        "codexPid": lease.codex_pid,
+        "codexStartTimeUs": lease.codex_start_time_us,
+        "issuedAtMs": lease.issued_at_ms,
+        "protocolVersion": lease.protocol_version,
+        "version": 1,
+    }))
 }
 
 /// Produces the versioned, sorted-key JSON covered by the broker Receipt
@@ -518,8 +645,9 @@ pub fn effect_noncommit_signing_bytes(
 #[cfg(test)]
 mod effect_tests {
     use super::{
-        EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectCommand, EffectNonCommit, EffectPermit,
-        EffectPermitPurpose, EffectReceipt, MissionFileEffect, PayloadDescriptor,
+        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectCommand,
+        EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt, MissionFileEffect,
+        PayloadDescriptor, RpcRequest, core_instance_lease_signing_bytes,
         effect_command_signing_bytes, effect_noncommit_signing_bytes, effect_permit_hash,
         effect_permit_signing_bytes, effect_receipt_signing_bytes,
     };
@@ -559,6 +687,20 @@ mod effect_tests {
     }
 
     #[test]
+    fn local_rpc_requests_reject_unknown_authority_fields() {
+        assert!(
+            serde_json::from_value::<RpcRequest>(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "mission.runtime.read",
+                "params": {},
+                "authority": "caller-selected"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn effect_signature_preimages_are_stable_and_exclude_only_the_signature() {
         let command = command();
         let mut permit = EffectPermit {
@@ -566,6 +708,7 @@ mod effect_tests {
             stable_effect_hash: "55".repeat(32),
             authorization_anchor: command.source_anchor.clone(),
             purpose: EffectPermitPurpose::Execute,
+            runtime_revision: 1,
             broker_session_nonce: "66".repeat(32),
             issued_at_ms: 100,
             expires_at_ms: 200,
@@ -633,5 +776,60 @@ mod effect_tests {
             unsigned_noncommit,
             effect_noncommit_signing_bytes(&noncommit).unwrap()
         );
+    }
+
+    #[test]
+    fn core_instance_lease_preimage_binds_process_incarnation_not_signature() {
+        let mut lease = CoreInstanceLease {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            audit_euid: 501,
+            app_pid: 10,
+            app_start_time_us: 1_000,
+            core_pid: 11,
+            core_start_time_us: 1_001,
+            core_audit_token_hex: "33".repeat(32),
+            codex_pid: 12,
+            codex_start_time_us: 1_002,
+            codex_audit_token_hex: "44".repeat(32),
+            core_instance_nonce: "11".repeat(32),
+            issued_at_ms: 2_000,
+            broker_key_id: "22".repeat(32),
+            broker_signature_hex: String::new(),
+        };
+        let unsigned = core_instance_lease_signing_bytes(&lease).unwrap();
+        lease.broker_signature_hex = "33".repeat(64);
+        assert_eq!(unsigned, core_instance_lease_signing_bytes(&lease).unwrap());
+        for changed in [
+            {
+                let mut changed = lease.clone();
+                changed.core_start_time_us += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.core_audit_token_hex = "55".repeat(32);
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_pid += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_start_time_us += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_audit_token_hex = "66".repeat(32);
+                changed
+            },
+        ] {
+            assert_ne!(
+                unsigned,
+                core_instance_lease_signing_bytes(&changed).unwrap()
+            );
+        }
     }
 }

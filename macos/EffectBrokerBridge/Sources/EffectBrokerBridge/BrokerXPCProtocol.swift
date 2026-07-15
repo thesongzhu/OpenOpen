@@ -17,6 +17,16 @@ public protocol EffectBrokerXPCProtocol {
     withReply reply: @escaping (Data) -> Void
   )
 
+  func acquireCoreLease(
+    _ requestJSON: Data,
+    withReply reply: @escaping (Data) -> Void
+  )
+
+  func applyRuntimeControl(
+    _ requestJSON: Data,
+    withReply reply: @escaping (Data) -> Void
+  )
+
   func putMissionFile(
     _ permitJSON: Data,
     payload: FileHandle,
@@ -64,6 +74,18 @@ public protocol EffectBrokerBackend: AnyObject {
     reply: @escaping (Data) -> Void
   )
 
+  func acquireCoreLease(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data,
+    reply: @escaping (Data) -> Void
+  )
+
+  func applyRuntimeControl(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data,
+    reply: @escaping (Data) -> Void
+  )
+
   func putMissionFile(
     peer: AuthenticatedBrokerPeer,
     permitJSON: Data,
@@ -82,6 +104,8 @@ enum BrokerRequestKind: String {
   case brokerStatus
   case session
   case enrollCore
+  case coreLeaseAcquire
+  case applyRuntimeControl
   case putMissionFile
   case reconcileMissionFile
 }
@@ -112,8 +136,11 @@ enum TypedJSONEnvelope {
     kind: BrokerRequestKind
   ) -> Bool {
     switch kind {
-    case .brokerStatus, .session:
+    case .session:
       return hasExactlyKeys(dictionary, ["type", "version"])
+    case .brokerStatus:
+      return hasExactlyKeys(dictionary, ["challenge", "type", "version"])
+        && isLowerHex(dictionary["challenge"], count: 64)
     case .enrollCore:
       guard
         hasExactlyKeys(
@@ -129,6 +156,21 @@ enum TypedJSONEnvelope {
         keyID: coreKeyID,
         verifyingKeyHex: coreVerifyingKeyHex
       )
+    case .coreLeaseAcquire:
+      return hasExactlyKeys(
+        dictionary,
+        ["codexPid", "coreInstanceNonce", "corePid", "type", "version"]
+      )
+        && isPositiveInt64(dictionary["corePid"])
+        && isPositiveInt64(dictionary["codexPid"])
+        && isLowerHex(dictionary["coreInstanceNonce"], count: 64)
+    case .applyRuntimeControl:
+      guard hasExactlyKeys(dictionary, ["control", "type", "version"]),
+        let control = dictionary["control"] as? [String: Any]
+      else {
+        return false
+      }
+      return acceptsRuntimeControl(control)
     case .putMissionFile, .reconcileMissionFile:
       guard hasExactlyKeys(dictionary, ["permit", "type", "version"]),
         let permit = dictionary["permit"] as? [String: Any]
@@ -159,6 +201,7 @@ enum TypedJSONEnvelope {
           "expiresAtMs",
           "issuedAtMs",
           "purpose",
+          "runtimeRevision",
           "stableEffectHash",
         ]
       ),
@@ -171,11 +214,28 @@ enum TypedJSONEnvelope {
       isNonnegativeInt64(permit["expiresAtMs"]),
       isNonnegativeInt64(permit["issuedAtMs"]),
       (permit["purpose"] as? String).map(allowedPurposes.contains) == true,
+      isPositiveUInt64(permit["runtimeRevision"]),
       isLowerHex(permit["stableEffectHash"], count: 64)
     else {
       return false
     }
     return acceptsCommand(command)
+  }
+
+  private static func acceptsRuntimeControl(_ control: [String: Any]) -> Bool {
+    hasExactlyKeys(
+      control,
+      [
+        "authorizationSignatureHex", "coreKeyId", "enabled", "protocolVersion",
+        "revision", "updatedAtMs",
+      ]
+    )
+      && control["protocolVersion"] as? Int == 1
+      && control["enabled"] is Bool
+      && isPositiveUInt64(control["revision"])
+      && isNonnegativeInt64(control["updatedAtMs"])
+      && isLowerHex(control["coreKeyId"], count: 64)
+      && isLowerHex(control["authorizationSignatureHex"], count: 128)
   }
 
   private static func acceptsCommand(_ command: [String: Any]) -> Bool {
@@ -296,7 +356,7 @@ enum TypedJSONEnvelope {
 
   private static func isNonnegativeInt64(_ value: Any?) -> Bool {
     guard let number = value as? NSNumber,
-      CFGetTypeID(number) != CFBooleanGetTypeID()
+      CFGetTypeID(number) != CFBooleanGetTypeID(), !CFNumberIsFloatType(number)
     else {
       return false
     }
@@ -305,7 +365,7 @@ enum TypedJSONEnvelope {
 
   private static func isPositiveInt64(_ value: Any?) -> Bool {
     guard let number = value as? NSNumber,
-      CFGetTypeID(number) != CFBooleanGetTypeID()
+      CFGetTypeID(number) != CFBooleanGetTypeID(), !CFNumberIsFloatType(number)
     else {
       return false
     }
@@ -315,11 +375,16 @@ enum TypedJSONEnvelope {
   private static func isBoundedUInt64(_ value: Any?, maximum: UInt64) -> Bool {
     guard let number = value as? NSNumber,
       CFGetTypeID(number) != CFBooleanGetTypeID(),
+      !CFNumberIsFloatType(number),
       let integer = UInt64(number.stringValue)
     else {
       return false
     }
     return integer <= maximum
+  }
+
+  private static func isPositiveUInt64(_ value: Any?) -> Bool {
+    isBoundedUInt64(value, maximum: UInt64.max) && (value as? NSNumber)?.uint64Value != 0
   }
 
   static let rejectedResponse = Data(
@@ -374,6 +439,36 @@ final class BrokerConnectionService: NSObject, EffectBrokerXPCProtocol {
       return
     }
     backend.enrollCore(peer: peer, requestJSON: canonicalJSON, reply: reply)
+  }
+
+  func acquireCoreLease(_ requestJSON: Data, withReply reply: @escaping (Data) -> Void) {
+    guard
+      let canonicalJSON = TypedJSONEnvelope.canonicalized(
+        requestJSON,
+        kind: .coreLeaseAcquire
+      )
+    else {
+      reply(TypedJSONEnvelope.rejectedResponse)
+      return
+    }
+    backend.acquireCoreLease(peer: peer, requestJSON: canonicalJSON, reply: reply)
+  }
+
+  func applyRuntimeControl(_ requestJSON: Data, withReply reply: @escaping (Data) -> Void) {
+    guard
+      let canonicalJSON = TypedJSONEnvelope.canonicalized(
+        requestJSON,
+        kind: .applyRuntimeControl
+      )
+    else {
+      reply(TypedJSONEnvelope.rejectedResponse)
+      return
+    }
+    backend.applyRuntimeControl(
+      peer: peer,
+      requestJSON: canonicalJSON,
+      reply: reply
+    )
   }
 
   func putMissionFile(

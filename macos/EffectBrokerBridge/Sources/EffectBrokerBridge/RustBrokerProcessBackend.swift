@@ -5,8 +5,204 @@ enum BrokerWorkerOperation: String {
   case status
   case session
   case enrollCore = "enroll-core"
+  case coreLeaseStatus = "core-lease-status"
+  case coreLeaseAcquire = "core-lease-acquire"
+  case coreLeaseRelease = "core-lease-release"
+  case runtimeControl = "runtime-control"
   case put
   case reconcile
+}
+
+struct BrokerProcessIdentity: Equatable {
+  let pid: pid_t
+  let parentPID: pid_t
+  let effectiveUserIdentifier: uid_t
+  let processGroupIdentifier: pid_t
+  let startTimeMicroseconds: UInt64
+  let executableURL: URL
+}
+
+private struct BrokerAuditedProcess {
+  let identity: BrokerProcessIdentity
+  let auditTokenHex: String
+}
+
+func stableWorkerAuditToken(
+  for pid: pid_t,
+  expectedParentPID: pid_t,
+  expectedEffectiveUserIdentifier: uid_t,
+  expectedExecutableURL: URL,
+  processInspector: any BrokerProcessInspecting,
+  terminationObserved: () -> Bool
+) -> String? {
+  guard pid > 0, !terminationObserved(),
+    let before = processInspector.auditTokenHex(for: pid),
+    let identity = processInspector.identity(for: pid),
+    let after = processInspector.auditTokenHex(for: pid),
+    !terminationObserved(), before == after,
+    identity.pid == pid,
+    identity.parentPID == expectedParentPID,
+    identity.effectiveUserIdentifier == expectedEffectiveUserIdentifier,
+    identity.startTimeMicroseconds > 0,
+    identity.executableURL.resolvingSymlinksInPath().standardizedFileURL
+      == expectedExecutableURL.resolvingSymlinksInPath().standardizedFileURL,
+    processInspector.isAlive(auditTokenHex: before)
+  else { return nil }
+  return before
+}
+
+protocol BrokerProcessInspecting {
+  func identity(for pid: pid_t) -> BrokerProcessIdentity?
+  func auditTokenHex(for pid: pid_t) -> String?
+  func isAlive(auditTokenHex: String) -> Bool
+  func terminate(auditTokenHex: String) -> Bool
+}
+
+struct DarwinBrokerProcessInspector: BrokerProcessInspecting {
+  func identity(for pid: pid_t) -> BrokerProcessIdentity? {
+    guard pid > 0 else { return nil }
+    var info = proc_bsdinfo()
+    let count = proc_pidinfo(
+      pid,
+      PROC_PIDTBSDINFO,
+      0,
+      &info,
+      Int32(MemoryLayout<proc_bsdinfo>.size)
+    )
+    guard count == Int32(MemoryLayout<proc_bsdinfo>.size) else { return nil }
+    let seconds = UInt64(info.pbi_start_tvsec)
+    let microseconds = UInt64(info.pbi_start_tvusec)
+    guard seconds <= (UInt64.max - microseconds) / 1_000_000 else { return nil }
+    var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+    let pgid = Darwin.getpgid(pid)
+    guard pgid > 0 else { return nil }
+    let executablePath = path.withUnsafeBufferPointer { buffer in
+      buffer.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: buffer.count) {
+        String(decodingCString: $0, as: UTF8.self)
+      }
+    }
+    return BrokerProcessIdentity(
+      pid: pid,
+      parentPID: pid_t(info.pbi_ppid),
+      effectiveUserIdentifier: uid_t(info.pbi_uid),
+      processGroupIdentifier: pgid,
+      startTimeMicroseconds: seconds * 1_000_000 + microseconds,
+      executableURL: URL(fileURLWithPath: executablePath).standardizedFileURL
+    )
+  }
+
+  func auditTokenHex(for pid: pid_t) -> String? {
+    guard pid > 0 else { return nil }
+    var task = mach_port_name_t(MACH_PORT_NULL)
+    guard task_name_for_pid(mach_task_self_, pid, &task) == KERN_SUCCESS else { return nil }
+    defer { mach_port_deallocate(mach_task_self_, task) }
+    var token = audit_token_t()
+    let expectedCount = mach_msg_type_number_t(
+      MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size
+    )
+    var count = expectedCount
+    let result = withUnsafeMutablePointer(to: &token) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { words in
+        task_info(task, task_flavor_t(TASK_AUDIT_TOKEN), words, &count)
+      }
+    }
+    guard result == KERN_SUCCESS, count == expectedCount else { return nil }
+    return withUnsafeBytes(of: token) { bytes in
+      bytes.map { String(format: "%02x", $0) }.joined()
+    }
+  }
+
+  func isAlive(auditTokenHex: String) -> Bool {
+    withAuditToken(auditTokenHex) { token in
+      guard let current = self.auditTokenHex(for: audit_token_to_pid(token)) else {
+        return false
+      }
+      return current.caseInsensitiveCompare(auditTokenHex) == .orderedSame
+    } ?? false
+  }
+
+  func terminate(auditTokenHex: String) -> Bool {
+    withAuditToken(auditTokenHex) { token in
+      var signal = SIGKILL
+      if proc_terminate_with_audittoken(&token, &signal) == 0 { return true }
+      return errno == ESRCH
+    } ?? false
+  }
+
+  private func withAuditToken<T>(
+    _ hex: String, body: (inout audit_token_t) -> T
+  ) -> T? {
+    guard hex.count == MemoryLayout<audit_token_t>.size * 2 else { return nil }
+    var bytes = [UInt8]()
+    bytes.reserveCapacity(MemoryLayout<audit_token_t>.size)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+      let next = hex.index(index, offsetBy: 2)
+      guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+      bytes.append(byte)
+      index = next
+    }
+    var token = audit_token_t()
+    guard bytes.count == MemoryLayout.size(ofValue: token) else { return nil }
+    withUnsafeMutableBytes(of: &token) { destination in
+      destination.copyBytes(from: bytes)
+    }
+    return body(&token)
+  }
+}
+
+protocol CoreBundleValidating {
+  func validate(
+    appExecutableURL: URL,
+    coreExecutableURL: URL,
+    coreAuditTokenHex: String,
+    codexExecutableURL: URL,
+    codexAuditTokenHex: String
+  ) -> Bool
+}
+
+private struct SignedCoreBundleValidator: CoreBundleValidating {
+  func validate(
+    appExecutableURL: URL,
+    coreExecutableURL: URL,
+    coreAuditTokenHex: String,
+    codexExecutableURL: URL,
+    codexAuditTokenHex: String
+  ) -> Bool {
+    let macOS = appExecutableURL.deletingLastPathComponent()
+    let contents = macOS.deletingLastPathComponent()
+    let bundle = contents.deletingLastPathComponent()
+    guard appExecutableURL.lastPathComponent == "OpenOpen",
+      macOS.lastPathComponent == "MacOS",
+      contents.lastPathComponent == "Contents",
+      bundle.pathExtension == "app",
+      coreExecutableURL == macOS.appendingPathComponent("OpenOpenCore").standardizedFileURL,
+      bundle.resolvingSymlinksInPath().standardizedFileURL == bundle.standardizedFileURL,
+      let identity = try? SecurityCodeSigningIdentityProvider().currentIdentity(),
+      identity.signingIdentifier == EffectBrokerConstants.brokerSigningIdentifier
+    else { return false }
+    guard
+      (try? StaticCodeSigningValidator.validate(
+        executableURL: bundle,
+        expectedSigningIdentifier: EffectBrokerConstants.hostSigningIdentifier,
+        teamIdentifier: identity.teamIdentifier
+      )) != nil
+    else { return false }
+    let expectedCodex = bundle.appendingPathComponent(
+      "Contents/Resources/Codex/0.144.0/bin/codex"
+    ).standardizedFileURL
+    guard codexExecutableURL == expectedCodex else { return false }
+    return
+      (try? StaticCodeSigningValidator.validateRunningProcess(
+        auditTokenHex: coreAuditTokenHex,
+        expectedSigningIdentifier: EffectBrokerConstants.coreSigningIdentifier,
+        teamIdentifier: identity.teamIdentifier
+      )) != nil
+      && (try? StaticCodeSigningValidator.validatePinnedCodex(
+        auditTokenHex: codexAuditTokenHex
+      )) != nil
+  }
 }
 
 protocol BrokerWorkerRunning: AnyObject {
@@ -30,18 +226,39 @@ enum BrokerWorkerError: Error, Equatable {
   case workerTimedOut
 }
 
+struct AuditTokenProcessReaper {
+  let processInspector: any BrokerProcessInspecting
+
+  func terminateAndConfirm(
+    _ auditTokenHex: String,
+    completion: DispatchSemaphore,
+    waitDeadline: DispatchTime = .now() + .seconds(2)
+  ) -> Bool {
+    if processInspector.isAlive(auditTokenHex: auditTokenHex),
+      !processInspector.terminate(auditTokenHex: auditTokenHex)
+    {
+      return false
+    }
+    guard processInspector.isAlive(auditTokenHex: auditTokenHex) else { return true }
+    _ = completion.wait(timeout: waitDeadline)
+    return !processInspector.isAlive(auditTokenHex: auditTokenHex)
+  }
+}
+
 final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
   private static let maximumPayloadBytes: UInt64 = 512 * 1024 * 1024
   private let executableURL: URL
   private let payloadIdleTimeoutMilliseconds: Int32
   private let operationTimeoutMilliseconds: UInt64
+  private let processInspector: any BrokerProcessInspecting
 
   init(
     identityProvider: any CodeSigningIdentityProviding =
       SecurityCodeSigningIdentityProvider(),
     sourceURL: URL? = nil,
     payloadIdleTimeoutMilliseconds: Int32 = 10_000,
-    operationTimeoutMilliseconds: UInt64 = 120_000
+    operationTimeoutMilliseconds: UInt64 = 120_000,
+    processInspector: any BrokerProcessInspecting = DarwinBrokerProcessInspector()
   ) throws {
     guard geteuid() == 0 else {
       throw BrokerWorkerError.daemonMustRunAsRoot
@@ -63,6 +280,7 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
     }
     self.payloadIdleTimeoutMilliseconds = payloadIdleTimeoutMilliseconds
     self.operationTimeoutMilliseconds = operationTimeoutMilliseconds
+    self.processInspector = processInspector
   }
 
   func run(
@@ -87,8 +305,24 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
     process.standardOutput = outputPipe
     process.standardError = FileHandle.nullDevice
     process.terminationHandler = { _ in completion.signal() }
+    var auditTokenHex: String?
     do {
       try process.run()
+      guard
+        let token = stableWorkerAuditToken(
+          for: process.processIdentifier,
+          expectedParentPID: getpid(),
+          expectedEffectiveUserIdentifier: 0,
+          expectedExecutableURL: executableURL,
+          processInspector: processInspector,
+          terminationObserved: { completion.wait(timeout: .now()) == .success }
+        )
+      else {
+        try? inputPipe.fileHandleForWriting.close()
+        _ = completion.wait(timeout: .now() + .seconds(2))
+        throw BrokerWorkerError.workerLaunchFailed
+      }
+      auditTokenHex = token
       if let requestJSON {
         try DeadlineIO.write(
           requestJSON,
@@ -113,7 +347,6 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
           guard observedBytes <= Self.maximumPayloadBytes,
             observedBytes <= expectedPayloadBytes
           else {
-            process.terminate()
             throw BrokerWorkerError.payloadTooLarge
           }
           try DeadlineIO.write(
@@ -123,13 +356,11 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
           )
         }
         guard observedBytes == expectedPayloadBytes else {
-          process.terminate()
           throw BrokerWorkerError.invalidPayloadDescriptor
         }
       }
       try inputPipe.fileHandleForWriting.close()
       guard completion.wait(timeout: deadline.dispatchDeadline) == .success else {
-        Self.terminateAndReap(process, completion: completion)
         throw BrokerWorkerError.workerTimedOut
       }
       let response = try outputPipe.fileHandleForReading.readToEnd() ?? Data()
@@ -140,8 +371,15 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
       }
       return response
     } catch {
-      if process.isRunning {
-        Self.terminateAndReap(process, completion: completion)
+      if let auditTokenHex {
+        guard
+          AuditTokenProcessReaper(processInspector: processInspector).terminateAndConfirm(
+            auditTokenHex, completion: completion
+          )
+        else {
+          try? inputPipe.fileHandleForWriting.close()
+          throw BrokerWorkerError.workerLaunchFailed
+        }
       }
       try? inputPipe.fileHandleForWriting.close()
       if error is BrokerWorkerError {
@@ -162,22 +400,6 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
       throw BrokerWorkerError.invalidWorkerBundleLayout
     }
     return url
-  }
-
-  private static func terminateAndReap(
-    _ process: Process,
-    completion: DispatchSemaphore
-  ) {
-    guard process.isRunning else {
-      return
-    }
-    process.terminate()
-    if completion.wait(timeout: .now() + .seconds(2)) == .timedOut,
-      process.isRunning
-    {
-      _ = Darwin.kill(process.processIdentifier, SIGKILL)
-      _ = completion.wait(timeout: .now() + .seconds(2))
-    }
   }
 
   private static func expectedPayloadBytes(
@@ -295,24 +517,81 @@ enum DeadlineIO {
   }
 }
 
+private struct CoreLeaseAcquireCallerRequest: Decodable {
+  let coreInstanceNonce: String
+  let corePid: Int32
+  let codexPid: Int32
+}
+
+private struct CoreInstanceLeaseWire: Codable, Equatable {
+  let protocolVersion: UInt32
+  let auditEuid: UInt32
+  let appPid: Int32
+  let appStartTimeUs: UInt64
+  let corePid: Int32
+  let coreStartTimeUs: UInt64
+  let coreAuditTokenHex: String
+  let codexPid: Int32
+  let codexStartTimeUs: UInt64
+  let codexAuditTokenHex: String
+  let coreInstanceNonce: String
+  let issuedAtMs: Int64
+  let brokerKeyId: String
+  let brokerSignatureHex: String
+}
+
+private struct CoreLeaseStatusResponse: Decodable {
+  let lease: CoreInstanceLeaseWire?
+  let status: String
+  let version: Int
+}
+
+private struct CoreLeaseAcquireWorkerRequest: Encodable {
+  let type = "coreLeaseAcquire"
+  let version = 1
+  let appPid: Int32
+  let appStartTimeUs: UInt64
+  let corePid: Int32
+  let coreStartTimeUs: UInt64
+  let coreAuditTokenHex: String
+  let codexPid: Int32
+  let codexStartTimeUs: UInt64
+  let codexAuditTokenHex: String
+  let coreInstanceNonce: String
+}
+
+private struct CoreLeaseReleaseWorkerRequest: Encodable {
+  let type = "coreLeaseRelease"
+  let version = 1
+  let lease: CoreInstanceLeaseWire
+}
+
 public final class RustBrokerProcessBackend: EffectBrokerBackend {
   private let runner: any BrokerWorkerRunning
+  private let processInspector: any BrokerProcessInspecting
+  private let coreBundleValidator: any CoreBundleValidating
   private let lock = NSLock()
 
   public convenience init() throws {
     try self.init(runner: SignedBrokerWorkerRunner())
   }
 
-  init(runner: any BrokerWorkerRunning) {
+  init(
+    runner: any BrokerWorkerRunning,
+    processInspector: any BrokerProcessInspecting = DarwinBrokerProcessInspector(),
+    coreBundleValidator: any CoreBundleValidating = SignedCoreBundleValidator()
+  ) {
     self.runner = runner
+    self.processInspector = processInspector
+    self.coreBundleValidator = coreBundleValidator
   }
 
   public func brokerStatus(
     peer: AuthenticatedBrokerPeer,
-    requestJSON _: Data,
+    requestJSON: Data,
     reply: @escaping (Data) -> Void
   ) {
-    reply(run(.status, peer: peer, requestJSON: nil, payload: nil))
+    reply(run(.status, peer: peer, requestJSON: requestJSON, payload: nil))
   }
 
   public func session(
@@ -329,6 +608,183 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
     reply: @escaping (Data) -> Void
   ) {
     reply(run(.enrollCore, peer: peer, requestJSON: requestJSON, payload: nil))
+  }
+
+  public func acquireCoreLease(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data,
+    reply: @escaping (Data) -> Void
+  ) {
+    lock.lock()
+    defer { lock.unlock() }
+    do {
+      let caller = try JSONDecoder().decode(CoreLeaseAcquireCallerRequest.self, from: requestJSON)
+      guard let app = processInspector.identity(for: peer.processIdentifier),
+        let auditedCore = auditedProcess(for: caller.corePid),
+        let auditedCodex = auditedProcess(for: caller.codexPid)
+      else {
+        reply(Self.rejectedResponse)
+        return
+      }
+      let core = auditedCore.identity
+      let codex = auditedCodex.identity
+      let coreAuditTokenHex = auditedCore.auditTokenHex
+      let codexAuditTokenHex = auditedCodex.auditTokenHex
+      guard
+        app.pid == peer.processIdentifier,
+        app.effectiveUserIdentifier == peer.effectiveUserIdentifier,
+        core.parentPID == app.pid,
+        codex.parentPID == core.pid,
+        core.effectiveUserIdentifier == peer.effectiveUserIdentifier,
+        codex.effectiveUserIdentifier == peer.effectiveUserIdentifier,
+        core.processGroupIdentifier == core.pid,
+        app.executableURL.lastPathComponent == "OpenOpen",
+        core.executableURL.lastPathComponent == "OpenOpenCore",
+        app.executableURL.deletingLastPathComponent()
+          == core.executableURL.deletingLastPathComponent(),
+        coreBundleValidator.validate(
+          appExecutableURL: app.executableURL,
+          coreExecutableURL: core.executableURL,
+          coreAuditTokenHex: coreAuditTokenHex,
+          codexExecutableURL: codex.executableURL,
+          codexAuditTokenHex: codexAuditTokenHex
+        )
+      else {
+        reply(Self.rejectedResponse)
+        return
+      }
+
+      let statusData = try runUnlocked(
+        .coreLeaseStatus, peer: peer, requestJSON: nil, payload: nil
+      )
+      let status = try JSONDecoder().decode(CoreLeaseStatusResponse.self, from: statusData)
+      guard status.version == 1, status.status == "ready" else {
+        reply(Self.rejectedResponse)
+        return
+      }
+      if let existing = status.lease {
+        if existing.auditEuid == peer.effectiveUserIdentifier,
+          existing.appPid == app.pid,
+          existing.appStartTimeUs == app.startTimeMicroseconds,
+          existing.corePid == core.pid,
+          existing.coreStartTimeUs == core.startTimeMicroseconds,
+          existing.coreAuditTokenHex == coreAuditTokenHex,
+          existing.codexPid == codex.pid,
+          existing.codexStartTimeUs == codex.startTimeMicroseconds,
+          existing.codexAuditTokenHex == codexAuditTokenHex,
+          existing.coreInstanceNonce == caller.coreInstanceNonce
+        {
+          reply(try Self.acceptedLeaseResponse(existing))
+          return
+        }
+        guard try retireLeaseAfterTerminatingExactProcesses(existing, peer: peer) else {
+          reply(Self.rejectedResponse)
+          return
+        }
+      }
+
+      let workerRequest = CoreLeaseAcquireWorkerRequest(
+        appPid: app.pid,
+        appStartTimeUs: app.startTimeMicroseconds,
+        corePid: core.pid,
+        coreStartTimeUs: core.startTimeMicroseconds,
+        coreAuditTokenHex: coreAuditTokenHex,
+        codexPid: codex.pid,
+        codexStartTimeUs: codex.startTimeMicroseconds,
+        codexAuditTokenHex: codexAuditTokenHex,
+        coreInstanceNonce: caller.coreInstanceNonce
+      )
+      let acquired = try runUnlocked(
+        .coreLeaseAcquire,
+        peer: peer,
+        requestJSON: try JSONEncoder().encode(workerRequest),
+        payload: nil
+      )
+      guard processInspector.isAlive(auditTokenHex: coreAuditTokenHex),
+        processInspector.isAlive(auditTokenHex: codexAuditTokenHex)
+      else {
+        // The durable record deliberately remains occupied. A later acquire
+        // retires only these exact audit-token process incarnations.
+        reply(Self.rejectedResponse)
+        return
+      }
+      reply(acquired)
+    } catch {
+      reply(Self.rejectedResponse)
+    }
+  }
+
+  public func applyRuntimeControl(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data,
+    reply: @escaping (Data) -> Void
+  ) {
+    guard
+      let object = try? JSONSerialization.jsonObject(with: requestJSON) as? [String: Any],
+      let control = object["control"] as? [String: Any],
+      let enabled = control["enabled"] as? Bool
+    else {
+      reply(Self.rejectedResponse)
+      return
+    }
+    lock.lock()
+    defer { lock.unlock() }
+    do {
+      let statusData = try runUnlocked(
+        .coreLeaseStatus, peer: peer, requestJSON: nil, payload: nil
+      )
+      let status = try JSONDecoder().decode(CoreLeaseStatusResponse.self, from: statusData)
+      guard status.version == 1, status.status == "ready" else {
+        reply(Self.rejectedResponse)
+        return
+      }
+      if enabled {
+        guard let lease = status.lease,
+          let app = processInspector.identity(for: peer.processIdentifier),
+          lease.auditEuid == peer.effectiveUserIdentifier,
+          lease.appPid == app.pid,
+          lease.appStartTimeUs == app.startTimeMicroseconds,
+          processInspector.isAlive(auditTokenHex: lease.coreAuditTokenHex),
+          processInspector.isAlive(auditTokenHex: lease.codexAuditTokenHex)
+        else {
+          reply(Self.rejectedResponse)
+          return
+        }
+        reply(
+          try runUnlocked(
+            .runtimeControl, peer: peer, requestJSON: requestJSON, payload: nil
+          ))
+        return
+      }
+
+      // Keep the old lease occupied while SIGKILL is delivered to the exact
+      // leased Codex and Core audit-token incarnations. Only after both are
+      // proven dead may protected Off become durable. A daemon crash can
+      // therefore occur either before Off persistence (no Off acceptance,
+      // old lease still occupied) or after both exact processes are dead.
+      if let lease = status.lease {
+        guard retireExactLeaseProcessesBeforeOff(lease) else {
+          reply(Self.rejectedResponse)
+          return
+        }
+      }
+      let acceptedOff = try runUnlocked(
+        .runtimeControl, peer: peer, requestJSON: requestJSON, payload: nil
+      )
+      guard Self.isAcceptedRuntimeResponse(acceptedOff) else {
+        reply(acceptedOff)
+        return
+      }
+      if let lease = status.lease {
+        guard try releaseLease(lease, peer: peer) else {
+          reply(Self.rejectedResponse)
+          return
+        }
+      }
+      reply(acceptedOff)
+    } catch {
+      reply(Self.rejectedResponse)
+    }
   }
 
   public func putMissionFile(
@@ -357,15 +813,94 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
     lock.lock()
     defer { lock.unlock() }
     do {
-      return try runner.run(
-        operation: operation,
-        auditEUID: peer.effectiveUserIdentifier,
-        requestJSON: requestJSON,
-        payload: payload
-      )
+      return try runUnlocked(operation, peer: peer, requestJSON: requestJSON, payload: payload)
     } catch {
       return Self.rejectedResponse
     }
+  }
+
+  private func runUnlocked(
+    _ operation: BrokerWorkerOperation,
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data?,
+    payload: FileHandle?
+  ) throws -> Data {
+    try runner.run(
+      operation: operation,
+      auditEUID: peer.effectiveUserIdentifier,
+      requestJSON: requestJSON,
+      payload: payload
+    )
+  }
+
+  private func retireLeaseAfterTerminatingExactProcesses(
+    _ lease: CoreInstanceLeaseWire,
+    peer: AuthenticatedBrokerPeer
+  ) throws -> Bool {
+    guard retireExactLeaseProcessesBeforeOff(lease) else { return false }
+    return try releaseLease(lease, peer: peer)
+  }
+
+  private func auditedProcess(for pid: pid_t) -> BrokerAuditedProcess? {
+    guard let before = processInspector.auditTokenHex(for: pid),
+      let identity = processInspector.identity(for: pid),
+      let after = processInspector.auditTokenHex(for: pid),
+      before == after
+    else { return nil }
+    return BrokerAuditedProcess(identity: identity, auditTokenHex: before)
+  }
+
+  private func retireExactLeaseProcessesBeforeOff(_ lease: CoreInstanceLeaseWire) -> Bool {
+    for token in [lease.codexAuditTokenHex, lease.coreAuditTokenHex] {
+      if processInspector.isAlive(auditTokenHex: token) {
+        guard processInspector.terminate(auditTokenHex: token) else { return false }
+        waitForAuditTokenToExit(token)
+      }
+      guard !processInspector.isAlive(auditTokenHex: token) else { return false }
+    }
+    return true
+  }
+
+  private func waitForAuditTokenToExit(_ token: String) {
+    for _ in 0..<40 {
+      guard processInspector.isAlive(auditTokenHex: token) else { return }
+      usleep(50_000)
+    }
+  }
+
+  private func releaseLease(
+    _ lease: CoreInstanceLeaseWire,
+    peer: AuthenticatedBrokerPeer
+  ) throws -> Bool {
+    let release = CoreLeaseReleaseWorkerRequest(lease: lease)
+    let response = try runUnlocked(
+      .coreLeaseRelease,
+      peer: peer,
+      requestJSON: try JSONEncoder().encode(release),
+      payload: nil
+    )
+    guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any],
+      object["version"] as? Int == 1,
+      object["status"] as? String == "released"
+    else { return false }
+    return true
+  }
+
+  private static func acceptedLeaseResponse(_ lease: CoreInstanceLeaseWire) throws -> Data {
+    try JSONSerialization.data(
+      withJSONObject: [
+        "lease": try JSONSerialization.jsonObject(with: JSONEncoder().encode(lease)),
+        "status": "accepted",
+        "version": 1,
+      ],
+      options: [.sortedKeys]
+    )
+  }
+
+  private static func isAcceptedRuntimeResponse(_ data: Data) -> Bool {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return false }
+    return object["version"] as? Int == 1 && object["status"] as? String == "accepted"
   }
 
   private static let rejectedResponse = Data(

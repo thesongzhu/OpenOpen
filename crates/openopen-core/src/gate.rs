@@ -120,18 +120,13 @@ pub enum GateDecision {
     NeedsMe(ApprovalKind),
 }
 
-/// A pure policy gate. It deliberately owns no Mission root and exposes no
-/// filesystem executor; production file permits are issued only by `Store`.
-#[derive(Clone, Debug, Default)]
-pub struct ActionGate {
-    enabled: bool,
-}
+/// A pure policy gate. It deliberately owns neither runtime enablement nor a
+/// Mission root and exposes no executor. The `Store` is the only production
+/// authority for the persistent global switch and effect-permit issuance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActionGate;
 
 impl ActionGate {
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
     #[must_use]
     pub fn authorize(
         &self,
@@ -139,9 +134,6 @@ impl ActionGate {
         proposal: &ActionProposal,
         payload: Option<&[u8]>,
     ) -> GateDecision {
-        if !self.enabled {
-            return GateDecision::Denied("OpenOpen is off");
-        }
         if proposal.mission_id != mission.id {
             return GateDecision::Denied("proposal mission mismatch");
         }

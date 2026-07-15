@@ -52,11 +52,11 @@ jobs:
       - name: Run strict Rust lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test the Swift broker bridge with warnings as errors
+      - name: Test the Swift app and broker package with warnings as errors
         working-directory: macos/EffectBrokerBridge
         run: swift test -Xswiftc -warnings-as-errors
 
-      - name: Build the Swift broker bridge release
+      - name: Build the Swift app and broker package release
         working-directory: macos/EffectBrokerBridge
         run: swift build -c release -Xswiftc -warnings-as-errors
 
@@ -65,6 +65,11 @@ jobs:
         run: |
           xcrun swift-format lint --strict --recursive Sources Tests
           plutil -lint Sources/EffectBrokerBridge/Resources/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist
+
+      - name: Verify app metadata and staging script syntax
+        run: |
+          plutil -lint macos/OpenOpenApp/Info.plist
+          bash -n scripts/stage_openopen_app.sh
 
       - name: Verify checks did not rewrite tracked files
         run: git diff --exit-code

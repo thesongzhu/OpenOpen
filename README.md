@@ -46,6 +46,20 @@ explicit `macos-26` runner label. Availability and inspected-run status are
 recorded in the acceptance ledger; CI is plumbing-tier evidence only and is
 not a substitute for signed/admin-installed cross-UID or real product proof.
 
+Stage a local ad-hoc app only from an explicit pinned Codex package root:
+
+```bash
+scripts/stage_openopen_app.sh \
+  --codex-package-root /absolute/path/to/codex-0.144.0-package \
+  --output /absolute/new/path/OpenOpen.app
+```
+
+The script verifies every pinned component hash before and after copying,
+includes the protected broker daemon/worker/LaunchDaemon plist, and exclusively
+claims a new output directory instead of merging into an existing app.
+`STAGED_AD_HOC_NOT_RELEASE_PROOF` is a local diagnostic only;
+it is not Developer ID signing, notarization, clean-install, or release proof.
+
 No credentials belong in this repository. ChatGPT and Discord credentials are
 stored at runtime in the macOS Keychain.
 

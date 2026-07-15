@@ -55,6 +55,20 @@ is a direct-dependency inventory, not the final transitive distribution report.
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | thiserror | 2.0.18 | MIT OR Apache-2.0 |
 | tempfile (development only) | 3.27.0 | MIT OR Apache-2.0 |
+| zeroize | 1.9.0 | Apache-2.0 OR MIT |
+
+## Pinned Codex component under implementation
+
+- Upstream: https://github.com/openai/codex
+- Runtime version: `0.144.0`
+- Source commit recorded by the package: `767822446c7a594caa19609ca435281a9ec67e0d`
+- License: Apache-2.0
+
+Generated app-server schemas and a component-hash manifest are tracked. The
+runtime binary is not stored in Git; the local staging script accepts only an
+explicit package root matching all pinned hashes. The Apache-2.0 license text
+and complete runtime/transitive notice set remain required before signed
+distribution.
 
 ## Planned dependencies not yet present
 
@@ -72,12 +86,6 @@ with locked artifacts and full notices, when implemented.
 The release package must reproduce the imsg MIT license. OpenOpen will bundle
 only the basic CLI and required resources; the private bridge helper is
 excluded.
-
-### OpenAI Codex
-
-- Upstream: https://github.com/openai/codex
-- Runtime version: pinned by the release lockfile
-- License: Apache-2.0
 
 ### Rust crates
 

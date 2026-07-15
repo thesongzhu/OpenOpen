@@ -7,9 +7,9 @@ different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Bootstrap `19ecdd9…` passes all 95 tests, strict Clippy, and fmt locally; PR run `29369643001` passes the same Rust suite plus release build on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-current-SHA release proof remains pending |
-| SwiftUI build and tests | Current-SHA build/test log | PR run `29369643001` passes all 25 EffectBrokerBridge/daemon tests, warnings-as-errors release build, strict format, and plist lint on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; the product SwiftUI app and release proof remain pending |
-| Codex stable protocol contract | Generated schema and live handshake | pending |
+| Rust domain and security tests | Current-SHA test log | Reviewed bootstrap remains 95-test green; thirteenth repaired uncommitted product-shell tree passes 134 ordinary Rust tests, release build, strict Clippy, fmt, and the explicit real pinned-runtime sandbox diagnostic twice from Repair20. Follow-up PR run `29370433505` covers only head `923c88a…`, not this working tree; two new formal reviewers, current-commit CI, and release proof remain pending |
+| SwiftUI build and tests | Current-SHA build/test log | Thirteenth repaired uncommitted product-shell tree passes 40 broker/signing tests plus 27 App tests, warnings-as-errors debug/release build, strict format, both plists, staging syntax, and diff checks. Exclusive `/private/tmp/OpenOpen-Stage-Repair20.app` passes deep strict ad-hoc verification with exact identifiers and pinned Codex identity/four hashes. No product-shell commit or Actions run exists yet; signed/admin runtime proof remains pending |
+| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; local outer-sandbox initialize plus account/read diagnostic passes. Real managed login, required-model catalog, structured turn, reviewers, current-commit CI, and signed-build proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
 | Discord bidirectional route | Signed-build bot/channel message IDs | pending |
@@ -313,3 +313,342 @@ different commit/build.
   distinction between PR integration-tree plumbing and exact-current-SHA or
   release proof. This closes the evidence-update Stage 5 gate only; its exact
   commit, push, and follow-up PR check remain pending.
+- 2026-07-14 CI evidence follow-up: exact commit `923c88a…` is the remote head
+  of draft PR #1. Actions run `29370433505` passed on synthesized merge
+  `d502b3d…`; head and merge share tree `ecc50fa…`. The PR remains draft and
+  unmerged. This closes only that evidence-follow-up integration-tree check.
+- 2026-07-14 product-shell local implementation: Store runtime control is
+  signed, persistent, and default-Off; Off blocks new/unresolved effects,
+  permits read-only reattestation, and cancels an active Codex operation. The
+  host uses a binary private Keychain bootstrap, production bundle-derived
+  paths, managed ChatGPT-only stable calls, one active cancellable operation,
+  strict structured outcomes, and short-lived model workspaces under an outer
+  sandbox. SwiftUI provides one window, menu bar, same-window Account/Models/
+  Connections/Skills/Privacy Settings, one suggestion slot, at most three
+  active cards, an honestly disabled microphone, and `SMAppService.mainApp`
+  Login Item registration after first successful enable. Local checks pass 112
+  Rust and 28 Swift tests plus strict build/lint/format; the exact pinned
+  runtime passes sandboxed initialize/account-read, and one hash-verified app
+  stages with explicit `STAGED_AD_HOC_NOT_RELEASE_PROOF`. Two fresh reviewers,
+  commit/push/Actions, real ChatGPT login/model output, signed/notarized clean
+  install, product E2E, and external users remain pending.
+- 2026-07-14 first product-shell reviewer cycle: both isolated reviewers FAIL.
+  They reproduced stale Execute authority after Off, signed runtime rollback,
+  local RPC memory/deadline gaps, old-process callback interference,
+  out-of-order switch writes, login-item/UI divergence, missing broker bundle
+  artifacts, floating IDs, closed-window restoration failure, and staging
+  TOCTOU. The prior 112/28 local green result is superseded and was never
+  pushed.
+- 2026-07-14 product-shell repair: Core signs the next runtime revision, the
+  protected broker durably applies it and returns a broker-signed Receipt, and
+  only then may Core commit. Broker/effect serialization plus exact revision
+  matching revokes old Execute permits before Off returns; append-only signed
+  runtime history rejects valid-row rollback. Core frames are bounded in both
+  directions, requests have cancellation/deadline cleanup, process generations
+  are isolated, and the Codex version probe is forcibly bounded. Swift switch
+  writes are serialized to last intent, login-item failure cannot misreport
+  Core state, response IDs reject floating representations, and menu actions
+  reopen the window. Staging now includes the daemon, worker, and LaunchDaemon
+  plist, verifies embedded pins after copy, and atomically claims a new output
+  directory before population. Local verification passes 116 Rust and 33 Swift
+  tests, strict release/lint/format checks, the real pinned-runtime sandbox
+  diagnostic, and deep ad-hoc verification of
+  `/private/tmp/OpenOpen-Stage-Repaired.app`. This is not signed/admin,
+  cross-UID, GitHub CI, real-provider, notarization, product-E2E, or release
+  proof; two fresh reviewers remain required.
+- 2026-07-14 second product-shell reviewer cycle: Reviewer C FAIL; Reviewer D
+  FAIL. They found that the Swift daemon's in-process lock did not cover a
+  legacy worker after daemon restart, whole-database/prefix rollback could
+  restore an old signed On state and prevent Core from catching up to the
+  broker high-water mark, model calls lacked live broker freshness, accepted
+  Off could revert the UI to On on Core failure, refresh could overwrite a
+  newer toggle, model catalog/Host output remained incompletely bounded, and
+  Keychain-derived buffers lacked guaranteed zeroization. Their isolated
+  116/33 reruns passed but did not close these findings; the branch stayed
+  unpushed.
+- 2026-07-14 second product-shell repair: runtime transitions and effect
+  commits now share one root-owned cross-process lock, and the exact
+  pre-rename callback rechecks the protected revision. The broker persists a
+  nonce-bound checkpoint; Core records a verified recovery jump after a full
+  Store rollback and can continue at the next revision. A one-time Core
+  challenge is included in the broker's current-state Receipt and consumed by
+  every account/model/outcome route, so a replayed old On proof cannot start a
+  model process. Swift keeps the UI/model routes Off until broker and Core
+  converge, retries recovery after broker acceptance, and generation-guards
+  refresh. Explicit field/catalog/frame limits, a bounded Host response queue,
+  and `zeroize` cover the remaining resource/secret findings. All 121 Rust and
+  35 Swift tests, release builds, strict Clippy/format/plist/diff checks, the
+  real pinned-runtime diagnostic, and deep ad-hoc verification of
+  `/private/tmp/OpenOpen-Stage-Repair2.app` pass locally. Two entirely fresh
+  isolated reviewer PASS reports remain required before commit/push; no
+  signed/admin, cross-UID, real-provider, notarization, product-E2E, or release
+  proof is claimed.
+- 2026-07-14 third product-shell reviewer cycle: Reviewer E FAIL; Reviewer F
+  FAIL. They reproduced a delayed old On proof crossing a newer Off generation,
+  account and model reads incorrectly sharing one consumed challenge, a failed
+  accepted-Off transition that could prevent a later On convergence, stale
+  refresh failure overwrite, Swift enrollment deriving/copying the effect
+  private key, an unbounded Codex stdout queue and turn accumulation, and a
+  legacy-worker test that proved lock waiting without exercising the protected
+  runtime/fence state. The prior 121/35 green result is superseded; the branch
+  remained local and unpushed.
+- 2026-07-14 third product-shell repair: Rust Core is now the only effect-key
+  derivation and enrollment-signing authority; Swift supplies only a pinned
+  public broker trust anchor and continues to wipe the one bootstrap master
+  buffer after transfer. Preparing Off clears the outstanding challenge;
+  every model entry is generation-bound, account and model reads obtain
+  distinct proofs, convergence includes desired/UI/Core/protected state, and
+  stale refresh success or failure cannot overwrite a newer toggle. Codex uses
+  a termination-safe bounded stdout queue and explicit per-turn item/text
+  ceilings. The legacy-worker test now updates a persistent SQLite protected
+  runtime from On revision 1 to Off revision 2 under the cross-process guard
+  and proves a later old-revision write reaches the exact commit fence and is
+  rejected before rename. All 125 Rust and 38 Swift tests, release builds,
+  warnings-as-errors, strict Clippy/format/plist/script/diff checks, the exact
+  pinned-runtime diagnostic, and deep ad-hoc verification of
+  `/private/tmp/OpenOpen-Stage-Repair5.app` pass locally. One cold first run
+  exposed that the former two-second version-probe bound was too short; the
+  probe remains force-bounded at five seconds and the final staged build passed
+  the complete exact diagnostic twice consecutively. Two entirely fresh
+  isolated reviewer PASS reports remain required before commit/push; no
+  product-shell GitHub CI, signed/admin, cross-UID, real-provider,
+  notarization, product-E2E, or release proof is claimed.
+- 2026-07-14 fourth product-shell reviewer cycle: security Reviewer G FAIL;
+  governance Reviewer H FAIL. Reviewer G reproduced that two independently
+  launched App/Core processes could hold separate challenges and cancellation
+  tokens against one Store, allowing a model call to cross another process's
+  broker-accepted Off-to-Core-commit window. Reviewer H found the live
+  `BUILD_WEEK.md` and `PROVENANCE.md` disclosures still described the obsolete
+  second 121/35 repair. The frozen 125/38 tree remained unpushed.
+- 2026-07-14 fourth product-shell repair: Core holds a private user-scoped
+  SQLite exclusive instance lock for its full lifetime, and Launch Services is
+  also told that multiple app instances are prohibited. A deterministic test
+  launches a second independent host test process against the same production-
+  shaped support directory, proves it fails with `AlreadyRunning`, releases
+  the first process, and proves clean takeover. Because only one Host can own
+  the Store/Codex authority, global Off's process-local challenge invalidation
+  and cancellation token cover the only running model process. All live
+  disclosure surfaces now report the fourth repair and 126 Rust/38 Swift local
+  tests. Release/lint/format/plist/script/diff checks, deep ad-hoc verification
+  of `/private/tmp/OpenOpen-Stage-Repair6.app`, and two consecutive exact
+  pinned-runtime diagnostics pass. Two fresh isolated reviewer PASS reports
+  remain required before any product-shell commit or push; no signed/admin,
+  cross-UID, real-provider, notarization, product-E2E, GitHub CI, or release
+  proof is claimed.
+- 2026-07-14 fifth product-shell reviewer cycle: fresh security Reviewers I and
+  J both FAIL the frozen fourth repair. They independently found that Host
+  released the user lock before detached model/Codex work was proven dead and
+  that any same-EUID process could unlink/recreate the user-owned SQLite lock
+  path, splitting exclusion. The frozen `5c1b663…` tree remained unpushed.
+- 2026-07-14 fifth product-shell repair: the user-owned lock is no longer a
+  security authority. The root effect broker now persists one signed lease per
+  audit EUID in its protected SQLite state, binding authenticated App and Core
+  PIDs plus start times, exact signed bundle layout, and a fresh Host nonce.
+  Core verifies the enrolled broker signature and requires the lease for model
+  routes and every On prepare/commit/recover path. Core is a private process-
+  group leader, and every spawned pinned Codex process is actively checked to
+  inherit that exact PGID; broker Off first durably stores
+  protected Off while retaining the old lease, sends TERM/KILL to the exact
+  leased group, waits until the complete PGID is empty, exact-CAS clears the
+  lease, and only then returns acceptance to App. Tests prove
+  daemon-restart persistence, exactly one concurrent acquire winner, exact
+  release, caller-authority rejection, process-incarnation binding, stale
+  group retirement, Off-before-acceptance reaping, and no-lease fail-closed
+  behavior. All 129 Rust tests and 43 Swift tests pass, together with Rust
+  release/fmt/strict Clippy, Swift warnings-as-errors test/release/strict
+  format, plist/script checks, deep ad-hoc verification of
+  `/private/tmp/OpenOpen-Stage-Repair10.app`, and two consecutive exact pinned-
+  runtime diagnostics. Two entirely fresh reviewer PASS reports remain
+  required before commit/push; signed/admin, cross-UID, real-provider,
+  notarization, product-E2E, product-shell GitHub CI, and release proof remain
+  unclaimed.
+- 2026-07-14 sixth product-shell reviewer cycle: fresh security Reviewer M
+  FAILS frozen fingerprint `6ce2ef2…`. It finds that a daemon crash between
+  protected Off persistence and PGID reaping can leave the old model group
+  running, and that an unrelated process reusing the old Core PID can wedge
+  lease retirement. Governance Reviewer N was immediately canceled because
+  the frozen tree was invalidated; no partial result is counted as PASS.
+- 2026-07-14 sixth product-shell repair: Global Off now retains the old lease,
+  validates the exact Core incarnation, delivers SIGKILL to its exact PGID,
+  and proves the group empty before protected Off persistence. A failed signal
+  therefore causes rejection without a protected-state write; after successful
+  signal delivery the old group cannot finish even if the daemon exits. Only
+  then does the broker persist Off, exact-CAS release the lease, and return
+  acceptance. A different start time proves PID reuse: the unrelated process
+  receives no signal while the signed stale lease is exactly released. The
+  focused reused-PID, kill-before-persistence, and failed-kill/no-persistence
+  tests pass; full evidence is 129 Rust and 45 Swift tests. Two entirely fresh
+  reviewers remain required before commit/push; signed/admin, cross-UID,
+  real-provider, product-shell GitHub CI, notarization, product E2E, and release
+  proof remain unclaimed.
+- 2026-07-14 seventh product-shell reviewer cycle: fresh governance Reviewer P
+  FAILS frozen fingerprint `8905784…` because two canonical master-plan status
+  paragraphs still described the completed foundation/fifth repair as current.
+  Security Reviewer O is canceled immediately after invalidation, and no
+  partial result is counted. The resume point and blocker are corrected to the
+  sixth code repair, seven issue-finding cycles, two fresh reviews, and then
+  product-shell commit/push/current CI. No product code or test evidence changes.
+- 2026-07-14 GitHub identity audit: `gh auth status` lists only `thesongzhu`,
+  `gh api user` returns `thesongzhu`, and local Git author configuration uses
+  `thesongzhu` with the account-ID noreply address. Public
+  `thesongzhu/OpenOpen` already exists with the reviewed bootstrap and draft
+  foundation-CI PR facts recorded below; the obsolete `mxclip` authentication
+  blocker is closed. This does not authorize an early product-shell push.
+- 2026-07-14 eighth product-shell reviewer cycle: fresh security Reviewer Q
+  and governance Reviewer R both FAIL frozen fingerprint `1dda502…`. Reviewer
+  Q finds the mutable-PGID escape, numeric killpg PID-reuse TOCTOU, and missing
+  exact running-Core identifier binding. Reviewer R finds the direct
+  `zeroize 1.9.0` notice missing. No partial result is counted as PASS.
+- 2026-07-14 seventh product-shell repair: the root broker now snapshots and
+  signs exact Core and persistent-Codex Mach audit tokens, rejects an identity
+  if its token changes across inspection, validates exact running Core and
+  Codex signing requirements, and terminates Codex then Core by audit token
+  before persisting Off and exact-CAS releasing the durable lease. The outer
+  sandbox denies fork, eliminating unregistered descendants; PGID is no
+  longer security authority. Direct `zeroize 1.9.0` disclosure is present.
+  All 130 ordinary Rust tests and 37 broker/signing plus 12 App Swift tests,
+  strict release/lint/format/plist/script/diff checks pass; the explicit real
+  runtime test passes twice. Repair12 was rejected when deep signing rewrote
+  the Core identifier; the corrected exclusive Repair14 stage preserves every
+  exact identifier/hash and passes deep ad-hoc verification. Two entirely
+  fresh reviewer PASS reports remain required before commit/push; no
+  signed/admin, cross-UID, real-provider, product-shell CI, notarization,
+  product-E2E, or release proof is claimed.
+- 2026-07-14 ninth product-shell reviewer cycle: fresh security Reviewer S and
+  governance Reviewer T both FAIL frozen fingerprint `81b20d6…`. Reviewer S
+  finds that persistent Codex initialization preceded the durable broker lease,
+  App/Core shutdown and cancellation still held numeric PID/PGID signal
+  authority, and the root worker timeout path could signal a reused numeric
+  PID. Reviewer T finds that `BUILD_WEEK.md` disclosed seven rather than eight
+  earlier issue-finding cycles. No partial result is counted as PASS.
+- 2026-07-14 eighth product-shell repair: the exact pinned Codex child now
+  starts uninitialized and accepts only the initialization handshake; no
+  account, model, or other request can precede the full broker-persisted and
+  Core-installed exact audit-token lease. A pre-lease failure aborts through
+  the unreaped Rust-owned `Child` handle, while a post-lease failure remains
+  fail-closed under durable broker authority. App/Core cleanup closes pipes and
+  waits without numeric signals. The root broker snapshots each worker audit
+  token before sending request bytes and reaps timeout/error paths only by that
+  exact token. All 131 ordinary Rust tests and 39 broker/signing plus 14 App
+  Swift tests, strict release/lint/format/plist/script/diff checks pass locally.
+  Exclusive `/private/tmp/OpenOpen-Stage-Repair15.app` passes deep strict
+  ad-hoc verification with the exact App/Core/broker/worker identifiers and
+  pinned Codex identifier, Team, CDHash, and four manifest hashes; the real
+  sandbox initialize/account-read diagnostic passes twice. Two entirely new
+  reviewer PASS reports remain required before commit/push. No product-shell
+  CI, signed/admin, cross-UID, real-provider, notarization, clean-install,
+  product-E2E, external-user, or release proof is claimed.
+- 2026-07-14 tenth product-shell reviewer cycle: fresh security Reviewer U
+  FAILS frozen fingerprint `dd3b1cea…`; governance Reviewer V PASSES that same
+  tree, but the PASS cannot be reused after the security-invalidating edit. U
+  proves repeated provisioning fails on duplicate Codex initialization before
+  Off can cancel Core work or reach the broker, and proves the first worker
+  audit token can bind a PID-reused unrelated root process. V independently
+  validates the then-current counts, Repair15, remote facts, and unclaimed
+  tiers. The eighth repair is superseded; no partial gate is carried forward.
+- 2026-07-14 ninth product-shell repair: broker trust and Codex readiness are
+  separate. Only On/model paths prepare the exact Codex lease, readiness is
+  cached for one Core instance nonce, and Host initialization is idempotent
+  under the same immutable lease. Off never spawns, reacquires, or initializes
+  Codex; it first clears challenges/cancels active Core work, then applies Off
+  against the durable broker lease, so dead Codex or future acquire failure
+  cannot block it. Worker authority now requires no observed termination and a
+  stable token→identity→token snapshot bound to exact PID, daemon parent, root
+  EUID, nonzero start time, and canonical protected executable before any
+  request bytes. All 131 ordinary Rust tests and 40 broker/signing plus 15 App
+  Swift tests and the full strict verification pass. Exclusive Repair16 passes
+  deep strict ad-hoc verification with exact identities/hashes, and its real
+  sandbox diagnostic passes twice. Two entirely fresh reviewer PASS reports
+  remain required before commit/push; no product-shell CI, signed/admin,
+  cross-UID, real-provider, notarization, clean-install, product-E2E,
+  external-user, or release proof is claimed.
+- 2026-07-14 eleventh product-shell reviewer cycle: fresh security Reviewer W
+  FAILS frozen fingerprint `dd9ad888…`; governance Reviewer X PASSES the same
+  tree, but its PASS cannot be reused after the security-invalidating edit. W
+  proves that Off was published before Core cancellation or broker proof, so a
+  repeated provisioning failure could leave protected On and active work behind
+  a false-Off UI; dashboard failure had the same false-Off result. X validates
+  the prior lifecycle repair, counts, Repair16, remote facts, and honest proof
+  boundaries. The ninth repair is superseded; no partial gate carries forward.
+- 2026-07-14 tenth product-shell repair: authoritative protected state, desired
+  state, model-entry permission, and transition/unknown presentation are now
+  separate. Off intent advances generation and immediately blocks new model
+  entry, then clears the Core challenge and cancels active work before any
+  fallible broker-trust call. A known-On runtime reports Off only after broker
+  acceptance or fresh matching protected proof; a fresh Core with no protected
+  history may report its explicit default-Off state. Pre-apply failure preserves
+  the last certain state, while response loss, dashboard failure, and mismatches
+  show Unknown. All 131 ordinary Rust tests and 40 broker/signing plus 21 App Swift
+  tests pass together with the strict verification set. Exclusive Repair17
+  passes deep strict ad-hoc verification with exact identities/hashes, and its
+  real sandbox diagnostic passes twice. Two entirely fresh reviewer PASS
+  reports remain required before commit/push; no product-shell CI,
+  signed/admin, cross-UID, real-provider, notarization, clean-install,
+  product-E2E, external-user, or release proof is claimed.
+- 2026-07-14 isolated pre-freeze security audit: Repair17 is rejected before
+  formal Stage 5. The audit reproduces explicit Off intent erased by refresh,
+  reusable cancellation identity and early active-slot removal, initial and
+  nondefault false-Off presentation, and a stale await stranding newer intent.
+  A first repair re-audit finds the narrower login install/cancel lock race.
+  This is issue-finding process evidence, not a required formal reviewer PASS.
+- 2026-07-14 eleventh product-shell repair: explicit user intent remains pending
+  until convergence; startup is Unknown; only exact Core default Off is accepted
+  without broker history; protected/Core revision and timestamp must match; a
+  pending Off never prepares Codex; stale generation failure continues to the
+  latest intent. Host uses unique per-operation cancellation tokens, retains
+  canceled active work until exact finish, and serializes login install/cancel
+  under one exact-token `active → login` boundary. All 133 ordinary Rust tests
+  and 40 broker/signing plus 24 App Swift tests pass with strict build/lint/
+  format checks. Repair18 is freshly staged and explicitly ad-hoc; deep exact
+  identity/four-hash verification and two real-runtime diagnostics pass. Two entirely
+  fresh formal reviewer PASS reports remain required before commit/push; no
+  product-shell CI, signed/admin, cross-UID, real-provider, notarization,
+  clean-install, product-E2E, external-user, or release proof is claimed.
+- 2026-07-14 twelfth product-shell reviewer cycle: fresh security Reviewer Y
+  FAILS frozen fingerprint `2426b866…`; governance Reviewer Z PASSES that same
+  tree, but its PASS cannot be reused after the security-invalidating edit. Y
+  proves a canceled pending login could clear the active slot and let a new
+  route reset the shared Codex cancellation flag while the protected broker
+  still reported the prior On state. Y also finds that App model authorization
+  compared recovered enabled/revision but omitted `updatedAtMs`. Z validates
+  the then-current counts, Repair18, remote facts, and honest unclaimed tiers.
+  No partial gate carries forward.
+- 2026-07-14 twelfth product-shell repair: one locked Host operation gate now
+  owns startup-unknown, enabled, and revision-bound pending-Off authority with
+  the exact active token. Off cancellation clears pending login state and
+  cannot be released by replaying an older On commit or recovery; only a
+  sufficiently new broker-protected On revision can reopen Codex work. App
+  model authorization now requires recovered enabled, revision, and
+  `updatedAtMs` to equal the protected authorization. A deterministic test
+  covers canceled-login slot release plus old-On commit/recovery replay and
+  fresh-revision recovery. All 134 ordinary Rust tests and 40 broker/signing
+  plus 25 App Swift tests pass with the strict build/lint/format/plist/script/
+  diff and credential scans. Repair19 is freshly staged and explicitly ad-hoc;
+  deep exact identity/four-hash verification and two correctly selected real
+  pinned-runtime diagnostics pass. Two entirely fresh reviewer PASS reports
+  remain required before commit/push; no product-shell CI, signed/admin,
+  cross-UID, real-provider, notarization, clean-install, product-E2E,
+  external-user, or release proof is claimed.
+- 2026-07-14 thirteenth product-shell reviewer cycle: fresh security Reviewer
+  AA FAILS frozen fingerprint `b0d9e514…`; governance Reviewer AB PASSES that
+  same tree, but its PASS cannot be reused after the security-invalidating
+  edit. AA proves a same-UID regular-file replacement of bundled
+  `OpenOpenCore` could receive the Keychain master because App checked only
+  path shape before launch and broker code identity only later. AB validates
+  the then-current Repair19 counts, stage, remote facts, provenance, and
+  unclaimed tiers. No partial gate carries forward.
+- 2026-07-14 thirteenth product-shell repair: App now requires the current host
+  identity, exact Core signing identifier, and identical Team in a strict
+  static-code check before process launch. It then derives the running Core's
+  Mach audit token and checks the same requirement against that exact process
+  incarnation before invoking the Keychain master loader or writing bootstrap
+  bytes. Tests prove a regular unsigned replacement and a running-auth failure
+  both leave the master-loader count at zero; fake-Core lifecycle tests inject
+  only explicit test validators. All 134 ordinary Rust tests and 40 broker/
+  signing plus 27 App Swift tests pass with strict build/lint/format/plist/
+  script/diff and credential scans. Repair20 is freshly staged and explicitly
+  ad-hoc; deep exact identity/four-hash verification and two correctly selected
+  real pinned-runtime diagnostics pass. Two entirely fresh reviewer PASS
+  reports remain required before commit/push; no product-shell CI,
+  signed/admin, cross-UID, real-provider, notarization, clean-install,
+  product-E2E, external-user, or release proof is claimed.

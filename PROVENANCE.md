@@ -12,8 +12,8 @@ staging.
 
 | OpenOpen module | Friday source | Adaptation | Verification |
 | --- | --- | --- | --- |
-| `crates/openopen-core/src/mission.rs` | `rust-core/crates/friday-core/src/mission.rs` | Independent OpenOpen lifecycle adapted from Friday's legal-transition and proof-before-completion invariants | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; PR run `29369643001` PASS on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-head and release proof pending |
-| `crates/openopen-core/src/store.rs` | `rust-core/crates/friday-storage/src/mission.rs`, `rust-core/crates/friday-storage/src/audit.rs` | Independent encrypted lifecycle persistence and signed/tail-anchored audit design | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; PR run `29369643001` PASS on synthesized merge `e0fed49…`, whose tree equals head `b61766b…`; exact-head and release proof pending |
+| `crates/openopen-core/src/mission.rs` | `rust-core/crates/friday-core/src/mission.rs` | Independent OpenOpen lifecycle adapted from Friday's legal-transition and proof-before-completion invariants | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; follow-up PR run `29370433505` PASS on synthesized merge `d502b3d…`, whose tree equals head `923c88a…`; exact-head and release proof pending |
+| `crates/openopen-core/src/store.rs` | `rust-core/crates/friday-storage/src/mission.rs`, `rust-core/crates/friday-storage/src/audit.rs` | Independent encrypted lifecycle persistence and signed/tail-anchored audit design | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; follow-up PR run `29370433505` PASS on synthesized merge `d502b3d…`, whose tree equals head `923c88a…`; the thirteenth uncommitted broker-checkpoint/default-Off/audit-token/Core-bootstrap repair passes local 134-Rust/67-Swift verification after thirteen formal product reviewer cycles plus one pre-freeze security audit found issues, and two entirely new formal reviewers remain pending |
 
 Workflow and Skill adaptations remain planned and are not yet present or
 claimed.
@@ -30,6 +30,13 @@ later upstream changes.
 
 ## Other sources
 
-`imsg`, Codex, serenity, rust_xlsxwriter, SQLite, and all transitive
-dependencies must be locked and represented in `THIRD_PARTY_NOTICES.md` before
-the signed distribution gate passes.
+Codex app-server schemas are generated from pinned runtime `0.144.0`; the
+tracked manifest binds the runtime package components and all 267 schemas. The
+runtime binary itself is not stored in Git. Local staging accepts only an
+explicit package root whose four component hashes match the manifest. This is
+implementation provenance, not redistribution, signed-package, or provider
+proof.
+
+`imsg`, serenity, rust_xlsxwriter, SQLite, Codex, and all transitive
+dependencies must have complete locked notices before the signed distribution
+gate passes.

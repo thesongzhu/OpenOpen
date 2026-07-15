@@ -7,11 +7,13 @@ use openopen_protocol::{
     ApprovalKind, ChannelEnvelope, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectBrokerSession,
     EffectCommand, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
     MAX_EFFECT_APPROVAL_IDS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECT_SCOPE_DIGEST_BYTES, Mission,
-    MissionFileEffect, PayloadDescriptor, Receipt, is_canonical_effect_identifier,
+    MissionFileEffect, PayloadDescriptor, Receipt, RuntimeControlAuthorization,
+    RuntimeControlReceipt, is_canonical_effect_identifier,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -21,7 +23,29 @@ const RECEIPT_COMMIT_ACTION: &str = "receipt.created";
 const EFFECT_AUTHORIZATION_ACTION: &str = "effect.authorized";
 const EFFECT_RECEIPT_ACTION: &str = "effect.committed";
 const EFFECT_NONCOMMIT_ACTION: &str = "effect.not_committed";
+const RUNTIME_CONTROL_ID: i64 = 1;
 const STORE_SCHEMA: &str = "PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS runtime_control (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+ revision INTEGER NOT NULL CHECK (revision > 0),
+ updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+ signature_hex TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_control_history (
+ revision INTEGER PRIMARY KEY CHECK (revision > 0),
+ enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+ updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+ signature_hex TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_control_recovery_checkpoint (
+ revision INTEGER PRIMARY KEY CHECK (revision > 0),
+ authorization_hash TEXT NOT NULL,
+ checkpoint_nonce TEXT NOT NULL,
+ request_nonce TEXT,
+ broker_key_id TEXT NOT NULL,
+ broker_signature_hex TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS mission_state (
  mission_id TEXT PRIMARY KEY, status_json TEXT NOT NULL, scope_digest TEXT NOT NULL,
  encrypted_blob BLOB NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
@@ -132,6 +156,14 @@ pub enum StoreError {
     EffectNonCommitMismatch(String),
     #[error("no independently provisioned effect-broker enrollment is available")]
     MissingTrustedBrokerEnrollment,
+    #[error("runtime control timestamp must be nonnegative")]
+    InvalidRuntimeControlTimestamp,
+    #[error("runtime control revision overflowed")]
+    RuntimeControlRevisionOverflow,
+    #[error("stored runtime control does not match its signed record")]
+    RuntimeControlMismatch,
+    #[error("OpenOpen is off")]
+    RuntimeDisabled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +194,14 @@ pub struct MissionCommandResult {
     pub mission: Mission,
     pub receipt: Option<Receipt>,
     pub anchor: AuditAnchor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeControl {
+    pub enabled: bool,
+    pub revision: u64,
+    pub updated_at_ms: i64,
 }
 
 struct AuditRecord<'a> {
@@ -212,7 +252,6 @@ struct MissionFilePutRequest {
 struct EffectResolution<'a, 'transaction> {
     transaction: &'a Transaction<'transaction>,
     authority: &'a LocalAuthority,
-    gate: &'a ActionGate,
     effect_id: &'a str,
     expected_anchor: &'a AuditAnchor,
     proposal: &'a ActionProposal,
@@ -338,6 +377,37 @@ impl Store {
         &self.authority
     }
 
+    #[must_use]
+    pub const fn trusted_broker_enrollment(&self) -> Option<&TrustedBrokerEnrollment> {
+        self.trusted_broker.as_ref()
+    }
+
+    /// Loads the exact Core-signed broker enrollment produced by the signed
+    /// admin-approved installation flow. Exact retries are idempotent and a
+    /// different broker identity is never accepted as rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid Core signature, malformed enrollment,
+    /// or attempted broker rotation.
+    pub fn install_trusted_broker(
+        &mut self,
+        record: &crate::BrokerEnrollmentRecord,
+    ) -> Result<(), StoreError> {
+        let enrollment =
+            TrustedBrokerEnrollment::from_signed_install_record(&self.authority, record)?;
+        match &self.trusted_broker {
+            None => self.trusted_broker = Some(enrollment),
+            Some(existing) if existing == &enrollment => {}
+            Some(_) => {
+                return Err(StoreError::EffectProtocol(
+                    crate::EffectProtocolError::UntrustedBroker,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
         self.connection.execute_batch(STORE_SCHEMA)?;
         let mut columns = self.connection.prepare("PRAGMA table_info(audit_ledger)")?;
@@ -366,6 +436,316 @@ impl Store {
             .prepare("SELECT effect_id FROM effect_fence LIMIT 0")?;
         self.connection
             .prepare("SELECT local_signature_hex FROM effect_noncommit LIMIT 0")?;
+        self.connection
+            .prepare("SELECT signature_hex FROM runtime_control LIMIT 0")?;
+        self.connection
+            .prepare("SELECT signature_hex FROM runtime_control_history LIMIT 0")?;
+        let recovery_columns = self
+            .connection
+            .prepare("PRAGMA table_info(runtime_control_recovery_checkpoint)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !recovery_columns.iter().any(|name| name == "request_nonce") {
+            self.connection.execute(
+                "ALTER TABLE runtime_control_recovery_checkpoint ADD COLUMN request_nonce TEXT",
+                [],
+            )?;
+        }
+        self.connection
+            .prepare("SELECT checkpoint_nonce FROM runtime_control_recovery_checkpoint LIMIT 0")?;
+        Ok(())
+    }
+
+    /// Reads the signed singleton runtime control. A missing row is the
+    /// durable default-Off state; malformed or changed rows fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for database or signature mismatch.
+    pub fn runtime_control(&self) -> Result<RuntimeControl, StoreError> {
+        load_runtime_control(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )
+    }
+
+    /// Signs but does not persist the next runtime-control transition. The
+    /// caller must first have the protected broker durably accept this exact
+    /// authorization, then call [`Self::commit_runtime_control`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid time, corrupt current state, signing
+    /// failure, or revision overflow.
+    pub fn prepare_runtime_control(
+        &self,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> Result<RuntimeControlAuthorization, StoreError> {
+        if updated_at_ms < 0 {
+            return Err(StoreError::InvalidRuntimeControlTimestamp);
+        }
+        let current = load_runtime_control(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RuntimeControlRevisionOverflow)?;
+        let mut authorization = RuntimeControlAuthorization {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            enabled,
+            revision,
+            updated_at_ms,
+            core_key_id: self.authority.effect_key_id(),
+            authorization_signature_hex: String::new(),
+        };
+        self.authority.sign_runtime_control(&mut authorization)?;
+        Ok(authorization)
+    }
+
+    /// Commits the exact Core-signed transition previously accepted by the
+    /// protected broker. Replays of the already-current value are idempotent;
+    /// skipped, stale, changed, or foreign transitions fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both Core and the pinned broker signed the exact
+    /// next transition, or if persistence/current-state verification fails.
+    pub fn commit_runtime_control(
+        &mut self,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<RuntimeControl, StoreError> {
+        if authorization.protocol_version != EFFECT_PROTOCOL_VERSION
+            || authorization.updated_at_ms < 0
+            || authorization.revision == 0
+        {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        self.authority
+            .verify_runtime_control(authorization)
+            .map_err(|_| StoreError::RuntimeControlMismatch)?;
+        let trusted_broker = self
+            .trusted_broker
+            .as_ref()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        crate::effect::verify_runtime_control_receipt(
+            trusted_broker,
+            authorization,
+            broker_receipt,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if current.enabled == authorization.enabled
+            && current.revision == authorization.revision
+            && current.updated_at_ms == authorization.updated_at_ms
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        let expected_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RuntimeControlRevisionOverflow)?;
+        if authorization.revision != expected_revision {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        let revision_i64 = i64::try_from(authorization.revision)
+            .map_err(|_| StoreError::RuntimeControlRevisionOverflow)?;
+        transaction.execute(
+            "INSERT INTO runtime_control_history
+                (revision, enabled, updated_at_ms, signature_hex)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                revision_i64,
+                i64::from(authorization.enabled),
+                authorization.updated_at_ms,
+                authorization.authorization_signature_hex,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO runtime_control
+                (singleton_id, enabled, revision, updated_at_ms, signature_hex)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(singleton_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                revision = excluded.revision,
+                updated_at_ms = excluded.updated_at_ms,
+                signature_hex = excluded.signature_hex",
+            params![
+                RUNTIME_CONTROL_ID,
+                i64::from(authorization.enabled),
+                revision_i64,
+                authorization.updated_at_ms,
+                authorization.authorization_signature_hex,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(RuntimeControl {
+            enabled: authorization.enabled,
+            revision: authorization.revision,
+            updated_at_ms: authorization.updated_at_ms,
+        })
+    }
+
+    /// Recovers a rolled-back Core Store from the protected broker's current,
+    /// nonce-bound signed checkpoint. Only a strictly newer broker revision is
+    /// allowed to jump the local history; stale or changed proofs fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the exact authorization is signed by Core and
+    /// its checkpoint Receipt is signed by the pinned protected broker.
+    pub fn recover_runtime_control(
+        &mut self,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<RuntimeControl, StoreError> {
+        if authorization.protocol_version != EFFECT_PROTOCOL_VERSION
+            || authorization.updated_at_ms < 0
+            || authorization.revision == 0
+        {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        self.authority
+            .verify_runtime_control(authorization)
+            .map_err(|_| StoreError::RuntimeControlMismatch)?;
+        let trusted_broker = self
+            .trusted_broker
+            .as_ref()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        crate::effect::verify_runtime_control_receipt(
+            trusted_broker,
+            authorization,
+            broker_receipt,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if authorization.revision < current.revision {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        if authorization.revision == current.revision {
+            if current.enabled == authorization.enabled
+                && current.updated_at_ms == authorization.updated_at_ms
+            {
+                transaction.commit()?;
+                return Ok(current);
+            }
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        let revision = i64::try_from(authorization.revision)
+            .map_err(|_| StoreError::RuntimeControlRevisionOverflow)?;
+        transaction.execute(
+            "INSERT INTO runtime_control_history
+                (revision, enabled, updated_at_ms, signature_hex)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                revision,
+                i64::from(authorization.enabled),
+                authorization.updated_at_ms,
+                authorization.authorization_signature_hex,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO runtime_control_recovery_checkpoint
+                (revision, authorization_hash, checkpoint_nonce, request_nonce,
+                 broker_key_id, broker_signature_hex)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revision,
+                broker_receipt.authorization_hash,
+                broker_receipt.checkpoint_nonce,
+                broker_receipt.request_nonce,
+                broker_receipt.broker_key_id,
+                broker_receipt.broker_signature_hex,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO runtime_control
+                (singleton_id, enabled, revision, updated_at_ms, signature_hex)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(singleton_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                revision = excluded.revision,
+                updated_at_ms = excluded.updated_at_ms,
+                signature_hex = excluded.signature_hex",
+            params![
+                RUNTIME_CONTROL_ID,
+                i64::from(authorization.enabled),
+                revision,
+                authorization.updated_at_ms,
+                authorization.authorization_signature_hex,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(RuntimeControl {
+            enabled: authorization.enabled,
+            revision: authorization.revision,
+            updated_at_ms: authorization.updated_at_ms,
+        })
+    }
+
+    /// Fails closed unless the signed Store-owned global switch is On.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeDisabled` for the default or explicit Off state and a
+    /// mismatch error for tampered storage.
+    pub fn require_runtime_enabled(&self) -> Result<(), StoreError> {
+        require_runtime_enabled(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )
+    }
+
+    /// Requires an exact live protected-broker checkpoint for an enabled
+    /// runtime before a model-bearing operation can begin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale/replayed proof, local rollback, Off, or an
+    /// untrusted broker signature.
+    pub fn require_runtime_checkpoint(
+        &self,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(), StoreError> {
+        self.authority
+            .verify_runtime_control(authorization)
+            .map_err(|_| StoreError::RuntimeControlMismatch)?;
+        let trusted_broker = self
+            .trusted_broker
+            .as_ref()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        crate::effect::verify_runtime_control_receipt(
+            trusted_broker,
+            authorization,
+            broker_receipt,
+        )?;
+        let current =
+            load_runtime_control(&self.connection, &self.authority, Some(trusted_broker))?;
+        if !authorization.enabled
+            || current.enabled != authorization.enabled
+            || current.revision != authorization.revision
+            || current.updated_at_ms != authorization.updated_at_ms
+        {
+            return Err(if authorization.enabled {
+                StoreError::RuntimeControlMismatch
+            } else {
+                StoreError::RuntimeDisabled
+            });
+        }
         Ok(())
     }
 
@@ -478,7 +858,6 @@ impl Store {
     /// broker session, conflicting id reuse, or signed-ledger mismatch.
     pub fn prepare_mission_file_put(
         &mut self,
-        gate: &ActionGate,
         effect_id: &str,
         expected_anchor: &AuditAnchor,
         proposal: &ActionProposal,
@@ -493,12 +872,14 @@ impl Store {
         let now_ms = current_unix_ms()?;
         crate::effect::validate_broker_session(&trusted_broker, broker_session, now_ms)?;
         let request = mission_file_put_request(proposal, payload)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let runtime = load_runtime_control(&transaction, &self.authority, Some(&trusted_broker))?;
         let (command, authorization_anchor, purpose) = resolve_effect_command(
             &EffectResolution {
                 transaction: &transaction,
                 authority: &self.authority,
-                gate,
                 effect_id,
                 expected_anchor,
                 proposal,
@@ -513,8 +894,11 @@ impl Store {
             command,
             effect_anchor(&authorization_anchor),
             purpose,
+            crate::effect::RuntimePermitContext {
+                revision: runtime.revision,
+                now_ms,
+            },
             broker_session,
-            now_ms,
         )?;
         transaction.commit()?;
         Ok(permit)
@@ -543,6 +927,7 @@ impl Store {
         let now_ms = current_unix_ms()?;
         crate::effect::validate_broker_session(&trusted_broker, broker_session, now_ms)?;
         let transaction = self.connection.transaction()?;
+        let runtime = load_runtime_control(&transaction, &self.authority, Some(&trusted_broker))?;
         verify_expected_anchor(
             &transaction,
             &self.authority,
@@ -566,8 +951,11 @@ impl Store {
             command,
             effect_anchor(&authorization_anchor),
             EffectPermitPurpose::Reconcile,
+            crate::effect::RuntimePermitContext {
+                revision: runtime.revision,
+                now_ms,
+            },
             broker_session,
-            now_ms,
         )?;
         transaction.commit()?;
         Ok(permit)
@@ -953,6 +1341,11 @@ fn resolve_effect_command(
     {
         return resolve_existing_effect_command(context, request, &stored);
     }
+    require_runtime_enabled(
+        context.transaction,
+        context.authority,
+        Some(context.trusted_broker),
+    )?;
     require_no_effect_fence(context.transaction)?;
     verify_expected_anchor(
         context.transaction,
@@ -966,9 +1359,7 @@ fn resolve_effect_command(
         &context.proposal.mission_id,
     )?
     .ok_or(StoreError::MissionNotFound)?;
-    let decision = context
-        .gate
-        .authorize(&mission, context.proposal, Some(context.payload));
+    let decision = ActionGate.authorize(&mission, context.proposal, Some(context.payload));
     if decision != GateDecision::Allowed {
         return Err(StoreError::EffectAuthorization(decision));
     }
@@ -1054,6 +1445,11 @@ fn resolve_existing_effect_command(
             EffectPermitPurpose::ReattestOnly,
         ));
     }
+    require_runtime_enabled(
+        context.transaction,
+        context.authority,
+        Some(context.trusted_broker),
+    )?;
     require_effect_fence(context.transaction, context.effect_id)?;
     if current_tail != authorization_anchor || current_tail != *context.expected_anchor {
         return Err(StoreError::AuditAnchorMismatch);
@@ -1061,9 +1457,7 @@ fn resolve_existing_effect_command(
     let mission =
         load_mission_for_update(context.transaction, context.authority, &command.mission_id)?
             .ok_or(StoreError::MissionNotFound)?;
-    let decision = context
-        .gate
-        .authorize(&mission, context.proposal, Some(context.payload));
+    let decision = ActionGate.authorize(&mission, context.proposal, Some(context.payload));
     if decision != GateDecision::Allowed {
         return Err(StoreError::EffectAuthorization(decision));
     }
@@ -2016,6 +2410,7 @@ fn verify_all_bindings(
     authority: &LocalAuthority,
     trusted_broker: Option<&TrustedBrokerEnrollment>,
 ) -> Result<(), StoreError> {
+    load_runtime_control(connection, authority, trusted_broker)?;
     verify_audited_entities_exist(connection, MISSION_COMMAND_ACTION)?;
     verify_audited_entities_exist(connection, RECEIPT_COMMIT_ACTION)?;
     verify_audited_entities_exist(connection, EFFECT_AUTHORIZATION_ACTION)?;
@@ -2094,6 +2489,147 @@ fn verify_all_bindings(
         }
     }
     Ok(())
+}
+
+fn load_runtime_control(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+) -> Result<RuntimeControl, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT enabled, revision, updated_at_ms, signature_hex
+             FROM runtime_control WHERE singleton_id = ?1",
+            [RUNTIME_CONTROL_ID],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut statement = connection.prepare(
+        "SELECT enabled, revision, updated_at_ms, signature_hex
+         FROM runtime_control_history ORDER BY revision ASC",
+    )?;
+    let history = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut checkpoints = load_runtime_recovery_checkpoints(connection)?;
+    let mut latest = None;
+    let mut previous_revision = 0_u64;
+    for (enabled, revision, updated_at_ms, signature_hex) in history {
+        let revision = u64::try_from(revision).map_err(|_| StoreError::RuntimeControlMismatch)?;
+        if !matches!(enabled, 0 | 1) || revision <= previous_revision || updated_at_ms < 0 {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        let authorization = RuntimeControlAuthorization {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            enabled: enabled == 1,
+            revision,
+            updated_at_ms,
+            core_key_id: authority.effect_key_id(),
+            authorization_signature_hex: signature_hex,
+        };
+        authority
+            .verify_runtime_control(&authorization)
+            .map_err(|_| StoreError::RuntimeControlMismatch)?;
+        let expected = previous_revision
+            .checked_add(1)
+            .ok_or(StoreError::RuntimeControlRevisionOverflow)?;
+        if let Some(receipt) = checkpoints.remove(&revision) {
+            crate::effect::verify_runtime_control_receipt(
+                trusted_broker.ok_or(StoreError::MissingTrustedBrokerEnrollment)?,
+                &authorization,
+                &receipt,
+            )?;
+        } else if revision != expected {
+            return Err(StoreError::RuntimeControlMismatch);
+        }
+        previous_revision = revision;
+        latest = Some(authorization);
+    }
+    if !checkpoints.is_empty() {
+        return Err(StoreError::RuntimeControlMismatch);
+    }
+    match (stored, latest) {
+        (None, None) => Ok(RuntimeControl {
+            enabled: false,
+            revision: 0,
+            updated_at_ms: 0,
+        }),
+        (Some((enabled, revision, updated_at_ms, signature_hex)), Some(latest)) => {
+            let revision =
+                u64::try_from(revision).map_err(|_| StoreError::RuntimeControlMismatch)?;
+            if !matches!(enabled, 0 | 1)
+                || (enabled == 1) != latest.enabled
+                || revision != latest.revision
+                || updated_at_ms != latest.updated_at_ms
+                || signature_hex != latest.authorization_signature_hex
+            {
+                return Err(StoreError::RuntimeControlMismatch);
+            }
+            Ok(RuntimeControl {
+                enabled: latest.enabled,
+                revision: latest.revision,
+                updated_at_ms: latest.updated_at_ms,
+            })
+        }
+        _ => Err(StoreError::RuntimeControlMismatch),
+    }
+}
+
+fn load_runtime_recovery_checkpoints(
+    connection: &Connection,
+) -> Result<BTreeMap<u64, RuntimeControlReceipt>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT revision, authorization_hash, checkpoint_nonce, request_nonce,
+                broker_key_id, broker_signature_hex
+         FROM runtime_control_recovery_checkpoint ORDER BY revision ASC",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                RuntimeControlReceipt {
+                    protocol_version: EFFECT_PROTOCOL_VERSION,
+                    authorization_hash: row.get(1)?,
+                    checkpoint_nonce: row.get(2)?,
+                    request_nonce: row.get(3)?,
+                    broker_key_id: row.get(4)?,
+                    broker_signature_hex: row.get(5)?,
+                },
+            ))
+        })?
+        .map(|result| {
+            let (revision, receipt) = result?;
+            let revision =
+                u64::try_from(revision).map_err(|_| StoreError::RuntimeControlMismatch)?;
+            Ok((revision, receipt))
+        })
+        .collect()
+}
+
+fn require_runtime_enabled(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+) -> Result<(), StoreError> {
+    if load_runtime_control(connection, authority, trusted_broker)?.enabled {
+        Ok(())
+    } else {
+        Err(StoreError::RuntimeDisabled)
+    }
 }
 
 fn verify_effect_authorization_bindings(

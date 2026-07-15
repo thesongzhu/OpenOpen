@@ -387,6 +387,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "openopen-codex-client"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "openopen-core"
 version = "0.1.0"
 dependencies = [
@@ -401,6 +414,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -425,10 +439,20 @@ dependencies = [
 name = "openopen-host"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "openopen-codex-client",
  "openopen-core",
  "openopen-protocol",
+ "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]

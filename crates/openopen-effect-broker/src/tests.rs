@@ -5,12 +5,16 @@
 use super::*;
 use ed25519_dalek::Signer;
 use openopen_core::{
-    ActionGate, ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor,
-    BrokerEnrollmentRecord, CreateMission, CreateWorkItem, EffectKind, LocalAuthority,
-    MissionCommand, MissionCommandEnvelope, MissionCommandResult, NewBoundaryApproval, Store,
-    StoreError, TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
+    ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor, BrokerEnrollmentRecord,
+    CreateMission, CreateWorkItem, EffectKind, LocalAuthority, MissionCommand,
+    MissionCommandEnvelope, MissionCommandResult, NewBoundaryApproval, Store, StoreError,
+    TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
 };
-use openopen_protocol::{ApprovalKind, EffectPermitPurpose, WorkItemStatus};
+use openopen_protocol::{
+    ApprovalKind, EFFECT_PROTOCOL_VERSION, EffectPermitPurpose, RuntimeControlAuthorization,
+    RuntimeControlReceipt, WorkItemStatus, runtime_control_authorization_hash,
+    runtime_control_receipt_signing_bytes,
+};
 use openopen_protocol::{EffectAuditAnchor, effect_receipt_signing_bytes};
 use std::fs::Permissions;
 use std::io::{Cursor, Read};
@@ -20,11 +24,47 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 struct Fixture {
     root: tempfile::TempDir,
     core_signing_key: SigningKey,
     config: BrokerConfig,
+}
+
+fn commit_runtime_with_broker(
+    store: &mut Store,
+    enabled: bool,
+    updated_at_ms: i64,
+    broker_seed: [u8; 32],
+) {
+    let authorization = store
+        .prepare_runtime_control(enabled, updated_at_ms)
+        .unwrap();
+    let receipt = signed_runtime_receipt(&authorization, broker_seed);
+    store
+        .commit_runtime_control(&authorization, &receipt)
+        .unwrap();
+}
+
+fn signed_runtime_receipt(
+    authorization: &RuntimeControlAuthorization,
+    broker_seed: [u8; 32],
+) -> RuntimeControlReceipt {
+    let key = SigningKey::from_bytes(&broker_seed);
+    let mut receipt = RuntimeControlReceipt {
+        protocol_version: EFFECT_PROTOCOL_VERSION,
+        authorization_hash: runtime_control_authorization_hash(authorization).unwrap(),
+        checkpoint_nonce: "90".repeat(32),
+        request_nonce: None,
+        broker_key_id: sha256_hex(&key.verifying_key().to_bytes()),
+        broker_signature_hex: String::new(),
+    };
+    receipt.broker_signature_hex = hex::encode(
+        key.sign(&runtime_control_receipt_signing_bytes(&receipt).unwrap())
+            .to_bytes(),
+    );
+    receipt
 }
 
 impl Fixture {
@@ -95,6 +135,7 @@ impl Fixture {
             stable_effect_hash,
             authorization_anchor,
             purpose: EffectPermitPurpose::Execute,
+            runtime_revision: 1,
             broker_session_nonce: self.config.session_nonce.clone(),
             issued_at_ms: now_ms,
             expires_at_ms: now_ms + 30_000,
@@ -131,6 +172,104 @@ fn same_uid_contract_independent_workers_share_one_cross_process_operation_lock(
     ));
     drop(first);
     BrokerEngine::open_internal(fixture.config.clone()).unwrap();
+}
+
+#[test]
+fn same_uid_contract_restarted_daemon_off_waits_then_revokes_old_runtime_at_commit_fence() {
+    let fixture = Fixture::new();
+    let runtime_db = fixture.config.protected_root.join("runtime-test.sqlite3");
+    let connection = rusqlite::Connection::open(&runtime_db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE protected_runtime(enabled INTEGER NOT NULL, revision INTEGER NOT NULL);
+             INSERT INTO protected_runtime(enabled, revision) VALUES(1, 1);",
+        )
+        .unwrap();
+    drop(connection);
+    let operation_guard =
+        acquire_protected_operation_guard(&fixture.config.protected_root).unwrap();
+    let mut engine =
+        BrokerEngine::open_with_operation_guard_internal(fixture.config.clone(), operation_guard)
+            .unwrap();
+    let payload = vec![0x72; 128 * 1024];
+    let permit = fixture.permit("legacy-worker-put", &["legacy.bin"], &payload);
+    let (reader, reached, resume) = blocking_reader(payload.clone());
+    let writer_runtime_db = runtime_db.clone();
+    let writer = std::thread::spawn(move || {
+        engine.put_file_with_commit_fence(&permit, reader, || {
+            let connection = rusqlite::Connection::open(writer_runtime_db)?;
+            let state: (i64, i64) = connection.query_row(
+                "SELECT enabled, revision FROM protected_runtime",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if state == (1, 1) {
+                Ok(())
+            } else {
+                Err(BrokerError::RuntimeRevoked)
+            }
+        })
+    });
+    reached.recv().unwrap();
+
+    let root = fixture.config.protected_root.clone();
+    let off_runtime_db = runtime_db.clone();
+    let (off_acquired_tx, off_acquired_rx) = channel();
+    let off = std::thread::spawn(move || {
+        let guard = acquire_protected_operation_guard(&root).unwrap();
+        rusqlite::Connection::open(off_runtime_db)
+            .unwrap()
+            .execute("UPDATE protected_runtime SET enabled = 0, revision = 2", [])
+            .unwrap();
+        off_acquired_tx.send(()).unwrap();
+        drop(guard);
+    });
+    assert!(
+        off_acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+
+    resume.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    off_acquired_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    off.join().unwrap();
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("mission-1/legacy.bin")).unwrap(),
+        payload
+    );
+
+    let operation_guard =
+        acquire_protected_operation_guard(&fixture.config.protected_root).unwrap();
+    let mut restarted =
+        BrokerEngine::open_with_operation_guard_internal(fixture.config.clone(), operation_guard)
+            .unwrap();
+    let rejected_payload = b"must not cross off";
+    let old_runtime_permit =
+        fixture.permit("post-off-old-runtime", &["rejected.bin"], rejected_payload);
+    assert!(matches!(
+        restarted.put_file_with_commit_fence(
+            &old_runtime_permit,
+            Cursor::new(rejected_payload),
+            || {
+                let connection = rusqlite::Connection::open(&runtime_db)?;
+                let state: (i64, i64) = connection.query_row(
+                    "SELECT enabled, revision FROM protected_runtime",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if state == (1, 1) {
+                    Ok(())
+                } else {
+                    Err(BrokerError::RuntimeRevoked)
+                }
+            }
+        ),
+        Err(BrokerError::RuntimeRevoked)
+    ));
+    assert!(!fixture.root.path().join("mission-1/rejected.bin").exists());
 }
 
 #[test]
@@ -185,11 +324,9 @@ fn same_uid_contract_lost_noncommit_response_recovers_under_fresh_session() {
     };
     let payload = b"must never be written";
     let resumed = approve_core_write(&mut store, working, &proposal, payload);
-    let mut gate = ActionGate::default();
-    gate.set_enabled(true);
+    commit_runtime_with_broker(&mut store, true, 1, [0x52; 32]);
     let execute = store
         .prepare_mission_file_put(
-            &gate,
             "lost-noncommit-effect",
             &resumed.anchor,
             &proposal,
@@ -610,9 +747,14 @@ fn same_uid_contract_expiry_after_rename_requires_reconciliation_proof() {
     engine.bind_workspace(&permit.command.mission_id).unwrap();
 
     assert!(matches!(
-        engine.commit_accepted_write(&entry, &permit, &validated, Cursor::new(payload), || Ok(
-            permit.expires_at_ms
-        ),),
+        engine.commit_accepted_write(
+            &entry,
+            &permit,
+            &validated,
+            Cursor::new(payload),
+            || Ok(permit.expires_at_ms),
+            || Ok(())
+        ),
         Err(BrokerError::InvalidPermit)
     ));
     assert_eq!(
@@ -1502,11 +1644,9 @@ fn same_uid_contract_core_store_broker_receipt_round_trip() {
     };
     let payload = b"verified workbook";
     let resumed = approve_core_write(&mut store, working, &proposal, payload);
-    let mut gate = ActionGate::default();
-    gate.set_enabled(true);
+    commit_runtime_with_broker(&mut store, true, 1, [0x32; 32]);
     let permit = store
         .prepare_mission_file_put(
-            &gate,
             "roundtrip-effect",
             &resumed.anchor,
             &proposal,
@@ -1587,11 +1727,9 @@ fn same_uid_contract_streaming_effect_fence_orders_outcome_before_pause() {
     };
     let payload = vec![0x5a; 256 * 1024];
     let resumed = approve_core_write(&mut store, working, &proposal, &payload);
-    let mut gate = ActionGate::default();
-    gate.set_enabled(true);
+    commit_runtime_with_broker(&mut store, true, 1, broker_seed);
     let permit = store
         .prepare_mission_file_put(
-            &gate,
             "streaming-fence-effect",
             &resumed.anchor,
             &proposal,

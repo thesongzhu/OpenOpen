@@ -43,6 +43,8 @@ pub enum BrokerError {
     InvalidRoot,
     #[error("another broker worker owns the protected effect operation lock")]
     OperationBusy,
+    #[error("the protected runtime revision changed before filesystem commit")]
+    RuntimeRevoked,
     #[error("broker session is malformed or expired")]
     InvalidSession,
     #[error("effect command is malformed")]
@@ -89,7 +91,31 @@ pub struct BrokerEngine {
     session_expires_at_ms: i64,
     workspace: Workspace,
     journal: Journal,
-    _operation_lock: OwnedFd,
+    _operation_lock: ProtectedOperationGuard,
+}
+
+/// Cross-process guard shared by runtime transitions and effect commits.
+///
+/// The privileged worker acquires this guard before reading protected runtime
+/// state and transfers it into `BrokerEngine`, so a daemon restart cannot let
+/// a newer Off transition overtake an older still-running effect worker.
+pub struct ProtectedOperationGuard {
+    root: PathBuf,
+    _lock: OwnedFd,
+}
+
+/// Waits for exclusive ownership of the protected operation boundary.
+///
+/// # Errors
+///
+/// Returns an error when the protected lock inode is not an exact private file.
+pub fn acquire_protected_operation_guard(
+    root: &Path,
+) -> Result<ProtectedOperationGuard, BrokerError> {
+    Ok(ProtectedOperationGuard {
+        root: root.to_path_buf(),
+        _lock: acquire_operation_lock(root, true)?,
+    })
 }
 
 impl BrokerEngine {
@@ -113,6 +139,40 @@ impl BrokerEngine {
     }
 
     fn open_internal(config: BrokerConfig) -> Result<Self, BrokerError> {
+        let operation_lock = ProtectedOperationGuard {
+            root: config.protected_root.clone(),
+            _lock: acquire_operation_lock(&config.protected_root, false)?,
+        };
+        Self::open_with_operation_guard_internal(config, operation_lock)
+    }
+
+    /// Opens a production broker while retaining an already acquired runtime
+    /// and effect serialization guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a caller/root mismatch, invalid session, or an
+    /// invalid protected workspace/journal.
+    pub fn open_with_operation_guard(
+        config: BrokerConfig,
+        operation_lock: ProtectedOperationGuard,
+    ) -> Result<Self, BrokerError> {
+        if config.authenticated_audit_euid == rustix::process::geteuid().as_raw() {
+            return Err(BrokerError::InvalidSecurityBoundary);
+        }
+        if config.protected_root != protected_root_for_audit_euid(config.authenticated_audit_euid) {
+            return Err(BrokerError::InvalidRoot);
+        }
+        Self::open_with_operation_guard_internal(config, operation_lock)
+    }
+
+    fn open_with_operation_guard_internal(
+        config: BrokerConfig,
+        operation_lock: ProtectedOperationGuard,
+    ) -> Result<Self, BrokerError> {
+        if operation_lock.root != config.protected_root {
+            return Err(BrokerError::InvalidRoot);
+        }
         if !is_lower_hex(&config.session_nonce, 64)
             || config.session_expires_at_ms <= current_unix_ms()?
         {
@@ -124,7 +184,6 @@ impl BrokerEngine {
         let broker_signing_key = SigningKey::from_bytes(&config.broker_signing_seed);
         let broker_key_id = sha256_hex(broker_signing_key.verifying_key().as_bytes());
         let workspace = Workspace::open(&config.protected_root)?;
-        let operation_lock = acquire_operation_lock(&config.protected_root)?;
         let journal = Journal::open(
             &config.protected_root,
             config.authenticated_audit_euid,
@@ -177,6 +236,28 @@ impl BrokerEngine {
         self.put_file_with_completion_clock(permit, payload, current_unix_ms()?, current_unix_ms)
     }
 
+    /// Applies one signed `PutFile` and rechecks protected runtime authority in
+    /// the exact pre-rename commit callback.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the supplied fence reports that the runtime revision is
+    /// no longer current, in addition to all normal effect validation errors.
+    pub fn put_file_with_commit_fence(
+        &mut self,
+        permit: &EffectPermit,
+        payload: impl Read,
+        commit_fence: impl FnOnce() -> Result<(), BrokerError>,
+    ) -> Result<EffectReceipt, BrokerError> {
+        self.put_file_with_clocks_and_fence(
+            permit,
+            payload,
+            current_unix_ms()?,
+            current_unix_ms,
+            commit_fence,
+        )
+    }
+
     #[cfg(test)]
     fn put_file_at(
         &mut self,
@@ -192,9 +273,20 @@ impl BrokerEngine {
     fn put_file_with_completion_clock(
         &mut self,
         permit: &EffectPermit,
+        payload: impl Read,
+        now_ms: i64,
+        completion_clock: impl FnOnce() -> Result<i64, BrokerError>,
+    ) -> Result<EffectReceipt, BrokerError> {
+        self.put_file_with_clocks_and_fence(permit, payload, now_ms, completion_clock, || Ok(()))
+    }
+
+    fn put_file_with_clocks_and_fence(
+        &mut self,
+        permit: &EffectPermit,
         mut payload: impl Read,
         now_ms: i64,
         completion_clock: impl FnOnce() -> Result<i64, BrokerError>,
+        commit_fence: impl FnOnce() -> Result<(), BrokerError>,
     ) -> Result<EffectReceipt, BrokerError> {
         let validated = self.validate_permit(permit, now_ms)?;
         if permit.purpose == EffectPermitPurpose::Reconcile {
@@ -246,6 +338,7 @@ impl BrokerEngine {
                 &validated,
                 &mut payload,
                 completion_clock,
+                commit_fence,
             )?;
             let completed_at_ms = committed
                 .completed_at_ms
@@ -305,6 +398,7 @@ impl BrokerEngine {
         validated: &ValidatedPut,
         payload: impl Read,
         completion_clock: impl FnOnce() -> Result<i64, BrokerError>,
+        commit_fence: impl FnOnce() -> Result<(), BrokerError>,
     ) -> Result<JournalEntry, BrokerError> {
         if !entry.write_started {
             self.workspace.cleanup_stage(
@@ -333,6 +427,7 @@ impl BrokerEngine {
             &entry.stage_name,
             payload,
             || {
+                commit_fence()?;
                 let commit_at_ms = current_unix_ms()?;
                 Self::validate_commit_instant(permit, session_expires_at_ms, commit_at_ms)?;
                 journal.mark_commit_intent(
@@ -920,7 +1015,7 @@ fn current_unix_ms() -> Result<i64, BrokerError> {
     i64::try_from(duration.as_millis()).map_err(|_| BrokerError::InvalidSystemTime)
 }
 
-fn acquire_operation_lock(root: &Path) -> Result<OwnedFd, BrokerError> {
+fn acquire_operation_lock(root: &Path, blocking: bool) -> Result<OwnedFd, BrokerError> {
     let path = root.join(OPERATION_LOCK_NAME);
     let lock = open(
         &path,
@@ -944,8 +1039,12 @@ fn acquire_operation_lock(root: &Path) -> Result<OwnedFd, BrokerError> {
     {
         return Err(BrokerError::InvalidRoot);
     }
-    flock(&lock, FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| BrokerError::OperationBusy)?;
+    let operation = if blocking {
+        FlockOperation::LockExclusive
+    } else {
+        FlockOperation::NonBlockingLockExclusive
+    };
+    flock(&lock, operation).map_err(|_| BrokerError::OperationBusy)?;
     Ok(lock)
 }
 
