@@ -75,9 +75,49 @@
   Actions run `29440208503` passes the complete strict workflow on synthesized
   merge `99ee2b10…`; its tree `730bce09…` equals the exact head tree. This is
   reviewed implementation and PR integration-tree plumbing evidence only.
-  Real GPT/Reminders/iMessage/Discord traffic, Developer-ID signing,
-  notarization, administrator/cross-UID proof, and `FRIDAY_ALPHA_READY` remain
-  pending.
+  Evidence follow-up `becea456…` is also pushed and Actions run `29442001103`
+  passes on equal-tree synthesized merge `2b80e2c…`. Real
+  GPT/Reminders/iMessage/Discord traffic, notarization,
+  administrator/cross-UID proof, and `FRIDAY_ALPHA_READY` remain pending.
+- The local signing slice adds an explicit Developer-ID-only staging
+  mode with no identity fallback, hardened runtime plus secure timestamps for
+  every OpenOpen executable, and the one Apple Events entitlement required by
+  the pinned imsg sender. It verifies the exact upstream Codex `rg` hash before
+  re-signing that same Mach-O for notarization and records both hashes plus its
+  runtime Team/CDHash. Historical v3 had Team `UHDY2275L5` and DMG SHA
+  `0d51c849…`; its structural and 93-Swift checks passed before review. The
+  first governance reviewer rejected fingerprint `eaa4bc2e…` because staging
+  trusted caller-authored imsg receipt data, the DMG creator did not bind the
+  exact same-Team App/nested code/receipts, and README omitted mandatory imsg
+  inputs. v3 is superseded. The repair pins exact imsg bytes, receipt, patch,
+  source/runtime/resource manifests and runtime allowlist, then requires the
+  exact OpenOpen bundle, eight Mach-O identities, Teams, Apple anchors,
+  hardened runtime/timestamps, entitlement split, receipts, upstream hashes,
+  and frozen CDHashes before DMG creation. Local v4 passed those focused checks
+  and produced signed DMG SHA `feec94d3…`, but both fresh v4 reviewers rejected
+  fingerprint `08a58745…`: file and directory modes were not bound, the exact
+  owner certificate leaf was not pinned, and staging did not compare owned
+  unsigned Mach-O content after every signature/final copy. v4 is historical,
+  not a signing PASS. The replacement repair pins the exact owner leaf, normalizes
+  and verifies the complete directory/file mode contract, and checks every owned
+  Mach-O before and after signing plus at final output. Closure candidate v5
+  embeds byte-identical provenance, has exact owner leaf SHA `a7e43925…` on all
+  owner code and the DMG, and passes the new mode/directory/identity negatives
+  plus the full 190-Rust/40+53-Swift strict suite; its signed review DMG SHA is
+  `494caddf…`. Fresh functional and governance reviewers both PASS unchanged
+  fingerprint `fdf5a00e…` with zero P0/P1/P2. Gatekeeper correctly reports
+  `Unnotarized Developer ID`; this is not `FRIDAY_ALPHA_READY` or release
+  proof. The provenance-bound replacement tree may be committed only after its
+  own two fresh reviewers PASS the unchanged final fingerprint. The rebuilt
+  App `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v5-evidence-final.app`
+  embeds provenance SHA `315deb30…`; its exactly verified signed DMG SHA is
+  `b7f3e718…`. The first final-evidence governance reviewer rejects that
+  fingerprint on one P2: another provenance paragraph still says “not yet
+  reviewed,” which becomes false when review completes. The peer review was
+  interrupted and is not counted. The narrow replacement removes dynamic
+  review status from embedded provenance; all package and proof gates remain
+  unchanged. Final2 embeds provenance SHA `155aa65a…`; its exactly verified
+  signed DMG SHA is `7c022b83…`.
 
 ## Planned Build Week additions (not yet claimed)
 

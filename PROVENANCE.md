@@ -131,8 +131,52 @@ later upstream changes.
   closure check. Two fresh replacement reviewers PASS fingerprint
   `3e201547…`; implementation commit `2685b57…` is pushed, and PR #2 Actions
   run `29440208503` passes on equal-tree synthesized merge `99ee2b10…`.
-  Full Disk Access, Messages Automation, real bidirectional traffic,
-  Developer-ID signing, notarization, and release proof remain pending.
+  Evidence follow-up `becea456…` passes run `29442001103`. The subsequent
+  local signing slice gives the pinned sender only
+  `com.apple.security.automation.apple-events`, signs it and every OpenOpen
+  executable with hardened runtime, a secure timestamp, and Team
+  `UHDY2275L5`, and records that Team/CDHash in its runtime receipt. It first
+  verifies the upstream Codex `rg` SHA-256 `4fdf1d83…`; because that upstream
+  nested executable is linker-ad-hoc, Developer-ID mode re-signs the same
+  Mach-O with OpenOpen Team/hardened runtime/timestamp and records upstream and
+  runtime hashes plus Team/CDHash in `CODEX-RUNTIME-RECEIPT.json`. The signed
+  local v3 app and DMG passed every-Mach-O structural verification, but the
+  first signing-slice governance reviewer rejected frozen fingerprint
+  `eaa4bc2e…`: staging still trusted a caller-supplied imsg receipt, the DMG
+  creator accepted a same-Team renamed app without exact nested-code and
+  receipt binding, and the README omitted the mandatory pinned inputs. v3 is
+  therefore historical and not an alpha candidate. The first repair pins the exact
+  schema-v2 build receipt, unsigned imsg bytes/size, patch, runtime/resource
+  trees, compiled-source manifests, and the three-file runtime allowlist before
+  any build or signature. DMG creation additionally requires the exact
+  OpenOpen bundle/signing identifiers, eight-Mach-O allowlist, Apple anchors,
+  Teams, hardened runtime/timestamps, entitlement split, runtime receipts,
+  upstream hashes, and frozen CDHashes. Local v4 satisfied that focused contract,
+  but both fresh v4 reviewers rejected unchanged fingerprint `08a58745…`: the
+  App verifier omitted modes, the DMG accepted any generic same-Team Developer
+  ID leaf rather than the exact owner certificate, and staging lacked complete
+  post-sign/final-copy unsigned-content checks. v4 and DMG SHA `feec94d3…` are
+  historical, not signing PASS evidence. The replacement repair pins owner leaf
+  SHA-256 `a7e43925…`, binds the exact directory/file/type/mode allowlists, and
+  checks every owned Mach-O before and after signing and at final output. A
+  process already authorized to use the owner's signing identity can call
+  `codesign` directly; output verification does not claim otherwise. Fresh
+  Focused replacement verification now passes exact owner-leaf checks on every
+  owned component and the DMG; all 18 directories are `0755`, the eight Mach-O
+  files are `0755`, and every other regular file is `0644`. Main-executable,
+  resource-file, directory-mode, extra-directory, and wrong-identity negatives
+  all fail before output, while the ad-hoc diagnostic route still stages
+  successfully. The provenance-embedded replacement candidate satisfies this
+  focused contract. Fresh functional and governance reviewers both PASS frozen
+  fingerprint `fdf5a00e8c0c4ca92ab4ff8e9cf33041c801bac5e74304bc484c613c35e33235`
+  with zero P0/P1/P2 after independently checking the original, mounted, and
+  copied App plus the focused negative routes. A provenance-bound replacement
+  tree may be committed only after two fresh reviewers PASS its unchanged final
+  fingerprint; reviewer results are task/PR evidence and are not recursively
+  embedded into the already reviewed package. These focused packaging facts
+  are not a substitute for the recorded full suite.
+  Full Disk Access, Messages Automation, real bidirectional traffic, commit/CI,
+  notarization, and release proof also remain pending.
 
 ### serenity (implemented exact direct dependency; provider proof pending)
 
@@ -152,8 +196,14 @@ Codex app-server schemas are generated from pinned runtime `0.144.0`; the
 tracked manifest binds the runtime package components and all 267 schemas. The
 runtime binary itself is not stored in Git. Local staging accepts only an
 explicit package root whose four component hashes match the manifest. This is
-implementation provenance, not redistribution, signed-package, or provider
-proof.
+implementation provenance, not redistribution or provider proof. The current
+local Developer-ID candidate verifies all four immutable upstream Codex file
+hashes before signing. It preserves the OpenAI-signed Codex and code-mode-host
+bytes/signatures; only the same upstream linker-ad-hoc `rg` Mach-O is re-signed
+for notarization, with a separate content/signature receipt. The candidate is
+not notarized, installed with administrator approval, or release proof. Review
+status is recorded in external task/PR evidence and is not recursively embedded
+into a reviewed package.
 
 `imsg` and serenity are present through the exact adaptation and direct
 dependency paths above. imsg's three Swift dependencies are locked by the
@@ -162,5 +212,5 @@ Friday-alpha distribution notice closure contains 190 OpenOpen and 924 Codex
 third-party package identities, 1888 document references, and 597 unique
 content-addressed texts; manifest SHA-256 is `818495226dda3332…`. Hero C's
 future `rust_xlsxwriter` is not distributed and must extend this closure when
-implemented. No local compile or ad-hoc stage is real provider, notarization,
-clean-install, or release proof.
+implemented. Neither the ad-hoc history nor the current local Developer-ID
+candidate is real provider, notarization, clean-install, or release proof.

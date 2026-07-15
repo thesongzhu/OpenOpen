@@ -26,6 +26,8 @@
   <true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 OpenOpen contributors.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>OpenOpen sends only owner-approved progress and Receipt messages through Messages.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
 	<string>OpenOpen creates only the exact Mission steps you confirm and reads their completion status as Evidence.</string>
 </dict>

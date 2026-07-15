@@ -46,12 +46,31 @@ explicit `macos-26` runner label. Availability and inspected-run status are
 recorded in the acceptance ledger; CI is plumbing-tier evidence only and is
 not a substitute for signed/admin-installed cross-UID or real product proof.
 
-Stage a local ad-hoc app only from an explicit pinned Codex package root:
+First build the exact pinned imsg runtime from a clean checkout at commit
+`fa2f82d7dbda4c802d91c1d41bb6c53564ed2fdc`. The stage rejects any imsg
+binary, receipt, resource, compiled-source manifest, or runtime-tree hash that
+differs from the reviewed Friday-alpha build:
 
 ```bash
+IMSG_SOURCE=/absolute/path/to/clean-imsg-checkout
+IMSG_RUNTIME=/private/tmp/OpenOpen-imsg-runtime
+IMSG_RECEIPT=/private/tmp/OpenOpen-imsg-build-receipt.json
+scripts/build_pinned_imsg.sh \
+  --source-root "$IMSG_SOURCE" \
+  --output "$IMSG_RUNTIME" \
+  --receipt "$IMSG_RECEIPT"
+```
+
+Stage a local ad-hoc diagnostic from that exact imsg runtime and an explicit
+pinned Codex package root:
+
+```bash
+CODEX_ROOT=/absolute/path/to/codex-0.144.0-package
 scripts/stage_openopen_app.sh \
-  --codex-package-root /absolute/path/to/codex-0.144.0-package \
-  --output /absolute/new/path/OpenOpen.app
+  --codex-package-root "$CODEX_ROOT" \
+  --imsg-binary "$IMSG_RUNTIME/bin/imsg" \
+  --imsg-receipt "$IMSG_RECEIPT" \
+  --output /absolute/new/path/OpenOpen-AdHoc.app
 ```
 
 The script verifies every pinned component hash before and after copying,
@@ -59,6 +78,38 @@ includes the protected broker daemon/worker/LaunchDaemon plist, and exclusively
 claims a new output directory instead of merging into an existing app.
 `STAGED_AD_HOC_NOT_RELEASE_PROOF` is a local diagnostic only;
 it is not Developer ID signing, notarization, clean-install, or release proof.
+
+To produce the separate Developer-ID-signed but still unnotarized alpha
+candidate, pass one exact certificate name explicitly to both stages. Omitting
+the option never produces a Developer-ID claim, and an unavailable or non-Apple
+identity fails closed:
+
+```bash
+DEVELOPER_ID_IDENTITY='Developer ID Application: Wenxin Dou (UHDY2275L5)'
+SIGNED_APP=/absolute/new/path/OpenOpen-DeveloperID.app
+SIGNED_DMG=/absolute/new/path/OpenOpen-DeveloperID.dmg
+scripts/stage_openopen_app.sh \
+  --codex-package-root "$CODEX_ROOT" \
+  --imsg-binary "$IMSG_RUNTIME/bin/imsg" \
+  --imsg-receipt "$IMSG_RECEIPT" \
+  --output "$SIGNED_APP" \
+  --developer-id-identity "$DEVELOPER_ID_IDENTITY"
+scripts/create_alpha_dmg.sh \
+  --app "$SIGNED_APP" \
+  --output "$SIGNED_DMG" \
+  --developer-id-identity "$DEVELOPER_ID_IDENTITY"
+```
+
+This frozen alpha path accepts only that exact owner certificate and verifies
+its SHA-256 leaf fingerprint after every owner signature and on the DMG. The
+scripts also compare each owned Mach-O before and after signing, then recheck
+the final App. A process already authorized to use the owner's private signing
+identity can invoke Apple's `codesign` directly; these scripts prove the exact
+candidate output and do not claim to sandbox that already-authorized signer.
+
+The Developer-ID output remains `NOT_NOTARIZED_NOT_RELEASE_PROOF`. Apple
+notarization credentials, submission, stapling, Gatekeeper acceptance, and
+administrator/cross-UID installation are separate required gates.
 
 No credentials belong in this repository. ChatGPT and Discord credentials are
 stored at runtime in the macOS Keychain.

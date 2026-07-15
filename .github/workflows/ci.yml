@@ -69,7 +69,9 @@ jobs:
       - name: Verify app metadata and staging script syntax
         run: |
           plutil -lint macos/OpenOpenApp/Info.plist
+          plutil -lint macos/OpenOpenApp/iMessage.entitlements
           bash -n scripts/stage_openopen_app.sh
+          bash -n scripts/create_alpha_dmg.sh
 
       - name: Verify checks did not rewrite tracked files
         run: git diff --exit-code

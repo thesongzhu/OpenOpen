@@ -8,7 +8,7 @@ different commit/build.
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
 | Rust domain and security tests | Current-SHA test log | Exact Friday-alpha commit `2685b57…` passes 190 ordinary Rust tests with one explicit environment-gated Codex test, release build, workspace strict Clippy, fmt, focused Host/imsg regressions, five pinned upstream imsg tests, and two explicit pinned-runtime sandbox diagnostics locally. Two fresh reviewers PASS fingerprint `3e201547…`; PR #2 Actions `29440208503` passes the strict workflow on equal-tree synthesized merge `99ee2b10…`. This is not provider or release proof |
-| SwiftUI build and tests | Current-SHA build/test log | Local Friday-alpha Repair3 tree passes 40 broker/signing tests plus 53 App tests, warnings-as-errors debug/release build, strict format, both plists, script syntax, and diff checks. New tests cover product chat selection plus activation and prepare-response-loss cleanup/retry. Corrected-provenance `/private/tmp/OpenOpen-FridayAlpha-Repair3-Final2.app` and DMG pass deep ad-hoc and read-only mount/copy/signature install verification at DMG SHA `bff4d18b…`; Team is `not set`, so signed/admin and cross-UID release proof remain pending |
+| SwiftUI build and tests | Current-SHA build/test log | The product tree passes all 40 broker/signing plus 53 App tests. Historical v3 and v4 failed review. Local v5 final-review candidate passes exact owner leaf, complete directory/file/type/mode/operational-metadata, pre/post/final unsigned-content, mounted/copied App, ad-hoc regression, and focused malicious negatives. Two fresh reviewers PASS fingerprint `fdf5a00e…`; evidence Final2 DMG SHA is `7c022b83…` and requires its own unchanged-fingerprint review plus current CI. No notarization or release PASS is claimed |
 | Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the Repair3 tree. Current PR #2 run `29440208503` passes integration-tree plumbing for head `2685b57…`. Real managed login, required-model catalog, structured turn, signed-build proof, and release proof remain pending |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
@@ -17,7 +17,7 @@ different commit/build.
 | Restart recovery and dedupe | Same-SHA runtime record | pending |
 | Skill lifecycle and containment | Security test report | pending |
 | Stress suite | Nonzero all-pass scenario artifact | pending |
-| Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | pending |
+| Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | v4 is historical reviewer FAIL, not signing PASS. Its App and DMG were correctly rejected as `Unnotarized Developer ID`, which is expected negative evidence only. Replacement review, notarization, staple, Gatekeeper acceptance, administrator/cross-UID and clean-install evidence remain pending |
 | Three external users | Consent-safe aggregate and 48-hour reuse | pending |
 | Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Repair3 replacement reviewers PASS fingerprint `3e201547…` with zero P0/P1/P2; the reviewed tree is exact commit `2685b57…`, now pushed with equal-tree PR CI PASS. Provider proof and final release-SHA review remain pending |
 
@@ -1031,3 +1031,132 @@ different commit/build.
   real GPT/Reminders/iMessage/Discord traffic, Developer-ID/notarization,
   administrator/cross-UID proof, `FRIDAY_ALPHA_READY`, and release proof remain
   pending.
+- 2026-07-15 evidence follow-up: two fresh isolated reviewers PASS frozen
+  fingerprint `1c8660779e17c06934a782c2e6e03ced67d9c9f312a9704a320341e05503bc3d`
+  with zero P0/P1/P2. Commit
+  `becea456a426a76a74428ed46a20311f2986d219` is pushed, and Actions run
+  `29442001103` passes every strict step on synthesized merge `2b80e2c…`; merge
+  and exact head share tree `bb84694e…`. PR #2 remains draft/unmerged and its
+  corrected metadata makes no provider or release claim.
+- 2026-07-15 local signing slice: explicit Developer-ID mode rejects a missing
+  or non-Developer-ID identity and never falls back. Every OpenOpen executable
+  has Team `UHDY2275L5`, hardened runtime, secure timestamp, and its exact
+  identifier; imsg alone carries the Apple Events entitlement required for its
+  selected-chat sender, and the adjacent runtime receipt binds its Team/CDHash.
+  The final all-Mach-O pass also found the pinned Codex `rg` was linker-ad-hoc;
+  Developer-ID mode now verifies its immutable upstream hash, re-signs only
+  that same Mach-O with the OpenOpen Team/hardened runtime/timestamp, and saves
+  both hashes plus Team/CDHash while preserving the OpenAI-signed Codex and
+  code-mode-host. `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v3.app` embeds
+  the current provenance and passes deep strict
+  verification; its signed, integrity-checked, mounted/copied DMG SHA-256 is
+  `0d51c84926d91620b0f5dab0737065ae2152ff4c3ef79c78ee7e26f9e505aba2`.
+  All 40+53 Swift tests, release build, strict format, plist/script/diff and
+  ad-hoc regression checks pass. Gatekeeper correctly rejects it as
+  `Unnotarized Developer ID`; two fresh reviewers, commit/CI, notarization,
+  admin/cross-UID install, provider traffic, `FRIDAY_ALPHA_READY`, and release
+  proof remain pending.
+- 2026-07-15 first signing-slice review: governance Reviewer FAIL on unchanged
+  fingerprint `eaa4bc2e19321f97e280968081af3e5b72c8ea7cac8030a0dca8dc56fab3f537`.
+  Staging accepted an arbitrary imsg binary paired with a caller-authored
+  receipt; the DMG creator checked only a dynamic Team and could accept a
+  renamed same-Team app without exact bundle, nested-code, receipt, hardened-
+  runtime, timestamp, entitlement, or `get-task-allow` binding; and README's
+  only staging command omitted mandatory imsg inputs. The functional reviewer
+  was interrupted when the fingerprint became obsolete and is not counted.
+  Historical v3 and DMG `0d51c849…` are superseded. The approved repair pins
+  the exact imsg receipt, bytes, size, source/patch/runtime/resource manifests,
+  runtime allowlist, OpenOpen bundle, eight Mach-O identities, Teams, Apple
+  anchors, hardened runtime/timestamps, entitlement split, receipts, upstream
+  hashes, and frozen CDHashes before DMG creation. Replacement verification
+  and two entirely fresh reviewers remain required; no signing PASS is claimed.
+- 2026-07-15 signing repair v4 local verification: staging now requires the
+  exact receipt SHA `c1769b40…`, unsigned imsg hash/size, patch, runtime/resource
+  trees, compiled-source manifests, and three-file allowlist before any build.
+  DMG creation binds bundle `com.thesongzhu.OpenOpen`, the exact eight Mach-O
+  paths, identifiers, Teams, stable CDHashes and unsigned Mach-O hashes, Apple Developer
+  ID anchors, hardened runtime/timestamps, exact entitlement sets, build/runtime
+  receipts, Codex upstream/runtime hashes, notice manifest, and embedded
+  provenance. Forged receipt, extra imsg runtime, same-Team wrong bundle,
+  extra App Mach-O, and tampered runtime receipt tests each exit 66 without
+  output. Replacement App v4 embeds
+  byte-identical provenance; signed DMG SHA-256 is
+  `feec94d3c1ea2fa0d92799e17b5920c2a8f4ae3d3f24fba5436b4cfe3b3537e3`.
+  A fresh re-sign/rebuild also passes the same verifier despite new timestamped
+  signature bytes, proving the exact code/resource contract is reproducible.
+  Mount/copy/exact revalidation passes; App and DMG correctly fail Gatekeeper
+  as `Unnotarized Developer ID`. Two fresh replacement reviewers remain
+  required; this is local structural evidence, not notarization or release
+  proof.
+- 2026-07-15 signing repair v4 review: functional and governance reviewers both
+  FAIL unchanged fingerprint
+  `08a58745c03de8195c06376e245d7791d0b49e2700e0223de817e7bf8a478b41`.
+  Functional review reproduces `Contents/MacOS/OpenOpen` changed from `0755` to
+  `0644` while the exact verifier still emits a success-labeled DMG containing
+  a non-executable main binary. Governance review confirms the same mode gap,
+  finds that the DMG path accepts a generic same-Team Developer-ID leaf instead
+  of the exact owner certificate, and finds that staging does not compare every
+  owned unsigned Mach-O after signing and after final copy. v4 and DMG
+  `feec94d3…` are historical local evidence, not signing PASS. The replacement
+  pins owner leaf SHA-256 `a7e43925…`, exact directory/file/type/mode allowlists,
+  and pre/post/final unsigned content. A process already authorized to use the
+  owner signing key can invoke `codesign` directly; no script-level sandbox
+  claim is made. Fresh verification and two entirely new reviewers are pending.
+- 2026-07-15 signing repair v5 complete local verification: review App
+  `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v5-final-review.app` embeds
+  byte-identical provenance SHA `4b584d99…`; every owner component and the DMG
+  has exact leaf SHA `a7e43925…`. Its exact layout has 18 `0755` directories,
+  eight `0755` Mach-O files, and 609 `0644` regular resources. Main-executable,
+  resource-file, and directory-mode changes, an extra empty directory, a wrong
+  signing identity, an ACL, BSD flags, and a behavior-changing extended
+  attribute all fail before output; the ad-hoc staging regression still passes.
+  The exact verifier passes original, mounted, and copied Apps;
+  190 ordinary Rust tests (one explicit environment-gated test ignored) and
+  40+53 Swift tests plus release/strict lint/format/plist/script/diff/credential
+  checks pass;
+  signed DMG SHA-256 is
+  `494caddfdee337eca99da1629e70b6143d2d08d2e2bde7b1c3378532ba88fb41`.
+  App and DMG correctly report `Unnotarized Developer ID`. Two entirely fresh
+  reviewers remain pending; no notarization, provider, admin/cross-UID,
+  `FRIDAY_ALPHA_READY`, or release proof is claimed.
+- 2026-07-15 signing v5 first closure review: fresh functional and governance
+  reviewers both PASS frozen fingerprint
+  `fdf5a00e8c0c4ca92ab4ff8e9cf33041c801bac5e74304bc484c613c35e33235`
+  before and after, with zero P0/P1/P2. They independently verify exact owner
+  leaf `a7e43925…` on every owner component and the DMG, all six frozen unsigned
+  Mach-O hashes, the exact 18-directory/617-file/eight-Mach-O layout and modes,
+  ACL/flag/xattr rejection, entitlements, receipts, mounted/copied App, focused
+  malicious negatives, DMG SHA `494caddf…`, expected `Unnotarized Developer
+  ID` rejection, live draft-PR facts, and the same-UID signer disclosure. This
+  closes the first v5 review only. The provenance-bound replacement tree may be
+  committed only after two fresh reviewers PASS its unchanged final
+  fingerprint; notarization, provider, admin/cross-UID,
+  `FRIDAY_ALPHA_READY`, and release proof remain pending.
+- 2026-07-15 signing v5 evidence-bound rebuild: no product code changed.
+  `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v5-evidence-final.app` embeds
+  byte-identical current provenance SHA `315deb30…`, passes the exact
+  Developer-ID stage contract, and produces signed DMG SHA-256
+  `b7f3e718e50426eccfabd1f0c73ed946b23a99e1d45b13563207d71de82935ac`.
+  Original, mounted, and copied App verification passes. Two fresh reviewers
+  must PASS the unchanged final fingerprint before commit; the package remains
+  unnotarized and is not provider, admin/cross-UID, `FRIDAY_ALPHA_READY`, or
+  release proof.
+- 2026-07-15 first v5 final-evidence review: governance Reviewer B FAILS frozen
+  fingerprint `c9505bed51642f07e6cc6cbf5c994eb0b73c91498e1ccddb7d87d7fd57ce84be`
+  on one P2. Embedded provenance still says “not yet reviewed,” which becomes
+  false as soon as the external review completes and contradicts the adjacent
+  nonrecursive-review rule. The peer reviewer is interrupted after the tree is
+  invalidated and is not counted. Reviewer B otherwise verifies DMG
+  `b7f3e718…`, exact owner leaf, layout/modes/content/signatures, mounted parity,
+  expected Gatekeeper rejection, remote facts, and all remaining exclusions.
+  The narrow replacement removes only dynamic review status from embedded
+  provenance; rebuild and two entirely fresh reviewers remain required.
+- 2026-07-15 signing v5 final-evidence Repair1: no product code changed.
+  `/private/tmp/OpenOpen-FridayAlpha-DeveloperID-v5-evidence-final2.app` embeds
+  byte-identical provenance SHA `155aa65a…`, whose review status is external
+  and nonrecursive. The unchanged exact Developer-ID stage and mounted/copied
+  DMG verification pass; signed DMG SHA-256 is
+  `7c022b83945cf30647ee9974566278249a39d525d2cee7341c50648bd136a2b4`.
+  Two entirely fresh reviewers must PASS the unchanged fingerprint before
+  commit. The package remains unnotarized and is not provider,
+  admin/cross-UID, `FRIDAY_ALPHA_READY`, or release proof.
