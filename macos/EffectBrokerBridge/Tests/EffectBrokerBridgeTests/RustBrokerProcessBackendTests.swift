@@ -4,6 +4,47 @@ import XCTest
 @testable import EffectBrokerBridge
 
 final class RustBrokerProcessBackendTests: XCTestCase {
+  func testBundledWorkerUsesTheKernelProcessPathAndExactAppLayout() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "OpenOpen-Broker-Path-\(UUID().uuidString)", isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let macOS = root.appendingPathComponent(
+      "OpenOpen.app/Contents/MacOS", isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+    let broker = macOS.appendingPathComponent("OpenOpenEffectBroker")
+    let worker = macOS.appendingPathComponent("OpenOpenEffectBrokerWorker")
+    XCTAssertTrue(FileManager.default.createFile(atPath: broker.path, contents: Data()))
+    XCTAssertTrue(FileManager.default.createFile(atPath: worker.path, contents: Data()))
+    let pid = getpid()
+    let inspector = SequencedProcessInspector(
+      identities: [
+        pid: BrokerProcessIdentity(
+          pid: pid,
+          parentPID: getppid(),
+          effectiveUserIdentifier: geteuid(),
+          processGroupIdentifier: getpgid(pid),
+          startTimeMicroseconds: 1,
+          executableURL: broker
+        )
+      ],
+      liveness: []
+    )
+
+    XCTAssertEqual(
+      try SignedBrokerWorkerRunner.bundledWorkerURL(processInspector: inspector),
+      worker
+    )
+    XCTAssertThrowsError(
+      try SignedBrokerWorkerRunner.siblingWorkerURL(
+        forBrokerExecutableURL: root.appendingPathComponent("OpenOpenEffectBroker")
+      )
+    ) { error in
+      XCTAssertEqual(error as? BrokerWorkerError, .invalidWorkerBundleLayout)
+    }
+  }
+
   func testWorkerReaperUsesOnlyTheExactAuditToken() {
     let inspector = SequencedProcessInspector(identities: [:], liveness: [true, false])
     let completion = DispatchSemaphore(value: 1)

@@ -389,17 +389,40 @@ final class SignedBrokerWorkerRunner: BrokerWorkerRunning {
     }
   }
 
-  private static func bundledWorkerURL() throws -> URL {
-    guard let executablePath = CommandLine.arguments.first, !executablePath.isEmpty else {
+  static func bundledWorkerURL(
+    processInspector: any BrokerProcessInspecting = DarwinBrokerProcessInspector()
+  ) throws -> URL {
+    let pid = getpid()
+    guard let identity = processInspector.identity(for: pid),
+      identity.pid == pid,
+      identity.effectiveUserIdentifier == geteuid()
+    else {
       throw BrokerWorkerError.invalidWorkerBundleLayout
     }
-    let url = URL(fileURLWithPath: executablePath).standardizedFileURL
-      .deletingLastPathComponent()
-      .appendingPathComponent("OpenOpenEffectBrokerWorker", isDirectory: false)
-    guard FileManager.default.fileExists(atPath: url.path) else {
+    return try siblingWorkerURL(forBrokerExecutableURL: identity.executableURL)
+  }
+
+  static func siblingWorkerURL(forBrokerExecutableURL broker: URL) throws -> URL {
+    let broker = broker.standardizedFileURL
+    let macOS = broker.deletingLastPathComponent()
+    let contents = macOS.deletingLastPathComponent()
+    let app = contents.deletingLastPathComponent()
+    guard broker.isFileURL,
+      broker.lastPathComponent == "OpenOpenEffectBroker",
+      macOS.lastPathComponent == "MacOS",
+      contents.lastPathComponent == "Contents",
+      app.pathExtension == "app",
+      app.resolvingSymlinksInPath().standardizedFileURL == app.standardizedFileURL
+    else {
       throw BrokerWorkerError.invalidWorkerBundleLayout
     }
-    return url
+    let worker = macOS.appendingPathComponent(
+      "OpenOpenEffectBrokerWorker", isDirectory: false
+    )
+    guard FileManager.default.fileExists(atPath: worker.path) else {
+      throw BrokerWorkerError.invalidWorkerBundleLayout
+    }
+    return worker
   }
 
   private static func expectedPayloadBytes(

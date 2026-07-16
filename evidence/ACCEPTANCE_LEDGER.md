@@ -1204,7 +1204,7 @@ different commit/build.
   `58b07dbcbce20fa6777dbfeedffbf7366863cf4d0329d6c54457b0fa561a31cb`.
   It remains unnotarized and is not provider, administrator/cross-UID,
   integrated-Mission, reviewer, `FRIDAY_ALPHA_READY`, or release proof.
-- 2026-07-15 first-install ServiceManagement follow-up candidate: the repaired
+- 2026-07-15 first-install ServiceManagement follow-up: the repaired
   installed App reaches `smd`; the live log confirms that macOS resolves the
   signed LaunchDaemon `BundleProgram` but has no BackgroundTaskManagement
   record and returns `SMAppService.Status.notFound`. The minimum repair sends
@@ -1212,8 +1212,22 @@ different commit/build.
   `SMAppService.register()` route, while enabled and approval-pending services
   never re-register. Focused state tests and the full 43 broker/signing plus 55
   App Swift tests, release, warnings, strict format/plist checks, exact
-  Developer-ID staging, and local signed DMG SHA-256
-  `3d47ec95faaa93f15fcddf80a4d7b783a668d87ae019b6c3684a6e19b3c0d02d`
-  pass. Commit/push/CI and the installed official-registration result remain
-  pending. No manual `launchctl` fallback, notarization, administrator/cross-UID,
-  provider, integrated-Mission, reviewer, milestone, or release claim exists.
+  Developer-ID staging, and exact-commit signed DMG SHA-256
+  `816fe86df990e0dbc4c170c9ef33b705964a721bd38d85efd903e284d7ba7b5e`
+  pass. Commit `ecf232b…` is pushed and PR run `29462137565` succeeds. The
+  owner-approved installed route creates the all-users BTM record and submits
+  the daemon in the system domain without a manual `launchctl` fallback. The
+  daemon starts but exits before protected worker installation, so provider,
+  integrated-Mission, reviewer, milestone, and release proof remain absent.
+- 2026-07-15 root-daemon kernel-path repair candidate: real launchd execution
+  proves that `BundleProgram` supplies a relative `argv[0]`; the broker used it
+  to derive its sibling worker and failed closed before creating protected
+  state. The candidate instead obtains its own absolute executable URL from the
+  kernel process identity, requires the exact symlink-free
+  `.app/Contents/MacOS/OpenOpenEffectBroker` layout, and then selects the signed
+  sibling worker. The focused layout test and full 44 broker/signing plus 55 App
+  Swift suites, release, warnings, strict format/plist checks, exact
+  Developer-ID staging, and local DMG SHA-256
+  `80358f5401fa8d8b526c47c68361100481d27ab9d8af2c29ded8131a8925e03f`
+  pass. Commit/push/CI and the installed root-daemon retry remain pending; no
+  provider, integrated Mission, reviewer, milestone, or release claim exists.
