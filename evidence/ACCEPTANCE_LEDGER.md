@@ -1255,7 +1255,7 @@ different commit/build.
   Core process group, and recovers On across a real App/Core/Codex restart. The
   PR run `29463375280` succeeds. Provider proof, integrated
   Mission, final reviewers, and `FRIDAY_ALPHA_READY` remain pending.
-- 2026-07-15 protected-Off replacement-Core repair candidate: the real Global
+- 2026-07-15 protected-Off replacement-Core repair: the real Global
   Off attempt terminates the exact leased Core and Codex processes and persists
   protected Off, but `commitOrRecover` immediately asked the replacement Core
   to verify the broker checkpoint before reinstalling the pinned broker
@@ -1268,6 +1268,18 @@ different commit/build.
   the prior fail-closed recovery test also passes. The complete 44
   broker/signing plus 56 App Swift suite, warnings-as-errors release build,
   strict format/plist/script checks, and Developer-ID staging at
-  `/private/tmp/OpenOpen-FridayAlpha-OffReenroll-precommit.app` pass. Commit,
-  push, exact-clean signed package, installed Off/On retry, provider proof,
-  integrated Mission, final reviewers, and the Friday milestone remain pending.
+  `/private/tmp/OpenOpen-FridayAlpha-OffReenroll-precommit.app` pass. Commit
+  `4b5df72…` is pushed and PR run `29463905626` succeeds. Exact-clean
+  Developer-ID App/DMG staging passes at DMG SHA-256
+  `425ce241a1b2b7f18ad4fd54da323c0db1b3a0840fa73b85dd0e67bfb27ea505`.
+  The installed same-commit build first reconciles stale local revision-1 On to
+  protected revision-2 Off. A real On creates revision 3 and the exact Codex
+  child; a real Global Off creates revision 4, terminates that exact Core and
+  Codex, starts a replacement Core, displays Off without an alert, and leaves
+  no Codex child. A second real On creates revision 5 and a fresh exact Codex
+  child. Managed ChatGPT still reports `Not connected`; `channel_pairing`,
+  `channel_observation`, `channel_outbound`, Mission, and Receipt counts remain
+  zero, and the Discord bot-token Keychain item is absent. Real provider
+  login, Reminders/iMessage permissions, Discord token/pairing and participant,
+  one integrated Mission, final reviewers, and the Friday milestone remain
+  pending.
