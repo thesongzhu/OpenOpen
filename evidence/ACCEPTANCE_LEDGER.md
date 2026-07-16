@@ -1219,7 +1219,7 @@ different commit/build.
   the daemon in the system domain without a manual `launchctl` fallback. The
   daemon starts but exits before protected worker installation, so provider,
   integrated-Mission, reviewer, milestone, and release proof remain absent.
-- 2026-07-15 root-daemon kernel-path repair candidate: real launchd execution
+- 2026-07-15 root-daemon kernel-path repair: real launchd execution
   proves that `BundleProgram` supplies a relative `argv[0]`; the broker used it
   to derive its sibling worker and failed closed before creating protected
   state. The candidate instead obtains its own absolute executable URL from the
@@ -1229,5 +1229,26 @@ different commit/build.
   Swift suites, release, warnings, strict format/plist checks, exact
   Developer-ID staging, and local DMG SHA-256
   `80358f5401fa8d8b526c47c68361100481d27ab9d8af2c29ded8131a8925e03f`
-  pass. Commit/push/CI and the installed root-daemon retry remain pending; no
-  provider, integrated Mission, reviewer, milestone, or release claim exists.
+  pass. Commit `1a31abc…` is pushed; the installed same-commit App is approved
+  through ServiceManagement, the system daemon remains running as root, and it
+  creates the root-owned mode-`0700` protected directory without a manual
+  `launchctl` bootstrap. PR run `29462729644` succeeds. The next
+  On attempt fails closed before model initialization; no provider, integrated
+  Mission, reviewer, milestone, or release claim exists.
+- 2026-07-15 signed-Codex runtime-receipt repair candidate: the installed
+  Developer-ID package preserves the exact upstream Codex `rg` bytes but must
+  re-sign that nested Mach-O for the owner distribution identity. Core still
+  compared its post-sign whole-file SHA-256 with the upstream pre-sign pin, so
+  `broker.codex.prepare` rejected the real package before spawning Codex. The
+  candidate keeps the upstream pin and requires either those exact upstream
+  bytes or the exact staged `CODEX-RUNTIME-RECEIPT.json`; the latter must bind
+  schema/component/version, upstream SHA, actual signed-runtime SHA, `rg`
+  identifier, bounded Team ID, and CDHash with no unknown fields. Tampered
+  bytes and a false upstream claim fail closed. The two focused regressions,
+  all 194 ordinary Rust tests with one explicit environment-gated ignore, all
+  44 broker/signing plus 55 App Swift tests, strict workspace Clippy, real
+  initialize/account-read through the installed signed runtime, and exact
+  Developer-ID staging at
+  `/private/tmp/OpenOpen-FridayAlpha-RuntimeReceipt-v1.app` pass. Commit/push,
+  exact-clean same-SHA package, installed On/broker-lease retry, provider proof,
+  integrated Mission, final reviewers, and `FRIDAY_ALPHA_READY` remain pending.

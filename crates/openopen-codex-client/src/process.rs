@@ -1,4 +1,5 @@
 use crate::{CodexError, wire::Transport};
+use serde::Deserialize;
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -18,6 +19,7 @@ pub const CODEX_CODE_MODE_HOST_SHA256: &str =
 pub const CODEX_RG_SHA256: &str =
     "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94";
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+const CODEX_RUNTIME_RECEIPT: &str = "CODEX-RUNTIME-RECEIPT.json";
 const CONFIG: &str = "forced_login_method = \"chatgpt\"\n\
 cli_auth_credentials_store = \"keyring\"\n\
 mcp_oauth_credentials_store = \"keyring\"\n\
@@ -34,6 +36,19 @@ pub struct CodexRuntimeConfig {
     pub codex_home: PathBuf,
     pub synthetic_home: PathBuf,
     pub model_workspace: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexRuntimeReceipt {
+    schema_version: u32,
+    component: String,
+    version: String,
+    upstream_rg_sha256: String,
+    runtime_rg_sha256: String,
+    signing_identifier: String,
+    team_identifier: String,
+    cdhash: String,
 }
 
 pub(crate) fn spawn(config: &CodexRuntimeConfig) -> Result<(Transport, i32), CodexError> {
@@ -57,9 +72,7 @@ pub(crate) fn spawn(config: &CodexRuntimeConfig) -> Result<(Transport, i32), Cod
         || file_sha256(&canonical_regular_file(
             &package_root.join("bin/codex-code-mode-host"),
         )?)? != CODEX_CODE_MODE_HOST_SHA256
-        || file_sha256(&canonical_regular_file(
-            &package_root.join("codex-path/rg"),
-        )?)? != CODEX_RG_SHA256
+        || verify_rg_runtime(package_root).is_err()
     {
         return Err(CodexError::RuntimeMismatch);
     }
@@ -110,6 +123,50 @@ pub(crate) fn spawn(config: &CodexRuntimeConfig) -> Result<(Transport, i32), Cod
     let process_identifier =
         i32::try_from(child.id()).map_err(|_| CodexError::SandboxUnavailable)?;
     Ok((Transport::new(child)?, process_identifier))
+}
+
+fn verify_rg_runtime(package_root: &Path) -> Result<(), CodexError> {
+    let rg = canonical_regular_file(&package_root.join("codex-path/rg"))?;
+    let runtime_sha = file_sha256(&rg)?;
+    if runtime_sha == CODEX_RG_SHA256 {
+        return Ok(());
+    }
+
+    let codex_root = package_root.parent().ok_or(CodexError::InvalidPath)?;
+    let resources_root = codex_root.parent().ok_or(CodexError::InvalidPath)?;
+    if package_root.file_name().and_then(|value| value.to_str()) != Some(CODEX_VERSION)
+        || codex_root.file_name().and_then(|value| value.to_str()) != Some("Codex")
+        || resources_root.file_name().and_then(|value| value.to_str()) != Some("Resources")
+    {
+        return Err(CodexError::InvalidPath);
+    }
+    let receipt_path =
+        canonical_regular_file(&resources_root.join("Notices").join(CODEX_RUNTIME_RECEIPT))?;
+    let receipt: CodexRuntimeReceipt =
+        serde_json::from_slice(&fs::read(receipt_path).map_err(CodexError::Io)?)
+            .map_err(|_| CodexError::RuntimeMismatch)?;
+    let valid_lower_hex = |value: &str, length: usize| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if receipt.schema_version != 1
+        || receipt.component != "openai/codex"
+        || receipt.version != CODEX_VERSION
+        || receipt.upstream_rg_sha256 != CODEX_RG_SHA256
+        || receipt.runtime_rg_sha256 != runtime_sha
+        || receipt.signing_identifier != "rg"
+        || receipt.team_identifier.len() != 10
+        || !receipt
+            .team_identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+        || !valid_lower_hex(&receipt.cdhash, 40)
+    {
+        return Err(CodexError::RuntimeMismatch);
+    }
+    Ok(())
 }
 
 fn require_inherited_process_group(child: &mut std::process::Child) -> Result<(), CodexError> {
@@ -257,13 +314,70 @@ fn sandbox_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{CODEX_BINARY_SHA256, CODEX_VERSION, sandbox_profile};
+    use super::{
+        CODEX_BINARY_SHA256, CODEX_RG_SHA256, CODEX_VERSION, file_sha256, sandbox_profile,
+        verify_rg_runtime,
+    };
+    use serde_json::json;
     use std::path::Path;
 
     #[test]
     fn runtime_pin_is_exact() {
         assert_eq!(CODEX_VERSION, "0.144.0");
         assert_eq!(CODEX_BINARY_SHA256.len(), 64);
+    }
+
+    #[test]
+    fn developer_id_rg_requires_an_exact_runtime_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let resources = root.path().join("Resources");
+        let package = resources.join("Codex").join(CODEX_VERSION);
+        let rg = package.join("codex-path/rg");
+        let notices = resources.join("Notices");
+        std::fs::create_dir_all(rg.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&notices).unwrap();
+        std::fs::write(&rg, b"owner-signed-rg-fixture").unwrap();
+        let runtime_sha = file_sha256(&rg).unwrap();
+        write_runtime_receipt(&notices, &runtime_sha, CODEX_RG_SHA256);
+        let package = std::fs::canonicalize(package).unwrap();
+        verify_rg_runtime(&package).unwrap();
+
+        std::fs::write(&rg, b"tampered-after-receipt").unwrap();
+        assert!(verify_rg_runtime(&package).is_err());
+    }
+
+    #[test]
+    fn developer_id_rg_rejects_a_receipt_with_a_false_upstream_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let resources = root.path().join("Resources");
+        let package = resources.join("Codex").join(CODEX_VERSION);
+        let rg = package.join("codex-path/rg");
+        let notices = resources.join("Notices");
+        std::fs::create_dir_all(rg.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&notices).unwrap();
+        std::fs::write(&rg, b"owner-signed-rg-fixture").unwrap();
+        let runtime_sha = file_sha256(&rg).unwrap();
+        write_runtime_receipt(&notices, &runtime_sha, &"0".repeat(64));
+        let package = std::fs::canonicalize(package).unwrap();
+        assert!(verify_rg_runtime(&package).is_err());
+    }
+
+    fn write_runtime_receipt(notices: &Path, runtime_sha: &str, upstream_sha: &str) {
+        let receipt = json!({
+            "schemaVersion": 1,
+            "component": "openai/codex",
+            "version": CODEX_VERSION,
+            "upstreamRgSha256": upstream_sha,
+            "runtimeRgSha256": runtime_sha,
+            "signingIdentifier": "rg",
+            "teamIdentifier": "UHDY2275L5",
+            "cdhash": "ab".repeat(20),
+        });
+        std::fs::write(
+            notices.join("CODEX-RUNTIME-RECEIPT.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

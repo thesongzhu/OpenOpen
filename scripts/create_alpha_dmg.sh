@@ -250,7 +250,7 @@ verify_exact_developer_app() {
     fi
   done <<EOF
 Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|-|5a02c4c91bef976f0581cdfb0222189e995f6b87050d3711fb7c5ce8937567bc
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|e95d09ccef59224a9855ff8fe2e1f8ad7994ae7e|47b4fae44d7fb2bbe089beb6db17003b4e96691d2fd120d10eaafe6a52c0c60a
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|f3953663d77e67778d92368cc3309bd7ca17c86f|1927f781f68b7799e22034f6413de5a346b8169e0f82dfe81bd0e014523044ed
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|9fb998731da69e2403cd39ba2fca481279309d51|622db755fe7fa0966f4062006846f5da98f539ff6db455d11311a2d633f76085
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|13ec588bddb971a721d0e7d858d81dd64fc39a04|af9c72d3eba3adab68ddb6f6d89997f92900fb7826f3be80ad510a2007fd7d05
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
