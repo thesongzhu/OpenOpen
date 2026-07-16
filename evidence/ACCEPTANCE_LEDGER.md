@@ -1283,3 +1283,32 @@ different commit/build.
   login, Reminders/iMessage permissions, Discord token/pairing and participant,
   one integrated Mission, final reviewers, and the Friday milestone remain
   pending.
+- 2026-07-15 managed-login callback repair: the owner-provided first login
+  attempt reaches Settings but displays `Local operation failed closed`. A
+  direct exact-pinned Codex app-server diagnostic successfully starts the
+  official managed-login URL, while the same `account/login/start` call under
+  OpenOpen's outer sandbox deterministically fails with `failed to start login
+  server: Operation not permitted (os error 1)`. Exact pinned Codex `0.144.0`
+  source binds `127.0.0.1` on default port 1455 or fallback 1457. The candidate
+  adds only `(local tcp "localhost:1455")` and
+  `(local tcp "localhost:1457")` inbound rules; wildcard inbound remains
+  rejected by the profile test. The new explicit environment-gated real
+  diagnostic now starts an `https://auth.openai.com/` login through that outer
+  sandbox. All 194 ordinary Rust tests pass with two explicit real-runtime
+  diagnostics ignored in the ordinary run; 44 broker/signing plus 56 App Swift
+  tests, release builds, strict lint/format/plist/script/diff checks, and
+  Developer-ID staging at
+  `/private/tmp/OpenOpen-FridayAlpha-LoginCallback-precommit.app` pass. This is
+  login-start evidence only: the candidate is unnotarized, uncommitted, and
+  not installed; no OAuth credential was submitted and no managed-account,
+  model, provider, integrated-Mission, reviewer, milestone, or release proof is
+  claimed.
+- 2026-07-15 login-callback first review: the functional reviewer rejects
+  frozen diff `22f7ac65…` on one P2 because the canonical architecture still
+  said `No port is opened`; that contradicted the bounded managed-login
+  callback listener. The security peer is interrupted and not counted after
+  the fingerprint becomes obsolete. The repair preserves JSON-RPC/stdio for
+  all Core↔Codex application traffic and documents the sole exception: during
+  managed sign-in, the pinned child may temporarily listen only on localhost
+  1455 or fallback 1457. Two entirely fresh replacement reviewers remain
+  required.

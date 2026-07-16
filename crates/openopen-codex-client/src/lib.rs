@@ -891,4 +891,27 @@ mod tests {
         .unwrap();
         let _ = client.read_account().unwrap();
     }
+
+    #[test]
+    #[ignore = "requires OPENOPEN_TEST_CODEX_RUNTIME pointing to the exact pinned macOS binary"]
+    fn real_pinned_runtime_begins_managed_login_inside_outer_sandbox() {
+        let runtime = std::env::var_os("OPENOPEN_TEST_CODEX_RUNTIME")
+            .expect("OPENOPEN_TEST_CODEX_RUNTIME is required for this explicit diagnostic");
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let codex_home = canonical_root.join("codex-home");
+        let synthetic_home = canonical_root.join("synthetic-home");
+        let model_workspace = canonical_root.join("model-input");
+        std::fs::create_dir(&model_workspace).unwrap();
+        let mut client = CodexClient::spawn(&CodexRuntimeConfig {
+            runtime: runtime.into(),
+            codex_home,
+            synthetic_home,
+            model_workspace,
+        })
+        .unwrap();
+        let login = client.begin_chatgpt_login().unwrap();
+        assert!(login.auth_url.starts_with("https://auth.openai.com/"));
+        assert!(!login.login_id.is_empty());
+    }
 }

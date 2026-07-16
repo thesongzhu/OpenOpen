@@ -304,6 +304,9 @@ fn sandbox_profile(
            (subpath {codex_home})\n\
            (subpath {synthetic_home}))\n\
          (allow network-outbound)\n\
+         (allow network-inbound\n\
+           (local tcp \"localhost:1455\")\n\
+           (local tcp \"localhost:1457\"))\n\
          (allow system-socket)\n\
          (allow mach-lookup)\n\
          (allow ipc-posix*)\n\
@@ -393,6 +396,10 @@ mod tests {
         assert!(profile.contains("(allow process-exec (literal \"/Bundle/OpenOpenCodex\"))"));
         assert!(profile.contains("(subpath \"/Bundle\")"));
         assert!(profile.contains("(subpath \"/App/ModelInput/turn-1\")"));
+        assert!(profile.contains("(local tcp \"localhost:1455\")"));
+        assert!(profile.contains("(local tcp \"localhost:1457\")"));
+        assert!(!profile.contains("(allow network-inbound)"));
+        assert!(!profile.contains("(local tcp \"*:*\")"));
         assert!(!profile.contains("(allow process-exec)"));
         assert!(!profile.contains("/Users/"));
     }

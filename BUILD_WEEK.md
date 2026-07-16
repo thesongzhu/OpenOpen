@@ -298,6 +298,17 @@ or override that canonical contract.
   equal-tree synthesized merge. Real ChatGPT output and real user Reminders
   proof remain pending. This is not product E2E or release proof.
 
+- The first real Connect ChatGPT attempt reached the signed managed-login path
+  but failed closed because OpenOpen's outer sandbox denied the pinned Codex
+  app-server's localhost OAuth callback listener. The minimum candidate allows
+  only localhost TCP ports 1455 and 1457, matching exact pinned Codex `0.144.0`
+  source; wildcard inbound remains denied. The repaired real sandbox diagnostic
+  starts the official OpenAI authorization URL, and the complete 194 ordinary
+  Rust, 44 broker/signing Swift, and 56 App Swift suites plus strict checks and
+  Developer-ID staging pass. The candidate is not yet committed or installed,
+  and no OAuth completion, provider traffic, milestone, or release proof is
+  claimed.
+
 ## Friday alpha target (not yet achieved)
 
 `FRIDAY_ALPHA_READY` requires Hero A plus real bidirectional iMessage and
