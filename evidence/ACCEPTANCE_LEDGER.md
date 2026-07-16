@@ -1189,18 +1189,31 @@ different commit/build.
   a quoting error before the corrected exact checks passed. PR CI, a current
   signed build, real integrated provider proof, and two fresh final reviewers
   remain pending; no milestone is claimed.
-- 2026-07-15 installed Developer-ID owner-test repair candidate: commit
+- 2026-07-15 installed Developer-ID owner-test repair: commit
   `600d1e1…` replaces the unsupported direct-distribution data-protection
   Keychain selector with one explicit login-Keychain backend. The next real
   owner-test reached the production Core but timed out before broker
   registration because `CoreProcessClient` used `read(upToCount:)` against a
   persistent child and did not deliver its short JSON line until EOF. The
-  current candidate uses readable `availableData`, proves a persistent fake
+  commit `121e73f…` uses readable `availableData`, proves a persistent fake
   Core responds before exit, and passes an explicit isolated round trip through
   the signed production `OpenOpenCore`. Full verification passes 190 ordinary
   Rust tests, 41 broker/signing plus 55 App Swift tests, release builds, strict
   lint/format/plist checks, and exact Developer-ID staging. Local signed DMG
-  SHA-256 is
-  `244ae36c3405c2c8e5b46e2b9e4c557238a6a2d7e2309176aff62e6a7352cbe3`.
+  exact-clean-commit SHA-256 is
+  `58b07dbcbce20fa6777dbfeedffbf7366863cf4d0329d6c54457b0fa561a31cb`.
   It remains unnotarized and is not provider, administrator/cross-UID,
   integrated-Mission, reviewer, `FRIDAY_ALPHA_READY`, or release proof.
+- 2026-07-15 first-install ServiceManagement follow-up candidate: the repaired
+  installed App reaches `smd`; the live log confirms that macOS resolves the
+  signed LaunchDaemon `BundleProgram` but has no BackgroundTaskManagement
+  record and returns `SMAppService.Status.notFound`. The minimum repair sends
+  both `notRegistered` and that first-install state through the one official
+  `SMAppService.register()` route, while enabled and approval-pending services
+  never re-register. Focused state tests and the full 43 broker/signing plus 55
+  App Swift tests, release, warnings, strict format/plist checks, exact
+  Developer-ID staging, and local signed DMG SHA-256
+  `3d47ec95faaa93f15fcddf80a4d7b783a668d87ae019b6c3684a6e19b3c0d02d`
+  pass. Commit/push/CI and the installed official-registration result remain
+  pending. No manual `launchctl` fallback, notarization, administrator/cross-UID,
+  provider, integrated-Mission, reviewer, milestone, or release claim exists.

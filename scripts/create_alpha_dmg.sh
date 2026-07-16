@@ -249,9 +249,9 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|-|61ef906bb3767be607f7ddd186149439e043dedf51602fbe04d7d6f6b137cf59
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|-|62b7b0aaa2a222d4679bcb6a759ef58061c64afe7be22577c7ffbf8ecf503d98
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|e95d09ccef59224a9855ff8fe2e1f8ad7994ae7e|47b4fae44d7fb2bbe089beb6db17003b4e96691d2fd120d10eaafe6a52c0c60a
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|d7e655fc6979e90748b841f50faf78531c5f4fdb|3c54d65a457b70d2fe904f26c057cff085b5196748daebd4c70d442c79827167
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|5510619554e8af6e8d57a7284b7e1442242ea558|a3a4f173957891464f3e4e8c6a9d878514811669527a2a763e1c72d28ad89236
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|13ec588bddb971a721d0e7d858d81dd64fc39a04|af9c72d3eba3adab68ddb6f6d89997f92900fb7826f3be80ad510a2007fd7d05
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-

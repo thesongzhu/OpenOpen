@@ -16,17 +16,7 @@ public final class PrivilegedBrokerRuntimeClient: @unchecked Sendable, BrokerRun
     coreIdentity: CoreEffectIdentity
   ) async throws -> EnrolledBrokerTrustAnchor {
     let service = BrokerServiceController()
-    let state: BrokerServiceState
-    switch service.state {
-    case .enabled:
-      state = .enabled
-    case .notRegistered:
-      state = try service.register()
-    case .requiresApproval:
-      state = .requiresApproval
-    case .notFound:
-      state = .notFound
-    }
+    let state = try service.registerIfNeeded()
     switch state {
     case .enabled:
       break
