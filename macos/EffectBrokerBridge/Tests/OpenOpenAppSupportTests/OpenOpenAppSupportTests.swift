@@ -2146,6 +2146,94 @@ func runningCoreAuthenticationFailurePrecedesTheMasterKeyLoad() async throws {
 }
 
 @Test
+func explicitRealCoreClientRoundTripUsesTheProductionPipeProtocol() async throws {
+  guard
+    let runtimePath = ProcessInfo.processInfo.environment["OPENOPEN_TEST_CORE_RUNTIME"],
+    let homePath = ProcessInfo.processInfo.environment["OPENOPEN_TEST_CORE_HOME"]
+  else { return }
+  guard homePath.hasPrefix("/private/tmp/OpenOpen-CoreClient-") else {
+    Issue.record("OPENOPEN_TEST_CORE_RUNTIME requires an isolated CFFIXED_USER_HOME")
+    return
+  }
+  let home = URL(fileURLWithPath: homePath)
+  try FileManager.default.createDirectory(
+    at: home.appendingPathComponent("Library/Application Support", isDirectory: true),
+    withIntermediateDirectories: true
+  )
+  let runtime = URL(fileURLWithPath: runtimePath).standardizedFileURL
+  let stderr = home.appendingPathComponent("core.stderr")
+  let executable = home.appendingPathComponent("core-wrapper")
+  let wrapper = """
+    #!/bin/sh
+    exec "\(runtime.path)" 2>"\(stderr.path)"
+    """
+  try Data(wrapper.utf8).write(to: executable)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: executable.path
+  )
+  let client = CoreProcessClient(
+    executableResolver: { executable },
+    staticCodeValidator: { _ in },
+    runningCodeValidator: { _ in },
+    masterKeyLoader: { Data(repeating: 7, count: 32) },
+    childEnvironmentLoader: {
+      [
+        "CFFIXED_USER_HOME": home.path,
+        "HOME": home.path,
+        "PATH": "/usr/bin:/bin",
+      ]
+    }
+  )
+  defer { client.shutdown() }
+
+  let identity: CoreEffectIdentity
+  do {
+    identity = try await client.effectIdentity()
+  } catch {
+    let diagnostic = (try? String(contentsOf: stderr, encoding: .utf8)) ?? "<no stderr>"
+    Issue.record("real Core stderr: \(diagnostic)")
+    throw error
+  }
+
+  #expect(identity.coreProcessIdentifier > 0)
+  #expect(identity.coreKeyID.count == 64)
+  #expect(identity.coreVerifyingKeyHex.count == 64)
+  #expect(identity.coreInstanceNonce.count == 64)
+}
+
+@Test
+func persistentCoreResponseCompletesBeforeTheChildExits() async throws {
+  let root = try TemporaryDirectory()
+  let executable = root.url.appendingPathComponent("persistent-core")
+  let script = """
+    #!/bin/sh
+    /bin/dd bs=55 count=1 of=/dev/null 2>/dev/null
+    IFS= read -r request
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"enabled":false,"revision":0,"updatedAtMs":0}}'
+    /bin/cat >/dev/null
+    """
+  try Data(script.utf8).write(to: executable)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o700],
+    ofItemAtPath: executable.path
+  )
+  let client = CoreProcessClient(
+    executableResolver: { executable },
+    staticCodeValidator: { _ in },
+    runningCodeValidator: { _ in },
+    masterKeyLoader: { Data(repeating: 7, count: 32) }
+  )
+  defer { client.shutdown() }
+
+  let runtime = try await client.runtime()
+
+  #expect(!runtime.enabled)
+  #expect(runtime.revision == 0)
+  #expect(runtime.updatedAtMs == 0)
+}
+
+@Test
 func responseIdentifiersRejectFloatingBooleanZeroAndNegativeJSONNumbers() throws {
   for json in ["1.0", "1e0", "true", "0", "-1"] {
     let value = try JSONSerialization.jsonObject(

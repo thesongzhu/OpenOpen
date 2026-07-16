@@ -249,7 +249,7 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|-|a385a9e5f9bc054d646c7cf93b543ec99f85c4e97149cf40154cead37bae9981
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|-|61ef906bb3767be607f7ddd186149439e043dedf51602fbe04d7d6f6b137cf59
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|e95d09ccef59224a9855ff8fe2e1f8ad7994ae7e|47b4fae44d7fb2bbe089beb6db17003b4e96691d2fd120d10eaafe6a52c0c60a
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|d7e655fc6979e90748b841f50faf78531c5f4fdb|3c54d65a457b70d2fe904f26c057cff085b5196748daebd4c70d442c79827167
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|13ec588bddb971a721d0e7d858d81dd64fc39a04|af9c72d3eba3adab68ddb6f6d89997f92900fb7826f3be80ad510a2007fd7d05

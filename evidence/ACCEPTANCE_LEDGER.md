@@ -1189,3 +1189,18 @@ different commit/build.
   a quoting error before the corrected exact checks passed. PR CI, a current
   signed build, real integrated provider proof, and two fresh final reviewers
   remain pending; no milestone is claimed.
+- 2026-07-15 installed Developer-ID owner-test repair candidate: commit
+  `600d1e1…` replaces the unsupported direct-distribution data-protection
+  Keychain selector with one explicit login-Keychain backend. The next real
+  owner-test reached the production Core but timed out before broker
+  registration because `CoreProcessClient` used `read(upToCount:)` against a
+  persistent child and did not deliver its short JSON line until EOF. The
+  current candidate uses readable `availableData`, proves a persistent fake
+  Core responds before exit, and passes an explicit isolated round trip through
+  the signed production `OpenOpenCore`. Full verification passes 190 ordinary
+  Rust tests, 41 broker/signing plus 55 App Swift tests, release builds, strict
+  lint/format/plist checks, and exact Developer-ID staging. Local signed DMG
+  SHA-256 is
+  `244ae36c3405c2c8e5b46e2b9e4c557238a6a2d7e2309176aff62e6a7352cbe3`.
+  It remains unnotarized and is not provider, administrator/cross-UID,
+  integrated-Mission, reviewer, `FRIDAY_ALPHA_READY`, or release proof.

@@ -111,6 +111,7 @@ public final class CoreProcessClient: @unchecked Sendable {
   private let staticCodeValidator: @Sendable (URL) throws -> Void
   private let runningCodeValidator: @Sendable (Int32) throws -> Void
   private let masterKeyLoader: @Sendable () throws -> Data
+  private let childEnvironmentLoader: @Sendable () -> [String: String]
   private var process: Process?
   private var input: FileHandle?
   private var pending: [UInt64: PendingRequest] = [:]
@@ -122,18 +123,25 @@ public final class CoreProcessClient: @unchecked Sendable {
     staticCodeValidator = { try CoreExecutableAuthenticator.validateStatic($0) }
     runningCodeValidator = { try CoreExecutableAuthenticator.validateRunning($0) }
     masterKeyLoader = { try KeychainMasterKey.loadOrCreate() }
+    childEnvironmentLoader = {
+      ["HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"]
+    }
   }
 
   init(
     executableResolver: @escaping @Sendable () throws -> URL,
     staticCodeValidator: @escaping @Sendable (URL) throws -> Void,
     runningCodeValidator: @escaping @Sendable (Int32) throws -> Void,
-    masterKeyLoader: @escaping @Sendable () throws -> Data
+    masterKeyLoader: @escaping @Sendable () throws -> Data,
+    childEnvironmentLoader: @escaping @Sendable () -> [String: String] = {
+      ["HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"]
+    }
   ) {
     self.executableResolver = executableResolver
     self.staticCodeValidator = staticCodeValidator
     self.runningCodeValidator = runningCodeValidator
     self.masterKeyLoader = masterKeyLoader
+    self.childEnvironmentLoader = childEnvironmentLoader
   }
 
   deinit {
@@ -596,10 +604,7 @@ public final class CoreProcessClient: @unchecked Sendable {
     child.executableURL = executable
     child.arguments = []
     child.currentDirectoryURL = executable.deletingLastPathComponent()
-    child.environment = [
-      "HOME": NSHomeDirectory(),
-      "PATH": "/usr/bin:/bin",
-    ]
+    child.environment = childEnvironmentLoader()
     child.standardInput = standardInput
     child.standardOutput = standardOutput
     child.standardError = standardError
@@ -642,30 +647,32 @@ public final class CoreProcessClient: @unchecked Sendable {
     readerQueue.async { [weak self] in
       guard let self else { return }
       var buffer = Data()
-      do {
-        while let chunk = try output.read(upToCount: 64 * 1024), !chunk.isEmpty {
-          buffer.append(chunk)
-          if buffer.count > Self.maximumFrameBytes, !buffer.contains(0x0A) {
+      while true {
+        // `read(upToCount:)` may wait for the requested byte count or EOF.
+        // Core is intentionally persistent and its line responses are much
+        // smaller than the read cap, so consume bytes as soon as the pipe is
+        // readable instead of requiring Core to exit after every response.
+        let chunk = output.availableData
+        guard !chunk.isEmpty else { break }
+        buffer.append(chunk)
+        if buffer.count > Self.maximumFrameBytes, !buffer.contains(0x0A) {
+          self.failGeneration(generation, with: .oversizedFrame)
+          self.shutdown(generation: generation, error: .oversizedFrame)
+          return
+        }
+        while let newline = buffer.firstIndex(of: 0x0A) {
+          var frame = Data(buffer[..<newline])
+          buffer.removeSubrange(...newline)
+          if frame.last == 0x0D {
+            frame.removeLast()
+          }
+          guard frame.count <= Self.maximumFrameBytes else {
             self.failGeneration(generation, with: .oversizedFrame)
             self.shutdown(generation: generation, error: .oversizedFrame)
             return
           }
-          while let newline = buffer.firstIndex(of: 0x0A) {
-            var frame = Data(buffer[..<newline])
-            buffer.removeSubrange(...newline)
-            if frame.last == 0x0D {
-              frame.removeLast()
-            }
-            guard frame.count <= Self.maximumFrameBytes else {
-              self.failGeneration(generation, with: .oversizedFrame)
-              self.shutdown(generation: generation, error: .oversizedFrame)
-              return
-            }
-            self.consume(frame: frame, generation: generation)
-          }
+          self.consume(frame: frame, generation: generation)
         }
-      } catch {
-        self.failGeneration(generation, with: .processTerminated)
       }
       self.failGeneration(generation, with: .processTerminated)
       self.processTerminated(generation: generation)
@@ -674,7 +681,7 @@ public final class CoreProcessClient: @unchecked Sendable {
 
   private func beginDraining(error: FileHandle) {
     errorQueue.async {
-      while let data = try? error.read(upToCount: 64 * 1024), !data.isEmpty {}
+      while !error.availableData.isEmpty {}
     }
   }
 
