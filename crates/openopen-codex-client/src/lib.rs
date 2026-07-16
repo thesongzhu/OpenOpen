@@ -77,6 +77,7 @@ pub struct CodexClient {
     early_turn_notifications: VecDeque<(String, Value, usize)>,
     early_turn_notification_bytes: usize,
     process_identifier: i32,
+    protocol_initialized: bool,
     initialized: bool,
 }
 
@@ -138,6 +139,7 @@ impl CodexClient {
             early_turn_notifications: VecDeque::new(),
             early_turn_notification_bytes: 0,
             process_identifier,
+            protocol_initialized: false,
             initialized: false,
         })
     }
@@ -183,6 +185,21 @@ impl CodexClient {
             return Err(CodexError::Protocol("initialize response mismatch"));
         }
         self.transport.send_notification("initialized", None)?;
+        self.protocol_initialized = true;
+        let verification = (|| {
+            let effective = self.request(
+                "config/read",
+                &json!({"includeLayers": false}),
+                REQUEST_TIMEOUT,
+            )?;
+            validate_effective_security_config(&effective)?;
+            process::ensure_credential_file_absent(&self.codex_home)
+        })();
+        if let Err(error) = verification {
+            self.protocol_initialized = false;
+            self.initialized = false;
+            return self.fail(error);
+        }
         self.initialized = true;
         Ok(())
     }
@@ -522,12 +539,13 @@ impl CodexClient {
         params: &Value,
         timeout: Duration,
     ) -> Result<Value, CodexError> {
-        if !request_allowed(self.initialized, method) {
+        if !request_allowed(self.protocol_initialized, self.initialized, method) {
             return Err(CodexError::Protocol("Codex lease is not initialized"));
         }
         if self.cancel.load(Ordering::Acquire) {
             return self.fail(CodexError::Cancelled);
         }
+        process::ensure_credential_file_absent(&self.codex_home)?;
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -542,6 +560,7 @@ impl CodexClient {
                     result,
                     error,
                 } if response_id == id => {
+                    process::ensure_credential_file_absent(&self.codex_home)?;
                     if let Some(error) = error {
                         return Err(CodexError::Remote {
                             code: error.code,
@@ -601,7 +620,9 @@ impl CodexClient {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(CodexError::Timeout)?;
+            process::ensure_credential_file_absent(&self.codex_home)?;
             let result = self.transport.recv(remaining.min(CANCEL_POLL_INTERVAL));
+            process::ensure_credential_file_absent(&self.codex_home)?;
             if !matches!(result, Err(CodexError::Timeout)) || Instant::now() >= deadline {
                 return result;
             }
@@ -618,8 +639,32 @@ impl CodexClient {
     }
 }
 
-fn request_allowed(initialized: bool, method: &str) -> bool {
-    initialized || method == "initialize"
+fn validate_effective_security_config(result: &Value) -> Result<(), CodexError> {
+    let config = result
+        .get("config")
+        .and_then(Value::as_object)
+        .ok_or(CodexError::Protocol("effective config missing"))?;
+    for (key, expected) in [
+        ("forced_login_method", "chatgpt"),
+        ("cli_auth_credentials_store", "keyring"),
+        ("mcp_oauth_credentials_store", "keyring"),
+    ] {
+        if config.get(key).and_then(Value::as_str) != Some(expected) {
+            return Err(CodexError::ConfigMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn request_allowed(
+    protocol_initialized: bool,
+    security_config_verified: bool,
+    method: &str,
+) -> bool {
+    if !protocol_initialized {
+        return method == "initialize";
+    }
+    security_config_verified || method == "config/read"
 }
 
 fn validate_thread(result: &Value, expected_cwd: &str) -> Result<(), CodexError> {
@@ -728,7 +773,7 @@ mod tests {
         CODEX_BINARY_SHA256, CODEX_CODE_MODE_HOST_SHA256, CODEX_PACKAGE_SHA256, CODEX_RG_SHA256,
         CODEX_VERSION, CodexClient, CodexError, CodexRuntimeConfig,
         MAX_TURN_ACCUMULATED_TEXT_BYTES, MAX_TURN_ITEMS, TurnAccumulator, inspect_item,
-        request_allowed, validate_thread,
+        request_allowed, validate_effective_security_config, validate_thread,
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -754,11 +799,40 @@ mod tests {
 
     #[test]
     fn uninitialized_codex_accepts_only_the_initialize_handshake() {
-        assert!(request_allowed(false, "initialize"));
+        assert!(request_allowed(false, false, "initialize"));
         for method in ["account/read", "model/list", "thread/start", "turn/start"] {
-            assert!(!request_allowed(false, method));
-            assert!(request_allowed(true, method));
+            assert!(!request_allowed(false, false, method));
+            assert!(!request_allowed(true, false, method));
+            assert!(request_allowed(true, true, method));
         }
+        assert!(request_allowed(true, false, "config/read"));
+    }
+
+    #[test]
+    fn managed_auth_storage_override_fails_before_any_account_route() {
+        for (key, value) in [
+            ("cli_auth_credentials_store", "auto"),
+            ("cli_auth_credentials_store", "file"),
+            ("mcp_oauth_credentials_store", "file"),
+        ] {
+            let mut config = json!({
+                "forced_login_method": "chatgpt",
+                "cli_auth_credentials_store": "keyring",
+                "mcp_oauth_credentials_store": "keyring"
+            });
+            config[key] = json!(value);
+            assert!(validate_effective_security_config(&json!({"config": config})).is_err());
+        }
+        assert!(
+            validate_effective_security_config(&json!({
+                "config": {
+                    "forced_login_method": "chatgpt",
+                    "cli_auth_credentials_store": "keyring",
+                    "mcp_oauth_credentials_store": "keyring"
+                }
+            }))
+            .is_ok()
+        );
     }
 
     #[test]

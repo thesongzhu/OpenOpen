@@ -20,6 +20,11 @@ pub const CODEX_RG_SHA256: &str =
     "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94";
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const CODEX_RUNTIME_RECEIPT: &str = "CODEX-RUNTIME-RECEIPT.json";
+const CODEX_SYSTEM_CONFIG_PATHS: [&str; 3] = [
+    "/private/etc/codex/requirements.toml",
+    "/private/etc/codex/managed_config.toml",
+    "/private/etc/codex/config.toml",
+];
 const CONFIG: &str = "forced_login_method = \"chatgpt\"\n\
 cli_auth_credentials_store = \"keyring\"\n\
 mcp_oauth_credentials_store = \"keyring\"\n\
@@ -83,13 +88,7 @@ pub(crate) fn spawn(config: &CodexRuntimeConfig) -> Result<(Transport, i32), Cod
     if sandbox_exec != Path::new(SANDBOX_EXEC) {
         return Err(CodexError::SandboxUnavailable);
     }
-    if codex_home
-        .join("auth.json")
-        .try_exists()
-        .map_err(CodexError::Io)?
-    {
-        return Err(CodexError::CredentialFilePresent);
-    }
+    ensure_credential_file_absent(&codex_home)?;
     let temp = codex_home.join("tmp");
     fs::create_dir_all(&temp).map_err(CodexError::Io)?;
     let temp = canonical_directory(&temp, false)?;
@@ -123,6 +122,14 @@ pub(crate) fn spawn(config: &CodexRuntimeConfig) -> Result<(Transport, i32), Cod
     let process_identifier =
         i32::try_from(child.id()).map_err(|_| CodexError::SandboxUnavailable)?;
     Ok((Transport::new(child)?, process_identifier))
+}
+
+pub(crate) fn ensure_credential_file_absent(codex_home: &Path) -> Result<(), CodexError> {
+    match fs::symlink_metadata(codex_home.join("auth.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CodexError::Io(error)),
+        Ok(_) => Err(CodexError::CredentialFilePresent),
+    }
 }
 
 fn verify_rg_runtime(package_root: &Path) -> Result<(), CodexError> {
@@ -280,6 +287,13 @@ fn sandbox_profile(
             let _ = write!(output, " (literal {path})");
             output
         });
+    let system_config_literals =
+        CODEX_SYSTEM_CONFIG_PATHS
+            .iter()
+            .fold(String::new(), |mut output, path| {
+                let _ = write!(output, " (literal \"{path}\")");
+                output
+            });
     Ok(format!(
         "(version 1)\n\
          (deny default)\n\
@@ -294,11 +308,17 @@ fn sandbox_profile(
            (subpath \"/System\")\n\
            (subpath \"/usr/lib\")\n\
            (subpath \"/private/var/db/dyld\")\n\
+           {system_config_literals}\n\
            (subpath {package_root})\n\
            (subpath {codex_home})\n\
            (subpath {synthetic_home})\n\
            (subpath {model_workspace}))\n\
-         (allow file-read-metadata (literal \"/var\"){ancestor_literals})\n\
+         (allow file-read-metadata\n\
+           (literal \"/var\")\n\
+           (literal \"/etc\")\n\
+           (literal \"/private/etc\")\n\
+           (literal \"/private/etc/codex\")\n\
+           {ancestor_literals})\n\
          (allow file-write*\n\
            (literal \"/dev/null\")\n\
            (subpath {codex_home})\n\
@@ -318,8 +338,8 @@ fn sandbox_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_BINARY_SHA256, CODEX_RG_SHA256, CODEX_VERSION, file_sha256, sandbox_profile,
-        verify_rg_runtime,
+        CODEX_BINARY_SHA256, CODEX_RG_SHA256, CODEX_SYSTEM_CONFIG_PATHS, CODEX_VERSION,
+        ensure_credential_file_absent, file_sha256, sandbox_profile, verify_rg_runtime,
     };
     use serde_json::json;
     use std::path::Path;
@@ -328,6 +348,14 @@ mod tests {
     fn runtime_pin_is_exact() {
         assert_eq!(CODEX_VERSION, "0.144.0");
         assert_eq!(CODEX_BINARY_SHA256.len(), 64);
+    }
+
+    #[test]
+    fn any_auth_json_filesystem_entry_is_rejected_without_reading_it() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_credential_file_absent(root.path()).unwrap();
+        std::fs::write(root.path().join("auth.json"), b"not inspected").unwrap();
+        assert!(ensure_credential_file_absent(root.path()).is_err());
     }
 
     #[test]
@@ -402,6 +430,11 @@ mod tests {
         assert!(!profile.contains("(local tcp \"*:*\")"));
         assert!(!profile.contains("(allow process-exec)"));
         assert!(!profile.contains("/Users/"));
+        for path in CODEX_SYSTEM_CONFIG_PATHS {
+            assert!(profile.contains(&format!("(literal \"{path}\")")));
+        }
+        assert!(!profile.contains("(subpath \"/etc\")"));
+        assert!(!profile.contains("(subpath \"/private/etc\")"));
     }
 
     #[cfg(target_os = "macos")]
@@ -460,6 +493,17 @@ mod tests {
                 .windows(4)
                 .any(|bytes| bytes == b"must")
         );
+        let system_canary_result = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/cat", "/etc/passwd"])
+            .env_clear()
+            .env("CFFIXED_USER_HOME", &synthetic_home)
+            .env("HOME", &synthetic_home)
+            .env("TMPDIR", &codex_home)
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(!system_canary_result.status.success());
+        assert!(system_canary_result.stdout.is_empty());
     }
 
     #[test]

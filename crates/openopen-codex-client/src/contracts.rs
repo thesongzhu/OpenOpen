@@ -28,7 +28,11 @@ pub struct ChatGptLogin {
 #[serde(rename_all = "camelCase", tag = "state", deny_unknown_fields)]
 pub enum AccountState {
     NotConnected,
-    ChatGpt { email: String, plan_type: String },
+    ChatGpt {
+        email: String,
+        #[serde(rename = "planType")]
+        plan_type: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,9 +220,29 @@ pub(crate) fn model_from_value(value: &Value) -> Result<Option<GptModel>, CodexE
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MODEL_DISPLAY_NAME_BYTES, OutcomeRequest, StructuredOutcome, model_from_value,
+        AccountState, MAX_MODEL_DISPLAY_NAME_BYTES, OutcomeRequest, StructuredOutcome,
+        model_from_value,
     };
     use serde_json::json;
+
+    #[test]
+    fn connected_account_uses_the_swift_camel_case_contract() {
+        let value = serde_json::to_value(AccountState::ChatGpt {
+            email: "owner@example.invalid".to_owned(),
+            plan_type: "pro".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "email": "owner@example.invalid",
+                "planType": "pro",
+                "state": "chatGpt"
+            })
+        );
+        assert!(value.get("plan_type").is_none());
+    }
 
     #[test]
     fn forged_or_duplicate_source_refs_fail_closed() {

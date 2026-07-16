@@ -973,6 +973,17 @@ private final class MockReminders: RemindersServing {
 }
 
 @Test
+func connectedAccountDecodesTheRustCamelCaseContract() throws {
+  let payload = Data(
+    #"{"email":"owner@example.invalid","planType":"pro","state":"chatGpt"}"#.utf8
+  )
+
+  let account = try JSONDecoder().decode(AccountState.self, from: payload)
+
+  #expect(account == .chatGpt(email: "owner@example.invalid", planType: "pro"))
+}
+
+@Test
 func heroAInitialEventKitAuthorityIsConsumedBeforeAnyExternalBoundary() throws {
   let mission = testConfirmedMission(
     writeDisposition: .recoverOnly,
