@@ -476,6 +476,10 @@ public final class AppModel: ObservableObject {
       var lastError: Error = error
       for delay in [50, 150, 300] {
         do {
+          // Protected Off terminates the exact leased Core before the broker
+          // persists Off. A replacement Core must receive the pinned broker
+          // enrollment before it can verify and recover that checkpoint.
+          _ = try await provisionBrokerTrust()
           return try await core.recoverRuntime(
             state.authorization,
             brokerReceipt: state.receipt

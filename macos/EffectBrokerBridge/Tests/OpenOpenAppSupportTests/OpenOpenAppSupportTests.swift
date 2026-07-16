@@ -526,11 +526,18 @@ private actor MockCore: CoreServing {
 private actor FailClosedOffCore: CoreServing {
   var control = RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0)
   var rejectOffRecovery = true
+  var coreInstanceNonce = String(repeating: "a", count: 64)
+  var brokerEnrollmentInstallCount = 0
+  var brokerEnrollmentInstalled = false
+  var terminateOnNextOffCommit = false
 
   func allowOffRecovery() { rejectOffRecovery = false }
+  func terminateCoreOnNextOffCommit() { terminateOnNextOffCommit = true }
 
   func runtime() -> RuntimeControl { control }
-  func effectIdentity() -> CoreEffectIdentity { testCoreIdentity() }
+  func effectIdentity() -> CoreEffectIdentity {
+    testCoreIdentity(coreInstanceNonce: coreInstanceNonce)
+  }
   func signBrokerEnrollment(_: EnrolledBrokerTrustAnchor) -> Data { Data("{}".utf8) }
   func runtimeChallenge() -> String { String(repeating: "a", count: 64) }
   func prepareRuntime(_ enabled: Bool) -> RuntimeControlAuthorization {
@@ -547,6 +554,12 @@ private actor FailClosedOffCore: CoreServing {
     _ authorization: RuntimeControlAuthorization,
     brokerReceipt _: RuntimeControlReceipt
   ) throws -> RuntimeControl {
+    if !authorization.enabled, terminateOnNextOffCommit {
+      terminateOnNextOffCommit = false
+      coreInstanceNonce = String(repeating: "b", count: 64)
+      brokerEnrollmentInstalled = false
+      throw CoreClientError.processTerminated
+    }
     if !authorization.enabled, rejectOffRecovery {
       throw CoreClientError.contractViolation("Core commit failed after protected Off.")
     }
@@ -561,6 +574,9 @@ private actor FailClosedOffCore: CoreServing {
     _ authorization: RuntimeControlAuthorization,
     brokerReceipt _: RuntimeControlReceipt
   ) throws -> RuntimeControl {
+    guard brokerEnrollmentInstalled else {
+      throw CoreClientError.contractViolation("Replacement Core has no broker enrollment.")
+    }
     if !authorization.enabled, rejectOffRecovery {
       throw CoreClientError.contractViolation("Core recovery is temporarily unavailable.")
     }
@@ -571,7 +587,10 @@ private actor FailClosedOffCore: CoreServing {
     )
     return control
   }
-  func installBrokerEnrollment(_: Data) {}
+  func installBrokerEnrollment(_: Data) {
+    brokerEnrollmentInstallCount += 1
+    brokerEnrollmentInstalled = true
+  }
   func dashboard() -> DashboardState {
     DashboardState(
       activeCards: [],
@@ -1303,6 +1322,25 @@ func brokerAcceptedOffNeverRevertsUIOnWhenCoreCommitAndRecoveryFail() async {
   await model.updateEnabled(true)
   #expect(model.enabled)
   #expect(model.errorMessage == nil)
+}
+
+@MainActor
+@Test
+func protectedOffReenrollsAReplacementCoreBeforeCheckpointRecovery() async {
+  let broker = MockBroker()
+  let core = FailClosedOffCore()
+  await core.allowOffRecovery()
+  let model = AppModel(core: core, broker: broker) {}
+  await model.updateEnabled(true)
+  #expect(model.enabled)
+  #expect(await core.brokerEnrollmentInstallCount == 1)
+
+  await core.terminateCoreOnNextOffCommit()
+  await model.updateEnabled(false)
+  #expect(!model.enabled)
+  #expect(model.runtimeDisplayState == .off)
+  #expect(model.errorMessage == nil)
+  #expect(await core.brokerEnrollmentInstallCount == 2)
 }
 
 @MainActor

@@ -1235,7 +1235,7 @@ different commit/build.
   `launchctl` bootstrap. PR run `29462729644` succeeds. The next
   On attempt fails closed before model initialization; no provider, integrated
   Mission, reviewer, milestone, or release claim exists.
-- 2026-07-15 signed-Codex runtime-receipt repair candidate: the installed
+- 2026-07-15 signed-Codex runtime-receipt repair: the installed
   Developer-ID package preserves the exact upstream Codex `rg` bytes but must
   re-sign that nested Mach-O for the owner distribution identity. Core still
   compared its post-sign whole-file SHA-256 with the upstream pre-sign pin, so
@@ -1248,7 +1248,26 @@ different commit/build.
   all 194 ordinary Rust tests with one explicit environment-gated ignore, all
   44 broker/signing plus 55 App Swift tests, strict workspace Clippy, real
   initialize/account-read through the installed signed runtime, and exact
-  Developer-ID staging at
-  `/private/tmp/OpenOpen-FridayAlpha-RuntimeReceipt-v1.app` pass. Commit/push,
-  exact-clean same-SHA package, installed On/broker-lease retry, provider proof,
-  integrated Mission, final reviewers, and `FRIDAY_ALPHA_READY` remain pending.
+  Developer-ID staging pass. Commit `a433d1c…` is pushed; exact-clean
+  same-commit App/DMG staging passes at DMG SHA-256
+  `c8b9cf89eec07a5664bc2170b2e6dba76c83899b002077989e596e6838ceeba1`.
+  The installed App reaches protected On, runs the exact Codex child under the
+  Core process group, and recovers On across a real App/Core/Codex restart. The
+  PR run `29463375280` succeeds. Provider proof, integrated
+  Mission, final reviewers, and `FRIDAY_ALPHA_READY` remain pending.
+- 2026-07-15 protected-Off replacement-Core repair candidate: the real Global
+  Off attempt terminates the exact leased Core and Codex processes and persists
+  protected Off, but `commitOrRecover` immediately asked the replacement Core
+  to verify the broker checkpoint before reinstalling the pinned broker
+  enrollment. The replacement correctly returns `Local Store verification
+  failed`; local Core state remains revision-1 On while protected state is
+  revision-2 Off, and no Codex child remains. The candidate reprovisions only
+  when the Core instance nonce changes, then performs the existing signed
+  checkpoint recovery. A focused regression simulates termination after broker
+  acceptance and proves the replacement receives enrollment before recovery;
+  the prior fail-closed recovery test also passes. The complete 44
+  broker/signing plus 56 App Swift suite, warnings-as-errors release build,
+  strict format/plist/script checks, and Developer-ID staging at
+  `/private/tmp/OpenOpen-FridayAlpha-OffReenroll-precommit.app` pass. Commit,
+  push, exact-clean signed package, installed Off/On retry, provider proof,
+  integrated Mission, final reviewers, and the Friday milestone remain pending.
