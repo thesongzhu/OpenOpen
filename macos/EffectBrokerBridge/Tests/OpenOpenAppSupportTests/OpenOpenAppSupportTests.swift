@@ -5503,7 +5503,9 @@ func oneListenerPermissionFailureDoesNotBlockOtherListenerOrLocalInput() async t
   #expect(model.dashboardControls.globalToggleEnabled)
 
   let pollsAfterIsolation = await core.channelPollCount
-  try? await Task.sleep(for: .milliseconds(20))
+  for _ in 0..<200 where await core.channelPollCount <= pollsAfterIsolation {
+    try? await Task.sleep(for: .milliseconds(2))
+  }
   #expect(await core.channelPollCount > pollsAfterIsolation)
   await model.updateEnabled(false)
   #expect(model.runtimeDisplayState == .off)
@@ -8964,6 +8966,7 @@ func crashedCoreCanRestartWithoutOldGenerationCallbacksFailingTheReplacement() a
       exit 0
     fi
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"enabled":false,"revision":0,"updatedAtMs":0}}'
+    /bin/cat >/dev/null
     """
   try Data(script.utf8).write(to: executable)
   try FileManager.default.setAttributes(
@@ -9213,9 +9216,13 @@ func cancellingOneRpcDoesNotTerminateTheSharedCoreOrRejectItsLateResponse() asyn
   let root = try TemporaryDirectory()
   let executable = root.url.appendingPathComponent("cancel-safe-core")
   let countFile = root.url.appendingPathComponent("cancel-safe-core.count")
+  let firstRequestFile = root.url.appendingPathComponent("cancel-safe-core.first-request")
+  let releaseFirstResponseFile = root.url.appendingPathComponent("cancel-safe-core.release-first")
   let script = """
     #!/bin/sh
     count_file="$0.count"
+    first_request_file="$0.first-request"
+    release_first_response_file="$0.release-first"
     count=0
     if [ -f "$count_file" ]; then count=$(/bin/cat "$count_file"); fi
     count=$((count + 1))
@@ -9224,7 +9231,10 @@ func cancellingOneRpcDoesNotTerminateTheSharedCoreOrRejectItsLateResponse() asyn
     request_number=0
     while IFS= read -r request; do
       request_number=$((request_number + 1))
-      if [ "$request_number" -eq 1 ]; then /bin/sleep 0.2; fi
+      if [ "$request_number" -eq 1 ]; then
+        : > "$first_request_file"
+        while [ ! -f "$release_first_response_file" ]; do /bin/sleep 0.01; done
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"enabled":false,"revision":0,"updatedAtMs":0}}\n' "$request_number"
     done
     """
@@ -9242,7 +9252,10 @@ func cancellingOneRpcDoesNotTerminateTheSharedCoreOrRejectItsLateResponse() asyn
   defer { client.shutdown() }
 
   let first = Task { try await client.runtime() }
-  try? await Task.sleep(for: .milliseconds(50))
+  for _ in 0..<500 where !FileManager.default.fileExists(atPath: firstRequestFile.path) {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(FileManager.default.fileExists(atPath: firstRequestFile.path))
   first.cancel()
   switch await first.result {
   case .success:
@@ -9250,7 +9263,7 @@ func cancellingOneRpcDoesNotTerminateTheSharedCoreOrRejectItsLateResponse() asyn
   case .failure(let error):
     #expect(error as? CoreClientError == .requestCancelled)
   }
-  try? await Task.sleep(for: .milliseconds(300))
+  try Data().write(to: releaseFirstResponseFile)
 
   let second = try await client.runtime()
   #expect(second == RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0))

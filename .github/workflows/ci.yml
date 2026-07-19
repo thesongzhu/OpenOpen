@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Rust and Swift verification
+    name: Rust and Swift release/static verification
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -52,10 +52,6 @@ jobs:
       - name: Run strict Rust lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test the Swift app and broker package with warnings as errors
-        working-directory: macos/EffectBrokerBridge
-        run: swift test -Xswiftc -warnings-as-errors
-
       - name: Build the Swift app and broker package release
         working-directory: macos/EffectBrokerBridge
         run: swift build -c release -Xswiftc -warnings-as-errors
@@ -74,4 +70,30 @@ jobs:
           bash -n scripts/create_alpha_dmg.sh
 
       - name: Verify checks did not rewrite tracked files
+        if: always()
+        run: git diff --exit-code
+
+  swift-tests:
+    name: Swift tests
+    runs-on: macos-26
+    timeout-minutes: 12
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Record runner toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Test the Swift app and broker package with warnings as errors
+        timeout-minutes: 10
+        working-directory: macos/EffectBrokerBridge
+        run: swift test -Xswiftc -warnings-as-errors
+
+      - name: Verify tests did not rewrite tracked files
+        if: always()
         run: git diff --exit-code
