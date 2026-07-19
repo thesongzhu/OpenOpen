@@ -2,28 +2,570 @@
 
 Product state: `IMPLEMENTATION_IN_PROGRESS`
 
+Current competition gate: `BUILD_WEEK_COMPETITION_READY`. The dated current
+competition contract at the top of the Master Plan supersedes the historical
+Slack, Auto, Hero B/C, Private Memory, notarization, clean-install, and formal
+three-user rows below. Those rows remain chronological/post-competition
+evidence only and cannot block or satisfy the current competition gate.
+
 No row may be marked PASS from a mock, fixture, screenshot, CI status, or a
 different commit/build.
 
 | Gate | Evidence required | Current result |
 | --- | --- | --- |
-| Rust domain and security tests | Current-SHA test log | Current implementation commit `5c185ab…` passes 191 ordinary Rust tests with one explicit environment-gated Codex test plus release, strict Clippy, format, metadata, script, diff, conflict-marker, and credential-pattern checks locally. Its PR CI and fresh final reviewers remain pending. The prior reviewed `5a461ef…` package/CI evidence remains valid only for that older implementation fingerprint; none of this is provider or release proof |
-| SwiftUI build and tests | Current-SHA build/test log | Reviewed commit `5a461ef…` passes 40 broker/signing plus 53 App tests. Final2 DMG SHA is `7c022b83…`; the reviewed package binds the exact owner leaf, layout, modes, content, signatures, and receipts. It remains unnotarized and has no provider, administrator/cross-UID, clean-install, or release PASS |
-| Codex stable protocol contract | Generated schema and live handshake | Pinned `0.144.0` manifest binds four runtime components and 267 generated schemas; the exact pinned outer-sandbox initialize diagnostic passes twice on the reviewed tree. PR #2 run `29450863581` passes integration-tree plumbing for head `5a461ef…`. Real managed login, required-model catalog, structured turn, signed-build provider proof, and release proof remain pending |
+| Connected competition story | Real Passport/ZIP → confirmed Memory → proactive suggestion → bounded Mission → reviewed GitHub Skill → iMessage/Discord → Reminders Evidence → Receipt → Workflow Candidate trace | pending; the official product route durably committed exactly two pairings: iMessage plus canonical Friday Discord application/bot `1472779237038493808`, guild `1476443817946124481`, channel `1476443818646831229`, and owner `370355408730324993`. Installed Repair22 final2 restored both listeners and durably closed its cursor without replay. The exact Owner-approved correction was sent once as provider message `1528211998263738570`, observed and dispatched once, then failed before structured-output parsing. It and original message `1527903489252921485` are terminal and never retry. Repair23 final7b was installed for bounded runtime validation, where the recurring blocking incident modal prevented the approved Dashboard input from being consumed. Mission/Receipt/outbound remain `0/0/0`; the real Mission has not begun. Memory, Skills, Understanding, and the connected competition story also do not yet exist |
+| Agent Understanding and proactivity | ≥60 human-expression evals, Owner-approved rubric, source explanation, cooldown/rejection behavior | pending; current Outcome contract does not yet implement `clarify/propose/cannotHelpSafely` |
+| ChatGPT Memory import | Real Quick Passport and one real official ChatGPT ZIP with fail-closed parser, review, cleanup, restart, and personalized Outcome | pending; competition V1 is OpenAI-only, the real ChatGPT export is `WAIT_EXTERNAL`, and Claude/cross-provider import is excluded and not claimed |
+| Product liveness and terminal incidents | Durable one-per-incident acknowledgement, non-blocking activity, usable Dashboard/Settings/Global Off, restart and 100-poll proof, zero retry/effect | Repair24 source uses a stable Store-owned incident identity, atomic acknowledged incident plus audit, bounded projection over complete durable history, non-blocking UI, listener-failure isolation, restart/response-loss handling, control-reachability tests, and a required typed poll capability that forbids model selection during account/recovery-only polling. A fresh pre-freeze Product Scout reports P0/P1/P2=`0/0/0`. Final6's Rust matrix passed but its Swift matrix is historical FAIL evidence; the supervisor-authorized deterministic test fingerprint must rerun the complete Rust/Swift/release/strict-lint matrix. Package and final review facts are valid only in a later external immutable receipt; this gate is not PASS until that matrix, the frozen-fingerprint Scout, and two fresh reviewers pass |
+| Instruction-only GitHub Skills | Real public GitHub import/audit/promotion/use/update/rollback and malicious fixture report | pending; DTO/RPC placeholders only |
+| Rust domain and security tests | Current-SHA test log | Repair24 coverage includes incident identity, atomic acknowledgement, 100 identical polls, bounded projection, restart/response loss, concurrent poll/ack, Global Off, listener isolation, explicit model-forbidden poll ingestion, Evidence-before-Done, 100 envelopes, and 10 Missions. Final6's wholly successful Rust log records 269 executed tests with two explicit real-runtime diagnostics ignored, release, strict Clippy/rustfmt, and locked offline metadata, but it cannot transfer to the later supervisor-authorized test fingerprint. That exact fingerprint must rerun the complete Rust and static matrix; package and review facts remain external fingerprint-bound evidence |
+| SwiftUI build and tests | Current-SHA test log | Repair24 covers the AppKit 200-poll focus/control fixture, restart state matrix, incident-scoped acknowledgement/refresh failure handling, strict channel DTOs, listener/account isolation, actual Core termination, connected-route effects without model authority, and deterministic On/Off/ack RPC gates. The first formal Repair24 Swift run remains historical FAIL evidence because its Off-during-poll test used a fixed 20 ms scheduling assumption. Final6 is also historical FAIL evidence: a sibling stale-dashboard test used a fixed 10 ms scheduling assumption. An isolated supervisor authorized a bounded Mock Core Dashboard-entry counter in both sibling tests, with no production change. Only a later wholly successful 56+193 warnings-as-errors log, release build, and authoritative direct strict swift-format log may certify this row. Frozen package and identical-fingerprint review evidence remain pending |
+| Codex stable protocol contract | Generated schema and live handshake | Installed Repair22 final2 uses pinned `0.144.0`, exact `gpt-5.6-sol`/`high`, and the managed ChatGPT account. One isolated synthetic turn proved the A4 failure class was an unexpected normal notification before schema parse. Pinned schema/source inspection found obsolete `agentMessage/delta` plus missing passive reasoning/token events. Repair23 accepts only the bounded identity-checked pinned passive set and retains fail-closed tool/action/reroute/unknown handling. A new signed-build real structured Outcome is still required |
 | Voice → Reminders → Receipt | Signed-build real runtime record | pending |
 | iMessage bidirectional route | Signed-build real message IDs | pending |
-| Discord bidirectional route | Signed-build bot/channel message IDs | pending |
-| Slack bidirectional and consent route | Signed-build Socket Mode IDs, durable consent/revocation, and doctor record | pending; planned for `JUDGE_SLICE_READY`, not implemented or claimed |
-| Quick Memory Passport and private recall | Signed-build reviewed import, retention cleanup, and one-use grant record | pending; planned for `JUDGE_SLICE_READY`, not implemented or claimed |
-| Receipt image → XLSX | Input/output hashes and workbook verification | pending |
-| Restart recovery and dedupe | Same-SHA runtime record | pending |
+| Discord bidirectional route | Signed-build bot/channel message IDs | inbound provider messages `1527903489252921485` and `1528211998263738570` were each sent exactly once and durably accepted; both dispatches are terminal failed without suggestion and never retry. No outbound Discord effect exists, so bidirectional PASS remains pending |
+| Slack bidirectional and consent route | Post-competition roadmap evidence | excluded from current competition gate; not implemented or claimed |
+| Quick Memory Passport and private recall | Historical roadmap wording | Quick Passport remains required; Private Memory is excluded from current competition gate |
+| Receipt image → XLSX | Post-competition roadmap evidence | excluded from current competition gate; not implemented or claimed |
+| Restart recovery and dedupe | Same-SHA runtime record | deterministic Repair18 Core-death, bounded restart, stale-UI, dual-listener, duplicate-lifecycle, Global Off, and no-old/new-Core-overlap tests pass; same-signed-build live restart and provider proof remain pending |
 | Skill lifecycle and containment | Security test report | pending |
-| Stress suite | Nonzero all-pass scenario artifact | Current implementation commit `5c185ab…` adds and locally passes the required ten-coexisting-Mission isolation scenario: ten bounded Missions are simultaneously Active, each cross-Mission Evidence injection is rejected without advancing the audit anchor, every Mission closes across a fresh Store restart, and ten exact Evidence/Reminder-source/Receipt chains remain isolated. The existing same-suite 100 shuffled duplicate-envelope test also passes. Provider failure/revocation and the one continuous real signed-build Mission trace remain pending, so the stress gate is not PASS |
-| Signed/notarized clean install | codesign/notary/staple/Gatekeeper evidence | Final2 signing/evidence review passes and exact commit `5a461ef…` is pushed, but DMG `7c022b83…` remains `Unnotarized Developer ID`. Notarization, staple, Gatekeeper acceptance, administrator/cross-UID and clean-install evidence remain pending; the current package is not release proof |
-| Three external users | Consent-safe aggregate and 48-hour reuse | pending |
-| Two isolated reviewers | PASS reports for release SHA | Two entirely fresh Final2 reviewers PASS code/signing fingerprint `026b2b1f…`; exact commit `5a461ef…` is pushed with equal-tree PR CI PASS. This ledger does not self-certify review of its own current document fingerprint; only external same-fingerprint reports and a stage-bound Advisor handoff can do that. Provider proof and final release-SHA review remain pending |
+| Stress suite | Nonzero all-pass scenario artifact | Repair14 passes 100 duplicated/out-of-order events across its Discord primary and iMessage additional route with stable dedupe/cursors, restart, no model dispatch, and no duplicate effect. A separate 10-concurrent-Mission test rejects cross-Mission route approval, wrong owner, and crossed conversation without audit movement, routes both valid channel events only to Mission 1, and preserves all ten Mission/Evidence/Receipt boundaries. Separate otherwise-valid negatives change only route-set revision or outbound recipient identity and leave audit unchanged. Provider failure/revocation and the one continuous real signed-build Mission trace remain pending, so the stress gate is not PASS |
+| Signed owner-test build | codesign, exact installed identity, broker/tmpfs and same-build product evidence | Repair22 final2 Developer-ID App manifest `cfa086be…`, DMG `8aa3dc16…`, App CDHash `4f5648ad…`, and Team `UHDY2275L5` passed two fresh reviews and were installed through official ServiceManagement/XPC. Its provider-readiness proof is real but its structured Outcome failed. Repair23 final2 through final6 packages are historical invalid artifacts. Exact final7b package/review facts remain bound only by its external immutable receipt; final7b was installed for bounded runtime validation, but its recurring modal blocked ordinary use and is not Alpha proof. Any Repair24 package/review facts are valid only in a later external immutable receipt; no Repair24 install/runtime proof exists |
+| Three external users | Post-competition validation | excluded from current competition gate; not claimed |
+| Two isolated reviewers | PASS reports for competition SHA | Historical results never transfer across a fingerprint. Repair23 final2 product failed P0/P1/P2=`0/0/1`; both final3 reviewers failed `0/0/2`; final4 findings combine to `0/1/1`; both final5 reviewers failed `0/1/0`; final6 security review found P0/P1/P2=`0/1/1` and the same-root supervisor required consolidation. Final6 is invalid. Exact final7 review facts are bound only by its external immutable receipt; this ledger does not self-certify them. Connected-story and final competition-SHA reviews remain separate later gates |
 
 ## Review history
+
+- 2026-07-18 Repair23 A4 structured-Outcome diagnosis: installed Repair22
+  final2 restored both durable listeners and accepted one exact Owner-approved
+  correction once. Provider message `1528211998263738570` was observed and
+  dispatched once, then terminally failed before structured JSON parsing with
+  no suggestion, Mission, Receipt, or outbound. Read-only pinned source/schema
+  inspection plus the one authorized isolated synthetic non-channel turn
+  identified a concrete protocol compatibility root: the client used obsolete
+  `agentMessage/delta` and rejected the pinned high-reasoning passive progress
+  stream. Repair23 accepts only the closed pinned passive set with exact
+  identity/count/byte/item/index validation, retains final-item authority and
+  fail-closed unknown/tool/action/reroute handling, and emits only fixed
+  non-sensitive failure classes. Repair23 final2 security passed `0/0/0`, but
+  its fresh product reviewer found
+  P0/P1/P2=`0/0/1`: active status accepted missing/non-array `activeFlags`, and
+  rate-limit metadata accepted known fields of the wrong pinned-schema type.
+  Final2 and both review results are historical. Final3 validated those
+  discriminated-union and known-field shapes, but both fresh final3 reviewers
+  failed P0/P1/P2=`0/0/2`: `turn/started.items`, lifecycle timestamps, bounded
+  item IDs and mandatory type-specific fields were incomplete, and current
+  embedded text still called its already-built package pending. Final4 closes
+  those exact findings and adds malformed Turn/item/lifecycle negatives, but
+  fresh final4 product/security review invalidated it before install with
+  combined P0/P1/P2=`0/1/1`: malformed nested `memoryCitation` data passed, and
+  malformed/forbidden turn errors did not terminate the reusable Codex
+  transport. Final5 validates the complete citation shape and terminates the
+  transport on every turn-collection error before Host reuse, but both fresh
+  final5 reviewers failed P0/P1/P2=`0/1/0`: terminal
+  `itemsView: summary|notLoaded` could be accepted as the complete authority
+  list and hide a tool/action item. Final6 is invalid: `turn/started` omitted
+  optional pinned Turn-field validation, and its Swift log ended with a missing
+  `swift-format` command while the receipt called that log PASS. Its security
+  review found P0/P1/P2=`0/1/1`, and the same-root supervisor required one
+  consolidation. Supervisor-approved final7 uses one sealed stage-aware Turn
+  validator for all three production routes, validates complete accepted nested
+  shapes, and wraps start/collection/terminal parsing in one transport-retiring
+  boundary. The complete matrix passes 253 executed Rust tests with two explicit
+  real-runtime diagnostics ignored, 56 broker/signing plus 140 App tests,
+  release builds and strict static checks. Exact package and fresh-review facts
+  are bound only by the external immutable final7 receipt; this ledger does not
+  self-certify or dynamically negate them.
+  Neither terminal real dispatch may ever retry; no new provider input or
+  milestone is claimed.
+
+- 2026-07-18 Repair22 Discord provider-readiness repair: after Repair21's real
+  protected Off PASS, official On advanced the Store to revision 29. The two
+  durable pairings, terminal failed/no-suggestion dispatch, and zero Mission/
+  Receipt/outbound state remained intact, but cursor-bearing Discord restore
+  could not reach Connected: Swift required Connected before it invoked the
+  existing typed poll that persists and acknowledges the recovery cursor.
+  Repair22 drains that bounded poll/ack path inside the existing Core-generation
+  fence before Connected, model, or outbound readiness. The complete 238-
+  executed-Rust/two-ignored and 56+140-Swift matrix plus release, strict static,
+  notice, and secret checks passes. Synchronized candidate identity is external
+  exact-fingerprint evidence; two fresh identical-fingerprint reviewers remain
+  pending. The frozen Discord correction is UNSENT; no installation or provider
+  action is authorized by this row.
+
+- 2026-07-18 Repair21 paused→Off diagnosis and repair: installed Repair20
+  final5 reached `.paused` after bounded recovery. One exact official Off
+  attempt failed closed with runtime still enabled at revision 27, pairings=2,
+  the sole dispatch failed/no-suggestion, and Mission/Receipt/outbound=0/0/0.
+  Source diagnosis found `.paused` missing from the existing replacement-Core
+  provisioning condition, so recovery state reset to ready and replacement
+  prepare preceded broker-trust enrollment. Repair21 adds only `.paused` to the
+  existing quiesced path. Direct success/failure tests causally require trust
+  before prepare, prove exactly one monotonic Off commit, and prove shutdown,
+  provisioning, and prepare failures publish no false Off or external work.
+  The complete matrix passed 238 executed Rust tests with two explicit real-
+  runtime diagnostics ignored and 56+127 Swift tests. Developer-ID App manifest
+  `509ee4b7…` and DMG `02964b91…` passed two fresh P0/P1/P2=`0/0/0` reviews,
+  were installed through the official broker route, and produced immutable A3
+  Off receipt `83da12fa…` at revision 28 with no external effect.
+
+- 2026-07-18 Repair20 replacement-review invalidation and batched repair: the
+  first frozen final1 product reviewer reported P0/P1/P2=`0/0/1` because no
+  direct test exercised failed shutdown followed by successful Off on the same
+  `AppModel`. The independent security reviewer reported `0/1/0`: a newer On
+  arriving during replacement enrollment could clear the quiesced marker and
+  publish false On without restoring Core/Codex or either durable listener.
+  Final1 manifest `d05a74e7…`, DMG `3c52395a…`, and both reviews are historical
+  and non-reusable. The replacement keeps exact quiescence latched until
+  protected Off commits; when On remains desired, it stays non-model-capable and
+  Turning On until a single fenced Core generation restores Codex, account/
+  models, and both durable listeners. A later Off interrupts that restoration
+  and completes Off. Four direct regressions cover failed-shutdown retry,
+  failed-shutdown On revalidation, quiesced Off→newer On, and restoration→newer
+  Off with unchanged pairings and zero proposal/send. The serial complete
+  matrix passes 237 executed Rust tests (two explicit external-runtime tests
+  ignored) and 56+117 Swift tests, both release builds, strict lint and format.
+  The earlier load-contended concurrent Swift/Rust run produced one existing
+  Core-restart test failure; that run is not counted. The exact test then passed
+  three consecutive isolated runs and the complete Swift suite passed alone.
+  Synchronized final2 packaging passed, but both fresh reviewers independently
+  rejected it with P0/P1/P2=`0/2/0`: a refused exact terminator cleared the
+  transport and then was skipped by same-generation retry, while recovery could
+  visibly publish On before the approved listeners completed. Final2 and those
+  review results are historical and non-reusable. Final3 quarantines the exact
+  Core generation and retries its captured audit token; every recovery route
+  remains Turning On and non-model-capable until the fenced Core, Codex,
+  account/models, and both listeners complete. Five focused regressions and the
+  serial complete 237-executed-Rust/56+117-Swift matrix pass, including release,
+  strict lint, and format. Synchronized final3 packaging also passes: 18
+  directories plus 617 files, normalized manifest `0ff61a64…`, exact mounted-
+  copy equality, DMG `ca90a111…`, App/Core/broker/worker CDHashes `957ee0b1…`/
+  `5120ebc5…`/`002e5156…`/`9200195f…`, and byte-identical embedded PROVENANCE
+  `39d342e5…`; Gatekeeper reports `Unnotarized Developer ID`. Fresh final3
+  product review rejected it with `0/1/0`, and security with `0/2/0`: ordinary
+  persisted protected Off→On bypassed the special restoration latch, while
+  Discord `connecting`/`reconnecting` could count as restored. Final3 and both
+  reports are historical and non-reusable. Final4 applies the fenced restoration
+  to every production-lifecycle protected On, requires bounded exact Discord
+  `connected`, pauses on terminal status or timeout, and lets a newer Off
+  interrupt without replay. Persisted-Off/two-pairing, connecting progression,
+  terminal-fault, bounded-timeout, and newer-Off regressions bring the complete
+  matrix to 237 executed Rust and 56+121 Swift tests. The synchronized final4
+  Developer-ID candidate passes an 18-directory/617-file normalized manifest
+  `486a3d6a…`, exact mounted-copy equality, DMG `c0eca10d…`,
+  App/Core/broker/worker CDHashes `b4ca388a…`/`5120ebc5…`/`002e5156…`/
+  `9200195f…`, byte-identical embedded PROVENANCE `056b5489…`, and honest
+  `Unnotarized Developer ID` labeling. The fresh final4 product reviewer then
+  reported P0/P1/P2=`0/1/0`: Core-death recovery briefly exposed Unknown rather
+  than Turning On. The independent security reviewer reported `0/2/0`:
+  protected On did not require exact ChatGPT plus `gpt-5.6-sol`/`high`, and Host
+  model work did not require exact Discord Connected after recovery. Final4 and
+  both reports are historical and non-reusable. Final5 keeps recovery Turning
+  On, requires the exact account/model before On/model entry, requires exact
+  Discord Connected for model/outbound work, and explicitly proves protected
+  Off still converges without account/model readiness. The complete source
+  matrix passes 238 executed Rust and 56+125 Swift tests. Synchronized final5
+  packaging and two entirely fresh reviews remain pending; no install,
+  Store/provider effect, or milestone is claimed.
+
+- 2026-07-18 Repair20 final1 diagnosis/package record (historical and
+  invalidated by the replacement-review entry above): installed Repair19
+  final5b recovered the exact sole dispatch to
+  `failed` with pairings=2 and Mission/Receipt/outbound=0/0/0. A real official
+  Global-Off attempt stopped the exact old Core, started a replacement, and
+  failed before broker XPC because the replacement Host's in-memory trusted-
+  broker enrollment was empty. Thirteen broker-signed recovery checkpoints in
+  the real Store made `mission.runtime.prepare(false)` correctly reject before
+  the App's later provisioning step. Repair20 clears cached Core identity after
+  positively proven exact shutdown, provisions the pinned broker enrollment
+  into only that quiesced replacement, generation-checks the still-current Off
+  intent, and then prepares through the unchanged Store/broker transaction.
+  Normal live-Core Off retains prepare-before-provision ordering. Failed exact
+  shutdown leaves the display Unknown and performs no prepare, provision,
+  broker apply, Store write, model call, or provider work; a later request must
+  retry exact shutdown rather than silently continue. All 237 executed Rust
+  tests (two explicit external-runtime diagnostics ignored) and 56+113 Swift
+  tests pass with warnings as errors, including the direct replacement-Host
+  guard and both Swift order/failure regressions. Release builds, strict lint/
+  format, metadata, notices, plist/scripts, diff, conflict, and credential-shape
+  checks also pass. Synchronized Developer-ID App manifest is `d05a74e7…` with
+  18 directories plus 617 files; App/Core/broker/worker CDHashes are
+  `16ac5ba5…`/`5120ebc5…`/`002e5156…`/`9200195f…`. The exact-verifier DMG SHA is
+  `3c52395a…`; Gatekeeper honestly reports `Unnotarized Developer ID`. Final1
+  and both of its review results are non-reusable and must not be installed.
+  No provider action or milestone was claimed by this historical record.
+
+- 2026-07-17 first real Repair18 Alpha intent and Repair19 diagnosis: Owner
+  approved one Discord send on the already paired Friday route. Provider
+  message `1527903489252921485`, content SHA-256
+  `f642122f48a43e42dd8217875d114afd27c134372c9ff2804ec49428a0e1288a`,
+  was sent exactly once, durably accepted, and claimed once for model work.
+  Store proof remains runtime enabled revision 27, pairings=2, Mission=0,
+  Receipt=0, outbound=0, and the dispatch remains `started`; App/Core/broker/
+  imsg remain live while the OpenOpen-owned Codex child is absent. Generated
+  pinned-runtime schema inspection plus official structured-output guidance
+  identified OpenOpen's unsupported `uniqueItems` keyword. Repair19 removes
+  that keyword only, preserves duplicate-source validation after parsing,
+  atomically terminalizes failed claimed work, rejects suggestion publication
+  from failed work, requires an explicit correction, keeps channel polling
+  live, and performs bounded exact-Core recovery. A concurrent final1
+  verification then exposed stdout EOF waking a retry before the Process
+  callback revoked the old input. Final2 revoked the shared input slot first,
+  but its two fresh reviewers invalidated it with product P0/P1/P2=`0/0/2`
+  and security `0/2/0`: Global Off could race a late durable model result, an
+  installed pre-write RPC retained its captured handle after EOF revocation,
+  and current README/provenance package text was stale. Final3 holds the active-
+  operation gate through reconciliation, rejects result commit across Off in
+  the same immediate Store transaction, and serializes EOF revocation with the
+  final pre-write authorization. Fresh final3 product review then invalidated
+  that package with P0/P1/P2=`0/1/0` while security passed `0/0/0`: successful
+  exact-Core recovery cleared the transient failure warning and the restarted
+  Host did not rediscover the durable failed dispatch. Final4 persistently
+  surfaces `Need you` only while the newest accepted dispatch is failed; a
+  later explicit correction supersedes it and no prior model call is replayed.
+  Both final4 reviewers then found one P1: persistent feedback starved the
+  provider correction poll, and a failure on one channel could clear another
+  channel's valid Outcome. Final5 polls transport before persistent failure
+  feedback and invalidates only the exact same-channel suggestion ID. Current
+  source passes 236 executed Rust tests (two explicit external-runtime
+  diagnostics ignored) and 56+111 Swift tests.
+  Candidate/reviewer facts remain external fingerprint-bound evidence;
+  reviewed install, correction approval, and real integrated closure remain
+  pending. The original
+  provider message must not be resent and no milestone is claimed.
+
+- 2026-07-17 real installed-runtime Core-loss diagnosis and Repair18 local
+  verification: after the durable Discord confirmation, Store evidence is
+  exactly two pairings and zero Mission/Receipt/outbound. At 14:51:52 PDT the
+  installed Core cleanly closed while the App and root broker remained alive;
+  bundled Codex and imsg were absent, and the visible Discord connected label
+  was cached rather than listener proof. The root is Swift view-task
+  cancellation calling the shared `CoreProcessClient.shutdown`, which closed
+  Core stdin; the Rust Host correctly exits on stdin EOF, so no crash report
+  exists. Repair18 makes per-request cancellation consume/ignore only that
+  request's late response, emits one bounded typed Core-lifecycle event,
+  immediately clears cached provider state, and either restores the exact two
+  durable routes once through a non-overlapping signed Core generation or
+  pauses with `Need you` after three bounded failures. Both fresh final1
+  reviewers rejected its frozen package before install with P0/P1/P2=`0/2/1`:
+  recovery cleanup could auto-launch Core outside the three-attempt budget,
+  Global Off omitted recovery and untracked startup listener work, and the
+  cancellation-before-write branch lacked a deterministic regression. That
+  package and both reviews are historical. The replacement cleanup requires an
+  already-running Core, a failed attempt exact-terminates and verifies its Core,
+  Global Off interrupts already-written noncooperative RPCs, and pre-write
+  cancellation removes its unreachable tombstone. The final2 package passed
+  those checks but was also invalidated before install: its fresh product
+  reviewer reported `0/1/0` and security `0/1/1`. One attempt could still
+  silently start a second Core and combine the two generations' listener and
+  model state; validation and later exact termination also used independently
+  captured audit tokens. Final3 fenced a complete recovery attempt and captured
+  one token for validation, retention, cleanup, and termination. Its source
+  fingerprint `da701e94…`, App manifest `e55269d3…`, and DMG `856f5403…` passed
+  the then-current matrix but are invalid: fresh product and security reviewers
+  each reported P0/P1/P2=`0/1/0`. Product proved provisioning/dashboard/Codex
+  startup calls preceded the fence and could cross generations or escape Off
+  tracking. Security proved a failed post-launch validation/bootstrap path
+  ignored exact terminator completion and could forget a still-live child.
+  Final4 fences and tracks startup from its first Core RPC and either observes
+  exact failed-child exit or quarantines the generation without input or
+  replacement-launch authority. All 56 broker/signing plus 108 App tests pass,
+  including startup-prefix generation drift, Off interruption, delayed accepted
+  termination, rejected termination quarantine, and replacement prohibition.
+  The complete 233-executed-Rust/56+108-Swift matrix, both release builds,
+  strict lint/format, locked metadata, notices, plist/scripts, diff, conflict,
+  and credential-shape checks pass. Final4 package and reviewer status is kept
+  only in external exact-fingerprint evidence and cannot self-authorize an
+  install. No real provider proof, re-pair, token action, send, Mission,
+  Receipt, or milestone is claimed.
+
+- 2026-07-16 Repair16 root diagnosis and local verification: the approved
+  Friday token was typed directly into OpenOpen without output, but setup
+  failed before provider access with the sanitized local-security-key error.
+  Production query inspection and a disposable Security.framework probe bind
+  the root to `kSecUseDataProtectionKeychain` and
+  `errSecMissingEntitlement (-34018)`. The production item remains absent.
+  Repair16 uses one native login Keychain backend without fallback, preserves
+  exact service/account/accessibility and redacted failures, and adds unique
+  disposable save/readback/update/delete plus legacy-failure regressions. The
+  full 220-Rust/56+76-Swift matrix, release/strict/static checks, and exact
+  Developer-ID App/DMG verification pass. No real token value, Discord request,
+  pairing, message, Mission, Receipt, reviewer PASS, or milestone proof is
+  claimed.
+
+- 2026-07-16 first Repair16 pre-install review: security PASS with
+  P0/P1/P2=`0/0/0`; product FAIL with `0/1/1`. The product reviewer proved
+  Swift displayed connected while the real Rust start contract returns
+  `connecting`, could retain stale success after poll failure, and left
+  iMessage discovery/conversation/owner controls mutable after durable pairing.
+  Frozen combined fingerprint `990425bb…`, manifest `452f9c0e…`, and DMG
+  `4080763d…` are historical and invalid for install. The replacement uses the
+  real Discord state machine, clears stale success on status/error, locks the
+  paired iMessage controls, and adds real-shape regressions. Both prior review
+  results are non-reusable after this edit; two entirely fresh reviewers are
+  required on the replacement fingerprint.
+
+- 2026-07-16 next Repair16 replacement product review: P0/P1/P2=`0/0/1`.
+  Production correctly maps `reconnecting`, but the frozen 78-App suite did
+  not directly drive that state. The in-progress security review is interrupted
+  and non-reusable. A direct connecting→reconnecting→connected regression now
+  proves pending recovery never retains the green connected feedback. This
+  changes no production or signed App byte; the prior fingerprint is invalid
+  and two entirely fresh reviewers are required on the new one.
+
+- 2026-07-16 following Repair16 product review: P0/P1/P2=`0/0/1`.
+  `connectDiscord` captured the runtime generation but, unlike adjacent channel
+  paths, its catch did not reject a late callback after Global Off. A delayed
+  start could therefore republish faulted feedback after Off cleared the
+  channel state. The narrow repair adds the generation guard and a deterministic
+  delayed-start→Off regression proving disconnected/nil feedback/nil error and
+  zero polling. The prior App/DMG and interrupted security review are invalid;
+  full verification, synchronized packaging, and two fresh reviewers remain.
+
+- 2026-07-16 Repair16 final3 review pair: product reports P0/P1/P2=`0/1/1`;
+  security reports `0/0/1`. Product proves iMessage activation assigned its
+  returned status before validating the post-await generation, and channel
+  polling mutated status, feedback, Mission events, and suggestions without a
+  post-await generation/cancellation check. Both reviewers also reject stale
+  Master Plan paragraphs that still presented final2/78 tests as current.
+  Security finds no Keychain, secret, entitlement, sandbox, package, or fake-
+  proof defect and confirms the clean-rebuilt broker differs only in linker
+  UUID/build metadata, with identical executable sections, symbols, and
+  strings. Final4 fences every channel await before mutation and adds delayed
+  activation→Off and delayed poll→Off regressions. The complete 220-Rust,
+  56-broker, 81-App strict matrix passes. Final3 and both reviews are
+  invalidated; the synchronized final4 package above requires two entirely
+  fresh reviewers before install.
+
+- 2026-07-16 Repair16 final4 review: security PASS reports P0/P1/P2=`0/0/0`;
+  product FAIL reports `0/1/1`. Product proves Host created the Discord provider
+  session before replying, but a lost reply left retry returning
+  `AlreadyRunning`, so Swift could not reattach without a broader restart. It
+  also proves the delayed-poll Off test used cancellation-aware sleep, meaning
+  no callback actually returned after cancellation. Final5 validates the exact
+  durable pairing and returns the one existing adapter's current state without
+  replacing it; changed pairing fails closed. Swift fault injection loses the
+  first reply after one session commit, retries through the stored token, and
+  observes exactly one provider session. Its poll mock uses a detached delay
+  unaffected by caller cancellation and asserts the one late callback returns
+  while all post-Off state stays empty/disconnected. The full 221-Rust,
+  56-broker, 82-App strict matrix passes. Final5 Developer-ID App manifest is
+  `bdeff03b…`, exact DMG SHA is `bd8f2b08…`, and embedded PROVENANCE is
+  byte-identical. Final4 and both reviewer results are historical; two entirely
+  fresh final5 reviewers remain required before install.
+
+- 2026-07-16 Repair16 final5 product review: FAIL P0/P1/P2=`0/1/0`;
+  the in-progress security review is interrupted and non-reusable. Host could
+  persist the confirmed Discord pairing and remove its setup session before a
+  lost reply left Swift with the stale setup/candidate. Retrying the visible
+  Confirm action then necessarily failed against the removed setup, while the
+  durable-pairing start path did not clear the contradictory UI. Final6 reads
+  the verified durable pairing after that failure, requires exact owner,
+  conversation, guild, bot/application, setup source message, and candidate ID
+  equality, loads the Keychain token through the existing redacted boundary,
+  and only then clears setup UI and starts the route. A fault injection commits
+  pairing, loses the reply, and proves one confirmation plus one provider
+  session reaches clean connecting state. The full 221-Rust, 56-broker,
+  83-App strict matrix passes. Final6 App manifest is `9d0ee12a…`, exact DMG is
+  `ca9f24d4…`, and embedded PROVENANCE is byte-identical. Two entirely fresh
+  final6 reviewers remain required before install.
+
+- 2026-07-16 Repair16 final6 product review: FAIL P0/P1/P2=`0/1/0`;
+  the in-progress security review is interrupted and non-reusable. Host
+  reattached every exact already-present session, including a terminal
+  `faulted` adapter whose provider task had ended. Swift's visible retry then
+  received the same terminal status and could not recover without a whole App
+  or Global-Off restart. Final7 adds a launch-pending marker so an immediate
+  response-loss retry retains the same scheduled/live session, while an exact
+  retry first stops and replaces one terminal faulted or launch-complete
+  disconnected session. Changed pairing still fails before movement and no
+  outbound effect is created. Host and Swift fault→retry regressions prove one
+  replacement session; the full 222-Rust, 56-broker, 84-App strict matrix
+  passes. Final7 App manifest is `5044a828…`, exact DMG is `8ea86593…`, and
+  embedded PROVENANCE is byte-identical. Two entirely fresh final7 reviewers
+  remain required before install.
+
+- 2026-07-16 Repair16 final7 product review: FAIL P0/P1/P2=`0/1/0`;
+  the in-progress security review is interrupted and non-reusable. Restart
+  recovery popped in-memory events before the Store durably accepted them,
+  exposed the raw adapter's Connected state and outbound handle while recovery
+  was unresolved, and left a failed recovery receiver installed. Final8 keeps
+  one exact event outstanding until Store acknowledgement, repeats it across
+  Store failure/response loss, denies Connected/outbound until the final cursor
+  is acknowledged, atomically rejects malformed batches, and stops/removes a
+  failed session for one clean exact-pairing retry. Global Off clears pending
+  recovery, and the outbound availability gate runs before Mission approval or
+  outbound-intent mutation. The full 227-executed-Rust, 56-broker, 84-App
+  strict matrix, stress, release, metadata, notice, diff, conflict, and secret
+  checks pass. Final8 App manifest is `64fc1bff…`, exact DMG is `18f9cb2b…`,
+  and embedded PROVENANCE SHA `1d93a19a…` is byte-identical. Two entirely fresh
+  final8 reviewers remain required before install.
+
+- 2026-07-17 Repair16 final8 product review: FAIL P0/P1/P2=`0/1/0`;
+  the unfinished security review is interrupted and non-reusable. Per-message
+  Store writes were durable and once-only, but Host could claim the first
+  recovered model dispatch before a later correction and the final provider
+  high-water cursor. Swift could surface and confirm that partial-batch Outcome.
+  Final9 keeps every queued Discord model dispatch closed until the complete
+  recovery sequence and final cursor are acknowledged. A chronological
+  original-intent→correction Host regression proves both messages are durable,
+  neither starts/surfaces a suggestion during partial recovery, and the oldest
+  dispatch becomes eligible only after cursor closure. The full
+  228-executed-Rust, 56-broker, 84-App strict matrix, stress, release, metadata,
+  notice, diff, conflict, and secret checks pass. Final9 App manifest is
+  `7c666b20…`, exact DMG is `15e4ca4f…`, and embedded PROVENANCE SHA
+  `cd7d15d7…` is byte-identical. Two entirely fresh final9 reviewers remain
+  required before install.
+
+- 2026-07-17 Repair16 final9 product review: FAIL P0/P1/P2=`0/1/0`;
+  its security review is interrupted and non-reusable. After final cursor
+  closure, Host ran and surfaced the oldest queued result while the correction
+  remained queued. Swift retained that obsolete Outcome, and restart Dashboard
+  restoration could expose an unconfirmable or stale result before recovery.
+  Final10 keeps intermediate results auditable but not visible or confirmable
+  while queued/started work remains. Only the newest ready result is restored
+  after recovery. The final GPT request includes at most eight chronological
+  same-owner/same-conversation messages only when audit order proves each
+  predecessor finished after the later message was already durable; the
+  existing 16 KiB prompt bound remains. Swift clears a recovering channel
+  result and replaces it with the final Host-arbitrated Outcome. The full
+  228-executed-Rust, 56-broker, 85-App strict matrix, stress, release, metadata,
+  notice, diff, conflict, and secret checks pass. Final10 App manifest is
+  `c19d08db…`, exact mounted/copied-verifier DMG is `9c786aa4…`, and embedded
+  PROVENANCE SHA `c7af7a7e…` is byte-identical. Two entirely fresh final10
+  reviewers remain required before install.
+
+- 2026-07-17 Repair16 final10 review pair: both entirely fresh reviewers FAIL
+  with P0/P1/P2=`0/1/0`. They independently prove that same-conversation audit
+  overlap showed only concurrency, not semantic correction, so an unrelated
+  second owner intent could import the first into a confirmable GPT Outcome.
+  Final11 removes that implicit authority: only an exact case-insensitive
+  `Correction to previous:` directive may import the immediately preceding
+  same-owner/same-conversation result when audit order also qualifies it. All
+  other messages, including overlapping unrelated intents and unmatched
+  directives, remain single-message; Host independently rejects a caller-built
+  multi-message request without the directive. The complete final11 matrix
+  passes: 230 executed Rust tests with two explicit real-runtime diagnostics
+  ignored, 56 broker/signing plus 85 App tests, stress, release, strict lint/
+  format, metadata, notices, plist/script, diff, conflict, credential-path, and
+  secret checks. Synchronized final11 App manifest `5bf86d5d…`, App/Core CDHashes
+  `6caafeac…`/`88f76fae…`, unchanged broker/worker identities, and exact read-only
+  mounted/copied-verifier DMG `a2887a91…` pass; embedded PROVENANCE `9fd57db9…`
+  is byte-identical and Gatekeeper honestly reports `Unnotarized Developer ID`.
+  Two fresh final11 reviewers remain pending. No install/provider/traffic/
+  milestone proof is claimed.
+
+- 2026-07-17 Repair16 final11 review pair: product FAIL P0/P1/P2=`0/0/1`;
+  security FAIL `0/1/1`. Host's defense-in-depth guard allowed caller-built 3+
+  message context when the last message held the directive. More importantly,
+  Store could begin C while immediate B was still started, then correction
+  lookup filtered to ready rows and skipped B for older ready A. Final12 makes
+  model dispatch strictly serial per channel, atomically begins only the oldest
+  queued source, first selects the immediate accepted predecessor and only then
+  evaluates that exact dispatch's readiness/audit order, and caps Host context
+  at exactly two. It also replaces the stale final10 present-tense blocker text.
+  The complete final12 matrix passes: 231 executed Rust tests with two explicit
+  real-runtime diagnostics ignored, 56 broker/signing plus 85 App tests,
+  stress, release, strict lint/format, metadata, notices, plist/scripts, diff,
+  conflict, credential-path, and secret checks. A synchronized package and two
+  fresh reviewers remain pending. Synchronized final12 App manifest
+  `74b71f64…`, App/Core CDHashes `be5761e1…`/`8b75c01e…`, unchanged broker/
+  worker identities, and exact read-only mounted/copied-verifier DMG
+  `d09a8008…` pass; embedded PROVENANCE `80d25f13…` is byte-identical and
+  Gatekeeper honestly reports `Unnotarized Developer ID`.
+  No install/provider/traffic/milestone proof is claimed.
+
+- 2026-07-17 Repair16 final12 review pair: product FAIL P0/P1/P2=`0/1/1`;
+  security FAIL `0/0/2`. Both identify stale current-state text that still names
+  final11/final10. Product also proves the distinct restart P1: final12's
+  strict FIFO correctly left the consumed model dispatch `started`, but Host
+  restart polling selected only queued work, making the existing exact-source
+  `RecoverOnly`→`Need you` route unreachable and blocking every later queue
+  item. Final13 selects the exact single started source before queued work,
+  never grants a second model call, fails closed on multiple started rows,
+  surfaces local `Need you`, and stops automatic polling for the paused channel.
+  The complete final13 matrix passes 233 executed Rust tests with two explicit
+  real-runtime diagnostics ignored, 56 broker/signing plus 86 App tests, both
+  stress suites, release, strict lint/format, metadata, notices, plist/scripts,
+  diff, conflict, credential-path, and secret checks. Final13 Developer-ID App
+  has 18 directories plus 617 files, manifest `dc83e390…`, App/Core CDHashes
+  `5691aaad…`/`c07958ff…`, unchanged broker/worker identities, and embedded
+  PROVENANCE `f027dc0d…`; exact read-only mounted/copied-verifier DMG SHA is
+  `9d6a1eb0…`, and Gatekeeper reports `Unnotarized Developer ID`. Two entirely
+  fresh reviewers remain pending. No install/provider/traffic/milestone proof
+  is claimed.
+
+- 2026-07-17 Repair16 final13 review pair: both fresh reviewers FAIL only one
+  shared P2, P0/P1/P2=`0/0/1`. They independently pass the implementation,
+  complete Rust/Swift matrix, started-dispatch recovery, FIFO/correction/
+  high-water, Keychain/secrets, exact App/DMG, deep signatures, mounted/copy
+  manifest, and no-overclaim checks. The later live Master Plan blocker
+  paragraph still called final12 current and its completed work pending. Final14
+  changes only that stale paragraph and records final13 as historical. Its
+  complete 233-Rust/56+86-Swift matrix, both stress suites, release, strict
+  lint/format, metadata, notices, plist/scripts, diff, conflict,
+  credential-path, and secret checks pass. Final14 Developer-ID App has 18
+  directories plus 617 files, manifest `69a28c4f…`, App/Core/broker/worker
+  CDHashes `fdd2cd29…`/`c07958ff…`/unchanged `002e5156…`/`9200195f…`, and
+  embedded PROVENANCE `f027dc0d…`; exact mounted/copied-verifier DMG SHA is
+  `1ca74ccd…`, and Gatekeeper reports `Unnotarized Developer ID`. Two entirely
+  fresh final14 reviewers remain pending. No install/provider/traffic/milestone
+  proof is claimed.
+
+- 2026-07-17 installed Repair16 final14 real Discord setup exposed a new P1 UI
+  contract defect: the official Gateway connected and returned a 19-digit bot
+  snowflake, but `LocalizedStringKey` interpolation inserted grouping commas in
+  the selectable pairing instruction, so the displayed mention could never
+  match the Rust adapter's exact digit-only syntax. Final15 converts the
+  `UInt64` with `String`, exposes one exact instruction String, and renders it
+  with `Text(verbatim:)`. A 19-digit grouping-locale regression proves the
+  exact mention, separators, and 32-lowercase-hex code. The complete current
+  matrix passed 233 executed Rust tests with two explicit real-runtime
+  diagnostics ignored, 56 broker/signing tests, and 87 App tests. The Owner
+  used Discord's real mention picker to send the corrected command exactly
+  once. OpenOpen's official Check remained inaccessible because the ordinary
+  Connections page kept a `SecureField` mounted and closed the authorized
+  Computer Use pipe. Final15 staging was invalidated before review/install.
+  Repair17 batches both defects: it retains the exact verbatim instruction,
+  moves token entry into an explicitly opened auto-focused secure sheet, uses
+  the unchanged Keychain/setup route, and erases the ephemeral draft on cancel,
+  submit, dismissal, and Global Off. The complete current matrix passes 233
+  executed Rust tests with two explicit diagnostics ignored, 56 broker/signing
+  tests, 90 App tests, release, strict lint/format, metadata, notices,
+  plist/scripts, diff, conflict, credential-shape, localized-snowflake, and
+  secret-path scans. Repair17 App manifest `6ae53c60668e…`, App/Core/broker/
+  worker CDHashes `ece5a62f…`/`c07958ff…`/unchanged `002e5156…`/`9200195f…`,
+  embedded PROVENANCE `a08fc810…`, and exact mounted/copied-verifier DMG SHA
+  `a1b3cf15…` pass; Gatekeeper reports `Unnotarized Developer ID`. Two fresh
+  reviewers, consolidated install, durable product confirmation of the
+  already-sent message, and real same-Mission proof remain pending; no
+  milestone is claimed.
+
+- 2026-07-17 first Repair17 reviewer cycle: the product reviewer rejects the
+  unchanged workspace with P0/P1/P2=`0/1/1`; the security review is stopped and
+  non-reusable after invalidation. The P1 proves the already-sent Discord pairing
+  command is bound to an in-memory Host setup session and random code that Global
+  Off/install/relaunch would destroy; a replacement setup cannot honestly consume
+  that message. The P2 finds the SwiftUI row still said a synchronized package
+  was required while the signed-build row recorded its exact completed manifest.
+  The corrected execution order prohibits install until the Owner-visible current
+  Repair16 UI Checks the existing message, verifies the exact approved Friday
+  guild/channel/owner, and action-time Confirms durable pairing. If the session is
+  lost first, no second pairing message or fake Store write is authorized. The
+  package bytes remain unchanged; this documentation-only edit invalidates the
+  reviewed workspace fingerprint and requires two entirely fresh reviewers.
+
+- 2026-07-16 Repair15 root diagnosis: the official bundled `imsg` basic-RPC
+  discovery succeeds and returns 23 bounded iMessage chats without exposing
+  message bodies or participant values, but Host rejected the batch because 21
+  legitimate rows have an empty optional display name. The focused repair
+  permits only empty names through the existing bounded/NUL-free/trimmed field
+  check, leaves participant/service/ID/dedupe/pairing/scope gates unchanged,
+  and adds explicit unnamed/mixed/invalid/filtering regressions plus a truthful
+  zero-result UI message. The complete 220-executed-Rust/56+72-Swift matrix and
+  release/strict/static checks pass. Synchronized Developer-ID final2 App
+  manifest `7edd3067…` and exact-verifier unnotarized DMG `6bcf0ade…` pass;
+  two fresh reviewers remain pending before installation.
 
 - 2026-07-14 foundation pass 1: Reviewer A FAIL; Reviewer B FAIL. Shared
   blockers were `NeedsMe` bypass, non-specific action approval, forgeable
@@ -1312,3 +1854,628 @@ different commit/build.
   managed sign-in, the pinned child may temporarily listen only on localhost
   1455 or fallback 1457. Two entirely fresh replacement reviewers remain
   required.
+- 2026-07-15 callback/policy/package closure: commits `cfdd0a0…`, `c81b86c…`,
+  and `d68fc9c…` are pushed to draft PR #2; Actions run `29469720290` succeeds.
+  Exact Developer-ID owner-test DMG SHA-256 is
+  `f2dff0d697076a54d193affa61127716e62c3198ebdc8162495023b9ca5bed16`.
+  The package is unnotarized, PR #2 remains draft/unmerged, and CI/package
+  structure is not provider or Mission evidence.
+- 2026-07-15 official credential migration and installed broker proof: the
+  Owner-authorized exact Codex `0.144.0` app-server migrates the existing
+  managed ChatGPT Pro session to Keychain using the official auto flow. A
+  second fresh keyring-only process reads the connected account, `auth.json`
+  is absent, and no credential body is read, parsed, copied, or logged. The
+  exact d68 App installs at `/Applications/OpenOpen.app`; the Owner enters the
+  administrator password only in System Settings, and official Background
+  Activity Off→On produces BTM generation 4. ServiceManagement runs new root
+  broker PID `91414` from the signed Team-`UHDY2275L5` App through Mach IPC;
+  old PID `71822` is absent and the protected directory is `root:wheel 0700`.
+  This closes credential migration, signed install, administrator approval,
+  and daemon replacement only. The d68 UI still reports Not connected; no
+  structured Outcome or integrated Mission is claimed.
+- 2026-07-15 Keychain-domain Repair1 review: the fresh functional reviewer
+  PASS is historical, but the fresh security reviewer FAIL invalidates that
+  fingerprint with P1 raw login-Keychain read/write and P2 effective-user and
+  backend-selection gaps. No PASS is reused. The replacement binds canonical
+  `/Users/<owner>` to Core effective UID, pins and verifies effective
+  `features.secret_auth_storage=false`, migrates only the byte-exact prior
+  config, retains synthetic `CFFIXED_USER_HOME`, and allows only the exact
+  encrypted login Keychain database read-only. Controlled live diagnostics
+  prove no database access and metadata-only access both return Not connected;
+  exact read-only access returns `ChatGpt`. A sandbox regression denies writes
+  and preserves a canary. Focused 56 Rust tests plus the real connected-account
+  diagnostic pass; `auth.json` remains absent. Exact Developer-ID App staging
+  reports `STAGED_DEVELOPER_ID_NOT_NOTARIZED_NOT_RELEASE_PROOF`; read-only
+  mount/copy/signature verification produces DMG SHA-256
+  `587dd5043784c209f6e467c7f9788faae967035b206e605d38e77a3eaae4aeba`.
+  Two entirely fresh replacement reviewers, exact commit/push/CI, signed
+  installation, and App UI/model proof remain pending.
+- 2026-07-15 blocker-routing governance update: direct Owner instruction
+  supersedes only the historical pull-only coordination rule. One structured
+  `BLOCKER_REQUEST` may go to the Primary Advisor; reversible in-scope computer
+  operations may continue, while secrets, payments, new recipients/data,
+  security-control changes, destructive external data, public release, merge,
+  and later stages remain Owner-only. This changes no stage or evidence gate.
+- 2026-07-15 Keychain-domain Repair2 replacement review: the fresh functional
+  reviewer PASS is historical, but the fresh security reviewer FAIL invalidates
+  frozen fingerprint `32fb6bbd…` on one P2. A symlinked `Library` or
+  `Library/Keychains` ancestor could redirect the nominal login database into a
+  sandbox-writable root. Repair3 walks every relative component with
+  `symlink_metadata`, rejects every ancestor/final symlink and wrong type,
+  requires the resolved path to equal the literal path, and rejects overlap in
+  either direction with `CODEX_HOME` or the synthetic home. Regressions cover
+  both ancestor links, a final-entry link, the ordinary exact layout, and both
+  overlap directions. All 200 ordinary Rust tests with two explicit
+  real-runtime tests ignored in the ordinary run, the explicit R3
+  outer-sandbox connected-account diagnostic, 44 broker/signing Swift tests,
+  57 App Swift tests, release/strict lint/format/plist/script/diff
+  checks, and exact Developer-ID App/DMG verification pass. Core pins are
+  unsigned-before `37261e8b…`, unsigned-after `0e9c2440…`, and CDHash
+  `088982d5…`; the unnotarized R3 DMG SHA-256 is
+  `6ec2370a55a3b8196eb8177abecb39c8db26b15c462b8344703ca57c8b76a4c1`.
+  No prior PASS is reused; two entirely fresh reviewers remain required.
+- 2026-07-15 Keychain-domain Repair3 replacement review: the fresh product
+  reviewer PASS is historical, but the fresh security reviewer FAIL invalidates
+  frozen fingerprint `cdac0ea59554de390407e3671a3d44af4e12622c42e270ba2a85c90e8d5220a4`
+  on one P2. The ordinary user can hard-link the real login Keychain database
+  into a same-device writable `CODEX_HOME`, so the sandbox's literal-path write
+  denial does not close the inode-alias route. The route is reproduced without
+  reading database contents. R3's tests, package, and product PASS are
+  historical and no review is reused.
+- 2026-07-15 Keychain-domain Repair4 in progress: the protected root broker
+  derives only the authenticated audit EUID and creates the one fixed
+  `/Library/Application Support/com.thesongzhu.OpenOpenRuntime/users/<uid>/CodexHome`
+  as a case-sensitive 256 MiB/32768-node tmpfs with `nodev,nosuid,noexec`,
+  root-owned mode-`0711` ancestors, and a user-owned mode-`0700` mount root.
+  Core independently requires that exact current-EUID path, owner, mode,
+  `tmpfs` mount point, and a device different from the exact read-only login
+  Keychain. A crash after mount but before ownership repair is recoverable; a
+  caller cannot select a path or UID. OpenOpen does not read, copy, parse,
+  clone, or migrate a credential; the new canonical runtime account requires
+  the pinned official Codex login flow. Focused verification passes 26
+  Codex-client tests with two real diagnostics explicitly ignored, 29 Host
+  tests, three Host-main tests, 46 broker/signing tests, and 58 App tests. This
+  is implementation evidence only. A signed install, exact mount flags/device/
+  owner proof, kernel `EXDEV` hard-link rejection, official account login,
+  real model output, package rebinding, full suites, and two fresh reviewers
+  remain pending.
+- 2026-07-15 Repair4 precommit verification and package binding: the complete
+  Rust workspace tests and release build pass, including 100 shuffled duplicate
+  envelopes, ten coexisting Missions, 30 effect-broker tests, 19 Discord tests,
+  and the full Mission/Store/Host/Codex suites. Strict Rust format and Clippy
+  pass after the sole first-run lint finding (`i8 as u8`) is expressed with the
+  behavior-identical Rust 1.96 `cast_unsigned()` method. All 47 broker/signing
+  and 58 App Swift tests, warnings-as-errors release build, strict Swift format,
+  plist/script/diff/conflict/credential scans, and exact Developer-ID staging
+  pass. The final staged App/Core/broker CDHashes are `e902db765b…`,
+  `2c1ba9286e…`, and `0c7bec14e2…`. The original, read-only mounted, and copied
+  App/DMG verification passes; unnotarized DMG SHA-256 is
+  `3be1970e75047c2025ac9194a86b346e8632fc6145a54f985a74c95a2d21aafd`.
+  This remains `NOT_NOTARIZED_NOT_RELEASE_PROOF`. The old d68 root broker is
+  still enabled pending the one official Background Activity Off operation.
+  The product was protected Off and the old App/Core were then quit through
+  the ordinary App UI, but read-only process inspection still shows the old
+  root broker PID `91414` alive from its 2026-07-15 21:44:34 start. The staged
+  App therefore has not been installed over that live service. No install,
+  real mount, hard-link rejection, official runtime-account login, model,
+  integrated Mission, reviewer, milestone, or release proof is claimed.
+- 2026-07-15 Repair4 install and Repair5 maintenance-Off closure: the Owner-
+  approved official Background Activity Off operation removes old root broker
+  PID `91414` and `system/com.thesongzhu.OpenOpen.EffectBroker`. Repair4 is
+  then installed only after staged/temporary/installed byte and deep-signature
+  equality. Its first launch with the service Off reports `OpenOpen Core
+  stopped unexpectedly`; source and process tracing show that `Host::open`
+  still tried to create the fixed root-broker-owned Codex directories before
+  the tmpfs existed. Repair5 leaves those paths absent while opening the Store
+  and Dashboard; the existing Codex spawn boundary validates the exact tmpfs
+  before creating its nested synthetic home. A regression proves this Off
+  startup contract. All 30 Host and three Host-main tests, the complete Rust
+  workspace tests/release/strict Clippy/format, 47 broker/signing and 58 App
+  Swift tests, warnings-as-errors release/strict format, and plist/script/diff/
+  conflict/credential checks pass. Exact Repair5 staged/installed file-
+  manifest SHA is
+  `1ca8f7fa24f43617bbf79e11a7540f011ac3bb20fd37156be3050f17a4840573`;
+  App/Core/broker CDHashes are `cd740e2778…`, `b158204369…`, and
+  `0c7bec14e2…`. Installed App PID `73188` and Core PID `73189` remain live from
+  `/Applications/OpenOpen.app` while the background switch is Off; the UI
+  honestly requests broker approval and no broker/service exists. Both the
+  Repair4 and d68 rollback Apps remain preserved. Background Activity On,
+  real mount/device/flags/owner/case and `EXDEV` proof, official runtime login,
+  model, integrated Mission, final package, reviewers, milestone, and release
+  proof remain pending.
+- 2026-07-15 Repair5 real broker/mount proof and bounded-capacity repair: the
+  official product On route starts new root broker PID `92981` at 23:57:58.
+  `proc_pidpath` binds that running PID to the exact installed broker, whose
+  Team/CDHash are `UHDY2275L5`/`0c7bec14e2…`; old PID `91414` remains absent.
+  The fixed runtime mount is real `tmpfs` with `nodev,noexec,nosuid`; root
+  ancestors are `root:wheel 0711`, the mount root is `jarvis:wheel 0700`, and
+  its device `872415239` differs from login-Keychain device `16777231`. A real
+  hard-link attempt returns `Cross-device link`, and case-distinct probes have
+  separate inodes before cleanup. No Keychain body is read and `auth.json` is
+  absent. The same proof finds the initial 8192-node ceiling already at 8130
+  used/62 free after the official Codex app-server materializes 8126 visible
+  runtime entries. Login/model work is not attempted on that unsafe 99%-inode
+  state. Repair6 changes only the fixed node ceiling to 32768; the 256 MiB byte
+  bound, case sensitivity, fixed path, different-device requirement, and all
+  security flags remain unchanged. Repair6 rebuild/remount/proof, official
+  login/model, integrated Mission, final package/reviewers, milestone, and
+  release proof remain pending.
+- 2026-07-16 Repair6 exact install and stale-mount removal: 47 broker/signing
+  plus 58 App Swift tests, warnings-as-errors release, strict format, script/
+  diff/credential checks, and Developer-ID staging pass after rebinding the App
+  and broker unsigned pins. Repair6 installs only after product Off, exact
+  App/Core/Codex shutdown, and official Background Activity Off. Source,
+  temporary-install, and installed file manifests all have SHA-256
+  `92c689b224e33f8bb99fe5a1161f3fb08e51665358a7c56e24ef17f674254747`;
+  App/Core/broker CDHashes are `9dbe6371af…`, `b158204369…`, and
+  `11df36a567…`; all modes and deep signatures pass. Repair5, Repair4, and d68
+  rollback Apps remain. Stopping the daemon leaves the old tmpfs mounted, so
+  the ordinary unprivileged unmount correctly fails with `Operation not
+  permitted`. The Owner then runs only the exact ordinary sudo unmount in local
+  Terminal and enters no credential in chat. Fresh inspection finds no mount;
+  the revealed path is a root:wheel mode-`0700` directory with link count 2 and
+  size 64. Background Activity remains Off and no App/Core/Codex/broker/service
+  exists. A TTY-scoped privileged read-only emptiness check, the broker's own
+  root pre-mount `directoryIsEmpty` gate, 32768-node remount/kernel proof,
+  official login/model, integrated Mission, final package/reviewers, milestone,
+  and release proof remain pending.
+- 2026-07-16 Repair6 real protected runtime-home closure: official Background
+  Activity On registers exact ServiceManagement service
+  `system/com.thesongzhu.OpenOpen.EffectBroker`; the product XPC route launches
+  App/Core/root-broker/Codex from the installed signed bundle. The fresh mount
+  is `tmpfs,local,nodev,noexec,nosuid`, exactly 256 MiB and 32768 nodes. Pinned
+  Codex initialization uses 8130 nodes and leaves 24638 free. Root ancestors
+  are `root:wheel 0711`, the mount root is `jarvis:wheel 0700`, runtime and
+  login-Keychain devices differ, a real hard-link attempt fails with
+  `Cross-device link`, two case-distinct probes have distinct inodes and are
+  cleaned, and `auth.json` is absent. This is real kernel/broker evidence, not
+  provider or milestone proof.
+- 2026-07-16 official OAuth persistence failure and Repair7 candidate: the
+  provider callback reaches the pinned official flow but fails closed with
+  sanitized `persist_failed` because the normal Codex sandbox intentionally
+  exposes the canonical login Keychain database read-only. No callback query,
+  OAuth code/state, credential body, or token is written to evidence. Repair7
+  adds a short-lived login-only Codex process whose outer sandbox adds write
+  authority only to that exact canonical database file and whose client rejects
+  account-read, model-list, thread, and turn routes. Success, failure, browser
+  launch failure, cancellation, and Global Off destroy it. Broker rotation
+  releases the prior lease only when the same authenticated App/Core/nonce is
+  unchanged and the old exact Codex audit-token incarnation is dead; an alive
+  old Codex is rejected and the Core is never signalled by this rotation path.
+  A fresh read-only Codex and new lease are required before account/models.
+  The complete Rust workspace passes, including 100 shuffled duplicate channel
+  envelopes and ten coexisting Missions; release, strict Clippy/format, all 49
+  broker/signing tests, all 60 App tests, warnings-as-errors release, strict
+  Swift format, and `git diff --check` pass. Exact Developer-ID staged App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainLogin-R7-consolidated.app` has file-
+  manifest SHA-256
+  `a551f6ba84abdd2e9fbf450cdf86c9fe27defa04e44dcf4dc0bc869f833d7713`;
+  App/Core/broker CDHashes are `169fc970d3…`, `08b035f653…`, and
+  `a67652d392…`. Exact DMG SHA-256 is
+  `a8364887266e171a4fe3ea573d2cbba7b68d40647290bf88c6005cbb6717fb4d`;
+  disk-image verification passes and Gatekeeper honestly reports
+  `Unnotarized Developer ID`. The official all-users OpenOpen Background
+  Activity switch now shows Off; old Repair6 broker PID `56300`, its launchd
+  service, and all Core/Codex processes are absent. The old App is quit, and
+  read-only `lsof` finds no open file under the still-mounted tmpfs. One exact
+  ordinary Owner `sudo umount`, exact consolidated install, and one later
+  Background On remain batched as the minimum system boundaries. Repair7 is
+  not installed, remains unnotarized, and is not
+  provider, integrated-Mission, reviewer, `FRIDAY_ALPHA_READY`, or release
+  proof.
+- 2026-07-16 Repair7 pre-install review rejects frozen workspace fingerprint
+  `1f083b3e4a8cf5335102a276c7ea6b0a6490be4cbe51bfc2568f013bf721cbfc`
+  with zero P0/P1 and four P2 findings. Product review finds that the explicit
+  real login diagnostic still used a temporary non-broker home and Model-
+  purpose client, and that current summaries retained old R5/R6 status.
+  Security review finds that an already-mounted tmpfs did not re-attest exact
+  byte/inode capacities and that `AGENTS.md` retained the superseded pull-only
+  rule. The fingerprint and App/DMG are obsolete; no PASS is reused. The repair
+  uses the fixed mount plus login-only client in the explicit diagnostic,
+  checks that account/model routes reject there, re-attests exact 256 MiB and
+  32768 total inodes for both existing and new mounts, synchronizes governance
+  and summaries, and requires two entirely fresh replacement reviewers.
+- 2026-07-16 Repair7 replacement pre-install candidate: all 202 ordinary Rust
+  tests with two explicit environment-gated diagnostics ignored in that run,
+  release build, strict Clippy and format, all 50 broker/signing plus 60 App
+  Swift tests, warnings-as-errors release, strict Swift format, and the
+  corrected explicit real login-only diagnostic against the fixed broker mount
+  pass. Exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainLogin-R7-replacement.app` has
+  635-entry manifest SHA-256
+  `0080905e1edcca5077c0f307cd0c838498fff71b3e93f83a4073ac1089623f5a`;
+  App/Core/broker CDHashes are `9b82231245…`, `08b035f653…`, and
+  `9251742693…`. The mounted/copied exact-verifier DMG SHA-256 is
+  `8735d3418665ea8a38b6b6975975448019e7bfa99bc0d6944005f6f24283a8c1`.
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two entirely fresh
+  pre-install reviewers remain required; the package is not installed and is
+  not provider, integrated-Mission, `FRIDAY_ALPHA_READY`, or release proof.
+- 2026-07-16 both fresh reviewers reject that replacement fingerprint
+  `84b5651c57916f2b8e415787be7da7e65199a2d3c52f92d15bdb9efc373e3706`
+  with zero P0/P2 and the same P1. `prepare` required the mount root to be
+  root-owned before checking the already-valid tmpfs even though first prepare
+  deliberately chowns it to the authenticated audit EUID. Login and the fresh
+  read-only post-login runtime therefore failed deterministically on their
+  second/third prepares. Replacement2 validates root-owned ancestors, accepts
+  only an exact audit-EUID:root `0700` existing 256 MiB/32768-node mount, and
+  requires an unmounted root-owned empty same-device directory before a new
+  mount. Manager-level tests prove two prepares mount once and that wrong owner
+  or inode capacity rejects without remount. The full 202-Rust/52+60-Swift
+  suites, release and strict lint/format pass. Exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainLogin-R7-replacement2.app` has
+  635-entry manifest SHA `1490a4ad6bff7558d3248f5c6d362aaf2773e1c37b47aaa60f6369b2a3e6c51d`;
+  App/Core/broker CDHashes are `aa3e9d95ce…`, `08b035f653…`, and
+  `54defef588…`. Mounted/copied exact-verifier DMG SHA is
+  `ca3043f21c43f506ac1634a3f92319480ca3f7a61fdcba6f6468b6f8a35882e3`.
+  Gatekeeper reports `Unnotarized Developer ID`. Fresh reviewers remain
+  required; no install, provider, milestone, notarization, or release proof is
+  claimed.
+- 2026-07-16 replacement2 installed proof and Repair8: two entirely fresh
+  pre-install reviewers passed the unchanged replacement2 fingerprint with
+  zero P0/P1/P2. The exact App was installed with Repair6 rollback preserved;
+  installed bytes, Developer-ID Team, and App/Core/broker CDHashes match the
+  reviewed candidate. The Owner enabled only the verified all-users OpenOpen
+  Background Activity item through the official administrator sheet. The
+  product XPC route launched root broker PID `93107` with `runs=1`, exact
+  executable `/Applications/OpenOpen.app/Contents/MacOS/OpenOpenEffectBroker`,
+  Team `UHDY2275L5`, and CDHash `54defef588…`. Product On created a fresh
+  `tmpfs,local,nodev,noexec,nosuid` CodexHome with exactly 256 MiB and 32768
+  nodes, 24636 free nodes after initialization, audit user ownership/mode
+  `0700`, and a device distinct from the login Keychain; `auth.json` remains
+  absent. Real official OAuth completed but returned sanitized
+  `persist_failed`. Kernel Seatbelt logs for the short-lived login-only Codex
+  PID prove denials on exact Keychains-parent metadata and one `.fl<hex>` lock
+  read; no credential body or callback query is retained. Repair8 adds only
+  those login-only read capabilities. Model profile rules remain unchanged;
+  deterministic tests prove model lock reads fail, login lock reads succeed,
+  lock/sibling writes fail, nonmatching dot files and sibling Keychain reads
+  fail, and only the exact login database remains writable. The complete 202
+  ordinary Rust suite with two explicit real-runtime diagnostics ignored, 52
+  broker/signing and 60 App Swift tests, Rust/Swift Release, strict
+  Clippy/warnings/format, metadata/script/plist/diff/conflict/credential checks
+  all pass. Exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainLock-R8-candidate.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `5ca2f1c07c491b4015c8f2fbff691ca58af750650f96fc4ad02d6194936ad50d`;
+  App/Core/broker CDHashes are `eb4e77fbc9…`, `3206dadda2…`, and
+  `54defef588…`. Exact mounted/copied-verifier DMG SHA is
+  `a84fc84ec8bc0465cef86e2b201c31302903fb224dc9a81c7088c817d8755c60`;
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two fresh reviewers,
+  one batched replacement cycle, real OAuth/account/models, integrated Mission,
+  and `FRIDAY_ALPHA_READY` remain pending. Neither replacement2 nor Repair8 is
+  notarized or release proof.
+- 2026-07-16 both fresh Repair8 reviewers independently reject workspace
+  fingerprint `86ec3b99d3d512fcc069686bcbc745cc72c0e5175c93f8427e808a8896ad4538`
+  and App/DMG `5ca2f1c0…`/`a84fc84e…` with zero P0/P1 and the same P2.
+  Present-tense BUILD_WEEK, embedded PROVENANCE, and Master Plan current-blocker
+  text still said Repair7 install/reviewer/mount work was pending despite the
+  newer installed replacement2 and real OAuth lock-denial evidence. Both
+  reviewers matched all package/workspace fingerprints and reported no other
+  implementation or security finding. The summaries are synchronized without
+  rewriting historical chronology or exclusions. Because PROVENANCE is
+  embedded in the App, the reviewed workspace/package is invalidated; a new
+  staged/signed package, complete final checks, and two entirely fresh
+  replacement reviewers are required. No prior PASS/FAIL result is reused.
+- 2026-07-16 Repair8 synchronized replacement package: present-tense summaries
+  now match replacement2 reviewer/install/broker/tmpfs/OAuth evidence, while
+  historical rows and all exclusions remain unchanged. Embedded PROVENANCE is
+  byte-identical to the repository. Exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainLock-R8-replacement.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `9bde9be3a12bead4d0817643c6ad6dc2de53e33a0dc8382f1f6390f0fb9f9c83`;
+  App/Core/broker CDHashes are `73e7688942…`, `3206dadda2…`, and
+  `54defef588…`. Exact mounted/copied-verifier DMG SHA is
+  `2df5a91aff5c47889749263f219fff13062d4caabcd2ee7e0ac5dc3ccc139321`.
+  Deep strict signing passes and Gatekeeper honestly reports
+  `Unnotarized Developer ID`. Two entirely fresh replacement reviewers and the
+  single batched install cycle remain pending; no provider, milestone,
+  notarization, or release proof is claimed.
+- 2026-07-16 Repair8 synchronized replacement review: the fresh product
+  reviewer PASS is historical, while the fresh security reviewer FAILS the
+  unchanged workspace `e42074a5817e56a8d067df1564621f535e54aae71b3b7dde4ad96be065720c09`,
+  binary diff `c3415b763b0ffd32e990e316200fce21f6683908487ab27ed9e8ef51f07da969`,
+  App `9bde9be3…`, and DMG `2df5a91a…` with zero P0, one P1, and zero P2. After
+  a signed exact Codex lease was installed, login success/failure/cancel cleanup
+  could still drop a transport whose `Child::kill()` used only a numeric PID.
+  Repair9 marks the transport permanently lease-bound during lease install;
+  thereafter Core closes stdin and a wait-only thread reaps, while the broker
+  terminates only the exact old Codex Mach audit-token incarnation before
+  same-Core lease rotation. Focused Codex-client/Host tests, strict Clippy, and
+  25 focused broker tests pass, including termination failure and numeric-PID
+  reuse. The complete 203 ordinary Rust, 54 broker/signing, and 60 App suites
+  plus release/strict checks pass. Synchronized Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-LeaseBoundary-R9-final.app` has 18
+  directories plus 617 files and manifest SHA
+  `d80220a3429d1bc1b8377da71b88e1032a19beae812e64bf625d5d29827e75d9`;
+  App/Core/broker CDHashes are `6d99da86…`, `c948c821…`, and `12957664…`.
+  Exact DMG SHA is
+  `9dbe22fc02076fa1ed230a3549f8455060f9c16b2c7f6de8639140e9a15b0e39`;
+  embedded PROVENANCE is byte-identical and Gatekeeper honestly reports
+  `Unnotarized Developer ID`. Final static verification passes; two entirely
+  fresh reviewers remain pending. No prior PASS is reused and no install/provider,
+  milestone, notarization, or release proof is claimed.
+- 2026-07-16 Repair9 final review and Repair10: product reviewer FAILS unchanged
+  workspace `232f55a4…`, binary diff `29df493b…`, App `d80220a3…`, and DMG
+  `9dbe22fc…` with one P1 and one P2; security reviewer independently FAILS the
+  same fingerprint with one P1. Product proves that failure/cancel/invalid-URL
+  cleanup clears Core's local lease while the next login prepare still required
+  it, wedging ordinary retry before broker rotation; it also finds the stale
+  `Current Repair7` stress label. Security proves audit-token reacquisition
+  failure was collapsed into death, allowing a live login-only Codex lease to
+  be released without exact termination. Repair10 removes only the obsolete
+  local-lease prerequisite while retaining trusted broker, runtime-enabled,
+  no-active-operation, uninitialized-candidate, signed-lease, and initialize
+  gates. App remembers a completed managed login across a later model-process
+  failure and retries read-only account/models without repeating login. Broker
+  liveness is now alive/dead/inspection-failure; only exact token mismatch or
+  ESRCH proves death, while unknown rejects same-Core rotation and Global Off
+  before termination, persistence, or release. All 203 ordinary Rust, 56
+  broker/signing, and 62 App tests plus release/strict checks pass. A
+  synchronized package and two entirely fresh reviewers remain pending; no
+  install/provider, milestone, notarization, or release proof is claimed.
+- 2026-07-16 Repair10 synchronized package: exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-LeaseRecovery-R10-final.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `09478032d388f70ee1063fbd7398a98ade95396aea1532de19480337c007f16b`;
+  App/Core/broker CDHashes are `5e77b8b7…`, `62769b84…`, and `6012c638…`.
+  Exact mounted/copied-verifier DMG SHA is
+  `7e5eb9afbaabc7b1b6d36d95190081c3b0351fd89e768714387e027eaf14cfdb`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two entirely fresh
+  reviewers and the single batched install/provider cycle remain pending; no
+  milestone, notarization, or release proof is claimed.
+- 2026-07-16 Repair10 final review and Repair11: product reviewer passes
+  workspace `3600099d…`, binary diff `ac169c46…`, App `09478032…`, and DMG
+  `7e5eb9af…` with zero findings; fresh security reviewer invalidates that PASS
+  and package with one P1. App asked the broker to durably acquire the exact
+  lease before the separate Core install request marked the transport bound;
+  broker or Core-install response loss could therefore route abort through
+  numeric `Child::kill()`. Repair11 adds a one-way Core candidate-bind RPC
+  before broker acquisition. Loss before that handoff cannot create a broker
+  lease; loss after it, broker response loss, and Core install request/reply
+  loss leave only pipe-close/wait-only cleanup. Tests prove broker-acquire and
+  install-response failure aborts observed an already-bound candidate. All 203
+  ordinary Rust, 56 broker/signing, and 63 App suites plus release/strict checks
+  pass. A synchronized package and two entirely fresh reviewers remain pending;
+  no install/provider, milestone, notarization, or release proof is claimed.
+- 2026-07-16 Repair11 synchronized package: exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-BrokerHandoff-R11-final.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `3c555dedb149070644ceeb2beed6fdc5b7b9ff2940d8efec7f177a1c1f9e8ecd`;
+  App/Core/broker CDHashes are `aa1f39b946…`, `cae5d6bfec…`, and
+  `6012c63841…`. Exact mounted/copied-verifier DMG SHA is
+  `13d984813e94e3d36c17dc25d82e458a91af20d8f29ecd9bfd6aa81df45d1208`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two entirely fresh
+  reviewers and the single batched install/provider cycle remain pending; no
+  milestone, notarization, or release proof is claimed.
+- 2026-07-16 first Repair11 final review and evidence-only repair: product
+  reviewer reports zero P0/P1 and two P2; security independently reports zero
+  P0/P1 and one shared P2. Both reject stale Current blockers/package-pending
+  summaries; product also rejects the claim that broker response-loss retry was
+  directly covered when the existing test only modeled rejection before a
+  durable lease and a separate test modeled Core install-response loss. The
+  MockBroker now persists a distinct exact-lease generation before losing the
+  first acquire response; retry must rotate that durable generation, while
+  both failed and replacement candidates were irreversibly broker-bound before
+  acquisition. The focused new test passes and raises the App suite to 64.
+  Current summaries now name Repair11 and its completed package. Production
+  sources, scripts, embedded PROVENANCE, App manifest `3c555ded…`, DMG
+  `13d98481…`, and installed Repair7 remain byte-unchanged; two entirely fresh
+  reviewers are required and no prior result is reused.
+- 2026-07-16 Repair11 install, real OAuth failure, and Repair12: two entirely
+  fresh reviewers passed unchanged pre-install workspace `ebd6731d…` and
+  binary diff `af33b3dc…` with zero P0/P1/P2. Exact Repair11 was installed;
+  the official product XPC route launched the exact signed root broker and
+  created a fresh 256 MiB/32768-node `tmpfs,local,nodev,noexec,nosuid` runtime
+  on a device distinct from the login Keychain, with `auth.json` absent. A real
+  official OAuth/MFA flow completed, then returned sanitized `persist_failed`.
+  Kernel Seatbelt evidence binds the login-only Codex PID to denied creation of
+  Security.framework's exact
+  `login.keychain-db.sb-<8 hex>-<6 alphanumeric>` atomic-save sidecar; no
+  callback query, code/state, credential body, or token is recorded. Repair12
+  adds only anchored login-only `file-write-create` for that shape. Focused
+  sandbox tests prove the model cannot create it, invalid names fail, a newly
+  created sidecar cannot subsequently be rewritten, and a pre-created matching
+  hard link remains non-writable with its target unchanged. All 203 ordinary
+  Rust, 56 broker/signing, and 64 App tests plus release, strict lint/format,
+  metadata, and script checks pass. Repair11 PASS/package evidence is
+  historical after the production change. Synchronized Developer-ID Repair12
+  App `/private/tmp/OpenOpen-FridayAlpha-KeychainSidecar-R12-final2.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `b954ae640be0f27467e2303a90db3d68345355fda397ab34df4ad9efeebedb32`;
+  App/Core/broker CDHashes are `549b4ad31f…`, `07ad9ba3ac…`, and
+  `6012c63841…`. Exact mounted/copied-verifier DMG SHA is
+  `16a11f84570ae27ae1b71f851ee0f96bb301148a4f17c82ce4ea33803d4aad54`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper reports `Unnotarized Developer ID`. Two entirely fresh reviewers
+  remain required before another install; no milestone or release proof is
+  claimed.
+- 2026-07-16 first Repair12 pre-install product review: zero P0/P1 and one P2.
+  The reviewer independently reproduced the exact R11 kernel denial, focused
+  Rust/Swift checks, R12 App manifest/DMG/signatures/CDHashes, embedded
+  PROVENANCE equality, and honest unnotarized status, and found no
+  implementation/package defect. It rejected only two stale present-tense
+  summaries that still said the already completed synchronized package was
+  pending. Those summaries now record package completion while preserving all
+  pending review/install/provider/release gates. The first reviewer result is
+  invalidated and will not be reused.
+- 2026-07-16 Repair12 lifecycle P1 and Repair13: after the documentation-only
+  P2 refreeze, both isolated review paths independently reproduce a P1 before
+  install. A real disposable `security add-generic-password` under the exact
+  create-only rule fails at `fchmod` with kernel `file-write-mode` denial and no
+  saved item; create→rename also fails. Repair12 is therefore invalidated and
+  was not installed. Repair13 permits only the anchored sidecar's create, mode,
+  owner, flags, times, and unlink operations for LoginWriteOnly; no sidecar
+  data write or generic directory rule exists and the model profile remains
+  unchanged. A complete disposable Security.framework save/readback/cleanup
+  passes. Invalid names, model save, pre-created-hardlink content write, and
+  hardlink rename-over-database fail. Same-UID metadata on a pre-created link
+  can change and is not overclaimed as wholly non-writable. Focused test and
+  strict Clippy/format pass; all Repair12 review/package results are historical,
+  and the new fingerprint requires full verification/package plus two fresh
+  reviewers.
+- 2026-07-16 Repair13 synchronized package: all 203 ordinary Rust, 56
+  broker/signing, and 64 App tests plus release/strict/static checks pass.
+  Exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainAtomic-R13-final2.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `869daf8407b005c83d40a3890cbfbb1fd0943fc6e06f0197e4123a884ceb47fc`;
+  App/Core/broker CDHashes are `bc58615e04…`, `9fdfe5aca8…`, and
+  `6012c63841…`. Exact mounted/copied-verifier DMG SHA is
+  `a84a798a9cc0fad8b330f955be116999f4632628d344d5df8a84a8bea412bd39`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Its later
+  review/install/provider diagnostics are historical evidence for Repair14 and
+  do not establish an integrated Mission, milestone, notarization, or release
+  proof.
+
+- 2026-07-16 Repair14 ChannelRouteSet implementation: the singular Mission
+  origin could not bind both approved adapters to one chronological Mission,
+  so it is replaced by one primary route plus explicitly owner-approved
+  additional routes. Genesis and each typed add-route approval commit route
+  state and audit atomically. Additional outbound classes default Off. Exact
+  Mission, route-set revision, durable pairing, owner, provider identity, and
+  inbound/outbound class checks fail closed. Accepted bound inbound persists a
+  typed participation event and never enters the Outcome queue or becomes
+  completion Evidence; Reminders readback remains the sole Friday completion
+  Evidence. Receipt return is bound to the exact approved route rather than an
+  implicit primary route. Empty and one-origin migration pass; invalid legacy
+  state fails without partial migration or a production compatibility reader.
+  The first final security reviewer passed while the product reviewer found
+  P1×2: Swift discarded the event, and terminal Mission routes captured later
+  explicit input. Final2 makes the durable event and a Store-verified typed
+  Mission participation command one transaction; the command advances only
+  the existing revision/timestamp and cannot decide approvals, change scope,
+  or attach Evidence. Swift accepts and displays only an exact correlated
+  Mission/route/channel/revision event, and terminal routes yield to the
+  established explicit-Outcome path. Both fresh final2 reviewers then find the
+  same P1: after a route-set revision advances, Swift rejects the immutable
+  historical event returned by Store/Host for duplicate/restart recovery.
+  Final3 accepts only a historical revision no newer than the current set when
+  the exact route existed at that revision; future and unknown routes remain
+  fail-closed. The final local run passes 215 ordinary Rust tests with two
+  explicit real-runtime diagnostics ignored, 56 broker/signing Swift tests,
+  71 App Swift tests, Rust/Swift release builds,
+  strict Clippy, warnings-as-errors, and strict Rust/Swift format. The tests
+  include 100 shuffled duplicate and
+  out-of-order envelopes across both routes, restart, stable cursor/audit/no
+  model dispatch, 10 concurrent Missions, wrong-owner/pairing/revision/class,
+  response-loss and Global-Off fail-closed routes. This is deterministic local
+  implementation evidence only. Synchronized Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-ChannelRouteSet-R14-final3-preinstall.app`
+  contains 18 directories plus 617 files. App/Core/broker/worker CDHashes are
+  `abe55bfb…`, `f2b144f5…`, unchanged `6012c638…`, and `9200195f…`;
+  embedded PROVENANCE is byte-identical. The exact mounted/copied-verifier DMG
+  SHA-256 is `43167af0fdc03c6d2ff9c39340b25535d57a5baed4728cb6c913eb394dfc45d9`;
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Full static scans,
+  two entirely fresh pre-install reviewers, installation, and the one real
+  correlated Mission story remain pending. No package is installed and no
+  milestone, notarization, or release proof is claimed.
+
+- 2026-07-16 first Repair14 pre-install product review: FAIL with zero P0/P1
+  and two P2. The top Current result table still described Repair13, and the
+  existing ten-Mission stress test exercised only Evidence isolation while the
+  separate two-route stress test used one Mission. The table now records
+  Repair14. A new deterministic test holds ten Missions active, gives Mission 1
+  both exact approved routes, rejects cross-Mission route approval and wrong
+  owner without audit movement, rejects a crossed iMessage conversation without
+  audit movement, routes valid Discord and iMessage events only to Mission 1,
+  and verifies zero Evidence/Receipt leakage. The targeted test passes. The
+  first product result and interrupted security review are invalidated; the
+  unchanged App/DMG bytes remain uninstalled and require two entirely fresh
+  reviewers on the repaired workspace fingerprint.
+
+- 2026-07-16 first Repair14 replacement product review: FAIL with zero P0/P1
+  and one P2. The existing stale-revision negative also used a wrong actor, and
+  the ten-Mission crossed-recipient wording described a conversation mismatch.
+  The repair isolates four otherwise-valid route approvals: wrong actor, stale
+  route-set revision, changed owner-recipient identity, and explicit rejection;
+  every case leaves the audit unchanged. A separate otherwise-valid outbound
+  intent changes only `recipient_id` and is rejected before authority
+  consumption with an unchanged audit. The ten-Mission case is now described
+  accurately as a crossed-conversation test. The first replacement product
+  result and interrupted security review are invalidated; two entirely fresh
+  reviewers remain required.
+
+- 2026-07-16 first Repair14 final review pair: security PASS with P0/P1/P2 =
+  0/0/0; product FAIL with P0/P1/P2 = 0/2/0. Product proves that Host returned
+  a durable `missionEvent` which Swift did not decode or display, and that a
+  terminal Mission's durable route made all later explicit input from the same
+  paired conversation `IgnoredInactiveMission`. Final2 adds only the
+  Store-derived participation command, exact Swift event contract/UI, duplicate
+  recovery response, and terminal-route release described above. Three focused
+  Rust negatives prove no approval/Evidence grant, no caller-fabricated event,
+  and a fresh post-terminal Outcome; two Swift tests prove exact display and
+  changed-revision rejection. Both first-final reports and the old package are
+  invalidated. Two entirely fresh final2 reviewers were required and produced
+  the shared P1 result recorded immediately below.
+
+- 2026-07-16 Repair14 final2 review pair: both fresh reviewers FAIL with
+  P0/P1/P2 = 0/1/0 on the same root. Store correctly returns an immutable
+  historical event for `missionUpdateRecovered`, but Swift required its
+  route-set revision to equal the latest set. Adding a route from revision 1
+  to 2 therefore faulted a legitimate revision-1 duplicate after restart.
+  Final3 accepts that event only when `event revision <= current revision`, the
+  exact route/channel still exists, and the route creation revision is not
+  newer than the event. New Swift tests prove historical recovery after route
+  addition and rejection of an unknown historical route; the existing future
+  revision negative remains. Both final2 reports and its App/DMG are historical.
+  The synchronized final3 package and two entirely fresh final3 reviewers are
+  required before any install.
+
+- 2026-07-16 first Repair14 final3 review pair: product and security each
+  report P0/P1/P2 = 0/0/1 with no implementation, package, secret, or
+  overclaim finding. Security rejects the stale Master Plan current-blocker
+  paragraph that still said final2, 56+68, and synchronized signing pending.
+  Product rejects the lack of one direct Swift regression for an existing
+  route whose creation revision is newer than the recovered event revision.
+  The current-blocker paragraph now records final3, 56+71, and the completed
+  synchronized App/DMG; the new regression exercises the exact additional
+  route at revision 2 with a claimed revision-1 event and proves fail-closed.
+  Both first-final3 reports are invalidated; two entirely fresh final3
+  reviewers remain required before any install.
+- 2026-07-16 first Repair13 reviewer pair: product reports zero P0/P1 and one
+  P2; security reports zero P0/P1 and two P2. Both independently pass the
+  implementation, disposable Security.framework lifecycle, model/hardlink
+  negatives, full suites, package/signature/hash verification, secret scan,
+  and honest unnotarized status. They reject stale present-tense R12/package
+  summaries and the embedded PROVENANCE create-only contradiction; security
+  additionally rejects the overbroad phrase “no sidecar data write,” because
+  exact creation necessarily allows bytes through the newly created descriptor.
+  Current text now says no separate `file-write-data` predicate, while existing
+  and pre-created-hardlink content writes remain denied. The first pair and the
+  provenance-embedded final2 package are invalidated; a synchronized package
+  and two entirely fresh reviewers are required.
+- 2026-07-16 Repair13 synchronized final3 package: exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainAtomic-R13-final3.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `0a5620b6f3184f92b6ec88e3bfd920b38690cdb73eaa7065d6c1b04b68a147bc`;
+  App/Core/broker CDHashes are `c61a7aec4b…`, `9fdfe5aca8…`, and
+  `6012c63841…`. Exact mounted/copied-verifier DMG SHA is
+  `1879e6db5e89e7abcc5551e9f96009f90fb4c48010894536aa0d6fd7dc5368ac`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two entirely fresh
+  pre-install reviewers remain required; no install, provider, milestone,
+  notarization, or release proof is claimed.
+- 2026-07-16 Repair13 final3 review: fresh product reviewer PASS reports zero
+  P0/P1/P2; fresh security reviewer reports zero P0/P1 and one P2. Security
+  finds no implementation, secret, package, or no-fake-proof defect except that
+  embedded PROVENANCE dynamically said two reviewers remained pending, making
+  the package self-invalidating when review completed. That dynamic status is
+  removed; embedded PROVENANCE now states the immutable rule that review exists
+  only in external task/PR evidence and the package never self-certifies.
+  Product PASS, security result, and final3 package are invalidated by the
+  embedded-byte change. A synchronized package and two entirely fresh reviewers
+  remain required.
+- 2026-07-16 Repair13 synchronized final4 package: exact Developer-ID App
+  `/private/tmp/OpenOpen-FridayAlpha-KeychainAtomic-R13-final4.app` has 18
+  directories plus 617 files and normalized manifest SHA
+  `2a17370077e4df61de91326bab9e8e001d1ce32292261ea67c12e82347b4f098`;
+  App/Core/broker CDHashes are `d2f44ba340…`, `9fdfe5aca8…`, and
+  `6012c63841…`. Exact mounted/copied-verifier DMG SHA is
+  `a4288eae0250d90877eaf848a6d32bfaf41b452693eca547cee7d50669d4fac6`;
+  embedded PROVENANCE is byte-identical, deep strict verification passes, and
+  Gatekeeper honestly reports `Unnotarized Developer ID`. Two entirely fresh
+  pre-install reviewers remain required; no install, provider, milestone,
+  notarization, or release proof is claimed.

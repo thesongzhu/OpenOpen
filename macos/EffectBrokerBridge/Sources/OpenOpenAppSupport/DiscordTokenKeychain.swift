@@ -8,10 +8,20 @@ public protocol DiscordTokenStoring: Sendable {
 }
 
 public final class DiscordTokenKeychain: DiscordTokenStoring, @unchecked Sendable {
-  private let service = "com.thesongzhu.OpenOpen.Discord"
-  private let account = "official-bot-token"
+  private let service: String
+  private let account: String
 
-  public init() {}
+  public convenience init() {
+    self.init(
+      service: "com.thesongzhu.OpenOpen.Discord",
+      account: "official-bot-token"
+    )
+  }
+
+  init(service: String, account: String) {
+    self.service = service
+    self.account = account
+  }
 
   public func save(_ token: String) throws {
     guard !token.isEmpty, token == token.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -25,9 +35,7 @@ public final class DiscordTokenKeychain: DiscordTokenStoring, @unchecked Sendabl
     let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
     if status == errSecSuccess { return }
     guard status == errSecItemNotFound else { throw CoreClientError.keychain(status) }
-    var insert = query
-    insert[kSecValueData as String] = data
-    insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    let insert = insertQuery(valueData: data)
     let inserted = SecItemAdd(insert as CFDictionary, nil)
     guard inserted == errSecSuccess else { throw CoreClientError.keychain(inserted) }
   }
@@ -54,12 +62,21 @@ public final class DiscordTokenKeychain: DiscordTokenStoring, @unchecked Sendabl
     }
   }
 
-  private func baseQuery() -> [String: Any] {
+  func baseQuery() -> [String: Any] {
+    // Direct Developer-ID distribution has no provisioning profile for the
+    // data-protection Keychain selector. Use exactly one native macOS login
+    // Keychain backend and never retry against a second backend after failure.
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: account,
-      kSecUseDataProtectionKeychain as String: true,
     ]
+  }
+
+  func insertQuery(valueData: Data) -> [String: Any] {
+    var query = baseQuery()
+    query[kSecValueData as String] = valueData
+    query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    return query
   }
 }

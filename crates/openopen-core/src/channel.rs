@@ -1,8 +1,10 @@
 use crate::mission::is_canonical_mission_id;
 use openopen_protocol::{
-    ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope, ChannelKind, ChannelMissionOrigin,
-    ChannelObservation, ChannelOutboundIntent, ChannelPairing, NeedsMe, Receipt,
+    ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope, ChannelKind, ChannelMissionEvent,
+    ChannelObservation, ChannelOutboundIntent, ChannelPairing, ChannelRoute, ChannelRouteApproval,
+    ChannelRouteRole, ChannelRouteSet, NeedsMe, Receipt,
 };
+use std::collections::HashSet;
 use thiserror::Error;
 
 const MAX_PROVIDER_IDENTIFIER_BYTES: usize = 512;
@@ -94,12 +96,99 @@ pub(crate) fn validate_observation(observation: &ChannelObservation) -> Result<(
     Ok(())
 }
 
-pub(crate) fn validate_origin(origin: &ChannelMissionOrigin) -> Result<(), ChannelError> {
-    if !is_canonical_mission_id(&origin.mission_id)
-        || !valid_provider_identifier(&origin.conversation_id)
-        || !valid_provider_identifier(&origin.owner_sender_id)
-        || !valid_provider_identifier(&origin.source_message_id)
-        || origin.bound_at_ms < 0
+pub(crate) fn validate_route(route: &ChannelRoute) -> Result<(), ChannelError> {
+    if !is_canonical_effect_identifier(&route.route_id)
+        || !valid_provider_identifier(&route.conversation_id)
+        || !valid_provider_identifier(&route.owner_sender_id)
+        || route
+            .provider_identity
+            .as_deref()
+            .is_some_and(|value| !valid_provider_identifier(value))
+        || route
+            .source_message_id
+            .as_deref()
+            .is_some_and(|value| !valid_provider_identifier(value))
+        || route.allowed_inbound_classes.is_empty()
+        || !strictly_sorted(&route.allowed_inbound_classes)
+        || !strictly_sorted(&route.allowed_outbound_classes)
+        || route.revision == 0
+        || !is_canonical_effect_identifier(&route.approval_id)
+        || !is_canonical_effect_identifier(&route.audit_id)
+        || route.bound_at_ms < 0
+        || route.updated_at_ms < route.bound_at_ms
+        || (route.role == ChannelRouteRole::Primary && route.source_message_id.is_none())
+    {
+        return Err(ChannelError::InvalidRecord);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_route_set(route_set: &ChannelRouteSet) -> Result<(), ChannelError> {
+    if !is_canonical_mission_id(&route_set.mission_id)
+        || route_set.revision == 0
+        || route_set.routes.is_empty()
+        || route_set.routes.len() > 8
+        || route_set.routes[0].role != ChannelRouteRole::Primary
+        || route_set.routes[0].route_id != route_set.primary_route_id
+        || route_set
+            .routes
+            .iter()
+            .filter(|route| route.role == ChannelRouteRole::Primary)
+            .count()
+            != 1
+        || route_set
+            .routes
+            .iter()
+            .any(|route| validate_route(route).is_err() || route.revision > route_set.revision)
+    {
+        return Err(ChannelError::InvalidRecord);
+    }
+    let mut route_ids = HashSet::new();
+    let mut boundaries = HashSet::new();
+    if route_set.routes.iter().any(|route| {
+        !route_ids.insert(route.route_id.as_str())
+            || !boundaries.insert((
+                route.channel,
+                route.conversation_id.as_str(),
+                route.owner_sender_id.as_str(),
+            ))
+    }) {
+        return Err(ChannelError::InvalidRecord);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_route_approval(approval: &ChannelRouteApproval) -> Result<(), ChannelError> {
+    if !is_canonical_effect_identifier(&approval.approval_id)
+        || !is_canonical_mission_id(&approval.mission_id)
+        || approval.expected_route_set_revision == 0
+        || !valid_provider_identifier(&approval.conversation_id)
+        || !valid_provider_identifier(&approval.owner_sender_id)
+        || approval
+            .provider_identity
+            .as_deref()
+            .is_some_and(|value| !valid_provider_identifier(value))
+        || approval.allowed_inbound_classes.is_empty()
+        || !strictly_sorted(&approval.allowed_inbound_classes)
+        || !strictly_sorted(&approval.allowed_outbound_classes)
+        || !valid_provider_identifier(&approval.actor_id)
+        || approval.decided_at_ms < 0
+    {
+        return Err(ChannelError::InvalidRecord);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_mission_event(event: &ChannelMissionEvent) -> Result<(), ChannelError> {
+    if !is_canonical_effect_identifier(&event.event_id)
+        || !is_canonical_mission_id(&event.mission_id)
+        || event.mission_revision <= 0
+        || !is_lower_hex(&event.mission_anchor_hash, 64)
+        || !is_canonical_effect_identifier(&event.route_id)
+        || event.route_set_revision == 0
+        || !valid_provider_identifier(&event.source_message_id)
+        || !is_lower_hex(&event.content_sha256, 64)
+        || event.recorded_at_ms < 0
     {
         return Err(ChannelError::InvalidRecord);
     }
@@ -109,6 +198,8 @@ pub(crate) fn validate_origin(origin: &ChannelMissionOrigin) -> Result<(), Chann
 pub(crate) fn validate_outbound(intent: &ChannelOutboundIntent) -> Result<(), ChannelError> {
     if !is_canonical_effect_identifier(&intent.outbound_id)
         || !is_canonical_mission_id(&intent.mission_id)
+        || !is_canonical_effect_identifier(&intent.route_id)
+        || intent.route_set_revision == 0
         || !valid_provider_identifier(&intent.conversation_id)
         || !valid_provider_identifier(&intent.recipient_id)
         || !is_lower_hex(&intent.content_sha256, 64)
@@ -123,6 +214,10 @@ pub(crate) fn validate_outbound(intent: &ChannelOutboundIntent) -> Result<(), Ch
         return Err(ChannelError::InvalidRecord);
     }
     Ok(())
+}
+
+fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 pub(crate) fn validate_delivery(receipt: &ChannelDeliveryReceipt) -> Result<(), ChannelError> {
@@ -186,6 +281,8 @@ mod tests {
         let intent = ChannelOutboundIntent {
             outbound_id: "receipt-1".into(),
             mission_id: "mission-1".into(),
+            route_id: "channel-route-1".into(),
+            route_set_revision: 1,
             channel: ChannelKind::IMessage,
             conversation_id: "chat-1".into(),
             recipient_id: "owner-1".into(),

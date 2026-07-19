@@ -17,6 +17,11 @@ public protocol EffectBrokerXPCProtocol {
     withReply reply: @escaping (Data) -> Void
   )
 
+  func prepareCodexRuntimeHome(
+    _ requestJSON: Data,
+    withReply reply: @escaping (Data) -> Void
+  )
+
   func acquireCoreLease(
     _ requestJSON: Data,
     withReply reply: @escaping (Data) -> Void
@@ -74,6 +79,12 @@ public protocol EffectBrokerBackend: AnyObject {
     reply: @escaping (Data) -> Void
   )
 
+  func prepareCodexRuntimeHome(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON: Data,
+    reply: @escaping (Data) -> Void
+  )
+
   func acquireCoreLease(
     peer: AuthenticatedBrokerPeer,
     requestJSON: Data,
@@ -104,6 +115,7 @@ enum BrokerRequestKind: String {
   case brokerStatus
   case session
   case enrollCore
+  case prepareCodexRuntimeHome
   case coreLeaseAcquire
   case applyRuntimeControl
   case putMissionFile
@@ -156,6 +168,8 @@ enum TypedJSONEnvelope {
         keyID: coreKeyID,
         verifyingKeyHex: coreVerifyingKeyHex
       )
+    case .prepareCodexRuntimeHome:
+      return hasExactlyKeys(dictionary, ["type", "version"])
     case .coreLeaseAcquire:
       return hasExactlyKeys(
         dictionary,
@@ -439,6 +453,21 @@ final class BrokerConnectionService: NSObject, EffectBrokerXPCProtocol {
       return
     }
     backend.enrollCore(peer: peer, requestJSON: canonicalJSON, reply: reply)
+  }
+
+  func prepareCodexRuntimeHome(
+    _ requestJSON: Data, withReply reply: @escaping (Data) -> Void
+  ) {
+    guard
+      let canonicalJSON = TypedJSONEnvelope.canonicalized(
+        requestJSON,
+        kind: .prepareCodexRuntimeHome
+      )
+    else {
+      reply(TypedJSONEnvelope.rejectedResponse)
+      return
+    }
+    backend.prepareCodexRuntimeHome(peer: peer, requestJSON: canonicalJSON, reply: reply)
   }
 
   func acquireCoreLease(_ requestJSON: Data, withReply reply: @escaping (Data) -> Void) {

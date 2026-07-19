@@ -44,12 +44,13 @@ enum ReaderEvent {
 }
 
 pub(crate) struct Transport {
-    child: Child,
-    writer: BufWriter<ChildStdin>,
+    child: Option<Child>,
+    writer: Option<BufWriter<ChildStdin>>,
     receiver: Receiver<ReaderEvent>,
     reader_overflow: Arc<AtomicBool>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    process_lease_bound: bool,
 }
 
 impl Transport {
@@ -76,13 +77,22 @@ impl Transport {
             while reader.read(&mut buffer).is_ok_and(|read| read != 0) {}
         });
         Ok(Self {
-            child,
-            writer: BufWriter::new(stdin),
+            child: Some(child),
+            writer: Some(BufWriter::new(stdin)),
             receiver,
             reader_overflow,
             stdout_thread: Some(stdout_thread),
             stderr_thread: Some(stderr_thread),
+            process_lease_bound: false,
         })
+    }
+
+    /// Permanently removes numeric-signal authority from this transport after
+    /// the exact child incarnation has been bound into the protected broker
+    /// lease. From this point on, only the broker may signal that process by
+    /// Mach audit token; Core can close its pipe and reap the eventual exit.
+    pub(crate) const fn mark_process_lease_bound(&mut self) {
+        self.process_lease_bound = true;
     }
 
     pub(crate) fn send_request(
@@ -155,18 +165,48 @@ impl Transport {
     }
 
     fn send_value(&mut self, value: &Value) -> Result<(), CodexError> {
-        serde_json::to_writer(&mut self.writer, value)
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or(CodexError::Process("app-server stdin closed"))?;
+        serde_json::to_writer(&mut *writer, value)
             .map_err(|_| CodexError::Protocol("request serialization failed"))?;
-        self.writer
+        writer
             .write_all(b"\n")
-            .and_then(|()| self.writer.flush())
+            .and_then(|()| writer.flush())
             .map_err(|_| CodexError::Process("stdin write failed"))
     }
 
     pub(crate) fn terminate(&mut self) {
-        let _ = self.writer.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut writer) = self.writer.take() {
+            let _ = writer.flush();
+            drop(writer);
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if self.process_lease_bound {
+            let stdout_thread = self.stdout_thread.take();
+            let stderr_thread = self.stderr_thread.take();
+            let _ = thread::Builder::new()
+                .name("openopen-codex-reaper".to_owned())
+                .spawn(move || {
+                    // Deliberately wait-only: the broker owns the sole
+                    // post-lease signal authority and targets the exact Mach
+                    // audit-token process incarnation. This thread only reaps
+                    // that child after pipe EOF or broker termination.
+                    let _ = child.wait();
+                    if let Some(handle) = stdout_thread {
+                        let _ = handle.join();
+                    }
+                    if let Some(handle) = stderr_thread {
+                        let _ = handle.join();
+                    }
+                });
+            return;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
         if let Some(handle) = self.stdout_thread.take() {
             let _ = handle.join();
         }
@@ -310,12 +350,15 @@ fn valid_request_id(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Incoming, parse_line, read_stdout};
+    use super::{Incoming, Transport, parse_line, read_stdout};
+    use std::fs;
     use std::io::Cursor;
+    use std::process::{Command, Stdio};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
+    use std::time::Duration;
 
     #[test]
     fn codex_wire_omits_jsonrpc_and_requires_unambiguous_response() {
@@ -349,5 +392,33 @@ mod tests {
         read_stdout(Cursor::new(b"{}\n{}\n"), &sender, &overflow);
         assert!(overflow.load(Ordering::Acquire));
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn leased_transport_closes_stdin_and_reaps_without_signalling_numeric_pid() {
+        let marker =
+            std::env::temp_dir().join(format!("openopen-leased-transport-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _ || printf closed > \"$1\"")
+            .arg("openopen-leased-transport")
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut transport = Transport::new(child).unwrap();
+        transport.mark_process_lease_bound();
+        transport.terminate();
+        for _ in 0..100 {
+            if matches!(fs::read_to_string(&marker).as_deref(), Ok("closed")) {
+                let _ = fs::remove_file(&marker);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("leased child did not observe pipe closure");
     }
 }

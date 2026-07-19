@@ -1,7 +1,7 @@
 use crate::{CryptoError, LocalAuthority};
 use openopen_protocol::{
-    ApprovalKind, ApprovalRequest, ApprovalStatus, ApprovalTarget, EvidenceKind, EvidenceRef,
-    Mission, MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
+    ApprovalKind, ApprovalRequest, ApprovalStatus, ApprovalTarget, ChannelMissionEvent,
+    EvidenceKind, EvidenceRef, Mission, MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -118,6 +118,10 @@ pub enum MissionCommand {
         evidence: EvidenceRef,
         now_ms: i64,
     },
+    RecordChannelParticipation {
+        mission_id: String,
+        event: ChannelMissionEvent,
+    },
     Complete {
         mission_id: String,
         receipt: NewReceipt,
@@ -141,6 +145,7 @@ impl MissionCommand {
             | Self::TransitionWorkItem { mission_id, .. }
             | Self::RequestWorkItemBoundary { mission_id, .. }
             | Self::AttachEvidence { mission_id, .. }
+            | Self::RecordChannelParticipation { mission_id, .. }
             | Self::Complete { mission_id, .. } => mission_id,
         }
     }
@@ -160,6 +165,9 @@ impl MissionCommand {
             Self::TransitionWorkItem { .. } => "mission.command.transition_work_item",
             Self::RequestWorkItemBoundary { .. } => "mission.command.request_work_item_boundary",
             Self::AttachEvidence { .. } => "mission.command.attach_evidence",
+            Self::RecordChannelParticipation { .. } => {
+                "mission.command.record_channel_participation"
+            }
             Self::Complete { .. } => "mission.command.complete",
         }
     }
@@ -261,7 +269,9 @@ pub(crate) fn apply_mission_command(
             return Err(MissionError::CommandMissionMismatch);
         }
         let now_ms = command_time(command);
-        if now_ms < mission.updated_at_ms {
+        if !matches!(command, MissionCommand::RecordChannelParticipation { .. })
+            && now_ms < mission.updated_at_ms
+        {
             return Err(MissionError::StaleCommandTime);
         }
         let receipt = apply_existing_command(&mut mission, command, authority)?;
@@ -411,6 +421,14 @@ fn apply_existing_command(
         MissionCommand::AttachEvidence {
             evidence, now_ms, ..
         } => add_evidence(mission, evidence.clone(), *now_ms, authority)?,
+        MissionCommand::RecordChannelParticipation { event, .. } => {
+            if event.mission_id != mission.id || mission.status.is_terminal() {
+                return Err(MissionError::InvalidMissionSnapshot(
+                    "channel participation must bind one non-terminal Mission",
+                ));
+            }
+            mission.updated_at_ms = mission.updated_at_ms.max(event.recorded_at_ms);
+        }
         MissionCommand::Complete {
             receipt, now_ms, ..
         } => return complete_mission(mission, receipt, *now_ms, authority).map(Some),
@@ -472,6 +490,7 @@ const fn command_time(command: &MissionCommand) -> i64 {
         | MissionCommand::RequestWorkItemBoundary { now_ms, .. }
         | MissionCommand::AttachEvidence { now_ms, .. }
         | MissionCommand::Complete { now_ms, .. } => *now_ms,
+        MissionCommand::RecordChannelParticipation { event, .. } => event.recorded_at_ms,
     }
 }
 

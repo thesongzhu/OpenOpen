@@ -13,6 +13,9 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 use thiserror::Error;
@@ -69,9 +72,15 @@ pub(crate) enum TransportEvent {
 
 struct DiscordSession {
     adapter: DiscordAdapter,
+    #[cfg(test)]
+    status_override: Option<DiscordConnectionStatus>,
     inbound: tokio::sync::mpsc::Receiver<DiscordInbound>,
     recovery: Option<Receiver<Result<RecoveryBatch, ()>>>,
     recovered: VecDeque<TransportEvent>,
+    recovery_waiting: Option<TransportEvent>,
+    recovery_required: bool,
+    launch_pending: Arc<AtomicBool>,
+    pairing: ChannelPairing,
     conversation_id: String,
 }
 
@@ -114,6 +123,11 @@ pub(crate) enum ChannelSendHandle {
     IMessage {
         adapter: Arc<ImsgAdapter>,
         chat_id: ChatId,
+    },
+    #[cfg(test)]
+    Test {
+        sends: Arc<AtomicUsize>,
+        recoveries: Arc<AtomicUsize>,
     },
 }
 
@@ -158,6 +172,11 @@ impl ChannelSendHandle {
                             provider_message_id,
                         }
                     })
+            }
+            #[cfg(test)]
+            Self::Test { sends, .. } => {
+                sends.fetch_add(1, Ordering::AcqRel);
+                ChannelSendResult::Uncertain
             }
         }
     }
@@ -205,6 +224,11 @@ impl ChannelSendHandle {
                 });
                 ChannelSendResult::Uncertain
             }
+            #[cfg(test)]
+            Self::Test { recoveries, .. } => {
+                recoveries.fetch_add(1, Ordering::AcqRel);
+                ChannelSendResult::Uncertain
+            }
         }
     }
 }
@@ -223,6 +247,8 @@ pub(crate) struct ChannelRuntime {
     imessage_discovery: Option<Arc<ImsgAdapter>>,
     prepared_imessage: Option<PreparedImsgSession>,
     imessage: Option<ImsgSession>,
+    #[cfg(test)]
+    test_send_handle: Option<(ChannelKind, ChannelSendHandle)>,
 }
 
 impl ChannelRuntime {
@@ -234,6 +260,8 @@ impl ChannelRuntime {
             imessage_discovery: None,
             prepared_imessage: None,
             imessage: None,
+            #[cfg(test)]
+            test_send_handle: None,
         })
     }
 
@@ -243,9 +271,6 @@ impl ChannelRuntime {
         token: Zeroizing<String>,
         cursor: Option<&ChannelCursor>,
     ) -> Result<ChannelConnectionStatus, ChannelRuntimeError> {
-        if self.discord.is_some() {
-            return Err(ChannelRuntimeError::AlreadyRunning);
-        }
         if pairing.channel != ChannelKind::Discord
             || !pairing.require_explicit_address
             || pairing
@@ -287,48 +312,85 @@ impl ChannelRuntime {
                 .map_err(|_| ChannelRuntimeError::PairingMismatch)?,
         )
         .map_err(|_| ChannelRuntimeError::PairingMismatch)?;
+        BotToken::new(token.as_str()).map_err(|_| ChannelRuntimeError::Adapter)?;
+        if let Some(status) = self.existing_discord_start_status(pairing)? {
+            return Ok(status);
+        }
         let (adapter, inbound) = DiscordAdapter::new(adapter_pairing, DISCORD_INBOUND_CAPACITY)
             .map_err(|_| ChannelRuntimeError::Adapter)?;
-        BotToken::new(token.as_str()).map_err(|_| ChannelRuntimeError::Adapter)?;
+        let launch_pending = Arc::new(AtomicBool::new(true));
+        let recovery_required = cursor.is_some();
         let recovery = if let Some(cursor) = cursor {
             let (sender, receiver) = mpsc::sync_channel(1);
             let recover_adapter = adapter.clone();
+            let pending = Arc::clone(&launch_pending);
             let request = RecoveryRequest {
                 conversation_id: pairing.conversation_id.clone(),
                 after_message_id: cursor.opaque_value.clone(),
                 max_pages: DISCORD_RECOVERY_PAGES,
             };
             self.runtime.spawn(async move {
-                let result = async {
+                let start_result = async {
                     let token_ref = BotToken::new(token.as_str()).map_err(|_| ())?;
-                    recover_adapter.start(token_ref).await.map_err(|_| ())?;
-                    recover_adapter
-                        .recover_after(&request)
-                        .await
-                        .map_err(|_| ())
+                    recover_adapter.start(token_ref).await.map_err(|_| ())
                 }
                 .await;
+                pending.store(false, Ordering::Release);
+                let result = match start_result {
+                    Ok(()) => recover_adapter
+                        .recover_after(&request)
+                        .await
+                        .map_err(|_| ()),
+                    Err(()) => Err(()),
+                };
                 let _ = sender.send(result);
             });
             Some(receiver)
         } else {
             let start_adapter = adapter.clone();
+            let pending = Arc::clone(&launch_pending);
             self.runtime.spawn(async move {
-                let Ok(token_ref) = BotToken::new(token.as_str()) else {
-                    return;
-                };
-                let _ = start_adapter.start(token_ref).await;
+                if let Ok(token_ref) = BotToken::new(token.as_str()) {
+                    let _ = start_adapter.start(token_ref).await;
+                }
+                pending.store(false, Ordering::Release);
             });
             None
         };
         self.discord = Some(DiscordSession {
             adapter,
+            #[cfg(test)]
+            status_override: None,
             inbound,
             recovery,
             recovered: VecDeque::new(),
+            recovery_waiting: None,
+            recovery_required,
+            launch_pending,
+            pairing: pairing.clone(),
             conversation_id: pairing.conversation_id.clone(),
         });
         Ok(ChannelConnectionStatus::Connecting)
+    }
+
+    fn existing_discord_start_status(
+        &mut self,
+        pairing: &ChannelPairing,
+    ) -> Result<Option<ChannelConnectionStatus>, ChannelRuntimeError> {
+        let Some(session) = self.discord.as_ref() else {
+            return Ok(None);
+        };
+        if session.pairing != *pairing {
+            return Err(ChannelRuntimeError::PairingMismatch);
+        }
+        let status = session.adapter.status();
+        let launch_pending = session.launch_pending.load(Ordering::Acquire);
+        if discord_session_should_restart(status, launch_pending) {
+            let session = self.discord.take().expect("existing Discord session");
+            self.runtime.block_on(session.adapter.stop());
+            return Ok(None);
+        }
+        Ok(Some(discord_session_status(session)))
     }
 
     pub(crate) fn start_discord_setup(
@@ -506,29 +568,10 @@ impl ChannelRuntime {
 
     pub(crate) fn status(&self, channel: ChannelKind) -> ChannelConnectionStatus {
         match channel {
-            ChannelKind::Discord => {
-                self.discord
-                    .as_ref()
-                    .map_or(
-                        ChannelConnectionStatus::Disconnected,
-                        |session| match session.adapter.status() {
-                            DiscordConnectionStatus::Disconnected
-                            | DiscordConnectionStatus::Stopping => {
-                                ChannelConnectionStatus::Disconnected
-                            }
-                            DiscordConnectionStatus::Connecting => {
-                                ChannelConnectionStatus::Connecting
-                            }
-                            DiscordConnectionStatus::Connected => {
-                                ChannelConnectionStatus::Connected
-                            }
-                            DiscordConnectionStatus::Reconnecting => {
-                                ChannelConnectionStatus::Reconnecting
-                            }
-                            DiscordConnectionStatus::Faulted => ChannelConnectionStatus::Faulted,
-                        },
-                    )
-            }
+            ChannelKind::Discord => self.discord.as_ref().map_or(
+                ChannelConnectionStatus::Disconnected,
+                discord_session_status,
+            ),
             ChannelKind::IMessage => self.imessage.as_ref().map_or_else(
                 || {
                     if self.prepared_imessage.is_some() || self.imessage_discovery.is_some() {
@@ -557,47 +600,37 @@ impl ChannelRuntime {
         &mut self,
         observed_at_ms: i64,
     ) -> Result<Option<TransportEvent>, ChannelRuntimeError> {
-        let Some(session) = self.discord.as_mut() else {
-            return Ok(None);
+        let result = match self.discord.as_mut() {
+            Some(session) => poll_discord_session(session, observed_at_ms),
+            None => Ok(None),
         };
-        if let Some(event) = session.recovered.pop_front() {
-            return Ok(Some(event));
+        if result.is_err()
+            && let Some(session) = self.discord.take()
+        {
+            self.runtime.block_on(session.adapter.stop());
         }
-        if let Some(recovery) = session.recovery.as_ref() {
-            match recovery.try_recv() {
-                Ok(Ok(batch)) => {
-                    for envelope in batch.envelopes {
-                        session
-                            .recovered
-                            .push_back(TransportEvent::Inbound(discord_inbound(envelope)?));
-                    }
-                    let order = batch
-                        .high_water_message_id
-                        .parse()
-                        .map_err(|_| ChannelRuntimeError::Recovery)?;
-                    session
-                        .recovered
-                        .push_back(TransportEvent::Cursor(ChannelCursor {
-                            channel: ChannelKind::Discord,
-                            conversation_id: session.conversation_id.clone(),
-                            opaque_value: batch.high_water_message_id,
-                            order,
-                            observed_at_ms,
-                        }));
-                    session.recovery = None;
-                    return Ok(session.recovered.pop_front());
-                }
-                Ok(Err(())) | Err(TryRecvError::Disconnected) => {
-                    return Err(ChannelRuntimeError::Recovery);
-                }
-                Err(TryRecvError::Empty) => return Ok(None),
-            }
+        result
+    }
+
+    pub(crate) fn acknowledge_recovery(
+        &mut self,
+        event: &TransportEvent,
+    ) -> Result<(), ChannelRuntimeError> {
+        if transport_event_channel(event) != ChannelKind::Discord {
+            return Ok(());
         }
-        match session.inbound.try_recv() {
-            Ok(envelope) => Ok(Some(TransportEvent::Inbound(discord_inbound(envelope)?))),
-            Err(TokioTryRecvError::Empty) => Ok(None),
-            Err(TokioTryRecvError::Disconnected) => Err(ChannelRuntimeError::Adapter),
+        let session = self.discord.as_mut().ok_or(ChannelRuntimeError::Recovery)?;
+        if !session.recovery_required {
+            return Ok(());
         }
+        if session.recovery_waiting.as_ref() != Some(event) {
+            return Err(ChannelRuntimeError::Recovery);
+        }
+        session.recovery_waiting = None;
+        if session.recovery.is_none() && session.recovered.is_empty() {
+            session.recovery_required = false;
+        }
+        Ok(())
     }
 
     fn poll_imessage(
@@ -686,16 +719,22 @@ impl ChannelRuntime {
     }
 
     pub(crate) fn send_handle(&self, channel: ChannelKind) -> Option<ChannelSendHandle> {
+        #[cfg(test)]
+        if let Some((expected_channel, handle)) = &self.test_send_handle
+            && *expected_channel == channel
+        {
+            return Some(handle.clone());
+        }
         match channel {
-            ChannelKind::Discord => {
-                self.discord
-                    .as_ref()
-                    .map(|session| ChannelSendHandle::Discord {
-                        adapter: session.adapter.clone(),
-                        runtime: self.runtime.handle().clone(),
-                        conversation_id: session.conversation_id.clone(),
-                    })
-            }
+            ChannelKind::Discord => self
+                .discord
+                .as_ref()
+                .filter(|session| discord_session_ready_for_send(session))
+                .map(|session| ChannelSendHandle::Discord {
+                    adapter: session.adapter.clone(),
+                    runtime: self.runtime.handle().clone(),
+                    conversation_id: session.conversation_id.clone(),
+                }),
             ChannelKind::IMessage => {
                 self.imessage
                     .as_ref()
@@ -705,6 +744,79 @@ impl ChannelRuntime {
                     })
             }
         }
+    }
+
+    pub(crate) fn model_work_ready(&self, channel: ChannelKind) -> bool {
+        match channel {
+            ChannelKind::Discord => self
+                .discord
+                .as_ref()
+                .is_some_and(discord_session_ready_for_model_work),
+            ChannelKind::IMessage => true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_discord_recovery(
+        &mut self,
+    ) -> std::sync::mpsc::SyncSender<Result<RecoveryBatch, ()>> {
+        let pairing = ChannelPairing {
+            channel: ChannelKind::Discord,
+            owner_sender_id: "1001".into(),
+            conversation_id: "2002".into(),
+            require_explicit_address: true,
+            discord: Some(openopen_protocol::DiscordPairingMetadata {
+                guild_id: "3003".into(),
+                bot_user_id: "4004".into(),
+                application_id: "5005".into(),
+                setup_source_message_id: "6006".into(),
+                setup_candidate_id: format!("discord-pair-{}", "a".repeat(64)),
+            }),
+            paired_at_ms: 1,
+        };
+        let adapter_pairing = DiscordPairing::new_with_application(1001, 2002, 4004, 5005)
+            .expect("valid test pairing");
+        let (adapter, inbound) =
+            DiscordAdapter::new(adapter_pairing, DISCORD_INBOUND_CAPACITY).unwrap();
+        let (sender, recovery) = mpsc::sync_channel(1);
+        self.discord = Some(DiscordSession {
+            adapter,
+            status_override: None,
+            inbound,
+            recovery: Some(recovery),
+            recovered: VecDeque::new(),
+            recovery_waiting: None,
+            recovery_required: true,
+            launch_pending: Arc::new(AtomicBool::new(true)),
+            pairing: pairing.clone(),
+            conversation_id: pairing.conversation_id,
+        });
+        sender
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_test_discord_connected(&mut self) {
+        self.discord
+            .as_mut()
+            .expect("test Discord session")
+            .status_override = Some(DiscordConnectionStatus::Connected);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_send_probe(
+        &mut self,
+        channel: ChannelKind,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        self.test_send_handle = Some((
+            channel,
+            ChannelSendHandle::Test {
+                sends: Arc::clone(&sends),
+                recoveries: Arc::clone(&recoveries),
+            },
+        ));
+        (sends, recoveries)
     }
 
     pub(crate) fn stop_all(&mut self) {
@@ -719,7 +831,7 @@ fn validate_imessage_chats(chats: Vec<Chat>) -> Result<Vec<ImessageChat>, Channe
         if chat.service != "iMessage" {
             continue;
         }
-        if !valid_imessage_chat_field(&chat.name, false)
+        if !valid_imessage_chat_field(&chat.name, true)
             || chat.participants.is_empty()
             || chat.participants.len() > MAX_IMESSAGE_CHAT_PARTICIPANTS
             || chat
@@ -758,6 +870,108 @@ fn valid_imessage_chat_field(value: &str, allow_empty: bool) -> bool {
         && (allow_empty || !value.is_empty())
 }
 
+fn poll_discord_session(
+    session: &mut DiscordSession,
+    observed_at_ms: i64,
+) -> Result<Option<TransportEvent>, ChannelRuntimeError> {
+    if let Some(event) = session.recovery_waiting.as_ref() {
+        return Ok(Some(event.clone()));
+    }
+    if let Some(event) = session.recovered.pop_front() {
+        session.recovery_waiting = Some(event.clone());
+        return Ok(Some(event));
+    }
+    if let Some(recovery) = session.recovery.as_ref() {
+        match recovery.try_recv() {
+            Ok(Ok(batch)) => {
+                let mut recovered = VecDeque::with_capacity(batch.envelopes.len() + 1);
+                for envelope in batch.envelopes {
+                    recovered.push_back(TransportEvent::Inbound(discord_inbound(envelope)?));
+                }
+                let order = batch
+                    .high_water_message_id
+                    .parse()
+                    .map_err(|_| ChannelRuntimeError::Recovery)?;
+                recovered.push_back(TransportEvent::Cursor(ChannelCursor {
+                    channel: ChannelKind::Discord,
+                    conversation_id: session.conversation_id.clone(),
+                    opaque_value: batch.high_water_message_id,
+                    order,
+                    observed_at_ms,
+                }));
+                session.recovery = None;
+                session.recovered = recovered;
+                let event = session
+                    .recovered
+                    .pop_front()
+                    .ok_or(ChannelRuntimeError::Recovery)?;
+                session.recovery_waiting = Some(event.clone());
+                return Ok(Some(event));
+            }
+            Ok(Err(())) | Err(TryRecvError::Disconnected) => {
+                return Err(ChannelRuntimeError::Recovery);
+            }
+            Err(TryRecvError::Empty) => return Ok(None),
+        }
+    }
+    if session.recovery_required {
+        return Err(ChannelRuntimeError::Recovery);
+    }
+    match session.inbound.try_recv() {
+        Ok(envelope) => Ok(Some(TransportEvent::Inbound(discord_inbound(envelope)?))),
+        Err(TokioTryRecvError::Empty) => Ok(None),
+        Err(TokioTryRecvError::Disconnected) => Err(ChannelRuntimeError::Adapter),
+    }
+}
+
+fn transport_event_channel(event: &TransportEvent) -> ChannelKind {
+    match event {
+        TransportEvent::Inbound(inbound) => inbound.channel,
+        TransportEvent::Cursor(cursor) => cursor.channel,
+    }
+}
+
+fn discord_session_status(session: &DiscordSession) -> ChannelConnectionStatus {
+    let status = discord_session_adapter_status(session);
+    let launch_pending = session.launch_pending.load(Ordering::Acquire);
+    match status {
+        DiscordConnectionStatus::Faulted => ChannelConnectionStatus::Faulted,
+        DiscordConnectionStatus::Disconnected if !launch_pending => {
+            ChannelConnectionStatus::Disconnected
+        }
+        DiscordConnectionStatus::Stopping => ChannelConnectionStatus::Disconnected,
+        _ if session.recovery_required => ChannelConnectionStatus::Connecting,
+        DiscordConnectionStatus::Disconnected => ChannelConnectionStatus::Connecting,
+        _ => discord_status(status),
+    }
+}
+
+fn discord_session_ready_for_send(session: &DiscordSession) -> bool {
+    discord_status_allows_work(
+        discord_session_adapter_status(session),
+        session.recovery_required,
+    )
+}
+
+fn discord_session_ready_for_model_work(session: &DiscordSession) -> bool {
+    discord_status_allows_work(
+        discord_session_adapter_status(session),
+        session.recovery_required,
+    )
+}
+
+fn discord_session_adapter_status(session: &DiscordSession) -> DiscordConnectionStatus {
+    #[cfg(test)]
+    if let Some(status) = session.status_override {
+        return status;
+    }
+    session.adapter.status()
+}
+
+fn discord_status_allows_work(status: DiscordConnectionStatus, recovery_required: bool) -> bool {
+    !recovery_required && status == DiscordConnectionStatus::Connected
+}
+
 fn discord_status(status: DiscordConnectionStatus) -> ChannelConnectionStatus {
     match status {
         DiscordConnectionStatus::Disconnected | DiscordConnectionStatus::Stopping => {
@@ -767,6 +981,17 @@ fn discord_status(status: DiscordConnectionStatus) -> ChannelConnectionStatus {
         DiscordConnectionStatus::Connected => ChannelConnectionStatus::Connected,
         DiscordConnectionStatus::Reconnecting => ChannelConnectionStatus::Reconnecting,
         DiscordConnectionStatus::Faulted => ChannelConnectionStatus::Faulted,
+    }
+}
+
+fn discord_session_should_restart(status: DiscordConnectionStatus, launch_pending: bool) -> bool {
+    match status {
+        DiscordConnectionStatus::Faulted => true,
+        DiscordConnectionStatus::Disconnected => !launch_pending,
+        DiscordConnectionStatus::Stopping
+        | DiscordConnectionStatus::Connecting
+        | DiscordConnectionStatus::Connected
+        | DiscordConnectionStatus::Reconnecting => false,
     }
 }
 
@@ -790,9 +1015,356 @@ fn discord_inbound(envelope: DiscordInbound) -> Result<TransportInbound, Channel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openopen_protocol::DiscordPairingMetadata;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
+
+    fn imessage_chat(id: i64, name: &str, participants: &[&str]) -> Chat {
+        Chat {
+            id: ChatId::new(id).unwrap(),
+            identifier: format!("chat-{id}"),
+            guid: format!("iMessage;+;chat-{id}"),
+            name: name.into(),
+            service: "iMessage".into(),
+            last_message_at: "2026-07-16T00:00:00Z".into(),
+            participants: participants.iter().map(|value| (*value).into()).collect(),
+            is_group: participants.len() > 1,
+            contact_name: None,
+            unread_count: None,
+        }
+    }
+
+    fn discord_channel_pairing() -> ChannelPairing {
+        ChannelPairing {
+            channel: ChannelKind::Discord,
+            owner_sender_id: "1001".into(),
+            conversation_id: "2002".into(),
+            require_explicit_address: true,
+            discord: Some(DiscordPairingMetadata {
+                guild_id: "3003".into(),
+                bot_user_id: "4004".into(),
+                application_id: "5005".into(),
+                setup_source_message_id: "6006".into(),
+                setup_candidate_id: format!("discord-pair-{}", "a".repeat(64)),
+            }),
+            paired_at_ms: 1,
+        }
+    }
+
+    fn discord_runtime_with_recovery() -> (
+        ChannelRuntime,
+        std::sync::mpsc::SyncSender<Result<RecoveryBatch, ()>>,
+    ) {
+        let pairing = discord_channel_pairing();
+        let adapter_pairing = DiscordPairing::new_with_application(1001, 2002, 4004, 5005)
+            .expect("valid test pairing");
+        let (adapter, inbound) =
+            DiscordAdapter::new(adapter_pairing, DISCORD_INBOUND_CAPACITY).unwrap();
+        let (sender, recovery) = mpsc::sync_channel(1);
+        let mut runtime = ChannelRuntime::new().unwrap();
+        runtime.discord = Some(DiscordSession {
+            adapter,
+            status_override: None,
+            inbound,
+            recovery: Some(recovery),
+            recovered: VecDeque::new(),
+            recovery_waiting: None,
+            recovery_required: true,
+            launch_pending: Arc::new(AtomicBool::new(true)),
+            pairing: pairing.clone(),
+            conversation_id: pairing.conversation_id,
+        });
+        (runtime, sender)
+    }
+
+    #[test]
+    fn discord_start_response_loss_retry_reattaches_to_exact_session() {
+        let pairing = discord_channel_pairing();
+        let adapter_pairing = DiscordPairing::new_with_application(1001, 2002, 4004, 5005)
+            .expect("valid test pairing");
+        let (adapter, inbound) =
+            DiscordAdapter::new(adapter_pairing, DISCORD_INBOUND_CAPACITY).unwrap();
+        let mut runtime = ChannelRuntime::new().unwrap();
+        let launch_pending = Arc::new(AtomicBool::new(true));
+        runtime.discord = Some(DiscordSession {
+            adapter,
+            status_override: None,
+            inbound,
+            recovery: None,
+            recovered: VecDeque::new(),
+            recovery_waiting: None,
+            recovery_required: false,
+            launch_pending: Arc::clone(&launch_pending),
+            pairing: pairing.clone(),
+            conversation_id: pairing.conversation_id.clone(),
+        });
+
+        assert_eq!(
+            runtime
+                .start_discord(&pairing, Zeroizing::new("token".into()), None)
+                .unwrap(),
+            ChannelConnectionStatus::Connecting
+        );
+        assert!(
+            Arc::ptr_eq(
+                &runtime.discord.as_ref().unwrap().launch_pending,
+                &launch_pending
+            ),
+            "retry must retain the one already-created provider session"
+        );
+
+        let mut changed_pairing = pairing;
+        changed_pairing.owner_sender_id = "1002".into();
+        assert!(matches!(
+            runtime.start_discord(&changed_pairing, Zeroizing::new("token".into()), None),
+            Err(ChannelRuntimeError::PairingMismatch)
+        ));
+    }
+
+    #[test]
+    fn discord_terminal_session_retry_replaces_only_the_exact_pairing() {
+        let pairing = discord_channel_pairing();
+        let adapter_pairing = DiscordPairing::new_with_application(1001, 2002, 4004, 5005)
+            .expect("valid test pairing");
+        let (adapter, inbound) =
+            DiscordAdapter::new(adapter_pairing, DISCORD_INBOUND_CAPACITY).unwrap();
+        let previous_launch = Arc::new(AtomicBool::new(false));
+        let mut runtime = ChannelRuntime::new().unwrap();
+        runtime.discord = Some(DiscordSession {
+            adapter,
+            status_override: None,
+            inbound,
+            recovery: None,
+            recovered: VecDeque::new(),
+            recovery_waiting: None,
+            recovery_required: false,
+            launch_pending: Arc::clone(&previous_launch),
+            pairing: pairing.clone(),
+            conversation_id: pairing.conversation_id.clone(),
+        });
+
+        assert!(discord_session_should_restart(
+            DiscordConnectionStatus::Faulted,
+            false
+        ));
+        assert!(discord_session_should_restart(
+            DiscordConnectionStatus::Disconnected,
+            false
+        ));
+        assert!(!discord_session_should_restart(
+            DiscordConnectionStatus::Disconnected,
+            true
+        ));
+        assert_eq!(
+            runtime
+                .start_discord(&pairing, Zeroizing::new("token".into()), None)
+                .unwrap(),
+            ChannelConnectionStatus::Connecting
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &runtime.discord.as_ref().unwrap().launch_pending,
+                &previous_launch
+            ),
+            "terminal retry must replace the stopped provider session exactly once"
+        );
+    }
+
+    #[test]
+    fn discord_recovery_repeats_each_event_until_durable_ack_and_blocks_send() {
+        let (mut runtime, recovery) = discord_runtime_with_recovery();
+        assert_eq!(
+            runtime.status(ChannelKind::Discord),
+            ChannelConnectionStatus::Connecting
+        );
+        assert!(runtime.send_handle(ChannelKind::Discord).is_none());
+        assert!(!runtime.model_work_ready(ChannelKind::Discord));
+        assert!(!discord_status_allows_work(
+            DiscordConnectionStatus::Connected,
+            true
+        ));
+
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: vec![
+                    DiscordInbound {
+                        source_message_id: "9001".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "first".into(),
+                        received_at_ms: 10,
+                    },
+                    DiscordInbound {
+                        source_message_id: "9002".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "second".into(),
+                        received_at_ms: 11,
+                    },
+                ],
+                high_water_message_id: "9003".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+
+        let first = runtime.poll(ChannelKind::Discord, 42).unwrap().unwrap();
+        assert_eq!(
+            runtime.poll(ChannelKind::Discord, 42).unwrap(),
+            Some(first.clone())
+        );
+        runtime.acknowledge_recovery(&first).unwrap();
+        assert!(!runtime.model_work_ready(ChannelKind::Discord));
+
+        let second = runtime.poll(ChannelKind::Discord, 42).unwrap().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            runtime.poll(ChannelKind::Discord, 42).unwrap(),
+            Some(second.clone())
+        );
+        runtime.acknowledge_recovery(&second).unwrap();
+        assert!(!runtime.model_work_ready(ChannelKind::Discord));
+
+        let cursor = runtime.poll(ChannelKind::Discord, 42).unwrap().unwrap();
+        assert!(matches!(
+            &cursor,
+            TransportEvent::Cursor(value)
+                if value.opaque_value == "9003" && value.order == 9003
+        ));
+        assert_eq!(
+            runtime.poll(ChannelKind::Discord, 42).unwrap(),
+            Some(cursor.clone())
+        );
+        assert!(runtime.send_handle(ChannelKind::Discord).is_none());
+        runtime.acknowledge_recovery(&cursor).unwrap();
+
+        assert!(!runtime.discord.as_ref().unwrap().recovery_required);
+        assert!(!runtime.model_work_ready(ChannelKind::Discord));
+        runtime.mark_test_discord_connected();
+        assert!(runtime.model_work_ready(ChannelKind::Discord));
+        assert!(runtime.send_handle(ChannelKind::Discord).is_some());
+        assert!(discord_status_allows_work(
+            DiscordConnectionStatus::Connected,
+            false
+        ));
+    }
+
+    #[test]
+    fn discord_model_and_send_work_require_exact_connected_after_recovery() {
+        for status in [
+            DiscordConnectionStatus::Disconnected,
+            DiscordConnectionStatus::Connecting,
+            DiscordConnectionStatus::Reconnecting,
+            DiscordConnectionStatus::Stopping,
+            DiscordConnectionStatus::Faulted,
+        ] {
+            assert!(!discord_status_allows_work(status, false));
+        }
+        assert!(!discord_status_allows_work(
+            DiscordConnectionStatus::Connected,
+            true
+        ));
+        assert!(discord_status_allows_work(
+            DiscordConnectionStatus::Connected,
+            false
+        ));
+    }
+
+    #[test]
+    fn discord_recovery_failure_stops_the_exact_session_for_clean_retry() {
+        let (mut runtime, recovery) = discord_runtime_with_recovery();
+        recovery.send(Err(())).unwrap();
+
+        assert!(matches!(
+            runtime.poll(ChannelKind::Discord, 42),
+            Err(ChannelRuntimeError::Recovery)
+        ));
+        assert!(runtime.discord.is_none());
+        assert_eq!(
+            runtime.status(ChannelKind::Discord),
+            ChannelConnectionStatus::Disconnected
+        );
+        assert!(runtime.send_handle(ChannelKind::Discord).is_none());
+    }
+
+    #[test]
+    fn discord_cursor_store_failure_retains_exact_recovery_event() {
+        let (mut runtime, recovery) = discord_runtime_with_recovery();
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: Vec::new(),
+                high_water_message_id: "9003".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+
+        let cursor = runtime.poll(ChannelKind::Discord, 42).unwrap().unwrap();
+        assert_eq!(
+            runtime.poll(ChannelKind::Discord, 99).unwrap(),
+            Some(cursor.clone())
+        );
+        let mut wrong = cursor.clone();
+        let TransportEvent::Cursor(wrong_cursor) = &mut wrong else {
+            unreachable!();
+        };
+        wrong_cursor.opaque_value = "9004".into();
+        wrong_cursor.order = 9004;
+        assert!(matches!(
+            runtime.acknowledge_recovery(&wrong),
+            Err(ChannelRuntimeError::Recovery)
+        ));
+        assert_eq!(
+            runtime.poll(ChannelKind::Discord, 100).unwrap(),
+            Some(cursor.clone())
+        );
+        runtime.acknowledge_recovery(&cursor).unwrap();
+        assert!(!runtime.discord.as_ref().unwrap().recovery_required);
+    }
+
+    #[test]
+    fn malformed_recovery_batch_is_atomic_and_stops_the_session() {
+        let (mut runtime, recovery) = discord_runtime_with_recovery();
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: vec![
+                    DiscordInbound {
+                        source_message_id: "9001".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "valid".into(),
+                        received_at_ms: 10,
+                    },
+                    DiscordInbound {
+                        source_message_id: "not-a-snowflake".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "invalid".into(),
+                        received_at_ms: 11,
+                    },
+                ],
+                high_water_message_id: "9003".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            runtime.poll(ChannelKind::Discord, 42),
+            Err(ChannelRuntimeError::Adapter)
+        ));
+        assert!(runtime.discord.is_none());
+    }
+
+    #[test]
+    fn global_off_stops_pending_discord_recovery() {
+        let (mut runtime, _recovery) = discord_runtime_with_recovery();
+        runtime.stop_all();
+
+        assert!(runtime.discord.is_none());
+        assert_eq!(
+            runtime.status(ChannelKind::Discord),
+            ChannelConnectionStatus::Disconnected
+        );
+    }
 
     struct FakeImsg {
         _root: tempfile::TempDir,
@@ -965,6 +1537,107 @@ for line in sys.stdin:
         assert_eq!(
             runtime.status(ChannelKind::IMessage),
             ChannelConnectionStatus::Disconnected
+        );
+    }
+
+    #[test]
+    fn unnamed_one_to_one_imessage_chat_preserves_empty_name() {
+        assert_eq!(
+            validate_imessage_chats(vec![imessage_chat(42, "", &["owner@example.invalid"])])
+                .unwrap(),
+            vec![ImessageChat {
+                chat_id: "42".into(),
+                name: String::new(),
+                service: "iMessage".into(),
+                participants: vec!["owner@example.invalid".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn mixed_named_and_unnamed_imessage_chats_are_valid() {
+        let chats = validate_imessage_chats(vec![
+            imessage_chat(
+                84,
+                "Family",
+                &["second@example.invalid", "owner@example.invalid"],
+            ),
+            imessage_chat(42, "", &["owner@example.invalid"]),
+        ])
+        .unwrap();
+        assert_eq!(
+            chats
+                .iter()
+                .map(|chat| (chat.chat_id.as_str(), chat.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("42", ""), ("84", "Family")]
+        );
+        assert_eq!(
+            chats[1].participants,
+            vec!["owner@example.invalid", "second@example.invalid"]
+        );
+    }
+
+    #[test]
+    fn invalid_imessage_names_and_participants_fail_closed() {
+        for name in [
+            "\0",
+            " untrimmed",
+            &"n".repeat(MAX_IMESSAGE_CHAT_FIELD_BYTES + 1),
+        ] {
+            assert!(
+                validate_imessage_chats(vec![imessage_chat(42, name, &["owner@example.invalid"])])
+                    .is_err()
+            );
+        }
+
+        let invalid_participant_sets = [
+            Vec::<&str>::new(),
+            vec!["owner@example.invalid", "owner@example.invalid"],
+            vec![""],
+            vec!["owner@example.invalid\0"],
+            vec![" owner@example.invalid"],
+        ];
+        for participants in invalid_participant_sets {
+            assert!(
+                validate_imessage_chats(vec![imessage_chat(42, "Owner", &participants)]).is_err()
+            );
+        }
+        let oversized_participant = "p".repeat(MAX_IMESSAGE_CHAT_FIELD_BYTES + 1);
+        assert!(
+            validate_imessage_chats(vec![imessage_chat(
+                42,
+                "Owner",
+                &[oversized_participant.as_str()]
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_imessage_chat_id_fails_closed() {
+        assert!(
+            validate_imessage_chats(vec![
+                imessage_chat(42, "First", &["first@example.invalid"]),
+                imessage_chat(42, "Second", &["second@example.invalid"]),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_imessage_rows_are_filtered_before_route_validation() {
+        let mut sms = imessage_chat(7, "", &[]);
+        sms.service = "SMS".into();
+        let valid = imessage_chat(42, "", &["owner@example.invalid"]);
+        assert_eq!(
+            validate_imessage_chats(vec![sms, valid]).unwrap(),
+            vec![ImessageChat {
+                chat_id: "42".into(),
+                name: String::new(),
+                service: "iMessage".into(),
+                participants: vec!["owner@example.invalid".into()],
+            }]
         );
     }
 }

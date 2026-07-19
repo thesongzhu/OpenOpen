@@ -3,7 +3,8 @@
 mod channels;
 
 use channels::{
-    ChannelConnectionStatus, ChannelRuntime, ChannelSendResult, TransportEvent, TransportInbound,
+    ChannelConnectionStatus, ChannelRuntime, ChannelRuntimeError, ChannelSendResult,
+    TransportEvent, TransportInbound,
 };
 
 use openopen_codex_client::{
@@ -19,9 +20,10 @@ use openopen_core::{
 };
 use openopen_protocol::{
     ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelKind, ChannelMessageKind, ChannelModelDisposition,
-    ChannelModelStart, ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent,
-    ChannelPairing, CoreInstanceLease, DiscordPairingMetadata, EvidenceKind, Mission,
+    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
+    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteSet,
+    CoreInstanceLease, DiscordPairingMetadata, EffectAuditAnchor, EvidenceKind, Mission,
     MissionStatus, OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse,
     RuntimeControlAuthorization, RuntimeControlReceipt, WorkItem, WorkItemStatus,
 };
@@ -73,6 +75,7 @@ pub struct HostPaths {
     pub synthetic_home: PathBuf,
     pub model_input_root: PathBuf,
     pub imsg_runtime: PathBuf,
+    pub user_home: PathBuf,
 }
 
 impl HostPaths {
@@ -103,13 +106,18 @@ impl HostPaths {
         let support_parent = exact_canonical_directory(&home.join("Library/Application Support"))?;
         let support = support_parent.join(APP_SUPPORT_COMPONENT);
         create_exact_private_directory(&support)?;
+        let runtime_home =
+            PathBuf::from("/Library/Application Support/com.thesongzhu.OpenOpenRuntime/users")
+                .join(rustix::process::geteuid().as_raw().to_string())
+                .join("CodexHome");
         Ok(Self {
             store: support.join("openopen.sqlite3"),
             codex_runtime: contents.join("Resources/Codex/0.144.0/bin/codex"),
-            codex_home: support.join("CodexHome"),
-            synthetic_home: support.join("CodexSyntheticHome"),
+            codex_home: runtime_home.clone(),
+            synthetic_home: runtime_home.join("SyntheticHome"),
             model_input_root: support.join("ModelInput"),
             imsg_runtime: contents.join("Resources/iMessage/0.13.0/bin/imsg"),
+            user_home: home,
         })
     }
 }
@@ -151,6 +159,40 @@ struct OperationState {
 }
 
 impl OperationState {
+    fn codex_replacement_allowed(&self) -> bool {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let no_login = self
+            .login
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+        matches!(gate.runtime, RuntimeAuthorityState::Enabled) && gate.active.is_none() && no_login
+    }
+
+    fn authorize_codex_abort(&self) -> bool {
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut login = self
+            .login
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (gate.active.as_ref(), login.as_ref()) {
+            (None, None) => true,
+            (Some(token), Some(_)) => {
+                token.store(true, Ordering::Release);
+                *login = None;
+                gate.active = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn begin_operation(&self) -> Option<Arc<AtomicBool>> {
         let mut gate = self
             .gate
@@ -299,6 +341,31 @@ impl OperationState {
             gate.active = None;
         }
     }
+
+    fn reconcile_active<T>(
+        &self,
+        token: &Arc<AtomicBool>,
+        reconcile: impl FnOnce() -> Result<T, HostCallError>,
+    ) -> Result<T, HostCallError> {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.load(Ordering::Acquire)
+            || !matches!(gate.runtime, RuntimeAuthorityState::Enabled)
+            || !gate
+                .active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return Err(HostCallError::Codex(CodexError::Cancelled));
+        }
+        // Hold the operation gate through the Store transaction and volatile
+        // publication. Global Off must acquire this same gate before it can
+        // cancel/latch the operation, while Store independently verifies the
+        // signed On row inside its immediate write transaction.
+        reconcile()
+    }
 }
 
 fn runtime_on_may_release(state: RuntimeAuthorityState, revision: u64) -> bool {
@@ -331,13 +398,12 @@ impl Host {
     /// Returns an error for unsafe paths or Store initialization failure.
     pub fn open(paths: HostPaths, master: [u8; 32]) -> Result<Self, HostError> {
         let master = Zeroizing::new(master);
-        for directory in [
-            &paths.codex_home,
-            &paths.synthetic_home,
-            &paths.model_input_root,
-        ] {
-            create_exact_private_directory(directory)?;
-        }
+        // The root broker owns creation of the fixed tmpfs Codex home. Core
+        // must remain able to open its Store and report protected Off while
+        // that broker-managed mount is absent. The Codex client validates the
+        // exact mount and only then creates the nested synthetic home during
+        // `broker.codex.prepare`.
+        create_exact_private_directory(&paths.model_input_root)?;
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| HostError::InstanceNonce)?;
         let authority = LocalAuthority::from_master(ISSUER_ID, *master);
@@ -377,12 +443,19 @@ impl Host {
             "broker.enrollment.sign" => self.sign_broker_enrollment(&request, responses),
             "broker.enrollment.install" => self.install_broker(&request, responses),
             "broker.codex.prepare" => self.prepare_codex_runtime(&request, responses),
+            "broker.codex.login.prepare" => {
+                self.prepare_login_codex_runtime(&request, responses);
+            }
+            "broker.codex.candidate.bind" => {
+                self.bind_codex_candidate_for_broker(&request, responses);
+            }
             "broker.codex.initialize" => self.initialize_codex_runtime(&request, responses),
             "broker.codex.abort" => self.abort_codex_candidate(&request, responses),
             "broker.lease.install" => self.install_core_lease(&request, responses),
             "mission.dashboard.read" => self.read_dashboard(&request, responses),
             "channel.pair" => self.pair_channel(&request, responses),
             "channel.pairing.read" => self.read_channel_pairing(&request, responses),
+            "channel.route.bind" => self.bind_channel_route(&request, responses),
             "channel.discord.setup.start" => self.start_discord_setup(&request, responses),
             "channel.discord.setup.poll" => self.poll_discord_setup(&request, responses),
             "channel.discord.setup.confirm" => self.confirm_discord_setup(&request, responses),
@@ -394,6 +467,9 @@ impl Host {
             "channel.imessage.prepare" => self.prepare_imessage(&request, responses),
             "channel.imessage.activate" => self.activate_imessage(&request, responses),
             "channel.poll" => self.poll_channel(&request, responses),
+            "channel.failure.acknowledge" => {
+                self.acknowledge_channel_failure(&request, responses);
+            }
             "channel.status" => self.channel_status(&request, responses),
             "channel.stop" => self.stop_channel(&request, responses),
             "channel.outbound.send" => self.send_channel_message(&request, responses),
@@ -403,6 +479,7 @@ impl Host {
             "models.list" => self.start_model_list(&request, responses),
             "outcome.propose" => self.start_outcome(&request, responses),
             "mission.confirm" => self.confirm_mission(&request, responses),
+            "mission.cancel" => self.cancel_mission(&request, responses),
             "mission.reminders.begin" => self.begin_reminder_dispatch(&request, responses),
             "mission.reminders.record" => self.record_reminder_mirror(&request, responses),
             "mission.reminders.complete" => self.complete_reminders(&request, responses),
@@ -491,6 +568,9 @@ impl Host {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(client) = slot.as_ref() {
+                if client.is_login_only() {
+                    return Err(HostCallError::Internal);
+                }
                 return Ok(client.process_identifier());
             }
             self.operations.codex_cancel.store(false, Ordering::Release);
@@ -500,12 +580,61 @@ impl Host {
                     codex_home: self.paths.codex_home.clone(),
                     synthetic_home: self.paths.synthetic_home.clone(),
                     model_workspace: self.paths.model_input_root.clone(),
+                    user_home: self.paths.user_home.clone(),
                 },
                 self.operations.codex_cancel.clone(),
             )
             .map_err(HostCallError::Codex)?;
             let pid = client.process_identifier();
             *slot = Some(client);
+            *self
+                .operations
+                .codex_pid
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pid);
+            Ok(pid)
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |codex_pid| success(request.id, json!({"codexPid": codex_pid})),
+        ));
+    }
+
+    fn prepare_login_codex_runtime(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        if decode_params::<NoParams>(request).is_err()
+            || self.store.trusted_broker_enrollment().is_none()
+            || !self.operations.codex_replacement_allowed()
+        {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let result = (|| -> Result<i32, HostCallError> {
+            // A failed, cancelled, or completed login deliberately retires the
+            // local lease before a fresh model/login process is prepared. The
+            // protected broker still owns the durable old audit-token lease;
+            // spawning this uninitialized candidate lets App ask the broker to
+            // terminate/release that exact old incarnation and issue the new
+            // lease. No account, model, or login request can run before the new
+            // signed lease is installed and initialization completes.
+            self.retire_codex_runtime();
+            self.operations.codex_cancel.store(false, Ordering::Release);
+            let client = CodexClient::spawn_login_uninitialized_with_cancel(
+                &CodexRuntimeConfig {
+                    runtime: self.paths.codex_runtime.clone(),
+                    codex_home: self.paths.codex_home.clone(),
+                    synthetic_home: self.paths.synthetic_home.clone(),
+                    model_workspace: self.paths.model_input_root.clone(),
+                    user_home: self.paths.user_home.clone(),
+                },
+                self.operations.codex_cancel.clone(),
+            )
+            .map_err(HostCallError::Codex)?;
+            let pid = client.process_identifier();
+            *self
+                .operations
+                .codex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
             *self
                 .operations
                 .codex_pid
@@ -544,24 +673,55 @@ impl Host {
         ));
     }
 
-    fn abort_codex_candidate(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
-        if decode_params::<NoParams>(request).is_err() || self.has_instance_lease() {
+    fn bind_codex_candidate_for_broker(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        if decode_params::<NoParams>(request).is_err()
+            || self.store.trusted_broker_enrollment().is_none()
+        {
             let _ = responses.send(invalid_params(request.id));
             return;
         }
-        self.operations.codex_cancel.store(true, Ordering::Release);
-        let client = self
-            .operations
-            .codex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        *self
-            .operations
-            .codex_pid
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        drop(client);
+        let result = (|| -> Result<(), HostCallError> {
+            let mut codex = self
+                .operations
+                .codex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let client = codex.as_mut().ok_or(HostCallError::Internal)?;
+            let installed = self
+                .instance_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if client.is_initialized()
+                && installed
+                    .as_ref()
+                    .is_none_or(|lease| lease.codex_pid != client.process_identifier())
+            {
+                return Err(HostCallError::Internal);
+            }
+            // This one-way handoff occurs before App may ask the broker to
+            // durably acquire the exact audit-token lease. Therefore broker
+            // response loss and the later Core-install request/response loss
+            // can never restore numeric-PID signal authority: abort/drop is
+            // pipe-close plus wait-only, and broker recovery owns termination.
+            client.mark_process_lease_bound();
+            Ok(())
+        })();
+        let _ = responses.send(result.map_or_else(
+            |_| failure(Some(request.id), -32_015, "Codex broker handoff rejected"),
+            |()| success(request.id, json!({"status": "bound"})),
+        ));
+    }
+
+    fn abort_codex_candidate(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        if decode_params::<NoParams>(request).is_err() || !self.operations.authorize_codex_abort() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        self.retire_codex_runtime();
         let _ = responses.send(success(request.id, json!({"status": "aborted"})));
     }
 
@@ -712,6 +872,24 @@ impl Host {
             {
                 return Err(HostCallError::Internal);
             }
+            let mut codex = self
+                .operations
+                .codex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(client) = codex.as_mut() {
+                if client.process_identifier() != params.lease.codex_pid {
+                    return Err(HostCallError::Internal);
+                }
+                // The broker has already issued a lease for this exact Codex
+                // audit-token incarnation. Remove Core's numeric-signal
+                // authority before publishing the lease locally; every later
+                // success, failure, cancellation, Global Off, or drop is
+                // pipe-close/reap only and the broker performs any required
+                // exact termination. A vacant slot has no process authority
+                // to revoke and remains fail-closed for every Codex route.
+                client.mark_process_lease_bound();
+            }
             let mut installed = self
                 .instance_lease
                 .lock()
@@ -736,100 +914,84 @@ impl Host {
             let _ = responses.send(invalid_params(request.id));
             return;
         }
-        let result = (|| -> Result<Value, HostCallError> {
-            let runtime = self.store.runtime_control()?;
-            let memory_suggestion = self
-                .operations
-                .suggestion
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let mut suggestion = memory_suggestion.or(self.store.latest_channel_suggestion()?);
-            let Some(anchor) = self.store.current_verified_audit_anchor()? else {
-                return Ok(json!({
-                    "activeCards": [],
-                    "channelOrigin": null,
-                    "confirmedMission": null,
-                    "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
-                    "needsYou": null,
-                    "receipt": null,
-                    "runtime": runtime,
-                    "suggestion": suggestion
-                }));
-            };
-            let missions = self.store.list_missions(&anchor)?;
-            let mut confirmed = Vec::new();
-            for mission in &missions {
-                if let Some(value) = confirmed_mission_from_mission(
-                    mission,
-                    &self.authority,
-                    ReminderWriteDisposition::RecoverOnly,
-                )? {
-                    confirmed.push(value);
-                }
-            }
-            let needs_you = missions.iter().find_map(|mission| {
-                (mission.status == MissionStatus::NeedsMe)
-                    .then_some(mission.needs_me.as_ref())
-                    .flatten()
-                    .map(|needs_me| MissionNeedsYou {
-                        mission_id: mission.id.clone(),
-                        title: mission.title.clone(),
-                        prompt: needs_me.prompt.clone(),
-                        created_at_ms: needs_me.created_at_ms,
-                    })
-            });
-            let receipt = self.store.list_receipts(&anchor)?.into_iter().next();
-            if suggestion.as_ref().is_some_and(|candidate| {
-                mission_id_for_suggestion_id(&candidate.id).is_ok_and(|mission_id| {
-                    confirmed
-                        .iter()
-                        .any(|mission| mission.mission_id == mission_id)
-                })
-            }) {
-                suggestion = None;
-            }
-            let mut active_cards = confirmed
-                .iter()
-                .take(3)
-                .map(|mission| {
-                    json!({"id": mission.mission_id, "state": "working", "title": mission.title})
-                })
-                .collect::<Vec<_>>();
-            if active_cards.len() < 3
-                && let Some(needs_you) = &needs_you
-            {
-                active_cards.push(json!({
-                    "id": needs_you.mission_id,
-                    "state": "Need you",
-                    "title": needs_you.title,
-                }));
-            }
-            let origin_mission_id = confirmed
-                .first()
-                .map(|mission| mission.mission_id.as_str())
-                .or_else(|| needs_you.as_ref().map(|value| value.mission_id.as_str()))
-                .or_else(|| receipt.as_ref().map(|value| value.mission_id.as_str()));
-            let channel_origin = origin_mission_id
-                .map(|mission_id| self.store.channel_mission_origin(mission_id))
-                .transpose()?
-                .flatten();
-            Ok(json!({
-                "activeCards": active_cards,
-                "channelOrigin": channel_origin,
-                "confirmedMission": confirmed.first(),
-                "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
-                "needsYou": needs_you,
-                "receipt": receipt,
-                "runtime": runtime,
-                "suggestion": suggestion
-            }))
-        })();
+        let result = self.dashboard_value();
         let response = result.map_or_else(
             |error| call_failure(request.id, &error),
             |dashboard| success(request.id, dashboard),
         );
         let _ = responses.send(response);
+    }
+
+    fn dashboard_value(&self) -> Result<Value, HostCallError> {
+        let runtime = self.store.runtime_control()?;
+        let mut suggestion = self.visible_dashboard_suggestion()?;
+        let incidents = self.store.channel_failure_incident_projection(None)?;
+        let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+            return Ok(empty_dashboard(runtime, suggestion.as_ref(), incidents));
+        };
+        let missions = self.store.list_missions(&anchor)?;
+        let confirmed = self.dashboard_confirmed_missions(&missions)?;
+        if suggestion.as_ref().is_some_and(|candidate| {
+            mission_id_for_suggestion_id(&candidate.id).is_ok_and(|mission_id| {
+                confirmed
+                    .iter()
+                    .any(|mission| mission.mission_id == mission_id)
+            })
+        }) {
+            suggestion = None;
+        }
+        let nonterminal = missions
+            .iter()
+            .filter(|mission| !mission.status.is_terminal())
+            .collect::<Vec<_>>();
+        if !nonterminal.is_empty() {
+            suggestion = None;
+        }
+        let focus = dashboard_focus(&nonterminal, &confirmed);
+        let focus_id = focus.map(|mission| mission.id.as_str());
+        let confirmed_mission = focus_id.and_then(|mission_id| {
+            confirmed
+                .iter()
+                .find(|candidate| candidate.mission_id == mission_id)
+        });
+        let receipt = (nonterminal.is_empty() && suggestion.is_none())
+            .then(|| self.store.list_receipts(&anchor))
+            .transpose()?
+            .and_then(|receipts| receipts.into_iter().next());
+        let route_mission_id =
+            focus_id.or_else(|| receipt.as_ref().map(|value| value.mission_id.as_str()));
+        let channel_route_set = route_mission_id
+            .map(|mission_id| self.store.channel_route_set(mission_id))
+            .transpose()?
+            .flatten();
+        Ok(json!({
+            "activeCards": dashboard_active_cards(&nonterminal, focus),
+            "channelFailureIncidents": incidents,
+            "channelRouteSet": channel_route_set,
+            "confirmedMission": confirmed_mission,
+            "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+            "needsYou": dashboard_needs_you(focus),
+            "receipt": receipt,
+            "runtime": runtime,
+            "suggestion": suggestion
+        }))
+    }
+
+    fn dashboard_confirmed_missions(
+        &self,
+        missions: &[Mission],
+    ) -> Result<Vec<ConfirmedMission>, HostCallError> {
+        missions
+            .iter()
+            .map(|mission| {
+                confirmed_mission_from_mission(
+                    mission,
+                    &self.authority,
+                    ReminderWriteDisposition::RecoverOnly,
+                )
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 
     fn pair_channel(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -849,6 +1011,21 @@ impl Host {
         let _ = responses.send(result.map_or_else(
             |error| host_failure(request.id, &error),
             |()| success(request.id, json!({"status": "paired"})),
+        ));
+    }
+
+    fn bind_channel_route(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<BindChannelRoute>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let result = self
+            .store
+            .require_runtime_checkpoint(&params.authorization, &params.broker_receipt)
+            .and_then(|()| self.store.bind_additional_channel_route(&params.approval));
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |route_set| success(request.id, route_set),
         ));
     }
 
@@ -979,7 +1156,7 @@ impl Host {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .start_discord(&pairing, token, cursor.as_ref())
-                .map_err(|_| HostCallError::Internal)
+                .map_err(|error| channel_runtime_failure(&error))
         })();
         self.finish_operation(&operation);
         let _ = responses.send(result.map_or_else(
@@ -1008,7 +1185,7 @@ impl Host {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .prepare_imessage(&self.paths.imsg_runtime, &pairing, cursor.as_ref())
-                .map_err(|_| HostCallError::Internal)
+                .map_err(|error| channel_runtime_failure(&error))
         })();
         self.finish_operation(&operation);
         let _ = responses.send(result.map_or_else(
@@ -1080,7 +1257,7 @@ impl Host {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .activate_imessage()
-            .map_err(|_| HostCallError::Internal);
+            .map_err(|error| channel_runtime_failure(&error));
         self.finish_operation(&operation);
         let _ = responses.send(result.map_or_else(
             |error| call_failure(request.id, &error),
@@ -1226,31 +1403,70 @@ impl Host {
             .store
             .get_mission(&params.mission_id, &anchor)?
             .ok_or(HostCallError::Internal)?;
-        let origin = self
+        let route_set = self
             .store
-            .channel_mission_origin(&params.mission_id)?
+            .channel_route_set(&params.mission_id)?
             .ok_or(HostCallError::Internal)?;
-        let payload = external_channel_payload(origin.channel, &params.content)?;
+        let route = route_set
+            .routes
+            .iter()
+            .find(|route| route.route_id == params.route_id)
+            .cloned()
+            .ok_or(HostCallError::Internal)?;
+        if route.revision > route_set.revision
+            || !route.allowed_outbound_classes.contains(&params.kind)
+        {
+            return Err(HostCallError::Internal);
+        }
+        let handle = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_handle(route.channel)
+            .ok_or(HostCallError::Internal)?;
+        let payload = external_channel_payload(route.channel, &params.content)?;
         let proposal = ActionProposal {
             effect: EffectKind::ChannelSend,
             mission_id: mission.id.clone(),
             mission_scope_digest: mission.scope_digest.clone(),
             target: ActionTarget::Channel {
-                channel: origin.channel,
-                conversation_id: origin.conversation_id.clone(),
-                recipient_ids: vec![origin.owner_sender_id.clone()],
+                channel: route.channel,
+                conversation_id: route.conversation_id.clone(),
+                recipient_ids: vec![route.owner_sender_id.clone()],
             },
             estimated_cost_micros: None,
         };
         let outbound_id = hashed_identifier(
             "channel-send",
             &json!({
-                "channel": origin.channel,
+                "channel": route.channel,
                 "contentSha256": format!("{:x}", Sha256::digest(&payload)),
                 "kind": params.kind,
                 "missionId": mission.id,
+                "routeId": route.route_id,
+                "routeSetRevision": route_set.revision,
             }),
         )?;
+        let recovery_cursor = self
+            .store
+            .channel_cursor(route.channel, &route.conversation_id)?;
+        let intent = ChannelOutboundIntent {
+            outbound_id: outbound_id.clone(),
+            mission_id: mission.id.clone(),
+            route_id: route.route_id.clone(),
+            route_set_revision: route_set.revision,
+            channel: route.channel,
+            conversation_id: route.conversation_id.clone(),
+            recipient_id: route.owner_sender_id.clone(),
+            kind: params.kind,
+            content_sha256: format!("{:x}", Sha256::digest(&payload)),
+            created_at_ms: params.approved_at_ms,
+            recovery_cursor,
+        };
+        if let Some(start) = self.store.recover_channel_outbound(&intent, &payload)? {
+            let message_body = String::from_utf8(payload).map_err(|_| HostCallError::Internal)?;
+            return Ok((start, message_body, handle));
+        }
         match params.kind {
             ChannelMessageKind::Progress => {
                 if mission.status != MissionStatus::Active
@@ -1292,29 +1508,172 @@ impl Host {
                 }
             }
         }
-        let recovery_cursor = self
-            .store
-            .channel_cursor(origin.channel, &origin.conversation_id)?;
-        let intent = ChannelOutboundIntent {
-            outbound_id,
-            mission_id: mission.id,
-            channel: origin.channel,
-            conversation_id: origin.conversation_id,
-            recipient_id: origin.owner_sender_id,
-            kind: params.kind,
-            content_sha256: format!("{:x}", Sha256::digest(&payload)),
-            created_at_ms: params.approved_at_ms,
-            recovery_cursor,
-        };
         let start = self.store.begin_channel_outbound(&intent, &payload)?;
-        let handle = self
+        let message_body = String::from_utf8(payload).map_err(|_| HostCallError::Internal)?;
+        Ok((start, message_body, handle))
+    }
+
+    fn next_ready_channel_model(
+        &mut self,
+        channel: ChannelKind,
+        observed_at_ms: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let model_work_ready = self
             .channels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .send_handle(origin.channel)
-            .ok_or(HostCallError::Internal)?;
-        let message_body = String::from_utf8(payload).map_err(|_| HostCallError::Internal)?;
-        Ok((start, message_body, handle))
+            .model_work_ready(channel);
+        if model_work_ready {
+            if let Some(source_message_id) = self.store.started_channel_model(channel)? {
+                self.store
+                    .fail_channel_model(channel, &source_message_id, observed_at_ms)?;
+                return Ok(Some(source_message_id));
+            }
+            if self.store.has_nonterminal_mission()? {
+                return Ok(None);
+            }
+            if let Some(source_message_id) = self.store.next_queued_channel_model(channel)? {
+                return Ok(Some(source_message_id));
+            }
+            Ok(None)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn channel_suggestion_is_current(
+        &self,
+        suggestion: &OutcomeSuggestion,
+    ) -> Result<bool, HostCallError> {
+        if self.store.has_nonterminal_mission()? {
+            return Ok(false);
+        }
+        let Some(source) = self.store.channel_source_for_suggestion(&suggestion.id)? else {
+            return Ok(true);
+        };
+        if self
+            .store
+            .latest_failed_channel_model(source.channel)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let model_work_ready = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .model_work_ready(source.channel);
+        if !model_work_ready || self.store.channel_model_work_pending(source.channel)? {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .latest_channel_suggestion_for(source.channel)?
+            .is_some_and(|latest| latest.id == suggestion.id))
+    }
+
+    fn visible_dashboard_suggestion(&self) -> Result<Option<OutcomeSuggestion>, HostCallError> {
+        let memory_suggestion = self
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(candidate) = memory_suggestion {
+            if self.channel_suggestion_is_current(&candidate)? {
+                return Ok(Some(candidate));
+            }
+            let mut slot = self
+                .operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.as_ref().is_some_and(|value| value.id == candidate.id) {
+                *slot = None;
+            }
+        }
+        let Some(candidate) = self.store.latest_channel_suggestion()? else {
+            return Ok(None);
+        };
+        if !self.channel_suggestion_is_current(&candidate)? {
+            return Ok(None);
+        }
+        *self
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(candidate.clone());
+        Ok(Some(candidate))
+    }
+
+    fn restore_channel_suggestion(
+        &self,
+        channel: ChannelKind,
+    ) -> Result<Option<OutcomeSuggestion>, HostCallError> {
+        if self.store.has_nonterminal_mission()? {
+            return Ok(None);
+        }
+        if self.store.channel_model_work_pending(channel)? {
+            return Ok(None);
+        }
+        let Some(candidate) = self.store.latest_channel_suggestion_for(channel)? else {
+            return Ok(None);
+        };
+        if !self.channel_suggestion_is_current(&candidate)? {
+            return Ok(None);
+        }
+        let existing = self
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if existing
+            .as_ref()
+            .is_some_and(|value| value.id == candidate.id)
+        {
+            return Ok(None);
+        }
+        if let Some(existing) = existing
+            && self
+                .store
+                .channel_source_for_suggestion(&existing.id)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let mut slot = self
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(candidate.clone());
+        Ok(Some(candidate))
+    }
+
+    fn respond_with_restored_channel_suggestion(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: &Arc<AtomicBool>,
+    ) -> bool {
+        match self.restore_channel_suggestion(params.channel) {
+            Ok(Some(suggestion)) => {
+                self.finish_operation(operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "ready", Some(&suggestion)),
+                ));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.finish_operation(operation);
+                let _ = responses.send(call_failure(request.id, &error));
+                true
+            }
+        }
     }
 
     fn poll_channel(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -1333,28 +1692,35 @@ impl Host {
                 return;
             }
         };
-        match self.store.next_queued_channel_model(params.channel) {
-            Ok(Some(source_message_id)) => {
-                match self
-                    .store
-                    .begin_channel_model(params.channel, &source_message_id)
-                {
-                    Ok(start) => {
-                        self.process_channel_model_start(
-                            request, responses, &params, operation, start,
-                        );
+        if params.model_work_allowed {
+            match self.next_ready_channel_model(params.channel, observed_at_ms) {
+                Ok(Some(source_message_id)) => {
+                    match self
+                        .store
+                        .begin_channel_model(params.channel, &source_message_id)
+                    {
+                        Ok(start) => {
+                            self.process_channel_model_start(
+                                request, responses, &params, operation, start,
+                            );
+                        }
+                        Err(error) => {
+                            self.finish_operation(&operation);
+                            let _ = responses.send(host_failure(request.id, &error));
+                        }
                     }
-                    Err(error) => {
-                        self.finish_operation(&operation);
-                        let _ = responses.send(host_failure(request.id, &error));
-                    }
+                    return;
                 }
-                return;
+                Ok(None) => {}
+                Err(error) => {
+                    self.finish_operation(&operation);
+                    let _ = responses.send(host_failure(request.id, &error));
+                    return;
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
-                self.finish_operation(&operation);
-                let _ = responses.send(host_failure(request.id, &error));
+            if self
+                .respond_with_restored_channel_suggestion(request, responses, &params, &operation)
+            {
                 return;
             }
         }
@@ -1373,31 +1739,68 @@ impl Host {
             return;
         };
         let Some(event) = event else {
-            self.finish_operation(&operation);
-            let _ = responses.send(success(
-                request.id,
-                self.channel_poll_value(params.channel, "idle", None),
-            ));
+            self.respond_when_channel_idle(request, responses, &params, &operation);
             return;
         };
         if let TransportEvent::Cursor(cursor) = event {
-            let result = self.store.advance_channel_cursor(&cursor);
-            self.finish_operation(&operation);
-            let _ = responses.send(result.map_or_else(
-                |error| host_failure(request.id, &error),
-                |()| {
-                    success(
-                        request.id,
-                        self.channel_poll_value(params.channel, "recovered", None),
-                    )
-                },
-            ));
+            match self.store.advance_channel_cursor(&cursor) {
+                Ok(()) => {
+                    let acknowledged = self
+                        .channels
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .acknowledge_recovery(&TransportEvent::Cursor(cursor));
+                    self.finish_operation(&operation);
+                    let _ = responses.send(acknowledged.map_or_else(
+                        |_| failure(Some(request.id), -32_000, "Channel transport failed closed"),
+                        |()| {
+                            success(
+                                request.id,
+                                self.channel_poll_value(params.channel, "recovered", None),
+                            )
+                        },
+                    ));
+                }
+                Err(error) => {
+                    self.finish_operation(&operation);
+                    let _ = responses.send(host_failure(request.id, &error));
+                }
+            }
             return;
         }
         let TransportEvent::Inbound(inbound) = event else {
             unreachable!();
         };
         self.process_channel_inbound(request, responses, &params, operation, &inbound);
+    }
+
+    fn acknowledge_channel_failure(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<AcknowledgeChannelFailure>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let expected_anchor = AuditAnchor {
+            sequence: params.expected_incident_audit_anchor.sequence,
+            entry_hash: params.expected_incident_audit_anchor.entry_hash,
+            signature_hex: params.expected_incident_audit_anchor.signature_hex,
+        };
+        let result = self.store.acknowledge_channel_failure_incident(
+            &params.incident_id,
+            &expected_anchor,
+            params.authorization.revision,
+            params.acknowledged_at_ms,
+        );
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |incident| success(request.id, json!(incident)),
+        ));
     }
 
     fn process_channel_inbound(
@@ -1409,28 +1812,128 @@ impl Host {
         inbound: &TransportInbound,
     ) {
         let observation = channel_observation(inbound);
-        let result = self
+        let ingested = match self
             .store
             .ingest_channel_message(&observation, &inbound.content)
-            .and_then(|ingested| {
-                if ingested.decision == ChannelInboundDecision::Accepted {
-                    self.store
-                        .begin_channel_model(
-                            observation.envelope.channel,
-                            &observation.envelope.source_message_id,
-                        )
-                        .map(Some)
-                } else {
-                    Ok(None)
-                }
-            });
-        let start = match result {
-            Ok(Some(value)) => value,
-            Ok(None) => {
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let model_work_ready = {
+            let mut channels = self
+                .channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if channels
+                .acknowledge_recovery(&TransportEvent::Inbound(inbound.clone()))
+                .is_err()
+            {
+                None
+            } else {
+                Some(params.model_work_allowed && channels.model_work_ready(params.channel))
+            }
+        };
+        let Some(model_work_ready) = model_work_ready else {
+            self.finish_operation(&operation);
+            let _ = responses.send(failure(
+                Some(request.id),
+                -32_000,
+                "Channel transport failed closed",
+            ));
+            return;
+        };
+        self.process_durable_channel_inbound(
+            request,
+            responses,
+            operation,
+            &DurableChannelInbound {
+                params,
+                observation: &observation,
+                ingested: &ingested,
+                model_work_ready,
+            },
+        );
+    }
+
+    fn process_durable_channel_inbound(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        operation: Arc<AtomicBool>,
+        context: &DurableChannelInbound<'_>,
+    ) {
+        if matches!(
+            context.ingested.decision,
+            ChannelInboundDecision::AcceptedMissionUpdate | ChannelInboundDecision::Duplicate
+        ) && context.ingested.mission_event.is_some()
+        {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                json!({
+                    "connectionStatus": self.channels
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .status(context.observation.envelope.channel),
+                    "eventStatus": if context.ingested.decision
+                        == ChannelInboundDecision::AcceptedMissionUpdate
+                    {
+                        "missionUpdated"
+                    } else {
+                        "missionUpdateRecovered"
+                    },
+                    "missionEvent": context.ingested.mission_event,
+                    "suggestion": null,
+                }),
+            ));
+            return;
+        }
+        if context.ingested.decision != ChannelInboundDecision::Accepted {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                self.channel_poll_value(context.observation.envelope.channel, "ignored", None),
+            ));
+            return;
+        }
+        if !context.model_work_ready {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                self.channel_poll_value(context.observation.envelope.channel, "recovering", None),
+            ));
+            return;
+        }
+        match self.store.has_nonterminal_mission() {
+            Ok(true) => {
                 self.finish_operation(&operation);
                 let _ = responses.send(success(
                     request.id,
-                    self.channel_poll_value(params.channel, "ignored", None),
+                    self.channel_poll_value(context.observation.envelope.channel, "deferred", None),
+                ));
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        }
+        let start = match self.store.begin_channel_model(
+            context.observation.envelope.channel,
+            &context.observation.envelope.source_message_id,
+        ) {
+            Ok(value) => value,
+            Err(StoreError::ChannelModelDeferredByMission) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(context.observation.envelope.channel, "deferred", None),
                 ));
                 return;
             }
@@ -1440,7 +1943,7 @@ impl Host {
                 return;
             }
         };
-        self.process_channel_model_start(request, responses, params, operation, start);
+        self.process_channel_model_start(request, responses, context.params, operation, start);
     }
 
     fn process_channel_model_start(
@@ -1451,71 +1954,167 @@ impl Host {
         operation: Arc<AtomicBool>,
         start: openopen_protocol::ChannelModelStart,
     ) {
+        if !params.model_work_allowed {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(
+                request.id,
+                self.channel_poll_value(params.channel, "recovering", None),
+            ));
+            return;
+        }
         match start.disposition {
             ChannelModelDisposition::SuggestionReady => {
+                let suggestion = match start.suggestion.as_ref() {
+                    Some(candidate) => match self.channel_suggestion_is_current(candidate) {
+                        Ok(true) => Some(candidate),
+                        Ok(false) => None,
+                        Err(error) => {
+                            self.finish_operation(&operation);
+                            let _ = responses.send(call_failure(request.id, &error));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(suggestion) = suggestion {
+                    *self
+                        .operations
+                        .suggestion
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(suggestion.clone());
+                }
                 self.finish_operation(&operation);
                 let _ = responses.send(success(
                     request.id,
-                    self.channel_poll_value(params.channel, "ready", start.suggestion.as_ref()),
+                    self.channel_poll_value(
+                        params.channel,
+                        if suggestion.is_some() {
+                            "ready"
+                        } else {
+                            "superseded"
+                        },
+                        suggestion,
+                    ),
                 ));
             }
             ChannelModelDisposition::RecoverOnly => {
                 self.finish_operation(&operation);
-                let _ = responses.send(success(
-                    request.id,
-                    self.channel_poll_value(params.channel, "needYou", None),
+                let response = self
+                    .failed_channel_poll_value(params.channel)
+                    .and_then(|value| {
+                        value.ok_or(HostCallError::Store(StoreError::ChannelObservationConflict))
+                    });
+                let _ = responses.send(response.map_or_else(
+                    |error| call_failure(request.id, &error),
+                    |value| success(request.id, value),
                 ));
             }
             ChannelModelDisposition::ExecuteNow => {
-                let connection_status = self
-                    .channels
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .status(params.channel);
-                let context = self.background_context(params.proof());
-                let suggestion_slot = self.operations.suggestion.clone();
-                let responses = responses.clone();
-                let request_id = request.id;
-                std::thread::spawn(move || {
-                    let result = run_channel_outcome(&context, &start).and_then(|suggestion| {
-                        let broker = context
-                            .trusted_broker
-                            .clone()
-                            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+                self.execute_channel_model(request, responses, params, operation, start);
+            }
+        }
+    }
+
+    fn execute_channel_model(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: Arc<AtomicBool>,
+        start: ChannelModelStart,
+    ) {
+        let model_context = match self
+            .store
+            .channel_model_context(start.envelope.channel, &start.envelope.source_message_id)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let connection_status = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status(params.channel);
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result =
+                run_channel_outcome(&context, &start, &model_context).and_then(|suggestion| {
+                    context.reconcile_channel_suggestion(&operation, &start, suggestion)
+                });
+            let response = if let Ok((suggestion, is_current)) = result {
+                success(
+                    request_id,
+                    json!({
+                        "connectionStatus": connection_status,
+                        "eventStatus": if is_current { "ready" } else { "superseded" },
+                        "suggestion": is_current.then_some(suggestion),
+                    }),
+                )
+            } else {
+                let recorded = context
+                    .trusted_broker
+                    .clone()
+                    .ok_or(StoreError::MissingTrustedBrokerEnrollment)
+                    .and_then(|broker| {
                         let mut store = Store::open_with_trusted_broker(
                             &context.paths.store,
                             context.authority.clone(),
                             broker,
                         )?;
-                        store.record_channel_suggestion(
+                        store.fail_channel_model(
                             start.envelope.channel,
                             &start.envelope.source_message_id,
-                            &suggestion,
-                            now_ms()?,
+                            now_ms().map_err(|_| StoreError::ChannelObservationConflict)?,
                         )?;
-                        *suggestion_slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(suggestion.clone());
-                        Ok(suggestion)
+                        let invalidated = store
+                            .latest_channel_suggestion_for(start.envelope.channel)?
+                            .map(|candidate| candidate.id);
+                        let incidents = store
+                            .channel_failure_incident_projection(Some(start.envelope.channel))?;
+                        if incidents.is_empty() {
+                            return Err(StoreError::ChannelObservationConflict);
+                        }
+                        Ok((invalidated, incidents))
                     });
-                    context.finish_operation(&operation);
-                    let _ = responses.send(result.map_or_else(
-                        |error| call_failure(request_id, &error),
-                        |suggestion| {
-                            success(
-                                request_id,
-                                json!({
-                                    "connectionStatus": connection_status,
-                                    "eventStatus": "ready",
-                                    "suggestion": suggestion,
-                                }),
-                            )
-                        },
-                    ));
-                });
-            }
-        }
+                match recorded {
+                    Ok((invalidated, incidents)) => {
+                        if let Some(invalidated_id) = invalidated.as_deref() {
+                            let mut slot = context
+                                .operations
+                                .suggestion
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot
+                                .as_ref()
+                                .is_some_and(|candidate| candidate.id == invalidated_id)
+                            {
+                                *slot = None;
+                            }
+                        }
+                        success(
+                            request_id,
+                            json!({
+                                "connectionStatus": connection_status,
+                                "eventStatus": "needYou",
+                                "suggestion": null,
+                                "invalidateSuggestionId": invalidated,
+                                "failureIncidents": incidents,
+                            }),
+                        )
+                    }
+                    Err(error) => host_failure(request_id, &error),
+                }
+            };
+            context.finish_operation(&operation);
+            let _ = responses.send(response);
+        });
     }
 
     fn channel_poll_value(
@@ -1534,6 +2133,56 @@ impl Host {
             "eventStatus": event_status,
             "suggestion": suggestion,
         })
+    }
+
+    fn respond_when_channel_idle(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: &Arc<AtomicBool>,
+    ) {
+        let poll_value = self.failed_channel_poll_value(params.channel).map(|value| {
+            value.unwrap_or_else(|| self.channel_poll_value(params.channel, "idle", None))
+        });
+        self.finish_operation(operation);
+        let _ = responses.send(poll_value.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        ));
+    }
+
+    fn failed_channel_poll_value(
+        &self,
+        channel: ChannelKind,
+    ) -> Result<Option<Value>, HostCallError> {
+        if self.store.latest_failed_channel_model(channel)?.is_none() {
+            return Ok(None);
+        }
+        let invalidated = self
+            .store
+            .latest_channel_suggestion_for(channel)?
+            .map(|candidate| candidate.id);
+        if let Some(invalidated_id) = invalidated.as_deref() {
+            let mut slot = self
+                .operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|candidate| candidate.id == invalidated_id)
+            {
+                *slot = None;
+            }
+        }
+        let mut value = self.channel_poll_value(channel, "needYou", None);
+        value["invalidateSuggestionId"] = json!(invalidated);
+        value["failureIncidents"] = json!(
+            self.store
+                .channel_failure_incident_projection(Some(channel))?
+        );
+        Ok(Some(value))
     }
 
     fn start_account_read(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -1580,6 +2229,7 @@ impl Host {
                 });
             if result.is_err() {
                 context.finish_operation(&token);
+                context.retire_codex_runtime();
             }
             let _ = responses.send(result.map_or_else(
                 |error| call_failure(request_id, &error),
@@ -1625,9 +2275,10 @@ impl Host {
         std::thread::spawn(move || {
             let result = context.with_client(|client| client.await_chatgpt_login(&params.login_id));
             context.finish_operation(&token);
+            context.retire_codex_runtime();
             let _ = responses.send(result.map_or_else(
                 |error| call_failure(request_id, &error),
-                |value| success(request_id, value),
+                |()| success(request_id, json!({"status": "completed"})),
             ));
         });
     }
@@ -1729,6 +2380,27 @@ impl Host {
                 return;
             }
             Ok(None) => {
+                let mission_id = match mission_id_for_suggestion_id(&params.suggestion_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = responses.send(call_failure(request.id, &error));
+                        return;
+                    }
+                };
+                match self.another_mission_needs_owner(&mission_id) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let _ = responses.send(call_failure(
+                            request.id,
+                            &HostCallError::MissionAlreadyInProgress,
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = responses.send(call_failure(request.id, &error));
+                        return;
+                    }
+                }
                 let suggestion = self
                     .operations
                     .suggestion
@@ -1744,6 +2416,17 @@ impl Host {
                     let _ = responses.send(invalid_params(request.id));
                     return;
                 };
+                match self.channel_suggestion_is_current(&suggestion) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = responses.send(invalid_params(request.id));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = responses.send(call_failure(request.id, &error));
+                        return;
+                    }
+                }
                 now_ms().and_then(|clicked_at_ms| {
                     self.persist_confirmed_mission(
                         &suggestion,
@@ -1774,6 +2457,54 @@ impl Host {
         let _ = responses.send(response);
     }
 
+    fn cancel_mission(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<CancelMission>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<MissionCancellation, HostCallError> {
+            let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+                return Err(HostCallError::Internal);
+            };
+            let Some(mission) = self.store.get_mission(&params.mission_id, &anchor)? else {
+                return Err(HostCallError::Internal);
+            };
+            if mission.status.is_terminal() {
+                return Err(HostCallError::Internal);
+            }
+            let cancelled_at_ms = now_ms()?;
+            let mut results = self
+                .store
+                .execute_mission_command_batch(&mission_command_batch(
+                    Some(&anchor),
+                    &mission.id,
+                    vec![MissionCommand::Cancel {
+                        mission_id: mission.id.clone(),
+                        now_ms: cancelled_at_ms,
+                    }],
+                )?)?;
+            let cancelled = results.pop().ok_or(HostCallError::Internal)?;
+            if cancelled.mission.id != mission.id
+                || cancelled.mission.status != MissionStatus::Cancelled
+                || cancelled.receipt.is_some()
+            {
+                return Err(HostCallError::Internal);
+            }
+            Ok(MissionCancellation {
+                mission_id: cancelled.mission.id,
+                status: cancelled.mission.status,
+                audit_anchor: cancelled.anchor,
+            })
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |cancelled| success(request.id, cancelled),
+        ));
+    }
+
     fn confirmed_mission_for_suggestion_id(
         &self,
         suggestion_id: &str,
@@ -1793,6 +2524,22 @@ impl Host {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    fn another_mission_needs_owner(
+        &self,
+        expected_mission_id: &str,
+    ) -> Result<bool, HostCallError> {
+        let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .list_missions(&anchor)?
+            .into_iter()
+            .any(|mission| {
+                mission.id != expected_mission_id && mission.status == MissionStatus::NeedsMe
+            }))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1908,7 +2655,7 @@ impl Host {
         let envelopes = mission_command_batch(expected_anchor.as_ref(), &mission_id, commands)?;
         let mut results = if let Some(source) = channel_source {
             self.store
-                .execute_mission_command_batch_with_channel_origin(
+                .execute_mission_command_batch_with_primary_channel_route(
                     &envelopes,
                     source.channel,
                     &source.source_message_id,
@@ -2133,28 +2880,23 @@ impl Host {
                 return;
             }
         };
-        let channel_origin = match self.store.channel_mission_origin(&mission.id) {
+        let channel_route_set = match self.store.channel_route_set(&mission.id) {
             Ok(value) => value,
             Err(error) => {
                 let _ = responses.send(host_failure(request.id, &error));
                 return;
             }
         };
-        let completion_time = match (
-            channel_origin.as_ref(),
+        let Some(completion_time) = receipt_completion_time(
+            channel_route_set.as_ref(),
             params.receipt_return_approved_at_ms,
+            params.receipt_return_route_id.as_deref(),
             mission.status,
-        ) {
-            (Some(_), Some(approved_at_ms), MissionStatus::Active)
-                if approved_at_ms >= mission.updated_at_ms && approved_at_ms <= observed_now =>
-            {
-                approved_at_ms
-            }
-            (Some(_), Some(_), MissionStatus::Completed) | (None, None, _) => observed_now,
-            _ => {
-                let _ = responses.send(invalid_params(request.id));
-                return;
-            }
+            mission.updated_at_ms,
+            observed_now,
+        ) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
         };
         let Some(completions) = validated_reminder_completions(
             &mission,
@@ -2172,7 +2914,8 @@ impl Host {
                 &anchor,
                 &completions,
                 completion_time,
-                channel_origin.as_ref(),
+                channel_route_set.as_ref(),
+                params.receipt_return_route_id.as_deref(),
             ),
             MissionStatus::Completed => {
                 match self.existing_receipt_for_completions(&mission, &anchor, &completions) {
@@ -2202,7 +2945,8 @@ impl Host {
         anchor: &AuditAnchor,
         completions: &BTreeMap<String, ReminderCompletion>,
         completed_at_ms: i64,
-        channel_origin: Option<&openopen_protocol::ChannelMissionOrigin>,
+        channel_route_set: Option<&ChannelRouteSet>,
+        receipt_return_route_id: Option<&str>,
     ) -> Result<Receipt, HostCallError> {
         let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 7);
         let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
@@ -2242,7 +2986,8 @@ impl Host {
         }
         let mut receipt_completed_at_ms = completed_at_ms;
         let mut receipt = new_reminder_receipt(mission, &evidence_ids, completed_at_ms)?;
-        if let Some(origin) = channel_origin {
+        if let (Some(route_set), Some(route_id)) = (channel_route_set, receipt_return_route_id) {
+            let route = approved_receipt_route(route_set, Some(route_id))?;
             receipt_completed_at_ms = completed_at_ms
                 .checked_add(6)
                 .ok_or(HostCallError::Internal)?;
@@ -2257,25 +3002,27 @@ impl Host {
                 completed_at_ms: receipt_completed_at_ms,
             };
             let content = channel_receipt_content(&receipt_value);
-            let payload = external_channel_payload(origin.channel, &content)?;
+            let payload = external_channel_payload(route.channel, &content)?;
             let proposal = ActionProposal {
                 effect: EffectKind::ChannelSend,
                 mission_id: mission.id.clone(),
                 mission_scope_digest: mission.scope_digest.clone(),
                 target: ActionTarget::Channel {
-                    channel: origin.channel,
-                    conversation_id: origin.conversation_id.clone(),
-                    recipient_ids: vec![origin.owner_sender_id.clone()],
+                    channel: route.channel,
+                    conversation_id: route.conversation_id.clone(),
+                    recipient_ids: vec![route.owner_sender_id.clone()],
                 },
                 estimated_cost_micros: None,
             };
             let outbound_id = hashed_identifier(
                 "channel-send",
                 &json!({
-                    "channel": origin.channel,
+                    "channel": route.channel,
                     "contentSha256": format!("{:x}", Sha256::digest(&payload)),
                     "kind": ChannelMessageKind::Receipt,
                     "missionId": mission.id,
+                    "routeId": route.route_id,
+                    "routeSetRevision": route_set.revision,
                 }),
             )?;
             commands.extend(channel_send_approval_commands(
@@ -2375,6 +3122,26 @@ impl Host {
         Some(token)
     }
 
+    fn validate_store_control_proof(
+        &self,
+        request_id: u64,
+        proof: &RuntimeProof,
+        responses: &Sender<RpcResponse>,
+    ) -> bool {
+        if !self.consume_runtime_challenge(&proof.broker_receipt) {
+            let _ = responses.send(invalid_params(request_id));
+            return false;
+        }
+        if let Err(error) = self
+            .store
+            .require_runtime_checkpoint(&proof.authorization, &proof.broker_receipt)
+        {
+            let _ = responses.send(host_failure(request_id, &error));
+            return false;
+        }
+        true
+    }
+
     fn consume_runtime_challenge(&self, receipt: &RuntimeControlReceipt) -> bool {
         let expected = self
             .operations
@@ -2401,7 +3168,29 @@ impl Host {
             trusted_broker: self.store.trusted_broker_enrollment().cloned(),
             proof,
             codex: self.operations.codex.clone(),
+            codex_pid: self.operations.codex_pid.clone(),
+            instance_lease: self.instance_lease.clone(),
         }
+    }
+
+    fn retire_codex_runtime(&self) {
+        self.operations.codex_cancel.store(true, Ordering::Release);
+        let client = self
+            .operations
+            .codex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        *self
+            .operations
+            .codex_pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .instance_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        drop(client);
     }
 
     fn has_instance_lease(&self) -> bool {
@@ -2430,9 +3219,46 @@ struct BackgroundContext {
     trusted_broker: Option<TrustedBrokerEnrollment>,
     proof: RuntimeProof,
     codex: Arc<Mutex<Option<CodexClient>>>,
+    codex_pid: Arc<Mutex<Option<i32>>>,
+    instance_lease: Arc<Mutex<Option<CoreInstanceLease>>>,
 }
 
 impl BackgroundContext {
+    fn reconcile_channel_suggestion(
+        &self,
+        operation: &Arc<AtomicBool>,
+        start: &ChannelModelStart,
+        suggestion: OutcomeSuggestion,
+    ) -> Result<(OutcomeSuggestion, bool), HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store.record_channel_suggestion(
+                start.envelope.channel,
+                &start.envelope.source_message_id,
+                &suggestion,
+                now_ms()?,
+            )?;
+            let is_current = !store.channel_model_work_pending(start.envelope.channel)?
+                && store
+                    .latest_channel_suggestion_for(start.envelope.channel)?
+                    .is_some_and(|latest| latest.id == suggestion.id);
+            if is_current {
+                *self
+                    .operations
+                    .suggestion
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(suggestion.clone());
+            }
+            Ok((suggestion, is_current))
+        })
+    }
+
     fn with_client<T>(
         &self,
         operation: impl FnOnce(&mut CodexClient) -> Result<T, CodexError>,
@@ -2458,6 +3284,24 @@ impl BackgroundContext {
 
     fn finish_operation(&self, token: &Arc<AtomicBool>) {
         self.operations.finish_operation(token);
+    }
+
+    fn retire_codex_runtime(&self) {
+        self.operations.codex_cancel.store(true, Ordering::Release);
+        let client = self
+            .codex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        *self
+            .codex_pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .instance_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        drop(client);
     }
 }
 
@@ -2491,6 +3335,92 @@ impl Drop for ModelWorkspace {
     }
 }
 
+struct DurableChannelInbound<'a> {
+    params: &'a PollChannel,
+    observation: &'a ChannelObservation,
+    ingested: &'a ChannelInboundResult,
+    model_work_ready: bool,
+}
+
+fn empty_dashboard(
+    runtime: impl Serialize,
+    suggestion: Option<&OutcomeSuggestion>,
+    incidents: impl Serialize,
+) -> Value {
+    json!({
+        "activeCards": [],
+        "channelFailureIncidents": incidents,
+        "channelRouteSet": null,
+        "confirmedMission": null,
+        "microphone": {"available": false, "reason": "Microphone unavailable until Voice setup"},
+        "needsYou": null,
+        "receipt": null,
+        "runtime": runtime,
+        "suggestion": suggestion
+    })
+}
+
+fn dashboard_focus<'a>(
+    nonterminal: &[&'a Mission],
+    confirmed: &[ConfirmedMission],
+) -> Option<&'a Mission> {
+    nonterminal
+        .iter()
+        .copied()
+        .find(|mission| mission.status == MissionStatus::NeedsMe)
+        .or_else(|| {
+            confirmed.first().and_then(|candidate| {
+                nonterminal
+                    .iter()
+                    .copied()
+                    .find(|mission| mission.id == candidate.mission_id)
+            })
+        })
+        .or_else(|| nonterminal.first().copied())
+}
+
+fn dashboard_active_cards(nonterminal: &[&Mission], focus: Option<&Mission>) -> Vec<Value> {
+    let focus_id = focus.map(|mission| mission.id.as_str());
+    focus
+        .into_iter()
+        .chain(nonterminal.iter().copied().filter(|mission| {
+            Some(mission.id.as_str()) != focus_id && mission.status == MissionStatus::NeedsMe
+        }))
+        .chain(nonterminal.iter().copied().filter(|mission| {
+            Some(mission.id.as_str()) != focus_id && mission.status != MissionStatus::NeedsMe
+        }))
+        .take(3)
+        .map(|mission| {
+            let state = match mission.status {
+                MissionStatus::Active => "working",
+                MissionStatus::NeedsMe => "Need you",
+                MissionStatus::Paused => "Paused",
+                MissionStatus::Proposed | MissionStatus::AwaitingConfirmation => {
+                    "Awaiting confirmation"
+                }
+                MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Cancelled => {
+                    unreachable!()
+                }
+            };
+            json!({"id": mission.id, "state": state, "title": mission.title})
+        })
+        .collect()
+}
+
+fn dashboard_needs_you(focus: Option<&Mission>) -> Option<MissionNeedsYou> {
+    focus.and_then(|mission| {
+        (mission.status == MissionStatus::NeedsMe)
+            .then_some(mission.needs_me.as_ref())
+            .flatten()
+            .map(|needs_me| MissionNeedsYou {
+                mission_id: mission.id.clone(),
+                title: mission.title.clone(),
+                prompt: needs_me.prompt.clone(),
+                created_at_ms: needs_me.created_at_ms,
+            })
+    })
+}
+
 #[derive(Debug, Error)]
 enum HostCallError {
     #[error("Store failed")]
@@ -2501,8 +3431,24 @@ enum HostCallError {
     Io(#[from] io::Error),
     #[error("host setup failed")]
     Host(#[from] HostError),
+    #[error("channel listener is unavailable")]
+    ChannelUnavailable,
+    #[error("channel boundary verification failed")]
+    ChannelIntegrity,
+    #[error("another Mission still needs the owner")]
+    MissionAlreadyInProgress,
     #[error("internal failure")]
     Internal,
+}
+
+fn channel_runtime_failure(error: &ChannelRuntimeError) -> HostCallError {
+    match error {
+        ChannelRuntimeError::PairingMismatch => HostCallError::ChannelIntegrity,
+        ChannelRuntimeError::Runtime(_)
+        | ChannelRuntimeError::AlreadyRunning
+        | ChannelRuntimeError::Adapter
+        | ChannelRuntimeError::Recovery => HostCallError::ChannelUnavailable,
+    }
 }
 
 #[derive(Deserialize)]
@@ -2608,6 +3554,7 @@ struct ChannelSelection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PollChannel {
     channel: ChannelKind,
+    model_work_allowed: bool,
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
 }
@@ -2623,8 +3570,28 @@ impl PollChannel {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcknowledgeChannelFailure {
+    incident_id: String,
+    expected_incident_audit_anchor: EffectAuditAnchor,
+    acknowledged_at_ms: i64,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl AcknowledgeChannelFailure {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SendChannelMessage {
     mission_id: String,
+    route_id: String,
     kind: ChannelMessageKind,
     content: String,
     approved_at_ms: i64,
@@ -2645,6 +3612,14 @@ impl SendChannelMessage {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PairChannel {
     pairing: ChannelPairing,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindChannelRoute {
+    approval: ChannelRouteApproval,
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
 }
@@ -2687,6 +3662,31 @@ struct ConfirmMission {
     reminder_target: ReminderTarget,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelMission {
+    mission_id: String,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl CancelMission {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionCancellation {
+    mission_id: String,
+    status: MissionStatus,
+    audit_anchor: AuditAnchor,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReminderTarget {
@@ -2718,6 +3718,7 @@ struct CompleteReminders {
     mission_id: String,
     completions: Vec<ReminderCompletion>,
     receipt_return_approved_at_ms: Option<i64>,
+    receipt_return_route_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2971,14 +3972,9 @@ fn external_channel_payload(channel: ChannelKind, content: &str) -> Result<Vec<u
 fn run_channel_outcome(
     context: &BackgroundContext,
     start: &ChannelModelStart,
+    model_context: &[(ChannelEnvelope, String)],
 ) -> Result<OutcomeSuggestion, HostCallError> {
-    let source_digest = serialized_sha256(&start.envelope)?;
-    let source_ref = format!("channel:{}", &source_digest[..24]);
-    let outcome = OutcomeRequest {
-        prompt: start.content.clone(),
-        allowed_source_refs: vec![source_ref],
-    };
-    outcome.validate()?;
+    let outcome = channel_outcome_request(start, model_context)?;
     let workspace = ModelWorkspace::create(&context.paths.model_input_root)?;
     let value = context.with_client(|client| {
         client.run_structured_outcome_in_workspace(&outcome, &workspace.path)
@@ -2999,6 +3995,67 @@ fn run_channel_outcome(
         return Err(HostCallError::Internal);
     }
     Ok(suggestion)
+}
+
+fn channel_outcome_request(
+    start: &ChannelModelStart,
+    model_context: &[(ChannelEnvelope, String)],
+) -> Result<OutcomeRequest, HostCallError> {
+    let Some((latest_envelope, latest_content)) = model_context.last() else {
+        return Err(HostCallError::Internal);
+    };
+    if model_context.len() > 2 {
+        return Err(HostCallError::Internal);
+    }
+    if latest_envelope != &start.envelope || latest_content != &start.content {
+        return Err(HostCallError::Internal);
+    }
+    if model_context.len() > 1 && !explicit_previous_message_correction(latest_content) {
+        return Err(HostCallError::Internal);
+    }
+    let mut allowed_source_refs = Vec::with_capacity(model_context.len());
+    for (envelope, _) in model_context {
+        if envelope.channel != start.envelope.channel
+            || envelope.sender_id != start.envelope.sender_id
+            || envelope.conversation_id != start.envelope.conversation_id
+        {
+            return Err(HostCallError::Internal);
+        }
+        let source_digest = serialized_sha256(envelope)?;
+        allowed_source_refs.push(format!("channel:{}", &source_digest[..24]));
+    }
+    let prompt = if model_context.len() == 1 {
+        start.content.clone()
+    } else {
+        let mut prompt = String::from(
+            "The following are exactly two chronological instructions from the same approved owner in the same approved conversation. The latest message explicitly begins with `Correction to previous:` and is authorized to revise only the immediately preceding message. Produce one final structured Outcome that honors the explicit correction and preserves only compatible details from that one predecessor.\n",
+        );
+        for (index, (_, content)) in model_context.iter().enumerate() {
+            prompt.push_str("\nMessage ");
+            prompt.push_str(&(index + 1).to_string());
+            prompt.push_str(":\n");
+            prompt.push_str(content);
+            prompt.push('\n');
+        }
+        prompt
+    };
+    let outcome = OutcomeRequest {
+        prompt,
+        allowed_source_refs,
+    };
+    outcome.validate()?;
+    Ok(outcome)
+}
+
+fn explicit_previous_message_correction(content: &str) -> bool {
+    const PREFIX: &str = "correction to previous:";
+    let Some(prefix) = content.get(..PREFIX.len()) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case(PREFIX)
+        && content
+            .get(PREFIX.len()..)
+            .is_some_and(|remainder| !remainder.trim().is_empty())
 }
 
 fn valid_outcome_suggestion(suggestion: &OutcomeSuggestion) -> bool {
@@ -3227,6 +4284,62 @@ fn reminder_mirror_links(
         .collect()
 }
 
+fn receipt_completion_time(
+    route_set: Option<&ChannelRouteSet>,
+    approved_at_ms: Option<i64>,
+    route_id: Option<&str>,
+    status: MissionStatus,
+    mission_updated_at_ms: i64,
+    observed_now: i64,
+) -> Option<i64> {
+    match (route_set, approved_at_ms, route_id, status) {
+        (Some(routes), Some(approved), Some(route), MissionStatus::Active)
+            if approved >= mission_updated_at_ms
+                && approved <= observed_now
+                && routes.routes.iter().any(|candidate| {
+                    candidate.route_id == route
+                        && candidate
+                            .allowed_outbound_classes
+                            .contains(&ChannelMessageKind::Receipt)
+                }) =>
+        {
+            Some(approved)
+        }
+        (Some(routes), Some(_), Some(route), MissionStatus::Completed)
+            if routes.routes.iter().any(|candidate| {
+                candidate.route_id == route
+                    && candidate
+                        .allowed_outbound_classes
+                        .contains(&ChannelMessageKind::Receipt)
+            }) =>
+        {
+            Some(observed_now)
+        }
+        (Some(_), None, None, MissionStatus::Active | MissionStatus::Completed) => {
+            Some(observed_now)
+        }
+        (None, None, None, _) => Some(observed_now),
+        _ => None,
+    }
+}
+
+fn approved_receipt_route<'a>(
+    route_set: &'a ChannelRouteSet,
+    route_id: Option<&str>,
+) -> Result<&'a openopen_protocol::ChannelRoute, HostCallError> {
+    let route_id = route_id.ok_or(HostCallError::Internal)?;
+    route_set
+        .routes
+        .iter()
+        .find(|route| {
+            route.route_id == route_id
+                && route
+                    .allowed_outbound_classes
+                    .contains(&ChannelMessageKind::Receipt)
+        })
+        .ok_or(HostCallError::Internal)
+}
+
 fn validated_reminder_completions(
     mission: &Mission,
     authority: &LocalAuthority,
@@ -3251,6 +4364,12 @@ fn validated_reminder_completions(
         reminder_authorization_from_mission(mission, ReminderWriteDisposition::RecoverOnly)
             .ok()??;
     let dispatch = reminder_dispatch_tokens(mission, &authorization, authority).ok()?;
+    let dispatch_started_at_ms = mission
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.kind == EvidenceKind::ReminderDispatchStarted)
+        .map(|evidence| evidence.observed_at_ms)
+        .max()?;
     let mirror_links =
         reminder_mirror_links(mission, &authorization.target, &dispatch, authority).ok()?;
     if mirror_links.len() != mission.work_items.len() {
@@ -3266,7 +4385,7 @@ fn validated_reminder_completions(
         if expected_sources.get(&completion.work_item_id) != Some(&completion.source_id)
             || completion.source_id.trim().is_empty()
             || completion.source_id.len() > 512
-            || (require_pending && completion.completed_at_ms < mission.updated_at_ms)
+            || completion.completed_at_ms < dispatch_started_at_ms
             || completion.completed_at_ms < mission.created_at_ms
             || completion.completed_at_ms > observed_now_ms
             || !source_ids.insert(completion.source_id.clone())
@@ -3633,6 +4752,17 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
             -32_016,
             "Keyring-only Codex state rejected an auth file",
         ),
+        HostCallError::ChannelUnavailable => {
+            failure(Some(id), -32_020, "Channel listener unavailable")
+        }
+        HostCallError::ChannelIntegrity => {
+            failure(Some(id), -32_021, "Channel boundary verification failed")
+        }
+        HostCallError::MissionAlreadyInProgress => failure(
+            Some(id),
+            -32_022,
+            "Finish the current Mission before confirming another",
+        ),
         _ => failure(Some(id), -32_000, "Local operation failed closed"),
     }
 }
@@ -3640,17 +4770,23 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTSTRAP_MAGIC, ChannelConnectionStatus, ChatGptLogin, Host, HostPaths, OperationState,
-        read_bootstrap,
+        BOOTSTRAP_MAGIC, ChannelConnectionStatus, ChannelSendResult, ChatGptLogin, CodexError,
+        Host, HostCallError, HostPaths, OperationState, PollChannel, ReminderTarget, RpcRequest,
+        SendChannelMessage, TransportEvent, TransportInbound, channel_outcome_request,
+        decode_params, mission_command_batch, read_bootstrap,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_core::{
         ActionGate, ActionProposal, ActionTarget, BrokerEnrollmentRecord, CreateMission,
-        CreateWorkItem, EffectKind, GateDecision, MissionCommand, TrustedBrokerEnrollment,
-        broker_enrollment_signing_bytes,
+        CreateWorkItem, EffectKind, GateDecision, MissionCommand, NewBoundaryApproval,
+        TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
     };
+    use openopen_discord_adapter::{InboundEnvelope as DiscordInbound, RecoveryBatch};
     use openopen_protocol::{
-        ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelKind, CoreInstanceLease,
+        ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelCursor, ChannelEnvelope,
+        ChannelFailureIncident, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
+        ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
+        ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision, CoreInstanceLease,
         EFFECT_PROTOCOL_VERSION, EvidenceKind, MissionStatus, OutcomeSuggestion, Receipt,
         RpcResponse, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
         core_instance_lease_signing_bytes, runtime_control_authorization_hash,
@@ -3659,10 +4795,11 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
     fn fixture() -> (tempfile::TempDir, Host) {
@@ -3679,11 +4816,26 @@ mod tests {
                 synthetic_home: support.join("synthetic-home"),
                 model_input_root: support.join("model-input"),
                 imsg_runtime: root_path.join("missing-imsg"),
+                user_home: root_path.clone(),
             },
             [7_u8; 32],
         )
         .unwrap();
         (root, host)
+    }
+
+    #[test]
+    fn host_open_leaves_codex_runtime_home_broker_owned() {
+        let (_root, mut host) = fixture();
+        assert!(!host.paths.codex_home.exists());
+        assert!(!host.paths.synthetic_home.exists());
+        assert!(host.paths.model_input_root.is_dir());
+
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":1,"method":"mission.dashboard.read","params":{}}"#,
+        );
+        assert!(dashboard.error.is_none());
     }
 
     fn fake_imsg_runtime(root: &std::path::Path) -> PathBuf {
@@ -3715,6 +4867,48 @@ for line in sys.stdin:
         receive.recv().unwrap()
     }
 
+    fn dashboard(host: &mut Host, request_id: u64) -> Value {
+        request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "mission.dashboard.read",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap()
+    }
+
+    fn runtime_challenge(host: &mut Host, request_id: u64) -> String {
+        request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "mission.runtime.challenge",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn channel_outbound_count(host: &Host) -> i64 {
+        Connection::open(&host.paths.store)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM channel_outbound", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
     fn hero_suggestion() -> OutcomeSuggestion {
         hero_suggestion_with_id("suggestion-1700000000000-0123456789abcdef0123456789abcdef")
     }
@@ -3740,6 +4934,71 @@ for line in sys.stdin:
         )
         .result
         .unwrap()
+    }
+
+    #[test]
+    fn a_need_you_mission_blocks_confirmation_of_a_second_mission() {
+        let (_root, mut host) = fixture();
+        let first = confirm_hero_mission(&mut host);
+        let first_mission_id = first["missionId"].as_str().unwrap().to_owned();
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let commands = mission_command_batch(
+            Some(&anchor),
+            &first_mission_id,
+            vec![MissionCommand::RequestScopeChange {
+                mission_id: first_mission_id.clone(),
+                approval: NewBoundaryApproval {
+                    id: "approval-owner-boundary".into(),
+                    kind: ApprovalKind::ExpandedScope,
+                    prompt: "Finish the exact owner boundary first.".into(),
+                    scope_digest: "owner-boundary-scope".into(),
+                    target: None,
+                },
+                needs_me_id: "needs-owner-boundary".into(),
+                now_ms: 2_000_000_000_000,
+            }],
+        )
+        .unwrap();
+        host.store.execute_mission_command_batch(&commands).unwrap();
+        let second_id = "suggestion-1700000000001-fedcba9876543210fedcba9876543210";
+        *host
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(hero_suggestion_with_id(second_id));
+
+        let response = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 399,
+                "method": "mission.confirm",
+                "params": {
+                    "suggestionId": second_id,
+                    "reminderTarget": {
+                        "sourceIdentifier": "source-1",
+                        "calendarIdentifier": "calendar-1"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response.error.unwrap().code, -32_022);
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let missions = host.store.list_missions(&anchor).unwrap();
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0].id, first_mission_id);
+        assert_eq!(missions[0].status, MissionStatus::NeedsMe);
+        assert!(
+            host.operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|value| value.id == second_id),
+            "a rejected second confirmation must not consume or mutate its proposal"
+        );
     }
 
     fn record_hero_mirror(host: &mut Host, confirmed: &Value, prefix: &str) -> Value {
@@ -3774,6 +5033,7 @@ for line in sys.stdin:
                 })
             })
             .collect::<Vec<_>>();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         request(
             host,
             &json!({
@@ -3832,6 +5092,29 @@ for line in sys.stdin:
         );
         operations.finish_operation(&second);
         assert!(operations.gate.lock().unwrap().active.is_none());
+    }
+
+    #[test]
+    fn global_off_revokes_channel_model_reconciliation_before_any_publish() {
+        let operations = OperationState::default();
+        operations.accept_recovered_runtime(true, 1);
+        let active = operations.begin_operation().unwrap();
+        assert_eq!(
+            operations.reconcile_active(&active, || Ok(7_u8)).unwrap(),
+            7
+        );
+
+        operations.cancel_active();
+        let published = AtomicBool::new(false);
+        let result = operations.reconcile_active(&active, || {
+            published.store(true, Ordering::Release);
+            Ok(8_u8)
+        });
+        assert!(matches!(
+            result,
+            Err(HostCallError::Codex(CodexError::Cancelled))
+        ));
+        assert!(!published.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3928,6 +5211,28 @@ for line in sys.stdin:
         assert!(racing.login.lock().unwrap().is_none());
         racing.finish_operation(&racing_token);
         assert!(racing.gate.lock().unwrap().active.is_none());
+
+        let aborting = OperationState::default();
+        aborting.accept_recovered_runtime(true, 1);
+        let login_token = aborting.begin_operation().unwrap();
+        assert!(aborting.install_login(
+            &login_token,
+            ChatGptLogin {
+                auth_url: "https://example.invalid".to_owned(),
+                login_id: "abort-before-browser".to_owned(),
+            }
+        ));
+        assert!(aborting.authorize_codex_abort());
+        assert!(login_token.load(Ordering::Acquire));
+        assert!(aborting.login.lock().unwrap().is_none());
+        assert!(aborting.gate.lock().unwrap().active.is_none());
+
+        let model_operation = OperationState::default();
+        model_operation.accept_recovered_runtime(true, 1);
+        let model_token = model_operation.begin_operation().unwrap();
+        assert!(!model_operation.authorize_codex_abort());
+        assert!(!model_token.load(Ordering::Acquire));
+        assert!(model_operation.gate.lock().unwrap().active.is_some());
     }
 
     #[test]
@@ -4326,7 +5631,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn identical_outcomes_create_distinct_missions_but_exact_suggestion_retry_is_idempotent() {
+    fn exact_suggestion_retry_is_idempotent_but_an_active_mission_blocks_a_distinct_suggestion() {
         let (_root, mut host) = fixture();
         let first = confirm_hero_mission(&mut host);
         let first_mission_id = first["missionId"].as_str().unwrap().to_owned();
@@ -4347,7 +5652,7 @@ for line in sys.stdin:
 
         let second_id = "suggestion-1700000000000-89abcdef0123456789abcdef01234567";
         *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion_with_id(second_id));
-        let second = request(
+        let rejected = request(
             &mut host,
             &json!({
                 "jsonrpc": "2.0",
@@ -4356,10 +5661,24 @@ for line in sys.stdin:
                 "params": {"suggestionId": second_id, "reminderTarget": {"sourceIdentifier": "source-1", "calendarIdentifier": "calendar-1"}}
             })
             .to_string(),
-        )
-        .result
-        .unwrap();
-        assert_ne!(second["missionId"], first_mission_id);
+        );
+        assert_eq!(rejected.error.unwrap().code, -32_602);
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            first_anchor
+        );
+        let missions = host.store.list_missions(&first_anchor).unwrap();
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0].id, first_mission_id);
+        assert!(
+            host.operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|value| value.id == second_id),
+            "rejecting a distinct suggestion while a Mission is active must not consume it"
+        );
     }
 
     #[test]
@@ -4481,6 +5800,14 @@ for line in sys.stdin:
             .get_mission(&mission_id, &anchor)
             .unwrap()
             .unwrap();
+        let dispatch_started_at_ms = mission
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.kind == EvidenceKind::ReminderDispatchStarted)
+            .map(|evidence| evidence.observed_at_ms)
+            .max()
+            .unwrap();
+        assert!(dispatch_started_at_ms < mission.updated_at_ms);
         let completions = mission
             .work_items
             .iter()
@@ -4489,7 +5816,7 @@ for line in sys.stdin:
                 json!({
                     "workItemId": item.id,
                     "sourceId": confirmed["reminderLinks"][index]["calendarItemIdentifier"],
-                    "completedAtMs": mission.updated_at_ms
+                    "completedAtMs": dispatch_started_at_ms
                 })
             })
             .collect::<Vec<_>>();
@@ -4554,6 +5881,165 @@ for line in sys.stdin:
                 .get_receipt(&receipt.id, &completed_anchor)
                 .unwrap(),
             Some(receipt)
+        );
+    }
+
+    #[test]
+    fn local_reminder_evidence_can_complete_a_routed_mission_without_channel_outbound() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let broker = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &broker).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let mission_id = seed_primary_discord_mission(&mut host);
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":320,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        let confirmed = record_hero_mirror(
+            &mut host,
+            &dashboard["confirmedMission"],
+            "eventkit-local-only",
+        );
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let mission = host
+            .store
+            .get_mission(&mission_id, &anchor)
+            .unwrap()
+            .unwrap();
+        let completions = mission
+            .work_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                json!({
+                    "workItemId": item.id,
+                    "sourceId": confirmed["reminderLinks"][index]["calendarItemIdentifier"],
+                    "completedAtMs": mission.updated_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let receipt = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 321,
+                "method": "mission.reminders.complete",
+                "params": {
+                    "missionId": mission_id,
+                    "completions": completions,
+                    "receiptReturnApprovedAtMs": null,
+                    "receiptReturnRouteId": null,
+                }
+            })
+            .to_string(),
+        );
+        assert!(receipt.error.is_none(), "{receipt:?}");
+        assert_eq!(receipt.result.unwrap()["actualModel"], "gpt-5.6-sol");
+        let outbound_count = Connection::open(&host.paths.store)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM channel_outbound", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(outbound_count, 0);
+    }
+
+    #[test]
+    fn typed_mission_cancel_preserves_started_reminder_and_route_audit_without_effects() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let broker = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &broker).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let mission_id = seed_primary_discord_mission(&mut host);
+        let started = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 322,
+                "method": "mission.reminders.begin",
+                "params": {"missionId": mission_id}
+            })
+            .to_string(),
+        );
+        assert_eq!(started.result.unwrap()["executeNow"], true);
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let before = host
+            .store
+            .get_mission(&mission_id, &anchor)
+            .unwrap()
+            .unwrap();
+        let before_evidence = before.evidence.clone();
+        let before_routes = host.store.channel_route_set(&mission_id).unwrap().unwrap();
+        let challenge = runtime_challenge(&mut host, 323);
+        let cancelled = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 324,
+                "method": "mission.cancel",
+                "params": {
+                    "missionId": mission_id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
+        let cancelled_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        let cancelled_mission = host
+            .store
+            .get_mission(&mission_id, &cancelled_anchor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled_mission.status, MissionStatus::Cancelled);
+        assert_eq!(cancelled_mission.evidence, before_evidence);
+        assert_eq!(
+            host.store.channel_route_set(&mission_id).unwrap().unwrap(),
+            before_routes
+        );
+        assert!(
+            host.store
+                .list_receipts(&cancelled_anchor)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(channel_outbound_count(&host), 0);
+
+        let dashboard = dashboard(&mut host, 325);
+        assert!(dashboard["activeCards"].as_array().unwrap().is_empty());
+        assert!(dashboard["confirmedMission"].is_null());
+        assert!(dashboard["receipt"].is_null());
+
+        let retry_challenge = runtime_challenge(&mut host, 326);
+        let terminal_retry = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 327,
+                "method": "mission.cancel",
+                "params": {
+                    "missionId": mission_id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&retry_challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert!(terminal_retry.error.is_some());
+        assert_eq!(
+            host.store.current_verified_audit_anchor().unwrap().unwrap(),
+            cancelled_anchor
         );
     }
 
@@ -4634,17 +6120,34 @@ for line in sys.stdin:
         assert!(dashboard["activeCards"].as_array().unwrap().is_empty());
         assert_eq!(dashboard["receipt"], receipt);
 
-        assert_dashboard_recovers_receipt_and_new_mission(&mut reopened, &receipt);
+        assert_dashboard_hides_historical_receipt_while_new_mission_is_active(
+            &mut reopened,
+            &receipt,
+        );
     }
 
-    fn assert_dashboard_recovers_receipt_and_new_mission(reopened: &mut Host, receipt: &Value) {
+    fn assert_dashboard_hides_historical_receipt_while_new_mission_is_active(
+        reopened: &mut Host,
+        historical_receipt: &Value,
+    ) {
         let second_id = "suggestion-1700000000000-89abcdef0123456789abcdef01234567";
         *reopened.operations.suggestion.lock().unwrap() = Some(hero_suggestion_with_id(second_id));
+        let pending = request(
+            reopened,
+            r#"{"jsonrpc":"2.0","id":311,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(pending["suggestion"]["id"], second_id);
+        assert!(pending["confirmedMission"].is_null());
+        assert!(pending["receipt"].is_null());
+        assert!(pending["channelRouteSet"].is_null());
+        assert!(pending["activeCards"].as_array().unwrap().is_empty());
         let second = request(
             reopened,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 311,
+                "id": 312,
                 "method": "mission.confirm",
                 "params": {"suggestionId": second_id, "reminderTarget": {"sourceIdentifier": "source-1", "calendarIdentifier": "calendar-1"}}
             })
@@ -4654,7 +6157,7 @@ for line in sys.stdin:
         .unwrap();
         let dashboard = request(
             reopened,
-            r#"{"jsonrpc":"2.0","id":312,"method":"mission.dashboard.read","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":313,"method":"mission.dashboard.read","params":{}}"#,
         )
         .result
         .unwrap();
@@ -4666,7 +6169,11 @@ for line in sys.stdin:
             dashboard["confirmedMission"]["reminderAuthorization"]["writeDisposition"],
             "recoverOnly"
         );
-        assert_eq!(&dashboard["receipt"], receipt);
+        assert!(dashboard["receipt"].is_null());
+        assert_ne!(
+            dashboard["confirmedMission"]["missionId"],
+            historical_receipt["missionId"]
+        );
         assert_eq!(dashboard["activeCards"].as_array().unwrap().len(), 1);
         assert_eq!(dashboard["activeCards"][0]["id"], second["missionId"]);
         assert_eq!(dashboard["activeCards"][0]["state"], "working");
@@ -5030,6 +6537,41 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn replacement_host_requires_exact_broker_reenrollment_before_preparing_off() {
+        let (_root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        let off = host.store.prepare_runtime_control(false, 2).unwrap();
+        host.store
+            .recover_runtime_control(&off, &broker_receipt(&off, None))
+            .unwrap();
+        let paths = host.paths.clone();
+        drop(host);
+
+        let mut replacement = Host::open(paths, [7_u8; 32]).unwrap();
+        let rejected = request(
+            &mut replacement,
+            r#"{"jsonrpc":"2.0","id":32,"method":"mission.runtime.prepare","params":{"enabled":false}}"#,
+        );
+        assert_eq!(rejected.error.unwrap().code, -32_000);
+
+        replacement.store.install_trusted_broker(&broker).unwrap();
+        let prepared = request(
+            &mut replacement,
+            r#"{"jsonrpc":"2.0","id":33,"method":"mission.runtime.prepare","params":{"enabled":false}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(prepared["enabled"], false);
+        assert_eq!(prepared["revision"], 3);
+        assert_eq!(replacement.store.runtime_control().unwrap().revision, 2);
+    }
+
+    #[test]
     fn rolled_back_runtime_prefix_blocks_every_model_route_with_live_off_checkpoint() {
         let (_root, mut host) = fixture();
         let enrollment = broker_record(&host);
@@ -5113,6 +6655,1268 @@ for line in sys.stdin:
         );
     }
 
+    #[test]
+    fn route_bind_rpc_adds_only_the_exact_durable_pairing_to_the_same_mission() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let mission_id = seed_primary_discord_mission(&mut host);
+
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "imessage-owner".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: true,
+                discord: None,
+                paired_at_ms: 4,
+            })
+            .unwrap();
+        let approval = json!({
+            "approvalId": "route-approval-host-imessage",
+            "missionId": mission_id,
+            "expectedRouteSetRevision": 1,
+            "channel": "iMessage",
+            "conversationId": "42",
+            "ownerSenderId": "imessage-owner",
+            "providerIdentity": null,
+            "allowedInboundClasses": ["missionParticipation", "needYouResponse"],
+            "allowedOutboundClasses": [],
+            "actorId": super::ISSUER_ID,
+            "decision": ChannelRouteApprovalDecision::Approve,
+            "decidedAtMs": 5,
+        });
+        let response = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 600,
+                "method": "channel.route.bind",
+                "params": {
+                    "approval": approval,
+                    "authorization": on,
+                    "brokerReceipt": receipt,
+                }
+            })
+            .to_string(),
+        );
+        assert!(response.error.is_none(), "{response:?}");
+        let route_set = response.result.unwrap();
+        assert_eq!(route_set["missionId"], mission_id);
+        assert_eq!(route_set["revision"], 2);
+        assert_eq!(route_set["routes"].as_array().unwrap().len(), 2);
+        assert_eq!(route_set["routes"][1]["channel"], "iMessage");
+        assert_eq!(route_set["routes"][1]["role"], "additional");
+        assert_eq!(route_set["routes"][1]["allowedOutboundClasses"], json!([]));
+
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":601,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(dashboard["channelRouteSet"], route_set);
+        assert!(dashboard.get("channelOrigin").is_none());
+    }
+
+    #[test]
+    fn outbound_response_loss_after_unrelated_route_append_never_calls_provider_send_twice() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let mission_id = seed_primary_discord_mission(&mut host);
+        let route_set = host.store.channel_route_set(&mission_id).unwrap().unwrap();
+        let primary = route_set
+            .routes
+            .iter()
+            .find(|route| route.route_id == route_set.primary_route_id)
+            .unwrap()
+            .clone();
+        let (sends, recoveries) = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .install_test_send_probe(ChannelKind::Discord);
+        let content = "Mission progress is ready.";
+        let first = SendChannelMessage {
+            mission_id: mission_id.clone(),
+            route_id: primary.route_id.clone(),
+            kind: ChannelMessageKind::Progress,
+            content: content.into(),
+            approved_at_ms: super::now_ms().unwrap(),
+            authorization: on.clone(),
+            broker_receipt: receipt.clone(),
+        };
+        let (started, message_body, handle) = host.prepare_channel_send(&first).unwrap();
+        assert_eq!(started.disposition, ChannelOutboundDisposition::ExecuteNow);
+        assert_eq!(
+            handle.send(&started.intent.outbound_id, &message_body),
+            ChannelSendResult::Uncertain
+        );
+        assert_eq!(sends.load(Ordering::Acquire), 1);
+
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "imessage-owner".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: true,
+                discord: None,
+                paired_at_ms: first.approved_at_ms + 1,
+            })
+            .unwrap();
+        let appended = host
+            .store
+            .bind_additional_channel_route(&ChannelRouteApproval {
+                approval_id: "append-unrelated-route-after-response-loss".into(),
+                mission_id: mission_id.clone(),
+                expected_route_set_revision: route_set.revision,
+                channel: ChannelKind::IMessage,
+                conversation_id: "42".into(),
+                owner_sender_id: "imessage-owner".into(),
+                provider_identity: None,
+                allowed_inbound_classes: vec![ChannelInboundMessageClass::MissionParticipation],
+                allowed_outbound_classes: Vec::new(),
+                actor_id: super::ISSUER_ID.into(),
+                decision: ChannelRouteApprovalDecision::Approve,
+                decided_at_ms: first.approved_at_ms + 1,
+            })
+            .unwrap();
+        assert_eq!(appended.revision, route_set.revision + 1);
+
+        let retry = SendChannelMessage {
+            approved_at_ms: first.approved_at_ms + 2,
+            ..first
+        };
+        let (recovered, recovered_body, recovered_handle) =
+            host.prepare_channel_send(&retry).unwrap();
+        assert_eq!(
+            recovered.disposition,
+            ChannelOutboundDisposition::RecoverOnly
+        );
+        assert_eq!(recovered.intent, started.intent);
+        let cursor = recovered.intent.recovery_cursor.as_ref().unwrap();
+        assert_eq!(
+            recovered_handle.recover(&recovered.intent.outbound_id, &recovered_body, cursor,),
+            ChannelSendResult::Uncertain
+        );
+        assert_eq!(sends.load(Ordering::Acquire), 1);
+        assert_eq!(recoveries.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn dashboard_focus_pins_need_you_confirmed_card_and_route_then_reveals_hidden_work() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let routed_mission_id = seed_primary_discord_mission(&mut host);
+
+        let mut other_ids = Vec::new();
+        for (index, suffix) in [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+            "33333333333333333333333333333333",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let suggestion =
+                hero_suggestion_with_id(&format!("suggestion-170000000000{}-{suffix}", index + 1));
+            let confirmed = host
+                .persist_confirmed_mission(
+                    &suggestion,
+                    &ReminderTarget {
+                        source_identifier: "source-1".into(),
+                        calendar_identifier: "calendar-1".into(),
+                    },
+                    super::now_ms().unwrap(),
+                )
+                .unwrap();
+            other_ids.push(confirmed.mission_id);
+        }
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        host.store
+            .execute_mission_command_batch(
+                &mission_command_batch(
+                    Some(&anchor),
+                    &routed_mission_id,
+                    vec![MissionCommand::RequestScopeChange {
+                        mission_id: routed_mission_id.clone(),
+                        approval: NewBoundaryApproval {
+                            id: "dashboard-focus-boundary".into(),
+                            kind: ApprovalKind::ExpandedScope,
+                            prompt: "Approve the exact bounded change.".into(),
+                            scope_digest: "dashboard-focus-scope".into(),
+                            target: None,
+                        },
+                        needs_me_id: "dashboard-focus-needs-you".into(),
+                        now_ms: super::now_ms().unwrap(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let initial_dashboard = dashboard(&mut host, 620);
+        let cards = initial_dashboard["activeCards"].as_array().unwrap();
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0]["id"], routed_mission_id);
+        assert_eq!(cards[0]["state"], "Need you");
+        assert!(initial_dashboard["confirmedMission"].is_null());
+        assert_eq!(initial_dashboard["needsYou"]["missionId"], cards[0]["id"]);
+        assert_eq!(
+            initial_dashboard["channelRouteSet"]["missionId"],
+            cards[0]["id"]
+        );
+        let visible_before = cards
+            .iter()
+            .filter_map(|card| card["id"].as_str())
+            .collect::<HashSet<_>>();
+        let hidden_id = other_ids
+            .iter()
+            .find(|mission_id| !visible_before.contains(mission_id.as_str()))
+            .unwrap();
+
+        let anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
+        host.store
+            .execute_mission_command_batch(
+                &mission_command_batch(
+                    Some(&anchor),
+                    &routed_mission_id,
+                    vec![MissionCommand::Cancel {
+                        mission_id: routed_mission_id.clone(),
+                        now_ms: super::now_ms().unwrap(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let after_cancel = dashboard(&mut host, 621);
+        let cards = after_cancel["activeCards"].as_array().unwrap();
+        assert_eq!(cards.len(), 3);
+        assert!(cards.iter().all(|card| card["id"] != routed_mission_id));
+        assert!(cards.iter().any(|card| card["id"] == hidden_id.as_str()));
+        let focused = after_cancel["confirmedMission"]["missionId"]
+            .as_str()
+            .unwrap();
+        assert!(cards.iter().any(|card| card["id"] == focused));
+        assert!(after_cancel["needsYou"].is_null());
+        assert!(after_cancel["channelRouteSet"].is_null());
+    }
+
+    #[test]
+    fn poll_contract_requires_an_explicit_model_work_capability() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let authorization = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&authorization, None);
+        let exact = json!({
+            "jsonrpc": "2.0",
+            "id": 698,
+            "method": "channel.poll",
+            "params": {
+                "channel": ChannelKind::IMessage,
+                "modelWorkAllowed": false,
+                "authorization": authorization,
+                "brokerReceipt": receipt,
+            }
+        });
+        let request: RpcRequest = serde_json::from_value(exact.clone()).unwrap();
+        let decoded = decode_params::<PollChannel>(&request).unwrap();
+        assert!(!decoded.model_work_allowed);
+
+        let mut missing = exact.clone();
+        missing["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelWorkAllowed");
+        let request: RpcRequest = serde_json::from_value(missing).unwrap();
+        assert!(decode_params::<PollChannel>(&request).is_err());
+
+        let mut unknown = exact;
+        unknown["params"]
+            .as_object_mut()
+            .unwrap()
+            .insert("allowModelFallback".into(), json!(true));
+        let request: RpcRequest = serde_json::from_value(unknown).unwrap();
+        assert!(decode_params::<PollChannel>(&request).is_err());
+    }
+
+    #[test]
+    fn model_forbidden_poll_ingests_inbound_without_starting_a_dispatch() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "owner@example.invalid".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: true,
+                discord: None,
+                paired_at_ms: 1,
+            })
+            .unwrap();
+
+        let params = PollChannel {
+            channel: ChannelKind::IMessage,
+            model_work_allowed: false,
+            authorization: on,
+            broker_receipt: receipt,
+        };
+        let inbound = TransportInbound {
+            channel: ChannelKind::IMessage,
+            source_message_id: "imessage-awaiting-account".into(),
+            sender_id: "owner@example.invalid".into(),
+            conversation_id: "42".into(),
+            content: "Keep this queued until managed ChatGPT is ready.".into(),
+            cursor_opaque_value: "imessage-awaiting-account-cursor".into(),
+            cursor_order: 1,
+            received_at_ms: 2,
+        };
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 699,
+            "method": "channel.poll",
+            "params": {}
+        }))
+        .unwrap();
+        let operation = host.operations.begin_operation().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        host.process_channel_inbound(&request, &send, &params, operation, &inbound);
+        let response = receive.recv().unwrap().result.unwrap();
+
+        assert_eq!(response["eventStatus"], "recovering");
+        assert!(response["suggestion"].is_null());
+        assert_eq!(
+            host.store
+                .next_queued_channel_model(ChannelKind::IMessage)
+                .unwrap()
+                .as_deref(),
+            Some("imessage-awaiting-account")
+        );
+        assert!(
+            host.store
+                .started_channel_model(ChannelKind::IMessage)
+                .unwrap()
+                .is_none(),
+            "a model-forbidden poll may persist/dedupe input but cannot start its dispatch"
+        );
+        assert!(
+            host.operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Chronological two-message recovery proof.
+    fn discord_recovery_defers_model_until_the_final_high_water_cursor() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::Discord,
+                owner_sender_id: "1001".into(),
+                conversation_id: "2002".into(),
+                require_explicit_address: true,
+                discord: Some(openopen_protocol::DiscordPairingMetadata {
+                    guild_id: "3003".into(),
+                    bot_user_id: "4004".into(),
+                    application_id: "5005".into(),
+                    setup_source_message_id: "6006".into(),
+                    setup_candidate_id: format!("discord-pair-{}", "a".repeat(64)),
+                }),
+                paired_at_ms: 1,
+            })
+            .unwrap();
+
+        let recovery = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .install_test_discord_recovery();
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: vec![
+                    DiscordInbound {
+                        source_message_id: "9001".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "prepare the first draft".into(),
+                        received_at_ms: 10,
+                    },
+                    DiscordInbound {
+                        source_message_id: "9002".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content: "Correction to previous: prepare only the revised draft".into(),
+                        received_at_ms: 11,
+                    },
+                ],
+                high_water_message_id: "9003".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+
+        let params = PollChannel {
+            channel: ChannelKind::Discord,
+            model_work_allowed: false,
+            authorization: on,
+            broker_receipt: receipt,
+        };
+        for (request_id, expected_source) in [(700, "9001"), (701, "9002")] {
+            let event = host
+                .channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .poll(ChannelKind::Discord, 42)
+                .unwrap()
+                .unwrap();
+            let TransportEvent::Inbound(inbound) = event else {
+                panic!("recovery must preserve both inbound events before its cursor");
+            };
+            assert_eq!(inbound.source_message_id, expected_source);
+            let request: RpcRequest = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "channel.poll",
+                "params": {}
+            }))
+            .unwrap();
+            let operation = host.operations.begin_operation().unwrap();
+            let (send, receive) = mpsc::sync_channel(1);
+            host.process_channel_inbound(&request, &send, &params, operation, &inbound);
+            let response = receive.recv().unwrap().result.unwrap();
+            assert_eq!(response["eventStatus"], "recovering");
+            assert!(response["suggestion"].is_null());
+            assert_eq!(
+                host.next_ready_channel_model(ChannelKind::Discord, 42)
+                    .unwrap(),
+                None
+            );
+        }
+
+        assert_eq!(
+            host.store
+                .next_queued_channel_model(ChannelKind::Discord)
+                .unwrap()
+                .as_deref(),
+            Some("9001")
+        );
+        assert!(
+            host.operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+
+        let cursor = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poll(ChannelKind::Discord, 42)
+            .unwrap()
+            .unwrap();
+        let TransportEvent::Cursor(cursor) = cursor else {
+            panic!("the final recovery event must be the provider high-water cursor");
+        };
+        host.store.advance_channel_cursor(&cursor).unwrap();
+        host.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acknowledge_recovery(&TransportEvent::Cursor(cursor))
+            .unwrap();
+        assert_eq!(
+            host.next_ready_channel_model(ChannelKind::Discord, 42)
+                .unwrap(),
+            None,
+            "a closed recovery cursor cannot grant model work while Discord is not Connected"
+        );
+        assert_eq!(
+            host.store
+                .next_queued_channel_model(ChannelKind::Discord)
+                .unwrap()
+                .as_deref(),
+            Some("9001"),
+            "the durable dispatch must remain queued without being begun"
+        );
+        host.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_test_discord_connected();
+        assert_eq!(
+            host.next_ready_channel_model(ChannelKind::Discord, 42)
+                .unwrap()
+                .as_deref(),
+            Some("9001"),
+            "the exact queued dispatch may begin only after the adapter is Connected"
+        );
+
+        let original = OutcomeSuggestion {
+            id: "suggestion-10-00000000000000000000000000000001".into(),
+            title: "Prepare the original draft".into(),
+            why_now: "The first recovered message requested it.".into(),
+            proposed_steps: vec!["Draft the original".into()],
+            source_refs: vec!["channel:original".into()],
+        };
+        assert_eq!(
+            host.store
+                .begin_channel_model(ChannelKind::Discord, "9001")
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::ExecuteNow
+        );
+        host.store
+            .record_channel_suggestion(ChannelKind::Discord, "9001", &original, 12)
+            .unwrap();
+        *host
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(original.clone());
+        assert!(
+            host.store
+                .channel_model_work_pending(ChannelKind::Discord)
+                .unwrap()
+        );
+        assert!(!host.channel_suggestion_is_current(&original).unwrap());
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":702,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert!(dashboard["suggestion"].is_null());
+        assert!(
+            request(
+                &mut host,
+                r#"{"jsonrpc":"2.0","id":703,"method":"mission.confirm","params":{"suggestionId":"suggestion-10-00000000000000000000000000000001","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+            )
+            .error
+            .is_some(),
+            "a recovered original must not confirm while its correction is queued"
+        );
+
+        let correction = OutcomeSuggestion {
+            id: "suggestion-11-00000000000000000000000000000002".into(),
+            title: "Prepare only the revised draft".into(),
+            why_now: "The later recovered correction supersedes the original.".into(),
+            proposed_steps: vec!["Draft only the revision".into()],
+            source_refs: vec!["channel:correction".into()],
+        };
+        assert_eq!(
+            host.store
+                .begin_channel_model(ChannelKind::Discord, "9002")
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::ExecuteNow
+        );
+        let correction_context = host
+            .store
+            .channel_model_context(ChannelKind::Discord, "9002")
+            .unwrap();
+        assert_eq!(
+            correction_context
+                .iter()
+                .map(|(envelope, content)| (envelope.source_message_id.as_str(), content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("9001", "prepare the first draft"),
+                (
+                    "9002",
+                    "Correction to previous: prepare only the revised draft"
+                ),
+            ],
+            "the final GPT turn must receive the chronological original and correction"
+        );
+        let final_start = ChannelModelStart {
+            envelope: correction_context.last().unwrap().0.clone(),
+            content: correction_context.last().unwrap().1.clone(),
+            disposition: ChannelModelDisposition::ExecuteNow,
+            suggestion: None,
+        };
+        let final_request = channel_outcome_request(&final_start, &correction_context).unwrap();
+        assert!(
+            final_request.prompt.find("prepare the first draft")
+                < final_request
+                    .prompt
+                    .find("Correction to previous: prepare only the revised draft")
+        );
+        assert_eq!(final_request.allowed_source_refs.len(), 2);
+        let unrelated_context = vec![
+            correction_context[0].clone(),
+            (correction_context[1].0.clone(), "book dinner".to_string()),
+        ];
+        let unrelated_start = ChannelModelStart {
+            envelope: unrelated_context.last().unwrap().0.clone(),
+            content: unrelated_context.last().unwrap().1.clone(),
+            disposition: ChannelModelDisposition::ExecuteNow,
+            suggestion: None,
+        };
+        assert!(
+            channel_outcome_request(&unrelated_start, &unrelated_context).is_err(),
+            "Host must reject caller-assembled multi-message context without the exact correction directive"
+        );
+        let mut middle_envelope = correction_context[0].0.clone();
+        middle_envelope.source_message_id = "9001-middle".into();
+        let overbounded_context = vec![
+            correction_context[0].clone(),
+            (middle_envelope, "an unauthorized extra predecessor".into()),
+            correction_context[1].clone(),
+        ];
+        let overbounded_start = ChannelModelStart {
+            envelope: overbounded_context.last().unwrap().0.clone(),
+            content: overbounded_context.last().unwrap().1.clone(),
+            disposition: ChannelModelDisposition::ExecuteNow,
+            suggestion: None,
+        };
+        assert!(
+            channel_outcome_request(&overbounded_start, &overbounded_context).is_err(),
+            "Host must reject a caller-assembled correction context over the exact two-message cap"
+        );
+        host.store
+            .record_channel_suggestion(ChannelKind::Discord, "9002", &correction, 13)
+            .unwrap();
+        assert!(
+            !host
+                .store
+                .channel_model_work_pending(ChannelKind::Discord)
+                .unwrap()
+        );
+        assert!(host.channel_suggestion_is_current(&correction).unwrap());
+
+        // Emulate loss of the final model response or a Host restart: the
+        // volatile slot is empty, while the durable final suggestion remains.
+        *host
+            .operations
+            .suggestion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let dashboard = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":704,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(dashboard["suggestion"]["id"], correction.id);
+        assert_eq!(
+            host.operations
+                .suggestion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|value| value.id.as_str()),
+            Some(correction.id.as_str())
+        );
+        let confirmed = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":705,"method":"mission.confirm","params":{"suggestionId":"suggestion-11-00000000000000000000000000000002","reminderTarget":{"sourceIdentifier":"source-1","calendarIdentifier":"calendar-1"}}}"#,
+        );
+        assert!(confirmed.error.is_none(), "{confirmed:?}");
+    }
+
+    fn assert_persistent_channel_model_need_you(
+        host: &mut Host,
+        channel: ChannelKind,
+        source_message_id: &str,
+        observed_at_ms: i64,
+    ) {
+        assert!(
+            host.next_ready_channel_model(channel, observed_at_ms)
+                .unwrap()
+                .is_none(),
+            "persistent Need you must leave the transport poll reachable"
+        );
+        let first = host.failed_channel_poll_value(channel).unwrap().unwrap();
+        assert_eq!(first["eventStatus"], "needYou");
+        assert!(first["invalidateSuggestionId"].is_null());
+        assert_eq!(first["failureIncidents"].as_array().unwrap().len(), 1);
+        for _ in 0..100 {
+            assert_eq!(
+                host.failed_channel_poll_value(channel).unwrap().unwrap(),
+                first,
+                "identical terminal polls must publish one stable durable incident"
+            );
+        }
+        assert_eq!(
+            host.store
+                .begin_channel_model(channel, source_message_id)
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::RecoverOnly,
+            "persistent Need you must never grant another model execution"
+        );
+    }
+
+    fn poll_channel_for_test(
+        host: &mut Host,
+        channel: ChannelKind,
+        authorization: &RuntimeControlAuthorization,
+        request_id: u64,
+    ) -> Value {
+        let challenge = request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id.saturating_add(100),
+                "method": "mission.runtime.challenge",
+                "params": {}
+            })
+            .to_string(),
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let receipt = broker_receipt(authorization, Some(&challenge));
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "channel.poll",
+            "params": {
+                "channel": channel,
+                "modelWorkAllowed": true,
+                "authorization": authorization,
+                "brokerReceipt": receipt,
+            }
+        }))
+        .unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        host.poll_channel(&request, &send);
+        let response = receive.recv().unwrap();
+        assert!(response.error.is_none(), "{response:?}");
+        response.result.unwrap()
+    }
+
+    #[test]
+    fn host_restart_surfaces_started_channel_model_as_need_you_without_reexecution() {
+        let (_root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "owner@example.invalid".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: true,
+                discord: None,
+                paired_at_ms: 1,
+            })
+            .unwrap();
+        let content = "@OpenOpen prepare the client follow-up";
+        host.store
+            .ingest_channel_message(
+                &ChannelObservation {
+                    envelope: ChannelEnvelope {
+                        channel: ChannelKind::IMessage,
+                        source_message_id: "imessage-model-started".into(),
+                        sender_id: "owner@example.invalid".into(),
+                        conversation_id: "42".into(),
+                        content_sha256: format!("{:x}", Sha256::digest(content)),
+                        received_at_ms: 2,
+                    },
+                    cursor: ChannelCursor {
+                        channel: ChannelKind::IMessage,
+                        conversation_id: "42".into(),
+                        opaque_value: "cursor-started".into(),
+                        order: 1,
+                        observed_at_ms: 2,
+                    },
+                    is_bot: false,
+                    explicitly_addressed: true,
+                },
+                content,
+            )
+            .unwrap();
+        assert_eq!(
+            host.store
+                .begin_channel_model(ChannelKind::IMessage, "imessage-model-started")
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::ExecuteNow
+        );
+        let paths = host.paths.clone();
+        drop(host);
+
+        let mut restarted = Host::open(paths, [7_u8; 32]).unwrap();
+        restarted.store.install_trusted_broker(&broker).unwrap();
+        restarted
+            .operations
+            .accept_committed_runtime(true, on.revision);
+        assert_eq!(
+            restarted
+                .next_ready_channel_model(ChannelKind::IMessage, 3)
+                .unwrap()
+                .as_deref(),
+            Some("imessage-model-started")
+        );
+        let start = restarted
+            .store
+            .begin_channel_model(ChannelKind::IMessage, "imessage-model-started")
+            .unwrap();
+        assert_eq!(start.disposition, ChannelModelDisposition::RecoverOnly);
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 709,
+            "method": "channel.poll",
+            "params": {}
+        }))
+        .unwrap();
+        let params = PollChannel {
+            channel: ChannelKind::IMessage,
+            model_work_allowed: true,
+            authorization: on,
+            broker_receipt: receipt,
+        };
+        let operation = restarted.operations.begin_operation().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        restarted.process_channel_model_start(&request, &send, &params, operation, start);
+        let response = receive.recv().unwrap().result.unwrap();
+        assert_eq!(response["eventStatus"], "needYou");
+        assert!(response["suggestion"].is_null());
+        assert!(
+            restarted
+                .store
+                .started_channel_model(ChannelKind::IMessage)
+                .unwrap()
+                .is_none(),
+            "recovery must terminally fail the consumed dispatch without granting a second model call"
+        );
+        assert_persistent_channel_model_need_you(
+            &mut restarted,
+            ChannelKind::IMessage,
+            "imessage-model-started",
+            4,
+        );
+    }
+
+    fn failed_imessage_incident_fixture(
+        host: &mut Host,
+    ) -> (
+        BrokerEnrollmentRecord,
+        RuntimeControlAuthorization,
+        ChannelFailureIncident,
+    ) {
+        let broker = broker_record(host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "owner@example.invalid".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: true,
+                discord: None,
+                paired_at_ms: 1,
+            })
+            .unwrap();
+        let content = "@OpenOpen prepare the exact checklist";
+        host.store
+            .ingest_channel_message(
+                &ChannelObservation {
+                    envelope: ChannelEnvelope {
+                        channel: ChannelKind::IMessage,
+                        source_message_id: "incident-ack-message".into(),
+                        sender_id: "owner@example.invalid".into(),
+                        conversation_id: "42".into(),
+                        content_sha256: format!("{:x}", Sha256::digest(content)),
+                        received_at_ms: 2,
+                    },
+                    cursor: ChannelCursor {
+                        channel: ChannelKind::IMessage,
+                        conversation_id: "42".into(),
+                        opaque_value: "incident-ack-cursor".into(),
+                        order: 1,
+                        observed_at_ms: 2,
+                    },
+                    is_bot: false,
+                    explicitly_addressed: true,
+                },
+                content,
+            )
+            .unwrap();
+        host.store
+            .begin_channel_model(ChannelKind::IMessage, "incident-ack-message")
+            .unwrap();
+        host.store
+            .fail_channel_model(ChannelKind::IMessage, "incident-ack-message", 3)
+            .unwrap();
+        let incident = host
+            .store
+            .channel_failure_incidents(None)
+            .unwrap()
+            .remove(0);
+        (broker, on, incident)
+    }
+
+    fn assert_incident_ack_survives_restart(
+        paths: HostPaths,
+        broker: &BrokerEnrollmentRecord,
+        on: &RuntimeControlAuthorization,
+        incident: &ChannelFailureIncident,
+    ) {
+        let mut restarted = Host::open(paths.clone(), [7_u8; 32]).unwrap();
+        restarted.store.install_trusted_broker(broker).unwrap();
+        restarted
+            .operations
+            .accept_committed_runtime(true, on.revision);
+        let dashboard = request(
+            &mut restarted,
+            r#"{"jsonrpc":"2.0","id":714,"method":"mission.dashboard.read","params":{}}"#,
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            dashboard["channelFailureIncidents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(dashboard["channelFailureIncidents"][0]["acknowledgement"].is_object());
+
+        let retry_challenge = request(
+            &mut restarted,
+            r#"{"jsonrpc":"2.0","id":715,"method":"mission.runtime.challenge","params":{}}"#,
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let retry = request(
+            &mut restarted,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 716,
+                "method": "channel.failure.acknowledge",
+                "params": {
+                    "incidentId": incident.incident_id.clone(),
+                    "expectedIncidentAuditAnchor": incident.incident_audit_anchor.clone(),
+                    "acknowledgedAtMs": 5,
+                    "authorization": on.clone(),
+                    "brokerReceipt": broker_receipt(on, Some(&retry_challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert!(retry.error.is_none(), "{retry:?}");
+        assert_eq!(
+            retry.result.unwrap()["acknowledgement"],
+            dashboard["channelFailureIncidents"][0]["acknowledgement"]
+        );
+        let connection = Connection::open(paths.store).unwrap();
+        let acknowledgement_audits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger
+                 WHERE action = 'channel.failure_incident_acknowledged'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledgement_audits, 1);
+        let durable = restarted.store.channel_failure_incidents(None).unwrap();
+        assert_eq!(durable.len(), 1);
+        assert!(durable[0].acknowledgement.is_some());
+        assert_eq!(
+            restarted
+                .store
+                .begin_channel_model(ChannelKind::IMessage, "incident-ack-message")
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::RecoverOnly
+        );
+    }
+
+    #[test]
+    fn incident_acknowledgement_uses_store_control_proof_without_codex_operation_slot() {
+        let (_root, mut host) = fixture();
+        let (broker, on, incident) = failed_imessage_incident_fixture(&mut host);
+        let occupied_model_slot = host.operations.begin_operation().unwrap();
+        let challenge = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":712,"method":"mission.runtime.challenge","params":{}}"#,
+        )
+        .result
+        .unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 713,
+                "method": "channel.failure.acknowledge",
+                "params": {
+                    "incidentId": incident.incident_id.clone(),
+                    "expectedIncidentAuditAnchor": incident.incident_audit_anchor.clone(),
+                    "acknowledgedAtMs": 4,
+                    "authorization": on.clone(),
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert!(response.error.is_none(), "{response:?}");
+        assert!(response.result.unwrap()["acknowledgement"].is_object());
+        assert!(
+            host.operations.begin_operation().is_none(),
+            "acknowledgement must not consume or release the independently occupied model slot"
+        );
+        host.finish_operation(&occupied_model_slot);
+
+        // Treat the successful response as lost, then retire and reopen the
+        // complete verified Host/Store. The Dashboard must expose the durable
+        // acknowledgement and an exact retry must remain idempotent.
+        let paths = host.paths.clone();
+        drop(host);
+        assert_incident_ack_survives_restart(paths, &broker, &on, &incident);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Chronological failure, recovery, and correction proof.
+    fn persistent_need_you_polls_and_persists_a_later_provider_correction() {
+        let (_root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        install_test_core_lease(&mut host);
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::Discord,
+                owner_sender_id: "1001".into(),
+                conversation_id: "2002".into(),
+                require_explicit_address: true,
+                discord: Some(openopen_protocol::DiscordPairingMetadata {
+                    guild_id: "3003".into(),
+                    bot_user_id: "4004".into(),
+                    application_id: "5005".into(),
+                    setup_source_message_id: "6006".into(),
+                    setup_candidate_id: format!("discord-pair-{}", "a".repeat(64)),
+                }),
+                paired_at_ms: 1,
+            })
+            .unwrap();
+        let original = "prepare the client follow-up";
+        host.store
+            .ingest_channel_message(
+                &ChannelObservation {
+                    envelope: ChannelEnvelope {
+                        channel: ChannelKind::Discord,
+                        source_message_id: "9001".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content_sha256: format!("{:x}", Sha256::digest(original)),
+                        received_at_ms: 2,
+                    },
+                    cursor: ChannelCursor {
+                        channel: ChannelKind::Discord,
+                        conversation_id: "2002".into(),
+                        opaque_value: "9001".into(),
+                        order: 9001,
+                        observed_at_ms: 2,
+                    },
+                    is_bot: false,
+                    explicitly_addressed: true,
+                },
+                original,
+            )
+            .unwrap();
+        host.store
+            .begin_channel_model(ChannelKind::Discord, "9001")
+            .unwrap();
+        host.store
+            .fail_channel_model(ChannelKind::Discord, "9001", 3)
+            .unwrap();
+
+        let recovery = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .install_test_discord_recovery();
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: vec![DiscordInbound {
+                    source_message_id: "9002".into(),
+                    sender_id: "1001".into(),
+                    conversation_id: "2002".into(),
+                    content: "Correction to previous: prepare only the revised follow-up".into(),
+                    received_at_ms: 4,
+                }],
+                high_water_message_id: "9003".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+        let inbound = poll_channel_for_test(&mut host, ChannelKind::Discord, &on, 710);
+        assert_eq!(inbound["eventStatus"], "recovering");
+        assert!(
+            host.store
+                .latest_failed_channel_model(ChannelKind::Discord)
+                .unwrap()
+                .is_none()
+        );
+        let cursor = poll_channel_for_test(&mut host, ChannelKind::Discord, &on, 711);
+        assert_eq!(cursor["eventStatus"], "recovered");
+        assert_eq!(
+            host.next_ready_channel_model(ChannelKind::Discord, 5)
+                .unwrap(),
+            None,
+            "the correction must not begin while the Discord adapter is not Connected"
+        );
+        assert_eq!(
+            host.store
+                .next_queued_channel_model(ChannelKind::Discord)
+                .unwrap()
+                .as_deref(),
+            Some("9002"),
+            "persistent Need you must not starve the durable correction queue"
+        );
+        host.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_test_discord_connected();
+        assert_eq!(
+            host.next_ready_channel_model(ChannelKind::Discord, 5)
+                .unwrap()
+                .as_deref(),
+            Some("9002"),
+            "the durable correction may begin only after the adapter is Connected"
+        );
+    }
+
+    fn seed_primary_discord_mission(host: &mut Host) -> String {
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::Discord,
+                owner_sender_id: "1001".into(),
+                conversation_id: "2002".into(),
+                require_explicit_address: true,
+                discord: Some(openopen_protocol::DiscordPairingMetadata {
+                    guild_id: "3003".into(),
+                    bot_user_id: "4004".into(),
+                    application_id: "5005".into(),
+                    setup_source_message_id: "6006".into(),
+                    setup_candidate_id: format!("discord-pair-{}", "a".repeat(64)),
+                }),
+                paired_at_ms: 1,
+            })
+            .unwrap();
+        let recovery = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .install_test_discord_recovery();
+        recovery
+            .send(Ok(RecoveryBatch {
+                envelopes: Vec::new(),
+                high_water_message_id: "0".into(),
+                pages_fetched: 1,
+            }))
+            .unwrap();
+        let recovery_cursor = host
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poll(ChannelKind::Discord, 1)
+            .unwrap()
+            .unwrap();
+        let TransportEvent::Cursor(recovery_cursor) = recovery_cursor else {
+            panic!("the seed Discord session must close its recovery cursor");
+        };
+        host.store.advance_channel_cursor(&recovery_cursor).unwrap();
+        host.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acknowledge_recovery(&TransportEvent::Cursor(recovery_cursor))
+            .unwrap();
+        host.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_test_discord_connected();
+        let content = "@OpenOpen prepare the client follow-up";
+        host.store
+            .ingest_channel_message(
+                &ChannelObservation {
+                    envelope: ChannelEnvelope {
+                        channel: ChannelKind::Discord,
+                        source_message_id: "discord-message-1".into(),
+                        sender_id: "1001".into(),
+                        conversation_id: "2002".into(),
+                        content_sha256: format!("{:x}", Sha256::digest(content)),
+                        received_at_ms: 2,
+                    },
+                    cursor: ChannelCursor {
+                        channel: ChannelKind::Discord,
+                        conversation_id: "2002".into(),
+                        opaque_value: "cursor-1".into(),
+                        order: 1,
+                        observed_at_ms: 2,
+                    },
+                    is_bot: false,
+                    explicitly_addressed: true,
+                },
+                content,
+            )
+            .unwrap();
+        host.store
+            .begin_channel_model(ChannelKind::Discord, "discord-message-1")
+            .unwrap();
+        let suggestion = hero_suggestion();
+        host.store
+            .record_channel_suggestion(ChannelKind::Discord, "discord-message-1", &suggestion, 3)
+            .unwrap();
+        *host.operations.suggestion.lock().unwrap() = Some(suggestion);
+        confirm_hero_mission(host)["missionId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
     fn broker_record(host: &Host) -> BrokerEnrollmentRecord {
         let key = SigningKey::from_bytes(&[41_u8; 32]);
         let verifying_key = key.verifying_key().to_bytes();
@@ -5134,6 +7938,50 @@ for line in sys.stdin:
                 .to_bytes(),
         );
         record
+    }
+
+    fn install_test_core_lease(host: &mut Host) {
+        let broker_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let mut lease = CoreInstanceLease {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            audit_euid: rustix::process::geteuid().as_raw(),
+            app_pid: 1,
+            app_start_time_us: 1,
+            core_pid: i32::try_from(std::process::id()).unwrap(),
+            core_start_time_us: 1,
+            core_audit_token_hex: "aa".repeat(32),
+            codex_pid: 42,
+            codex_start_time_us: 2,
+            codex_audit_token_hex: "bb".repeat(32),
+            core_instance_nonce: host.instance_nonce.clone(),
+            issued_at_ms: super::now_ms().unwrap(),
+            broker_key_id: format!(
+                "{:x}",
+                Sha256::digest(broker_key.verifying_key().to_bytes())
+            ),
+            broker_signature_hex: String::new(),
+        };
+        lease.broker_signature_hex = hex::encode(
+            broker_key
+                .sign(&core_instance_lease_signing_bytes(&lease).unwrap())
+                .to_bytes(),
+        );
+        *host
+            .operations
+            .codex_pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(42);
+        let response = request(
+            host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 712,
+                "method": "broker.lease.install",
+                "params": {"lease": lease}
+            })
+            .to_string(),
+        );
+        assert_eq!(response.result.unwrap()["status"], "installed");
     }
 
     fn broker_receipt(

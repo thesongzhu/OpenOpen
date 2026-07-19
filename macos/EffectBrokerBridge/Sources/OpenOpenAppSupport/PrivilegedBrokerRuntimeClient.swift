@@ -1,3 +1,4 @@
+import Darwin
 import EffectBrokerBridge
 import Foundation
 
@@ -62,6 +63,26 @@ public final class PrivilegedBrokerRuntimeClient: @unchecked Sendable, BrokerRun
     default:
       throw CoreClientError.contractViolation("The protected broker state is incomplete.")
     }
+  }
+
+  public func prepareCodexRuntimeHome() async throws -> String {
+    let encoded = try JSONEncoder().encode(
+      PrepareCodexRuntimeHomeRequest(type: "prepareCodexRuntimeHome", version: 1)
+    )
+    let response = try await request(encoded) { proxy, data, reply in
+      proxy.prepareCodexRuntimeHome(data, withReply: reply)
+    }
+    let decoded = try JSONDecoder().decode(PrepareCodexRuntimeHomeResponse.self, from: response)
+    let expected =
+      "/Library/Application Support/com.thesongzhu.OpenOpenRuntime/users/\(geteuid())/CodexHome"
+    guard decoded.version == 1, decoded.status == "ready", decoded.runtimeDevice > 0,
+      decoded.runtimeHome == expected
+    else {
+      throw CoreClientError.contractViolation(
+        "The protected Codex runtime home is unavailable."
+      )
+    }
+    return decoded.runtimeHome
   }
 
   public func acquireCoreLease(
@@ -165,6 +186,18 @@ private struct ApplyRuntimeControlRequest: Encodable {
   let type: String
   let version: Int
   let control: RuntimeControlAuthorization
+}
+
+private struct PrepareCodexRuntimeHomeRequest: Encodable {
+  let type: String
+  let version: Int
+}
+
+private struct PrepareCodexRuntimeHomeResponse: Decodable {
+  let runtimeHome: String
+  let runtimeDevice: UInt64
+  let status: String
+  let version: Int
 }
 
 private struct CoreLeaseAcquireRequest: Encodable {

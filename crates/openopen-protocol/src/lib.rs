@@ -17,7 +17,7 @@ pub struct OutcomeSuggestion {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MissionStatus {
     Proposed,
@@ -174,7 +174,7 @@ pub struct Receipt {
     pub completed_at_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChannelKind {
     IMessage,
@@ -244,12 +244,15 @@ pub struct ChannelObservation {
 #[serde(rename_all = "camelCase")]
 pub enum ChannelInboundDecision {
     Accepted,
+    AcceptedMissionUpdate,
     Duplicate,
     IgnoredUnpaired,
     IgnoredSender,
     IgnoredConversation,
     IgnoredBot,
     IgnoredNotAddressed,
+    IgnoredMessageClass,
+    IgnoredInactiveMission,
     IgnoredStaleCursor,
 }
 
@@ -258,6 +261,7 @@ pub enum ChannelInboundDecision {
 pub struct ChannelInboundResult {
     pub decision: ChannelInboundDecision,
     pub cursor: ChannelCursor,
+    pub mission_event: Option<ChannelMissionEvent>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,20 +281,131 @@ pub struct ChannelModelStart {
     pub suggestion: Option<OutcomeSuggestion>,
 }
 
-/// The exact approved conversation to which one Mission may return progress,
-/// Need-you prompts, and its Receipt.
+/// Sanitized classification for one terminal channel-model incident. The
+/// failed dispatch remains the immutable authority; this type grants no retry
+/// or provider effect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelFailureClass {
+    ModelResultUnavailable,
+}
+
+/// Durable owner acknowledgement for one exact terminal incident.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ChannelMissionOrigin {
-    pub mission_id: String,
+pub struct ChannelFailureAcknowledgement {
+    pub acknowledged_at_ms: i64,
+    pub runtime_revision: u64,
+    pub audit_anchor: EffectAuditAnchor,
+}
+
+/// One stable, audited presentation record derived from immutable failed-
+/// dispatch correlation. It is informational only and cannot reopen model or
+/// provider authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelFailureIncident {
+    pub incident_id: String,
     pub channel: ChannelKind,
-    pub conversation_id: String,
-    pub owner_sender_id: String,
-    pub source_message_id: String,
-    pub bound_at_ms: i64,
+    pub failure_class: ChannelFailureClass,
+    pub occurred_at_ms: i64,
+    pub runtime_revision: u64,
+    pub dispatch_state_hash: String,
+    pub source_audit_anchor: EffectAuditAnchor,
+    pub incident_audit_anchor: EffectAuditAnchor,
+    pub acknowledgement: Option<ChannelFailureAcknowledgement>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelInboundMessageClass {
+    MissionParticipation,
+    NeedYouResponse,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelRouteRole {
+    Primary,
+    Additional,
+}
+
+/// One immutable, owner-confirmed Mission route. The Store derives the route
+/// and audit identities and never accepts a caller-assembled route snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRoute {
+    pub route_id: String,
+    pub role: ChannelRouteRole,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub owner_sender_id: String,
+    pub provider_identity: Option<String>,
+    pub source_message_id: Option<String>,
+    pub allowed_inbound_classes: Vec<ChannelInboundMessageClass>,
+    pub allowed_outbound_classes: Vec<ChannelMessageKind>,
+    pub revision: u64,
+    pub approval_id: String,
+    pub audit_id: String,
+    pub bound_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRouteSet {
+    pub mission_id: String,
+    pub revision: u64,
+    pub primary_route_id: String,
+    pub routes: Vec<ChannelRoute>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelRouteApprovalDecision {
+    Approve,
+    Reject,
+}
+
+/// Typed owner decision used only to add one exact durable pairing to an
+/// existing Mission route set. Additional outbound classes are explicit and
+/// callers must send an empty list to retain the safe default.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRouteApproval {
+    pub approval_id: String,
+    pub mission_id: String,
+    pub expected_route_set_revision: u64,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub owner_sender_id: String,
+    pub provider_identity: Option<String>,
+    pub allowed_inbound_classes: Vec<ChannelInboundMessageClass>,
+    pub allowed_outbound_classes: Vec<ChannelMessageKind>,
+    pub actor_id: String,
+    pub decision: ChannelRouteApprovalDecision,
+    pub decided_at_ms: i64,
+}
+
+/// Durable participation bound to one exact Mission and route revision. This
+/// is never completion Evidence and never grants a new Mission or scope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelMissionEvent {
+    pub event_id: String,
+    pub mission_id: String,
+    pub mission_revision: i64,
+    pub mission_anchor_hash: String,
+    pub route_id: String,
+    pub route_set_revision: u64,
+    pub message_class: ChannelInboundMessageClass,
+    pub channel: ChannelKind,
+    pub source_message_id: String,
+    pub content_sha256: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChannelMessageKind {
     NeedYou,
@@ -303,6 +418,8 @@ pub enum ChannelMessageKind {
 pub struct ChannelOutboundIntent {
     pub outbound_id: String,
     pub mission_id: String,
+    pub route_id: String,
+    pub route_set_revision: u64,
     pub channel: ChannelKind,
     pub conversation_id: String,
     pub recipient_id: String,

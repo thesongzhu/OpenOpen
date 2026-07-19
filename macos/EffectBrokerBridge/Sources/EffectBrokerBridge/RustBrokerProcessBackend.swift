@@ -27,6 +27,12 @@ private struct BrokerAuditedProcess {
   let auditTokenHex: String
 }
 
+enum BrokerProcessLiveness: Equatable {
+  case alive
+  case dead
+  case inspectionFailure
+}
+
 func stableWorkerAuditToken(
   for pid: pid_t,
   expectedParentPID: pid_t,
@@ -46,7 +52,7 @@ func stableWorkerAuditToken(
     identity.startTimeMicroseconds > 0,
     identity.executableURL.resolvingSymlinksInPath().standardizedFileURL
       == expectedExecutableURL.resolvingSymlinksInPath().standardizedFileURL,
-    processInspector.isAlive(auditTokenHex: before)
+    processInspector.liveness(auditTokenHex: before) == .alive
   else { return nil }
   return before
 }
@@ -54,7 +60,7 @@ func stableWorkerAuditToken(
 protocol BrokerProcessInspecting {
   func identity(for pid: pid_t) -> BrokerProcessIdentity?
   func auditTokenHex(for pid: pid_t) -> String?
-  func isAlive(auditTokenHex: String) -> Bool
+  func liveness(auditTokenHex: String) -> BrokerProcessLiveness
   func terminate(auditTokenHex: String) -> Bool
 }
 
@@ -113,13 +119,33 @@ struct DarwinBrokerProcessInspector: BrokerProcessInspecting {
     }
   }
 
-  func isAlive(auditTokenHex: String) -> Bool {
+  func liveness(auditTokenHex: String) -> BrokerProcessLiveness {
     withAuditToken(auditTokenHex) { token in
-      guard let current = self.auditTokenHex(for: audit_token_to_pid(token)) else {
-        return false
+      let pid = audit_token_to_pid(token)
+      guard pid > 0 else { return .inspectionFailure }
+      if let current = self.auditTokenHex(for: pid) {
+        return current.caseInsensitiveCompare(auditTokenHex) == .orderedSame
+          ? .alive : .dead
       }
-      return current.caseInsensitiveCompare(auditTokenHex) == .orderedSame
-    } ?? false
+      // Failure to reacquire the audit token is not proof of death. Confirm
+      // whether a process still occupies the numeric slot using read-only
+      // kernel process metadata. A present process is inspectionFailure; only
+      // an unoccupied slot reported as ESRCH is positive death evidence for
+      // the leased incarnation. Every other inspection failure stays unknown.
+      var info = proc_bsdinfo()
+      errno = 0
+      let count = proc_pidinfo(
+        pid,
+        PROC_PIDTBSDINFO,
+        0,
+        &info,
+        Int32(MemoryLayout<proc_bsdinfo>.size)
+      )
+      if count == Int32(MemoryLayout<proc_bsdinfo>.size) {
+        return .inspectionFailure
+      }
+      return errno == ESRCH ? .dead : .inspectionFailure
+    } ?? .inspectionFailure
   }
 
   func terminate(auditTokenHex: String) -> Bool {
@@ -234,14 +260,19 @@ struct AuditTokenProcessReaper {
     completion: DispatchSemaphore,
     waitDeadline: DispatchTime = .now() + .seconds(2)
   ) -> Bool {
-    if processInspector.isAlive(auditTokenHex: auditTokenHex),
-      !processInspector.terminate(auditTokenHex: auditTokenHex)
-    {
-      return false
+    switch processInspector.liveness(auditTokenHex: auditTokenHex) {
+    case .inspectionFailure: return false
+    case .dead: return true
+    case .alive:
+      guard processInspector.terminate(auditTokenHex: auditTokenHex) else { return false }
     }
-    guard processInspector.isAlive(auditTokenHex: auditTokenHex) else { return true }
+    switch processInspector.liveness(auditTokenHex: auditTokenHex) {
+    case .dead: return true
+    case .inspectionFailure: return false
+    case .alive: break
+    }
     _ = completion.wait(timeout: waitDeadline)
-    return !processInspector.isAlive(auditTokenHex: auditTokenHex)
+    return processInspector.liveness(auditTokenHex: auditTokenHex) == .dead
   }
 }
 
@@ -593,20 +624,28 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
   private let runner: any BrokerWorkerRunning
   private let processInspector: any BrokerProcessInspecting
   private let coreBundleValidator: any CoreBundleValidating
+  private let codexRuntimeHome: any CodexRuntimeHomePreparing
   private let lock = NSLock()
 
   public convenience init() throws {
-    try self.init(runner: SignedBrokerWorkerRunner())
+    try self.init(
+      runner: SignedBrokerWorkerRunner(),
+      codexRuntimeHome: CodexRuntimeHomeManager(
+        mounter: SystemCodexRuntimeHomeMounter()
+      )
+    )
   }
 
   init(
     runner: any BrokerWorkerRunning,
     processInspector: any BrokerProcessInspecting = DarwinBrokerProcessInspector(),
-    coreBundleValidator: any CoreBundleValidating = SignedCoreBundleValidator()
+    coreBundleValidator: any CoreBundleValidating = SignedCoreBundleValidator(),
+    codexRuntimeHome: any CodexRuntimeHomePreparing = RejectingCodexRuntimeHomePreparer()
   ) {
     self.runner = runner
     self.processInspector = processInspector
     self.coreBundleValidator = coreBundleValidator
+    self.codexRuntimeHome = codexRuntimeHome
   }
 
   public func brokerStatus(
@@ -631,6 +670,21 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
     reply: @escaping (Data) -> Void
   ) {
     reply(run(.enrollCore, peer: peer, requestJSON: requestJSON, payload: nil))
+  }
+
+  public func prepareCodexRuntimeHome(
+    peer: AuthenticatedBrokerPeer,
+    requestJSON _: Data,
+    reply: @escaping (Data) -> Void
+  ) {
+    lock.lock()
+    defer { lock.unlock() }
+    do {
+      let receipt = try codexRuntimeHome.prepare(for: peer.effectiveUserIdentifier)
+      reply(try JSONEncoder().encode(receipt))
+    } catch {
+      reply(Self.rejectedResponse)
+    }
   }
 
   public func acquireCoreLease(
@@ -700,9 +754,32 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
           reply(try Self.acceptedLeaseResponse(existing))
           return
         }
-        guard try retireLeaseAfterTerminatingExactProcesses(existing, peer: peer) else {
-          reply(Self.rejectedResponse)
-          return
+        let sameAuthenticatedCore =
+          existing.auditEuid == peer.effectiveUserIdentifier
+          && existing.appPid == app.pid
+          && existing.appStartTimeUs == app.startTimeMicroseconds
+          && existing.corePid == core.pid
+          && existing.coreStartTimeUs == core.startTimeMicroseconds
+          && existing.coreAuditTokenHex == coreAuditTokenHex
+          && existing.coreInstanceNonce == caller.coreInstanceNonce
+        if sameAuthenticatedCore {
+          // A login-only Codex process and the normal read-only model process
+          // deliberately use distinct leases. Core has no numeric-signal
+          // authority after lease installation, so the broker retires only the
+          // exact previously leased Codex audit-token incarnation before
+          // rotation. The authenticated App/Core incarnation remains unchanged
+          // and is never signalled by this path.
+          guard retireExactCodexProcess(existing),
+            try releaseLease(existing, peer: peer)
+          else {
+            reply(Self.rejectedResponse)
+            return
+          }
+        } else {
+          guard try retireLeaseAfterTerminatingExactProcesses(existing, peer: peer) else {
+            reply(Self.rejectedResponse)
+            return
+          }
         }
       }
 
@@ -723,8 +800,8 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
         requestJSON: try JSONEncoder().encode(workerRequest),
         payload: nil
       )
-      guard processInspector.isAlive(auditTokenHex: coreAuditTokenHex),
-        processInspector.isAlive(auditTokenHex: codexAuditTokenHex)
+      guard processInspector.liveness(auditTokenHex: coreAuditTokenHex) == .alive,
+        processInspector.liveness(auditTokenHex: codexAuditTokenHex) == .alive
       else {
         // The durable record deliberately remains occupied. A later acquire
         // retires only these exact audit-token process incarnations.
@@ -767,8 +844,8 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
           lease.auditEuid == peer.effectiveUserIdentifier,
           lease.appPid == app.pid,
           lease.appStartTimeUs == app.startTimeMicroseconds,
-          processInspector.isAlive(auditTokenHex: lease.coreAuditTokenHex),
-          processInspector.isAlive(auditTokenHex: lease.codexAuditTokenHex)
+          processInspector.liveness(auditTokenHex: lease.coreAuditTokenHex) == .alive,
+          processInspector.liveness(auditTokenHex: lease.codexAuditTokenHex) == .alive
         else {
           reply(Self.rejectedResponse)
           return
@@ -864,6 +941,17 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
     return try releaseLease(lease, peer: peer)
   }
 
+  private func retireExactCodexProcess(_ lease: CoreInstanceLeaseWire) -> Bool {
+    let token = lease.codexAuditTokenHex
+    switch processInspector.liveness(auditTokenHex: token) {
+    case .inspectionFailure: return false
+    case .dead: return true
+    case .alive:
+      guard processInspector.terminate(auditTokenHex: token) else { return false }
+      return waitForAuditTokenToExit(token)
+    }
+  }
+
   private func auditedProcess(for pid: pid_t) -> BrokerAuditedProcess? {
     guard let before = processInspector.auditTokenHex(for: pid),
       let identity = processInspector.identity(for: pid),
@@ -875,20 +963,27 @@ public final class RustBrokerProcessBackend: EffectBrokerBackend {
 
   private func retireExactLeaseProcessesBeforeOff(_ lease: CoreInstanceLeaseWire) -> Bool {
     for token in [lease.codexAuditTokenHex, lease.coreAuditTokenHex] {
-      if processInspector.isAlive(auditTokenHex: token) {
+      switch processInspector.liveness(auditTokenHex: token) {
+      case .inspectionFailure: return false
+      case .dead: continue
+      case .alive:
         guard processInspector.terminate(auditTokenHex: token) else { return false }
-        waitForAuditTokenToExit(token)
+        guard waitForAuditTokenToExit(token) else { return false }
       }
-      guard !processInspector.isAlive(auditTokenHex: token) else { return false }
     }
     return true
   }
 
-  private func waitForAuditTokenToExit(_ token: String) {
+  private func waitForAuditTokenToExit(_ token: String) -> Bool {
     for _ in 0..<40 {
-      guard processInspector.isAlive(auditTokenHex: token) else { return }
+      switch processInspector.liveness(auditTokenHex: token) {
+      case .dead: return true
+      case .inspectionFailure: return false
+      case .alive: break
+      }
       usleep(50_000)
     }
+    return false
   }
 
   private func releaseLease(

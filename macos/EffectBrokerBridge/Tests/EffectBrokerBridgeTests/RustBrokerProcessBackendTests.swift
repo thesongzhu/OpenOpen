@@ -4,6 +4,31 @@ import XCTest
 @testable import EffectBrokerBridge
 
 final class RustBrokerProcessBackendTests: XCTestCase {
+  func testRuntimeHomeUsesOnlyAuthenticatedPeerEUIDAndFixedRootPath() throws {
+    let preparer = CapturingRuntimeHomePreparer()
+    let backend = RustBrokerProcessBackend(
+      runner: CapturingWorkerRunner(result: .failure(TestWorkerError.failed)),
+      codexRuntimeHome: preparer
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 777, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    var response: Data?
+    backend.prepareCodexRuntimeHome(
+      peer: peer,
+      requestJSON: Data(#"{"type":"prepareCodexRuntimeHome","version":1}"#.utf8)
+    ) { response = $0 }
+    let receipt = try JSONDecoder().decode(
+      CodexRuntimeHomeReceipt.self, from: XCTUnwrap(response)
+    )
+    XCTAssertEqual(preparer.auditEUIDs, [777])
+    XCTAssertEqual(
+      receipt.runtimeHome,
+      "/Library/Application Support/com.thesongzhu.OpenOpenRuntime/users/777/CodexHome"
+    )
+    XCTAssertEqual(CodexRuntimeHomeManager.path(for: 777), receipt.runtimeHome)
+  }
+
   func testBundledWorkerUsesTheKernelProcessPathAndExactAppLayout() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(
       "OpenOpen-Broker-Path-\(UUID().uuidString)", isDirectory: true
@@ -113,14 +138,138 @@ final class RustBrokerProcessBackendTests: XCTestCase {
   }
 
   func testProductionBrokerContainsNoNumericSignalFallback() throws {
+    let sources = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .appendingPathComponent("Sources/EffectBrokerBridge")
+    for name in ["RustBrokerProcessBackend.swift", "CodexRuntimeHome.swift"] {
+      let text = try String(
+        contentsOf: sources.appendingPathComponent(name), encoding: .utf8
+      )
+      XCTAssertFalse(text.contains("Darwin.kill("))
+      XCTAssertFalse(text.contains("process.terminate()"))
+    }
+  }
+
+  func testProductionRuntimeHomeUsesOnlyTheBoundedSystemTmpfsContract() throws {
     let source = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()
       .deletingLastPathComponent()
       .deletingLastPathComponent()
-      .appendingPathComponent("Sources/EffectBrokerBridge/RustBrokerProcessBackend.swift")
+      .appendingPathComponent("Sources/EffectBrokerBridge/CodexRuntimeHome.swift")
     let text = try String(contentsOf: source, encoding: .utf8)
-    XCTAssertFalse(text.contains("Darwin.kill("))
-    XCTAssertFalse(text.contains("process.terminate()"))
+    XCTAssertTrue(
+      text.contains(
+        #"/System/Library/Filesystems/tmpfs.fs/Contents/Resources/mount_tmpfs"#
+      )
+    )
+    XCTAssertTrue(text.contains(#""nodev,nosuid,noexec""#))
+    XCTAssertTrue(text.contains(#""-e", "-n", "32768", "-s", "256m""#))
+    XCTAssertFalse(text.contains("mount_apfs"))
+    XCTAssertFalse(text.contains("/sbin/umount"))
+  }
+
+  func testExistingTmpfsMustReattestExactByteAndInodeCapacities() {
+    let path = CodexRuntimeHomeManager.path(for: 501)
+    let flags = UInt32(MNT_NODEV | MNT_NOEXEC | MNT_NOSUID)
+    let exact = CodexRuntimeFileSystemSnapshot(
+      blockSize: 4096,
+      blocks: 65536,
+      files: 32768,
+      flags: flags,
+      typeName: "tmpfs",
+      mountPoint: path
+    )
+    XCTAssertTrue(CodexRuntimeHomeManager.isExactFileSystem(exact, mountedAt: path))
+    XCTAssertFalse(
+      CodexRuntimeHomeManager.isExactFileSystem(
+        CodexRuntimeFileSystemSnapshot(
+          blockSize: exact.blockSize,
+          blocks: exact.blocks,
+          files: 8192,
+          flags: exact.flags,
+          typeName: exact.typeName,
+          mountPoint: exact.mountPoint
+        ),
+        mountedAt: path
+      )
+    )
+    XCTAssertFalse(
+      CodexRuntimeHomeManager.isExactFileSystem(
+        CodexRuntimeFileSystemSnapshot(
+          blockSize: exact.blockSize,
+          blocks: 32768,
+          files: exact.files,
+          flags: exact.flags,
+          typeName: exact.typeName,
+          mountPoint: exact.mountPoint
+        ),
+        mountedAt: path
+      )
+    )
+    XCTAssertFalse(
+      CodexRuntimeHomeManager.isExactFileSystem(
+        CodexRuntimeFileSystemSnapshot(
+          blockSize: UInt64.max,
+          blocks: 2,
+          files: exact.files,
+          flags: exact.flags,
+          typeName: exact.typeName,
+          mountPoint: exact.mountPoint
+        ),
+        mountedAt: path
+      )
+    )
+  }
+
+  func testRuntimeHomePrepareReusesExactMountWithoutRemounting() throws {
+    let fileSystem = SimulatedCodexRuntimeHomeFileSystem()
+    let manager = CodexRuntimeHomeManager(
+      mounter: fileSystem,
+      fileSystemInspector: fileSystem,
+      pathOperator: fileSystem,
+      effectiveUserIdentifier: { 0 }
+    )
+
+    let first = try manager.prepare(for: 501)
+    let second = try manager.prepare(for: 501)
+
+    XCTAssertEqual(first, second)
+    XCTAssertEqual(first.runtimeHome, CodexRuntimeHomeManager.path(for: 501))
+    XCTAssertEqual(first.runtimeDevice, 2)
+    XCTAssertEqual(fileSystem.mountCalls, [first.runtimeHome])
+    XCTAssertEqual(fileSystem.pathSnapshot(at: first.runtimeHome)?.owner, 501)
+  }
+
+  func testRuntimeHomePrepareRejectsWrongExistingOwnerOrCapacityWithoutRemounting() throws {
+    let wrongOwner = SimulatedCodexRuntimeHomeFileSystem()
+    let ownerManager = CodexRuntimeHomeManager(
+      mounter: wrongOwner,
+      fileSystemInspector: wrongOwner,
+      pathOperator: wrongOwner,
+      effectiveUserIdentifier: { 0 }
+    )
+    let ownerReceipt = try ownerManager.prepare(for: 501)
+    wrongOwner.replaceOwner(777, at: ownerReceipt.runtimeHome)
+    XCTAssertThrowsError(try ownerManager.prepare(for: 501)) { error in
+      XCTAssertEqual(error as? CodexRuntimeHomeError, .invalidDirectory)
+    }
+    XCTAssertEqual(wrongOwner.mountCalls, [ownerReceipt.runtimeHome])
+
+    let wrongCapacity = SimulatedCodexRuntimeHomeFileSystem()
+    let capacityManager = CodexRuntimeHomeManager(
+      mounter: wrongCapacity,
+      fileSystemInspector: wrongCapacity,
+      pathOperator: wrongCapacity,
+      effectiveUserIdentifier: { 0 }
+    )
+    let capacityReceipt = try capacityManager.prepare(for: 501)
+    wrongCapacity.replaceInodeCapacity(8192, at: capacityReceipt.runtimeHome)
+    XCTAssertThrowsError(try capacityManager.prepare(for: 501)) { error in
+      XCTAssertEqual(error as? CodexRuntimeHomeError, .invalidDirectory)
+    }
+    XCTAssertEqual(wrongCapacity.mountCalls, [capacityReceipt.runtimeHome])
   }
 
   func testAuditTokenTerminatesTheExactProcessIncarnation() throws {
@@ -134,10 +283,10 @@ final class RustBrokerProcessBackendTests: XCTestCase {
     }
     let inspector = DarwinBrokerProcessInspector()
     let token = try XCTUnwrap(inspector.auditTokenHex(for: child.processIdentifier))
-    XCTAssertTrue(inspector.isAlive(auditTokenHex: token))
+    XCTAssertEqual(inspector.liveness(auditTokenHex: token), .alive)
     XCTAssertTrue(inspector.terminate(auditTokenHex: token))
     child.waitUntilExit()
-    XCTAssertFalse(inspector.isAlive(auditTokenHex: token))
+    XCTAssertEqual(inspector.liveness(auditTokenHex: token), .dead)
   }
 
   func testPayloadReadWithoutEOFOrBytesTimesOut() throws {
@@ -364,7 +513,7 @@ final class RustBrokerProcessBackendTests: XCTestCase {
           executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
         ),
       ],
-      liveness: [true, false, false, true, false, false, true, true]
+      liveness: [true, false, true, false, true, true]
     )
     let backend = RustBrokerProcessBackend(
       runner: runner,
@@ -389,6 +538,256 @@ final class RustBrokerProcessBackendTests: XCTestCase {
       inspector.terminatedTokens,
       [String(format: "%064x", 100), String(format: "%064x", 99)]
     )
+  }
+
+  func testSameAuthenticatedCoreRotatesOnlyAfterOldCodexAuditTokenIsDead() {
+    let nonce = String(repeating: "a", count: 64)
+    let old = coreLeaseJSON(appPID: 42, corePID: 43, nonce: nonce, status: "ready")
+    let acquired = Data(#"{"status":"accepted","version":1}"#.utf8)
+    let runner = LeaseWorkerRunner(status: old, acquire: acquired)
+    let appURL = URL(fileURLWithPath: "/Applications/OpenOpen.app/Contents/MacOS/OpenOpen")
+    let coreURL = appURL.deletingLastPathComponent().appendingPathComponent("OpenOpenCore")
+    let inspector = SequencedProcessInspector(
+      identities: [
+        42: BrokerProcessIdentity(
+          pid: 42, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 7, startTimeMicroseconds: 4_200,
+          executableURL: appURL
+        ),
+        43: BrokerProcessIdentity(
+          pid: 43, parentPID: 42, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 43, startTimeMicroseconds: 4_300,
+          executableURL: coreURL
+        ),
+        45: BrokerProcessIdentity(
+          pid: 45, parentPID: 43, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 45, startTimeMicroseconds: 4_500,
+          executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
+        ),
+      ],
+      liveness: [false, true, true]
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let caller = Data(
+      #"{"codexPid":45,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":43,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    var response: Data?
+    backend.acquireCoreLease(peer: peer, requestJSON: caller) { response = $0 }
+    XCTAssertEqual(response, acquired)
+    XCTAssertEqual(
+      runner.calls.map(\.operation),
+      [.coreLeaseStatus, .coreLeaseRelease, .coreLeaseAcquire]
+    )
+    XCTAssertTrue(inspector.terminatedTokens.isEmpty)
+  }
+
+  func testSameAuthenticatedCoreNeverTargetsReusedOldCodexNumericPID() {
+    let nonce = String(repeating: "a", count: 64)
+    let old = coreLeaseJSON(appPID: 42, corePID: 43, nonce: nonce, status: "ready")
+    let acquired = Data(#"{"status":"accepted","version":1}"#.utf8)
+    let runner = LeaseWorkerRunner(status: old, acquire: acquired)
+    let appURL = URL(fileURLWithPath: "/Applications/OpenOpen.app/Contents/MacOS/OpenOpen")
+    let coreURL = appURL.deletingLastPathComponent().appendingPathComponent("OpenOpenCore")
+    let inspector = SequencedProcessInspector(
+      identities: [
+        42: BrokerProcessIdentity(
+          pid: 42, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 7, startTimeMicroseconds: 4_200,
+          executableURL: appURL
+        ),
+        43: BrokerProcessIdentity(
+          pid: 43, parentPID: 42, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 43, startTimeMicroseconds: 4_300,
+          executableURL: coreURL
+        ),
+        44: BrokerProcessIdentity(
+          pid: 44, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 44, startTimeMicroseconds: 9_900,
+          executableURL: URL(fileURLWithPath: "/usr/bin/unrelated")
+        ),
+        45: BrokerProcessIdentity(
+          pid: 45, parentPID: 43, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 45, startTimeMicroseconds: 4_500,
+          executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
+        ),
+      ],
+      // The old audit token is dead even though its numeric PID is now reused.
+      liveness: [false, true, true]
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let caller = Data(
+      #"{"codexPid":45,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":43,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    var response: Data?
+    backend.acquireCoreLease(peer: peer, requestJSON: caller) { response = $0 }
+    XCTAssertEqual(response, acquired)
+    XCTAssertEqual(
+      runner.calls.map(\.operation),
+      [.coreLeaseStatus, .coreLeaseRelease, .coreLeaseAcquire]
+    )
+    XCTAssertTrue(inspector.terminatedTokens.isEmpty)
+  }
+
+  func testSameAuthenticatedCoreTerminatesOnlyExactOldCodexBeforeRotation() throws {
+    let nonce = String(repeating: "a", count: 64)
+    let old = coreLeaseJSON(appPID: 42, corePID: 43, nonce: nonce, status: "ready")
+    let acquired = Data(#"{"status":"accepted","version":1}"#.utf8)
+    let runner = LeaseWorkerRunner(status: old, acquire: acquired)
+    let appURL = URL(fileURLWithPath: "/Applications/OpenOpen.app/Contents/MacOS/OpenOpen")
+    let coreURL = appURL.deletingLastPathComponent().appendingPathComponent("OpenOpenCore")
+    let inspector = SequencedProcessInspector(
+      identities: [
+        42: BrokerProcessIdentity(
+          pid: 42, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 7, startTimeMicroseconds: 4_200,
+          executableURL: appURL
+        ),
+        43: BrokerProcessIdentity(
+          pid: 43, parentPID: 42, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 43, startTimeMicroseconds: 4_300,
+          executableURL: coreURL
+        ),
+        45: BrokerProcessIdentity(
+          pid: 45, parentPID: 43, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 45, startTimeMicroseconds: 4_500,
+          executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
+        ),
+      ],
+      liveness: [true, false, true, true]
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let caller = Data(
+      #"{"codexPid":45,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":43,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    var response: Data?
+    backend.acquireCoreLease(peer: peer, requestJSON: caller) { response = $0 }
+    XCTAssertEqual(response, acquired)
+    XCTAssertEqual(
+      runner.calls.map(\.operation),
+      [.coreLeaseStatus, .coreLeaseRelease, .coreLeaseAcquire]
+    )
+    XCTAssertEqual(inspector.terminatedTokens, [String(format: "%064x", 44)])
+  }
+
+  func testSameAuthenticatedCoreNeverReleasesLeaseWhenExactCodexTerminationFails() throws {
+    let nonce = String(repeating: "a", count: 64)
+    let old = coreLeaseJSON(appPID: 42, corePID: 43, nonce: nonce, status: "ready")
+    let runner = LeaseWorkerRunner(status: old, acquire: Data())
+    let appURL = URL(fileURLWithPath: "/Applications/OpenOpen.app/Contents/MacOS/OpenOpen")
+    let coreURL = appURL.deletingLastPathComponent().appendingPathComponent("OpenOpenCore")
+    let inspector = SequencedProcessInspector(
+      identities: [
+        42: BrokerProcessIdentity(
+          pid: 42, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 7, startTimeMicroseconds: 4_200,
+          executableURL: appURL
+        ),
+        43: BrokerProcessIdentity(
+          pid: 43, parentPID: 42, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 43, startTimeMicroseconds: 4_300,
+          executableURL: coreURL
+        ),
+        45: BrokerProcessIdentity(
+          pid: 45, parentPID: 43, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 45, startTimeMicroseconds: 4_500,
+          executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
+        ),
+      ],
+      liveness: [true],
+      terminationResult: false
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let caller = Data(
+      #"{"codexPid":45,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":43,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    var response: Data?
+    backend.acquireCoreLease(peer: peer, requestJSON: caller) { response = $0 }
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: XCTUnwrap(response)) as? [String: Any]
+    )
+    XCTAssertEqual(object["status"] as? String, "rejected")
+    XCTAssertEqual(runner.calls.map(\.operation), [.coreLeaseStatus])
+    XCTAssertEqual(inspector.terminatedTokens, [String(format: "%064x", 44)])
+  }
+
+  func testSameAuthenticatedCoreNeverReleasesLeaseWhenCodexInspectionIsUnknown() throws {
+    let nonce = String(repeating: "a", count: 64)
+    let old = coreLeaseJSON(appPID: 42, corePID: 43, nonce: nonce, status: "ready")
+    let runner = LeaseWorkerRunner(status: old, acquire: Data())
+    let appURL = URL(fileURLWithPath: "/Applications/OpenOpen.app/Contents/MacOS/OpenOpen")
+    let coreURL = appURL.deletingLastPathComponent().appendingPathComponent("OpenOpenCore")
+    let inspector = SequencedProcessInspector(
+      identities: [
+        42: BrokerProcessIdentity(
+          pid: 42, parentPID: 1, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 7, startTimeMicroseconds: 4_200,
+          executableURL: appURL
+        ),
+        43: BrokerProcessIdentity(
+          pid: 43, parentPID: 42, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 43, startTimeMicroseconds: 4_300,
+          executableURL: coreURL
+        ),
+        45: BrokerProcessIdentity(
+          pid: 45, parentPID: 43, effectiveUserIdentifier: 501,
+          processGroupIdentifier: 45, startTimeMicroseconds: 4_500,
+          executableURL: coreURL.deletingLastPathComponent().appendingPathComponent("codex")
+        ),
+      ],
+      livenessResults: [.inspectionFailure]
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let caller = Data(
+      #"{"codexPid":45,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":43,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    var response: Data?
+    backend.acquireCoreLease(peer: peer, requestJSON: caller) { response = $0 }
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: XCTUnwrap(response)) as? [String: Any]
+    )
+    XCTAssertEqual(object["status"] as? String, "rejected")
+    XCTAssertEqual(runner.calls.map(\.operation), [.coreLeaseStatus])
+    XCTAssertTrue(inspector.terminatedTokens.isEmpty)
   }
 
   func testReusedCorePIDIsNeverTargetedAndDoesNotWedgeTheOldLease() {
@@ -424,7 +823,7 @@ final class RustBrokerProcessBackendTests: XCTestCase {
           executableURL: URL(fileURLWithPath: "/usr/bin/unrelated")
         ),
       ],
-      liveness: [false, false, false, false, true, true]
+      liveness: [false, false, true, true]
     )
     let backend = RustBrokerProcessBackend(
       runner: runner,
@@ -468,7 +867,7 @@ final class RustBrokerProcessBackendTests: XCTestCase {
           executableURL: coreURL
         ),
       ],
-      liveness: [true, false, false, true, false, false]
+      liveness: [true, false, true, false]
     )
     let runner = LeaseWorkerRunner(status: lease, acquire: accepted) {
       XCTAssertEqual(inspector.terminatedTokens.count, 2)
@@ -541,6 +940,37 @@ final class RustBrokerProcessBackendTests: XCTestCase {
     XCTAssertEqual(inspector.terminatedTokens.count, 1)
   }
 
+  func testOffNeverPersistsOrReleasesWhenAuditTokenInspectionIsUnknown() throws {
+    let lease = coreLeaseJSON(
+      appPID: 42, corePID: 43, nonce: String(repeating: "a", count: 64), status: "ready"
+    )
+    let runner = LeaseWorkerRunner(status: lease, acquire: Data())
+    let inspector = SequencedProcessInspector(
+      identities: [:], livenessResults: [.inspectionFailure]
+    )
+    let backend = RustBrokerProcessBackend(
+      runner: runner,
+      processInspector: inspector,
+      coreBundleValidator: AllowingCoreBundleValidator()
+    )
+    let peer = AuthenticatedBrokerPeer(
+      effectiveUserIdentifier: 501, processIdentifier: 42, auditSessionIdentifier: 7
+    )
+    let request = Data(
+      """
+      {"control":{"authorizationSignatureHex":"\(String(repeating: "a", count: 128))","coreKeyId":"\(String(repeating: "b", count: 64))","enabled":false,"protocolVersion":1,"revision":2,"updatedAtMs":10},"type":"applyRuntimeControl","version":1}
+      """.utf8
+    )
+    var response: Data?
+    backend.applyRuntimeControl(peer: peer, requestJSON: request) { response = $0 }
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: XCTUnwrap(response)) as? [String: Any]
+    )
+    XCTAssertEqual(object["status"] as? String, "rejected")
+    XCTAssertEqual(runner.calls.map(\.operation), [.coreLeaseStatus])
+    XCTAssertTrue(inspector.terminatedTokens.isEmpty)
+  }
+
   func testOnRejectsWhenAnExactLeasedProcessIncarnationIsGone() throws {
     let lease = coreLeaseJSON(
       appPID: 42, corePID: 43, nonce: String(repeating: "a", count: 64), status: "ready"
@@ -582,6 +1012,126 @@ final class RustBrokerProcessBackendTests: XCTestCase {
 
 private enum TestWorkerError: Error {
   case failed
+}
+
+private final class CapturingRuntimeHomePreparer: CodexRuntimeHomePreparing {
+  private(set) var auditEUIDs = [uid_t]()
+
+  func prepare(for auditEUID: uid_t) -> CodexRuntimeHomeReceipt {
+    auditEUIDs.append(auditEUID)
+    return CodexRuntimeHomeReceipt(
+      runtimeHome: CodexRuntimeHomeManager.path(for: auditEUID),
+      runtimeDevice: 99,
+      status: "ready",
+      version: 1
+    )
+  }
+}
+
+private final class SimulatedCodexRuntimeHomeFileSystem: CodexRuntimeHomeMounting,
+  CodexRuntimeFileSystemInspecting, CodexRuntimePathOperating
+{
+  private var paths = [String: CodexRuntimePathSnapshot]()
+  private var fileSystems = [String: CodexRuntimeFileSystemSnapshot]()
+  private(set) var mountCalls = [String]()
+
+  func mount(at path: String) throws {
+    guard let existing = paths[path], existing.isDirectory else {
+      throw CodexRuntimeHomeError.mountFailed
+    }
+    mountCalls.append(path)
+    paths[path] = CodexRuntimePathSnapshot(
+      owner: existing.owner,
+      group: existing.group,
+      mode: existing.mode,
+      device: 2,
+      isDirectory: true
+    )
+    fileSystems[path] = CodexRuntimeFileSystemSnapshot(
+      blockSize: 4096,
+      blocks: 65536,
+      files: 32768,
+      flags: UInt32(MNT_NODEV | MNT_NOEXEC | MNT_NOSUID),
+      typeName: "tmpfs",
+      mountPoint: path
+    )
+  }
+
+  func snapshot(at path: String) -> CodexRuntimeFileSystemSnapshot? {
+    if let mounted = fileSystems[path] { return mounted }
+    guard paths[path] != nil else { return nil }
+    return CodexRuntimeFileSystemSnapshot(
+      blockSize: 4096,
+      blocks: 1,
+      files: 1,
+      flags: 0,
+      typeName: "apfs",
+      mountPoint: "/"
+    )
+  }
+
+  func pathSnapshot(at path: String) -> CodexRuntimePathSnapshot? {
+    paths[path]
+  }
+
+  func createDirectory(at path: String, mode: mode_t) -> Bool {
+    guard paths[path] == nil else { return false }
+    paths[path] = CodexRuntimePathSnapshot(
+      owner: 0, group: 0, mode: mode, device: 1, isDirectory: true
+    )
+    return true
+  }
+
+  func setOwner(_ owner: uid_t, group: gid_t, at path: String) -> Bool {
+    guard let existing = paths[path] else { return false }
+    paths[path] = CodexRuntimePathSnapshot(
+      owner: owner,
+      group: group,
+      mode: existing.mode,
+      device: existing.device,
+      isDirectory: existing.isDirectory
+    )
+    return true
+  }
+
+  func setMode(_ mode: mode_t, at path: String) -> Bool {
+    guard let existing = paths[path] else { return false }
+    paths[path] = CodexRuntimePathSnapshot(
+      owner: existing.owner,
+      group: existing.group,
+      mode: mode,
+      device: existing.device,
+      isDirectory: existing.isDirectory
+    )
+    return true
+  }
+
+  func directoryIsEmpty(at path: String) throws -> Bool {
+    paths[path] != nil
+  }
+
+  func replaceOwner(_ owner: uid_t, at path: String) {
+    guard let existing = paths[path] else { return }
+    paths[path] = CodexRuntimePathSnapshot(
+      owner: owner,
+      group: existing.group,
+      mode: existing.mode,
+      device: existing.device,
+      isDirectory: existing.isDirectory
+    )
+  }
+
+  func replaceInodeCapacity(_ files: UInt64, at path: String) {
+    guard let existing = fileSystems[path] else { return }
+    fileSystems[path] = CodexRuntimeFileSystemSnapshot(
+      blockSize: existing.blockSize,
+      blocks: existing.blocks,
+      files: files,
+      flags: existing.flags,
+      typeName: existing.typeName,
+      mountPoint: existing.mountPoint
+    )
+  }
 }
 
 private final class CapturingWorkerRunner: BrokerWorkerRunning {
@@ -654,7 +1204,7 @@ private final class LeaseWorkerRunner: BrokerWorkerRunning {
 
 private final class SequencedProcessInspector: BrokerProcessInspecting {
   let identities: [pid_t: BrokerProcessIdentity]
-  var liveness: [Bool]
+  var livenessResults: [BrokerProcessLiveness]
   let terminationResult: Bool
   private(set) var terminatedTokens = [String]()
 
@@ -663,14 +1213,24 @@ private final class SequencedProcessInspector: BrokerProcessInspecting {
     terminationResult: Bool = true
   ) {
     self.identities = identities
-    self.liveness = liveness
+    self.livenessResults = liveness.map { $0 ? .alive : .dead }
+    self.terminationResult = terminationResult
+  }
+
+  init(
+    identities: [pid_t: BrokerProcessIdentity],
+    livenessResults: [BrokerProcessLiveness], terminationResult: Bool = true
+  ) {
+    self.identities = identities
+    self.livenessResults = livenessResults
     self.terminationResult = terminationResult
   }
 
   func identity(for pid: pid_t) -> BrokerProcessIdentity? { identities[pid] }
   func auditTokenHex(for pid: pid_t) -> String? { String(format: "%064x", pid) }
-  func isAlive(auditTokenHex _: String) -> Bool {
-    liveness.isEmpty ? false : liveness.removeFirst()
+  func liveness(auditTokenHex _: String) -> BrokerProcessLiveness {
+    if livenessResults.isEmpty { return .dead }
+    return livenessResults.removeFirst()
   }
   func terminate(auditTokenHex: String) -> Bool {
     terminatedTokens.append(auditTokenHex)
@@ -696,7 +1256,7 @@ private final class MockProcessInspector: BrokerProcessInspecting {
     auditTokens[pid] = tokens
     return token
   }
-  func isAlive(auditTokenHex _: String) -> Bool { true }
+  func liveness(auditTokenHex _: String) -> BrokerProcessLiveness { .alive }
   func terminate(auditTokenHex _: String) -> Bool { true }
 }
 

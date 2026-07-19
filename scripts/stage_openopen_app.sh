@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --codex-package-root ABSOLUTE_PATH --imsg-binary ABSOLUTE_PATH --imsg-receipt ABSOLUTE_PATH --output ABSOLUTE_PATH [--developer-id-identity CERTIFICATE_NAME]" >&2
+  echo "usage: $0 --codex-package-root ABSOLUTE_PATH --imsg-binary ABSOLUTE_PATH --imsg-receipt ABSOLUTE_PATH --output ABSOLUTE_PATH [--developer-id-identity CERTIFICATE_NAME --identity-receipt-output ABSOLUTE_PATH]" >&2
   exit 64
 }
 
@@ -10,6 +10,7 @@ codex_root=""
 imsg_binary=""
 imsg_receipt=""
 output=""
+identity_receipt_output=""
 signing_identity="-"
 signing_mode="ad-hoc"
 readonly expected_developer_id_identity="Developer ID Application: Wenxin Dou (UHDY2275L5)"
@@ -40,6 +41,11 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && -n "$2" ]] || usage
       signing_identity="$2"
       signing_mode="developer-id"
+      shift 2
+      ;;
+    --identity-receipt-output)
+      [[ $# -ge 2 ]] || usage
+      identity_receipt_output="$2"
       shift 2
       ;;
     *) usage ;;
@@ -73,6 +79,16 @@ imsg_entitlements="$repo_root/macos/OpenOpenApp/iMessage.entitlements"
   exit 65
 }
 if [[ "$signing_mode" == "developer-id" ]]; then
+  [[ "$identity_receipt_output" = /* \
+    && "$identity_receipt_output" == *.receipt \
+    && "$identity_receipt_output" != "/" ]] || {
+    echo "Developer-ID mode requires an absolute external .receipt output" >&2
+    exit 65
+  }
+  [[ ! -e "$identity_receipt_output" ]] || {
+    echo "refusing to overwrite existing identity receipt: $identity_receipt_output" >&2
+    exit 65
+  }
   [[ "$signing_identity" == "$expected_developer_id_identity" ]] || {
     echo "Developer-ID mode requires the pinned owner Developer ID Application certificate" >&2
     exit 65
@@ -83,11 +99,21 @@ if [[ "$signing_mode" == "developer-id" ]]; then
       exit 65
     }
 fi
+if [[ "$signing_mode" != "developer-id" && -n "$identity_receipt_output" ]]; then
+  echo "post-stage identity receipts require Developer-ID mode" >&2
+  exit 65
+fi
 codex_root="$(cd "$codex_root" && pwd -P)"
 output_parent="$(dirname "$output")"
 mkdir -p "$output_parent"
 output_parent="$(cd "$output_parent" && pwd -P)"
 output="$output_parent/$(basename "$output")"
+if [[ -n "$identity_receipt_output" ]]; then
+  identity_receipt_parent="$(dirname "$identity_receipt_output")"
+  mkdir -p "$identity_receipt_parent"
+  identity_receipt_parent="$(cd "$identity_receipt_parent" && pwd -P)"
+  identity_receipt_output="$identity_receipt_parent/$(basename "$identity_receipt_output")"
+fi
 
 verify_sha() {
   local expected="$1"
@@ -160,7 +186,7 @@ verify_unsigned_macho_sha() {
   actual="$(/usr/bin/shasum -a 256 "$scratch" | /usr/bin/awk '{print $1}')"
   rm -f "$scratch"
   [[ "$actual" == "$expected" ]] || {
-    echo "unsigned Mach-O content mismatch: $path" >&2
+    echo "unsigned Mach-O content mismatch: $path (expected $expected, actual $actual)" >&2
     exit 66
   }
 }
@@ -292,6 +318,262 @@ verify_no_get_task_allow() {
   }
 }
 
+entitlements_json() {
+  local path="$1"
+  local raw
+  raw="$({ /usr/bin/codesign -d --entitlements :- "$path" 2>/dev/null || true; })"
+  if [[ -z "$raw" ]]; then
+    /usr/bin/printf '{}\n'
+  else
+    /usr/bin/printf '%s' "$raw" | /usr/bin/plutil -convert json -o - -
+  fi
+}
+
+signing_value() {
+  local path="$1"
+  local field="$2"
+  /usr/bin/codesign -d --verbose=4 "$path" 2>&1 \
+    | /usr/bin/awk -F= -v field="$field" '$1 == field {print $2}'
+}
+
+canonical_xattrs() {
+  local path="$1"
+  local attribute value result=""
+  while IFS= read -r attribute; do
+    [[ -n "$attribute" ]] || continue
+    value="$(/usr/bin/xattr -px "$attribute" "$path" 2>/dev/null \
+      | /usr/bin/tr -d ' \r\n')"
+    result+="${attribute}=${value};"
+  done < <(/usr/bin/xattr "$path" 2>/dev/null | LC_ALL=C sort || true)
+  if [[ -n "$result" ]]; then
+    /usr/bin/printf '%s\n' "$result"
+  else
+    /usr/bin/printf '%s\n' '-'
+  fi
+}
+
+write_tree_manifest() {
+  local root="$1"
+  local destination="$2"
+  local path relative kind mode flags attributes size sha
+  [[ -d "$root" && ! -L "$root" \
+    && -z "$(/usr/bin/find -P "$root" ! -type d ! -type f -print -quit)" ]] || {
+    echo "manifest root contains a missing, aliased, or non-regular entry: $root" >&2
+    exit 66
+  }
+  (
+    /usr/bin/printf 'OPENOPEN-TREE-MANIFEST-V1\n'
+    while IFS= read -r -d '' path; do
+      relative="${path#"$root"/}"
+      [[ "$path" != "$root" ]] || relative="."
+      if LC_ALL=C /usr/bin/printf '%s' "$relative" \
+        | /usr/bin/grep -q '[[:cntrl:]]'; then
+        echo "manifest path contains a forbidden control byte" >&2
+        return 66
+      fi
+      mode="$(/usr/bin/stat -f '%Lp' "$path")"
+      flags="$(/usr/bin/stat -f '%f' "$path")"
+      attributes="$(canonical_xattrs "$path")"
+      if [[ -d "$path" ]]; then
+        kind="D"
+        size="-"
+        sha="-"
+      else
+        kind="F"
+        size="$(/usr/bin/stat -f '%z' "$path")"
+        sha="$(/usr/bin/shasum -a 256 "$path" | /usr/bin/awk '{print $1}')"
+      fi
+      /usr/bin/printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$kind" "$mode" "$flags" "$attributes" "$size" "$sha" "$relative"
+    done < <(/usr/bin/find -P "$root" -print0 | LC_ALL=C /usr/bin/sort -z)
+  ) >"$destination"
+}
+
+write_source_snapshot_manifest() {
+  local source_root="$1"
+  local destination="$2"
+  local scratch index_raw index_raw_after flags_raw flags_raw_after head_raw
+  local index_manifest head_manifest index_manifest_sha
+  local head diff_sha record metadata relative path
+  local index_mode index_oid index_stage extra tag
+  local tree_mode tree_type tree_oid mode mode_value size size_after sha
+  scratch="$(/usr/bin/mktemp -d /private/tmp/OpenOpen-source-index.XXXXXX)"
+  index_raw="$scratch/index.raw"
+  index_raw_after="$scratch/index-after.raw"
+  flags_raw="$scratch/index-flags.raw"
+  flags_raw_after="$scratch/index-flags-after.raw"
+  head_raw="$scratch/head.raw"
+  index_manifest="$scratch/index.tsv"
+  head_manifest="$scratch/head.tsv"
+  git -C "$source_root" diff --cached --quiet -- || {
+    rm -rf "$scratch"
+    echo "source snapshot requires an empty Git index" >&2
+    return 66
+  }
+  head="$(git -C "$source_root" rev-parse HEAD)"
+  git -C "$source_root" ls-files --stage -z >"$index_raw"
+  git -C "$source_root" ls-files -v -z --cached >"$flags_raw"
+  git -C "$source_root" ls-tree -r -z --full-tree "$head" >"$head_raw"
+  git -C "$source_root" ls-files --stage -z >"$index_raw_after"
+  git -C "$source_root" ls-files -v -z --cached >"$flags_raw_after"
+  if ! /usr/bin/cmp -s "$index_raw" "$index_raw_after" \
+    || ! /usr/bin/cmp -s "$flags_raw" "$flags_raw_after"; then
+    rm -rf "$scratch"
+    echo "source Git index changed while its snapshot was captured" >&2
+    return 66
+  fi
+  while IFS= read -r -d '' record; do
+    [[ "$record" == ?' '* ]] || {
+      rm -rf "$scratch"
+      echo "source Git index flags have an invalid shape" >&2
+      return 66
+    }
+    tag="${record%% *}"
+    relative="${record#? }"
+    [[ "$tag" == "H" && -n "$relative" ]] || {
+      rm -rf "$scratch"
+      echo "source Git index contains assume-unchanged, skip-worktree, or non-cached state: $relative" >&2
+      return 66
+    }
+  done <"$flags_raw"
+  : >"$index_manifest"
+  while IFS= read -r -d '' record; do
+    [[ "$record" == *$'\t'* ]] || {
+      rm -rf "$scratch"
+      echo "source Git index entry has an invalid shape" >&2
+      return 66
+    }
+    metadata="${record%%$'\t'*}"
+    relative="${record#*$'\t'}"
+    IFS=' ' read -r index_mode index_oid index_stage extra <<<"$metadata"
+    [[ -z "${extra:-}" && "$index_stage" == "0" \
+      && "$index_mode" =~ ^100(644|755)$ \
+      && "$index_oid" =~ ^[0-9a-f]{40,64}$ ]] || {
+      rm -rf "$scratch"
+      echo "source Git index contains a non-regular or non-stage-zero entry: $relative" >&2
+      return 66
+    }
+    if [[ -z "$relative" ]] \
+      || LC_ALL=C /usr/bin/printf '%s' "$relative" \
+        | /usr/bin/grep -q '[[:cntrl:]]'; then
+      rm -rf "$scratch"
+      echo "source Git index path contains a forbidden control byte" >&2
+      return 66
+    fi
+    /usr/bin/printf '%s\t%s\t%s\n' \
+      "$index_mode" "$index_oid" "$relative" >>"$index_manifest"
+  done <"$index_raw"
+  : >"$head_manifest"
+  while IFS= read -r -d '' record; do
+    [[ "$record" == *$'\t'* ]] || {
+      rm -rf "$scratch"
+      echo "source HEAD tree entry has an invalid shape" >&2
+      return 66
+    }
+    metadata="${record%%$'\t'*}"
+    relative="${record#*$'\t'}"
+    IFS=' ' read -r tree_mode tree_type tree_oid extra <<<"$metadata"
+    [[ -z "${extra:-}" && "$tree_type" == "blob" \
+      && "$tree_mode" =~ ^100(644|755)$ \
+      && "$tree_oid" =~ ^[0-9a-f]{40,64}$ ]] || {
+      rm -rf "$scratch"
+      echo "source HEAD contains a symlink, submodule, or non-regular entry: $relative" >&2
+      return 66
+    }
+    if [[ -z "$relative" ]] \
+      || LC_ALL=C /usr/bin/printf '%s' "$relative" \
+        | /usr/bin/grep -q '[[:cntrl:]]'; then
+      rm -rf "$scratch"
+      echo "source HEAD path contains a forbidden control byte" >&2
+      return 66
+    fi
+    /usr/bin/printf '%s\t%s\t%s\n' \
+      "$tree_mode" "$tree_oid" "$relative" >>"$head_manifest"
+  done <"$head_raw"
+  /usr/bin/cmp -s "$index_manifest" "$head_manifest" || {
+    rm -rf "$scratch"
+    echo "source Git index tree does not exactly equal HEAD" >&2
+    return 66
+  }
+  index_manifest_sha="$(/usr/bin/shasum -a 256 "$index_manifest" \
+    | /usr/bin/awk '{print $1}')"
+  diff_sha="$(git -C "$source_root" diff --binary --no-ext-diff -- \
+    | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+  (
+    /usr/bin/printf 'OPENOPEN-SOURCE-SNAPSHOT-V2\n'
+    /usr/bin/printf 'HEAD\t%s\n' "$head"
+    /usr/bin/printf 'INDEX\tempty\n'
+    /usr/bin/printf 'INDEX-MANIFEST-SHA256\t%s\n' "$index_manifest_sha"
+    /usr/bin/printf 'TRACKED-WORKTREE-DIFF-SHA256\t%s\n' "$diff_sha"
+    while IFS=$'\t' read -r index_mode index_oid relative; do
+      path="$source_root/$relative"
+      [[ -f "$path" && ! -L "$path" ]] || {
+        echo "tracked source snapshot entry is not a regular file: $relative" >&2
+        return 66
+      }
+      mode="$(/usr/bin/stat -f '%Lp' "$path")"
+      mode_value=$((8#$mode))
+      size="$(/usr/bin/stat -f '%z' "$path")"
+      sha="$(/usr/bin/shasum -a 256 "$path" | /usr/bin/awk '{print $1}')"
+      size_after="$(/usr/bin/stat -f '%z' "$path")"
+      [[ "$size" == "$size_after" ]] || {
+        echo "tracked source entry changed while hashing: $relative" >&2
+        return 66
+      }
+      if [[ "$index_mode" == "100644" ]]; then
+        (( (mode_value & 0111) == 0 )) || {
+          echo "tracked non-executable source has executable mode: $relative" >&2
+          return 66
+        }
+      else
+        (( (mode_value & 0100) != 0 )) || {
+          echo "tracked executable source lacks owner-execute mode: $relative" >&2
+          return 66
+        }
+      fi
+      /usr/bin/printf 'TRACKED\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$index_mode" "$index_oid" "$mode" "$size" "$sha" "$relative"
+    done <"$index_manifest"
+    while IFS= read -r -d '' relative; do
+      if [[ -z "$relative" ]] \
+        || LC_ALL=C /usr/bin/printf '%s' "$relative" \
+          | /usr/bin/grep -q '[[:cntrl:]]'; then
+        echo "untracked source path contains a forbidden control byte" >&2
+        return 66
+      fi
+      path="$source_root/$relative"
+      [[ -f "$path" && ! -L "$path" ]] || {
+        echo "untracked source snapshot entry is not a regular file: $relative" >&2
+        return 66
+      }
+      mode="$(/usr/bin/stat -f '%Lp' "$path")"
+      size="$(/usr/bin/stat -f '%z' "$path")"
+      sha="$(/usr/bin/shasum -a 256 "$path" | /usr/bin/awk '{print $1}')"
+      size_after="$(/usr/bin/stat -f '%z' "$path")"
+      [[ "$size" == "$size_after" ]] || {
+        echo "untracked source entry changed while hashing: $relative" >&2
+        return 66
+      }
+      /usr/bin/printf 'UNTRACKED\t%s\t%s\t%s\t%s\n' \
+        "$mode" "$size" "$sha" "$relative"
+    done < <(git -C "$source_root" ls-files --others --exclude-standard -z)
+  ) >"$destination" || {
+    rm -rf "$scratch" "$destination"
+    return 66
+  }
+  if ! git -C "$source_root" diff --cached --quiet -- \
+    || [[ "$(git -C "$source_root" rev-parse HEAD)" != "$head" ]] \
+    || ! /usr/bin/cmp -s "$index_raw" \
+      <(git -C "$source_root" ls-files --stage -z) \
+    || ! /usr/bin/cmp -s "$flags_raw" \
+      <(git -C "$source_root" ls-files -v -z --cached); then
+    rm -rf "$scratch" "$destination"
+    echo "source HEAD or Git index changed after its snapshot was captured" >&2
+    return 66
+  fi
+  rm -rf "$scratch"
+}
+
 verify_sha "978740e6bcbd9af2f850823b723fb74f16d8d1e44de05f7dd6737ae631f72017" "$codex_root/bin/codex"
 verify_sha "c1b3af67fd28bbf768765357251f7b29d315150068cb41101dc77eb8a42bc7eb" "$codex_root/codex-package.json"
 verify_sha "067ee7894c49489ca72fc2ca6093f408302241bd22097fcd12d785c9ba40fd43" "$codex_root/bin/codex-code-mode-host"
@@ -321,11 +603,13 @@ readonly expected_imsg_cli_sources_sha="2f39e12fcf0879359c3f16a60061d7ab9fadcf14
 readonly expected_imsg_unsigned_sha="cdea42cf30e731d52c00524c16db5865fe2d01ef6a3f377cb6e3a3eb65f5f313"
 readonly expected_rg_unsigned_before_sha="7894fcced308b247aee2315d133e0670d73e608bfb41d8bb003665cc31328c47"
 readonly expected_rg_unsigned_sha="ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6"
-readonly expected_app_unsigned_sha="a9a6e5457ff4b65b1e3986c65e4e5d2977b0bdd829f455843632de361c4ceced"
-readonly expected_core_unsigned_before_sha="8a2781c85c961b7f74111f7f6052ca5ad105bf1dfef65446322d9ab545d1a5d9"
-readonly expected_core_unsigned_sha="afe83cea55b437288e8546387f75afdcd0b4f8f6f306c983f9142dd3c809cf84"
-readonly expected_broker_unsigned_sha="622db755fe7fa0966f4062006846f5da98f539ff6db455d11311a2d633f76085"
-readonly expected_worker_unsigned_sha="af9c72d3eba3adab68ddb6f6d89997f92900fb7826f3be80ad510a2007fd7d05"
+readonly expected_app_unsigned_before_sha="0518f4cb2ffb30211892d55fd7475fbfee40e1a056b10c257fa61d69fcdf9027"
+readonly expected_app_unsigned_sha="d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c"
+readonly expected_core_unsigned_before_sha="63602d67ebb952ba02228ad5dc4df8517a4fb4ea4ffd6a5facc20ba7edd3e714"
+readonly expected_core_unsigned_sha="160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed"
+readonly expected_broker_unsigned_before_sha="07d566ba598dad22194372ba16c8f49b97f18e69e3b67d179d2dad276d7c5cf9"
+readonly expected_broker_unsigned_sha="c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee"
+readonly expected_worker_unsigned_sha="4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208"
 verify_sha "$expected_imsg_receipt_sha" "$imsg_receipt"
 imsg_receipt_sha="$expected_imsg_receipt_sha"
 receipt_value() {
@@ -449,6 +733,22 @@ for compiled_section in IMsgCore imsg; do
   }
 done
 
+staging="$(/usr/bin/mktemp -d "$output_parent/.OpenOpen-stage.XXXXXX")"
+claimed_output=0
+claimed_receipt=0
+cleanup() {
+  rm -rf "$staging"
+  if [[ "$claimed_output" -eq 1 ]]; then
+    rm -rf "$output"
+  fi
+  if [[ "$claimed_receipt" -eq 1 ]]; then
+    rm -rf "$identity_receipt_output"
+  fi
+}
+trap cleanup EXIT
+prebuild_source_snapshot="$staging/prebuild-source-snapshot.tsv"
+write_source_snapshot_manifest "$repo_root" "$prebuild_source_snapshot"
+
 cd "$repo_root"
 cargo build --release -p openopen-host -p openopen-effect-broker
 swift build \
@@ -462,16 +762,6 @@ swift build \
   --configuration release \
   -Xswiftc -warnings-as-errors
 swift_bin="$(swift build --package-path macos/EffectBrokerBridge --show-bin-path --configuration release)"
-
-staging="$(/usr/bin/mktemp -d "$output_parent/.OpenOpen-stage.XXXXXX")"
-claimed_output=0
-cleanup() {
-  rm -rf "$staging"
-  if [[ "$claimed_output" -eq 1 ]]; then
-    rm -rf "$output"
-  fi
-}
-trap cleanup EXIT
 app="$staging/OpenOpen.app"
 mkdir -p \
   "$app/Contents/MacOS" \
@@ -593,6 +883,7 @@ staged_imsg_probe_db="$staging/staged-imsg-probe.sqlite"
   }
 sign_owned_code \
   "$app/Contents/MacOS/OpenOpen" com.thesongzhu.OpenOpen "" \
+  "$expected_app_unsigned_before_sha" \
   "$expected_app_unsigned_sha"
 sign_owned_code \
   "$app/Contents/MacOS/OpenOpenCore" com.thesongzhu.OpenOpen.Core "" \
@@ -601,6 +892,7 @@ sign_owned_code \
 sign_owned_code \
   "$app/Contents/MacOS/OpenOpenEffectBroker" \
   com.thesongzhu.OpenOpen.EffectBroker "" \
+  "$expected_broker_unsigned_before_sha" \
   "$expected_broker_unsigned_sha"
 sign_owned_code \
   "$app/Contents/MacOS/OpenOpenEffectBrokerWorker" \
@@ -725,9 +1017,187 @@ if [[ "$signing_mode" == "developer-id" ]]; then
       and (.cdhash | length == 40)' \
     "$output/Contents/Resources/Notices/CODEX-RUNTIME-RECEIPT.json" >/dev/null
 fi
-claimed_output=0
 if [[ "$signing_mode" == "developer-id" ]]; then
-  echo "STAGED_DEVELOPER_ID_NOT_NOTARIZED_NOT_RELEASE_PROOF $imsg_team $output"
+  receipt_staging="$staging/OpenOpen-PostStage-Identity.receipt"
+  receipt_resources="$receipt_staging/Contents/Resources"
+  mkdir -p "$receipt_resources"
+  /usr/bin/plutil -create xml1 "$receipt_staging/Contents/Info.plist"
+  /usr/bin/plutil -insert CFBundleIdentifier -string \
+    com.thesongzhu.OpenOpen.PostStageIdentityReceipt \
+    "$receipt_staging/Contents/Info.plist"
+  /usr/bin/plutil -insert CFBundleName -string OpenOpenPostStageIdentityReceipt \
+    "$receipt_staging/Contents/Info.plist"
+  /usr/bin/plutil -insert CFBundlePackageType -string BNDL \
+    "$receipt_staging/Contents/Info.plist"
+  /usr/bin/plutil -insert CFBundleVersion -string 2 \
+    "$receipt_staging/Contents/Info.plist"
+
+  app_manifest="$receipt_resources/app-manifest.tsv"
+  write_tree_manifest "$output" "$app_manifest"
+  app_manifest_sha="$(/usr/bin/shasum -a 256 "$app_manifest" \
+    | /usr/bin/awk '{print $1}')"
+  app_directory_count="$(/usr/bin/find -P "$output" -type d -print \
+    | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+  app_file_count="$(/usr/bin/find -P "$output" -type f -print \
+    | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+  [[ "$app_directory_count" == "18" && "$app_file_count" == "617" ]] || {
+    echo "post-stage App shape changed before identity receipt" >&2
+    exit 66
+  }
+  source_snapshot="$receipt_resources/source-snapshot.tsv"
+  write_source_snapshot_manifest "$repo_root" "$source_snapshot"
+  [[ "$(/usr/bin/head -n 1 "$source_snapshot")" \
+    == "OPENOPEN-SOURCE-SNAPSHOT-V2" ]] || {
+    echo "post-stage source snapshot format mismatch" >&2
+    exit 66
+  }
+  /usr/bin/cmp -s "$prebuild_source_snapshot" "$source_snapshot" || {
+    echo "source snapshot changed between build input and post-stage receipt" >&2
+    exit 66
+  }
+  source_snapshot_sha="$(/usr/bin/shasum -a 256 "$source_snapshot" \
+    | /usr/bin/awk '{print $1}')"
+
+  components_jsonl="$staging/receipt-components.jsonl"
+  : >"$components_jsonl"
+  while IFS='|' read -r relative identifier unsigned_sha; do
+    component="$output/$relative"
+    component_team="$(signing_value "$component" TeamIdentifier)"
+    component_cdhash="$(signing_value "$component" CDHash)"
+    component_signed_sha="$(/usr/bin/shasum -a 256 "$component" \
+      | /usr/bin/awk '{print $1}')"
+    component_entitlements="$(entitlements_json "$component")"
+    [[ "$component_team" == "$imsg_team" \
+      && "$component_cdhash" =~ ^[0-9a-f]{40}$ \
+      && "$component_entitlements" == "{}" ]] || {
+      echo "post-stage component identity is invalid: $relative" >&2
+      exit 66
+    }
+    /usr/bin/jq -n \
+      --arg path "$relative" \
+      --arg identifier "$identifier" \
+      --arg team_identifier "$component_team" \
+      --arg cdhash "$component_cdhash" \
+      --arg signed_sha256 "$component_signed_sha" \
+      --arg unsigned_sha256 "$unsigned_sha" \
+      --argjson entitlements "$component_entitlements" \
+      '{path: $path, identifier: $identifier,
+        teamIdentifier: $team_identifier, cdhash: $cdhash,
+        signedSha256: $signed_sha256, unsignedSha256: $unsigned_sha256,
+        hardenedRuntime: true, secureTimestamp: true,
+        entitlements: $entitlements}' \
+      >>"$components_jsonl"
+  done <<EOF
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$expected_app_unsigned_sha
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$expected_core_unsigned_sha
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$expected_broker_unsigned_sha
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$expected_worker_unsigned_sha
+EOF
+
+  source_head="$(git rev-parse HEAD)"
+  source_status_sha="$(git status --porcelain=v1 -uall \
+    | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+  source_diff_sha="$(git diff --binary --no-ext-diff \
+    | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+  stage_script_sha="$(/usr/bin/shasum -a 256 "$repo_root/scripts/stage_openopen_app.sh" \
+    | /usr/bin/awk '{print $1}')"
+  dmg_script_sha="$(/usr/bin/shasum -a 256 "$repo_root/scripts/create_alpha_dmg.sh" \
+    | /usr/bin/awk '{print $1}')"
+  provenance_sha="$(/usr/bin/shasum -a 256 "$repo_root/PROVENANCE.md" \
+    | /usr/bin/awk '{print $1}')"
+  third_party_notices_sha="$(/usr/bin/shasum -a 256 \
+    "$repo_root/THIRD_PARTY_NOTICES.md" | /usr/bin/awk '{print $1}')"
+  identity_json="$receipt_resources/identity.json"
+  /usr/bin/jq -n \
+    --arg receipt_kind "com.thesongzhu.OpenOpen.post-stage-identity" \
+    --arg head "$source_head" \
+    --arg status_sha256 "$source_status_sha" \
+    --arg binary_diff_sha256 "$source_diff_sha" \
+    --arg stage_script_sha256 "$stage_script_sha" \
+    --arg dmg_script_sha256 "$dmg_script_sha" \
+    --arg provenance_sha256 "$provenance_sha" \
+    --arg third_party_notices_sha256 "$third_party_notices_sha" \
+    --arg source_snapshot_sha256 "$source_snapshot_sha" \
+    --arg signing_identity "$signing_identity" \
+    --arg team_identifier "$imsg_team" \
+    --arg leaf_certificate_sha256 "$expected_developer_id_leaf_sha" \
+    --arg manifest_sha256 "$app_manifest_sha" \
+    --argjson directory_count "$app_directory_count" \
+    --argjson file_count "$app_file_count" \
+    --slurpfile components "$components_jsonl" \
+    '{schemaVersion: 2, receiptKind: $receipt_kind,
+      source: {head: $head, statusSha256: $status_sha256,
+        binaryDiffSha256: $binary_diff_sha256,
+        indexState: "empty",
+        sourceSnapshotFile: "Contents/Resources/source-snapshot.tsv",
+        sourceSnapshotFormat: "OPENOPEN-SOURCE-SNAPSHOT-V2",
+        sourceSnapshotSha256: $source_snapshot_sha256,
+        stageScriptSha256: $stage_script_sha256,
+        dmgScriptSha256: $dmg_script_sha256,
+        provenanceSha256: $provenance_sha256,
+        thirdPartyNoticesSha256: $third_party_notices_sha256},
+      signer: {identity: $signing_identity, teamIdentifier: $team_identifier,
+        leafCertificateSha256: $leaf_certificate_sha256},
+      app: {bundleIdentifier: "com.thesongzhu.OpenOpen",
+        manifestFile: "Contents/Resources/app-manifest.tsv",
+        manifestFormat: "OPENOPEN-TREE-MANIFEST-V1",
+        manifestSha256: $manifest_sha256,
+        directoryCount: $directory_count, fileCount: $file_count,
+        metadataPolicy: {types: ["directory", "regular-file"],
+          directoryMode: "755", regularFileMode: "644", machOMode: "755",
+          bsdFlags: "0", aclEntries: 0,
+          allowedExtendedAttributes: ["com.apple.provenance"]},
+        components: $components}}' >"$identity_json"
+
+  /usr/bin/find -P "$receipt_staging" -type d -exec /bin/chmod 0755 {} +
+  /usr/bin/find -P "$receipt_staging" -type f -exec /bin/chmod 0644 {} +
+  /usr/bin/xattr -cr "$receipt_staging"
+  /usr/bin/codesign --force --sign "$signing_identity" \
+    --identifier com.thesongzhu.OpenOpen.PostStageIdentityReceipt \
+    --options runtime --timestamp "$receipt_staging"
+  /usr/bin/codesign --verify --strict "$receipt_staging"
+  verify_signing_field "$receipt_staging" Identifier \
+    com.thesongzhu.OpenOpen.PostStageIdentityReceipt
+  verify_signing_field "$receipt_staging" TeamIdentifier "$imsg_team"
+  verify_hardened_timestamped "$receipt_staging"
+  verify_developer_id_application "$receipt_staging" "$imsg_team"
+  verify_owner_certificate "$receipt_staging"
+  verify_no_get_task_allow "$receipt_staging"
+  [[ "$(entitlements_json "$receipt_staging")" == "{}" ]] || {
+    echo "post-stage identity receipt has unexpected entitlements" >&2
+    exit 66
+  }
+  /usr/bin/jq -e --arg manifest_sha "$app_manifest_sha" \
+    '.schemaVersion == 2
+      and .receiptKind == "com.thesongzhu.OpenOpen.post-stage-identity"
+      and .app.manifestSha256 == $manifest_sha
+      and (.app.components | length) == 4' "$identity_json" >/dev/null
+
+  claimed_receipt=1
+  /usr/bin/ditto "$receipt_staging" "$identity_receipt_output"
+  /usr/bin/codesign --verify --strict "$identity_receipt_output"
+  verify_signing_field "$identity_receipt_output" Identifier \
+    com.thesongzhu.OpenOpen.PostStageIdentityReceipt
+  verify_signing_field "$identity_receipt_output" TeamIdentifier "$imsg_team"
+  verify_owner_certificate "$identity_receipt_output"
+  source_receipt_manifest="$staging/source-receipt-manifest.tsv"
+  output_receipt_manifest="$staging/output-receipt-manifest.tsv"
+  write_tree_manifest "$receipt_staging" "$source_receipt_manifest"
+  write_tree_manifest "$identity_receipt_output" "$output_receipt_manifest"
+  /usr/bin/cmp -s "$source_receipt_manifest" "$output_receipt_manifest" || {
+    echo "external post-stage identity receipt changed during publication" >&2
+    exit 66
+  }
+  /bin/bash "$repo_root/scripts/create_alpha_dmg.sh" \
+    --app "$output" \
+    --identity-receipt "$identity_receipt_output" \
+    --developer-id-identity "$signing_identity" \
+    --verify-identity-receipt-only
+  receipt_cdhash="$(signing_value "$identity_receipt_output" CDHash)"
+  claimed_receipt=0
+  claimed_output=0
+  echo "STAGED_DEVELOPER_ID_WITH_EXTERNAL_IDENTITY_RECEIPT_NOT_NOTARIZED_NOT_RELEASE_PROOF $imsg_team $app_manifest_sha $receipt_cdhash $output $identity_receipt_output"
 else
+  claimed_output=0
   echo "STAGED_AD_HOC_NOT_RELEASE_PROOF $output"
 fi

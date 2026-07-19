@@ -108,8 +108,7 @@ impl OutcomeRequest {
                 "sourceRefs": {
                     "items": source_items,
                     "maxItems": self.allowed_source_refs.len(),
-                    "type": "array",
-                    "uniqueItems": true
+                    "type": "array"
                 },
                 "title": {"maxLength": 120, "minLength": 1, "type": "string"},
                 "whyNow": {"maxLength": 300, "minLength": 1, "type": "string"}
@@ -265,6 +264,12 @@ mod tests {
         assert_eq!(
             request.output_schema()["properties"]["sourceRefs"]["items"]["enum"][0],
             "typed:1"
+        );
+        assert!(
+            request.output_schema()["properties"]["sourceRefs"]
+                .get("uniqueItems")
+                .is_none(),
+            "Codex structured output supports only its documented JSON Schema subset; duplicate refs remain rejected after parsing"
         );
     }
 

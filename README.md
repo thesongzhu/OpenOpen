@@ -1,25 +1,177 @@
 # OpenOpen
 
 OpenOpen is a local-first outcome distribution layer for people who know AI
-exists but do not yet know what to ask it to do. It turns an explicit voice,
-message, or receipt into a bounded Mission, trackable steps, a `Need you`
-boundary, and an evidence-backed Receipt in apps the user already knows.
+exists but do not yet know what to ask it to do. Within sources the user has
+approved, it learns what matters, notices one concrete opportunity, prepares
+one bounded help proposal, asks at most one decision-changing question, and
+remains responsible through an evidence-backed Receipt in apps the user
+already knows.
 
 The Build Week product targets macOS 14+ on Apple Silicon and uses the user's
 own ChatGPT plan through an embedded Codex App Server. OpenOpen has no cloud
 service and no central telemetry.
 
+Competition V1 is OpenAI-only: ChatGPT is the only AI account, Memory/Passport
+source, and Deep ZIP source. Claude, Anthropic integrations, and cross-provider
+import are excluded and are not claimed.
+
 ## Current status
 
 Implementation is in progress. A green unit test or mock is not release proof.
-The product must not be described as `PRODUCT_READY_FOR_DEMO` until every gate
-in [the master plan](docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md) passes on the same
-signed build and commit.
+The current competition product must not be described as
+`BUILD_WEEK_COMPETITION_READY` until the dated current competition contract in
+[the master plan](docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md) passes. Older full
+production gates remain honest post-competition roadmap items.
 
-Reviewed commit `5a461ef…` and PR Actions run `29450863581` close the current
-code/signing plumbing review only. PR #2 remains draft and unmerged; the
-Developer-ID package is unnotarized, and real GPT, Reminders, iMessage,
-Discord, Slack, clean-install, and external-user proof remain pending.
+Historical reviewed commit `5a461ef…` and PR Actions run `29450863581` closed
+an earlier code/signing plumbing review only; they do not review the current
+implementation. Installed Repair19 final5b has exact signed runtime proof and
+exactly two durable pairings (iMessage and the canonical Friday Discord route).
+Its one-time first-start recovery terminalized the sole consumed Discord model
+dispatch as failed without replay, resend, suggestion, Mission, Receipt, or
+outbound work. The original provider message must not be resent.
+
+Repair19 removes only the unsupported structured-output
+`uniqueItems` keyword, terminalizes the consumed failed dispatch without
+replay, keeps explicit-correction polling live, and boundedly recovers the
+exact Core. Two fresh final2 reviews rejected that candidate before install:
+Global Off could still race a late durable suggestion, an RPC already installed
+before stdout EOF could retain stale write authority, and current-status text
+was stale. Final3 makes the Store reject model results across Off in the same
+immediate transaction, holds the active-operation gate through reconciliation,
+and serializes EOF revocation with the final pre-write authorization check. The
+fresh final3 security review passed, but product review invalidated that package
+with one P1: successful Core recovery cleared the transient warning while the
+durable failed dispatch was no longer rediscovered. Final4 makes the newest
+failed dispatch persistently surface `Need you` after restart until a later
+explicit correction supersedes it, without granting another model call. The
+final3 and final4 were both invalidated before install. Final4 product review
+proved persistent `Need you` starved the provider poll that must ingest a
+correction; security review proved one channel's failure could clear another
+channel's valid Outcome. Final5 polls transport before persistent failure
+feedback and invalidates only the exact same-channel suggestion ID. Final5b
+passed two fresh reviews, was installed, and produced the bounded recovery
+above. Real use then exposed Repair20's exact Global-Off ordering defect: after
+the exact old Core was stopped, the replacement Core tried to verify signed
+runtime history before receiving the pinned broker enrollment. Repair20
+provisions that enrollment first only for the positively quiesced replacement-
+Core branch; normal live-Core Off still cancels and prepares before any
+provisioning, and an unproven shutdown performs neither prepare nor broker
+apply. The first replacement review pair invalidated `final1` before install:
+product found the missing same-model failed-shutdown retry regression, and
+security found that a newer On intent could falsely converge without restoring
+the killed Core and both listeners. Repair20 now latches the quiesced transition
+until protected Off commits. If On is still desired, the UI remains Turning On
+and model entry stays disabled until the exact Core generation, Codex, account/
+models, and both durable listeners are restored; a newer Off re-quiesces and
+converges Off without replay. Failed shutdown may be retried on the same model,
+while a newer On must revalidate both durable listeners before it can display
+On. Both fresh final2 reviewers rejected that package with P0/P1/P2=`0/2/0`:
+a refused exact Core terminator was not retried on the same captured audit
+token, and recovery could publish On before listener restoration completed.
+Final3 quarantines and retries that exact Core generation, and publishes On only
+after the fenced Core, Codex, account/models, and both listeners are restored.
+Fresh final3 product/security review nevertheless rejected it with `0/1/0` and
+`0/2/0`: ordinary persisted Off→On bypassed that special latch, and Discord
+`connecting`/`reconnecting` counted as restored. Final4 applies the restoration
+gate to every production-lifecycle protected On and requires bounded proof of
+exact Discord `connected`; terminal status or timeout pauses fail closed, and a
+newer Off interrupts without replay. Both fresh final4 reviewers invalidated
+that package before install: product reported P0/P1/P2=`0/1/0` because a real
+Core-death recovery briefly displayed Unknown instead of Turning On; security
+reported `0/2/0` because protected On could publish without exact ChatGPT plus
+`gpt-5.6-sol`/`high`, and Host model work did not require Discord's exact live
+`connected` state after recovery. Final5 keeps every Core-death recovery
+Turning On, enables model entry only after the managed ChatGPT account and
+exact Sol/high catalog are freshly proven, and requires exact Discord Connected
+for both model and outbound work. Missing account/model readiness opens only the
+managed Account setup boundary; it never blocks protected Off. Final5 passed
+its complete matrix and two fresh reviews, was installed, and preserved the two
+pairings, failed dispatch, and zero Mission/Receipt/outbound state. Its bounded
+recovery then reached `.paused`; the one official Off attempt still failed
+because `.paused` was omitted from the existing replacement-Core provisioning
+condition. Repair21 adds only that explicit state to the already reviewed
+quiesced path, so broker trust is provisioned before the replacement Core
+prepares Off. Direct tests cover the successful monotonic commit and shutdown/
+provision/prepare failures, with no false Off or external work. The Repair21
+complete matrix passed 238 executed Rust tests with two explicit real-runtime
+diagnostics ignored and 56 broker/signing plus 127 App tests. Its synchronized
+Developer-ID App manifest `509ee4b7…` and DMG `02964b91…` passed two fresh
+P0/P1/P2=`0/0/0` reviews, were installed through the official broker route,
+and durably committed Global Off from revision 27 to 28 while preserving both
+pairings, the failed/no-suggestion dispatch, and zero Mission/Receipt/outbound
+work. A later official On advanced to revision 29 but exposed Repair22: a
+    cursor-bearing Discord restore waited for Connected before it drove the
+    existing typed recovery poll that must clear `recovery_required`. Repair22
+    drains that transaction before Connected/model/outbound readiness. Its
+    final2 package passed two fresh reviews, was installed, restored both
+    durable listeners, and accepted the exact Owner-approved correction once as
+    provider message `1528211998263738570`. The dispatch failed before
+    structured JSON parsing because the client rejected pinned passive
+    high-reasoning progress methods and used obsolete `agentMessage/delta`
+    instead of `item/agentMessage/delta`. Repair23 accepts only the closed
+    pinned passive progress set with strict identity/count/byte/index checks;
+    tools, actions, reroutes, malformed or unknown notifications remain fail
+    closed. Both real provider dispatches remain terminal and never retry.
+    Repair23 final2 was invalidated before installation when its fresh product
+    reviewer found that allowed passive metadata did not fully reject pinned-
+    schema-malformed active flags and rate-limit fields. Both fresh final3
+    reviewers then invalidated that package before installation with
+    P0/P1/P2=`0/0/2`: `turn/started` did not require its pinned `items`, allowed
+    items did not require bounded IDs and type-specific mandatory fields, and
+    the embedded current-state text still called the already-built package
+    pending. Final4 added the missing Turn/item/lifecycle validation, but its
+    fresh product/security reviews invalidated it before install with combined
+    P0/P1/P2=`0/1/1`: malformed `memoryCitation` objects passed incomplete
+    nested validation, and protocol/item/output errors returned failure without
+    terminating the reusable Codex transport. Final5 closed those findings,
+    but both fresh final5 reviewers invalidated it before install with
+    P0/P1/P2=`0/1/0`: `turn/completed` did not require the pinned full
+    `itemsView`, so a valid display summary could hide tool/action items while
+    supplying an otherwise valid final JSON. Final6 is also invalid: its
+    `turn/started` route did not validate every optional pinned Turn field, and
+    its recorded Swift log ended with a missing `swift-format` command while
+    the receipt incorrectly called that log PASS. Supervisor-approved final7
+    replaces the fragmented checks with one sealed stage-aware gateway used by
+    `turn/start`, `turn/started`, and `turn/completed`, validates the complete
+    known Turn and accepted nested item shapes, rebuilds authority only from a
+    terminal full list, and terminates the transport on every turn/protocol/
+    output error. The complete current-fingerprint matrix passes 253 executed
+    Rust tests with two explicit real-runtime diagnostics ignored, 56 broker/
+    signing plus 140 App tests, release builds, strict lint/format, locked
+    metadata, notices, plist/scripts, diff/conflict, and secret scans. The
+    signed-package and fresh-review facts are intentionally bound only by the
+    external immutable final7 receipt; this embedded-capable text does not
+    self-certify or dynamically negate them. The exact final7b build was later
+    installed for bounded runtime validation. That real state exposed a
+    recurring blocking modal for the same durable terminal failure. Repair24
+    keeps the failed dispatch immutable, persists one incident and atomic
+    acknowledgement, prevents repeat modal presentation across polling/restart,
+    and leaves the incident visible as non-blocking activity without any model
+    or provider retry. Incident-scoped feedback/refresh, strict channel DTOs,
+    model-gated Discord setup, connected-route effects during account setup,
+    and an explicit required poll capability that blocks model selection while
+    the account or recovery path is not model-ready close the remaining
+    liveness findings without granting model authority. A fresh pre-freeze
+    Product Scout reports P0/P1/P2=`0/0/0`. Final6's Rust matrix passed but its
+    Swift matrix exposed a fixed-delay test-scheduling race and is historical
+    FAIL evidence. An isolated supervisor authorized only a bounded Mock Core
+    Dashboard-entry synchronization in the two sibling generation tests. The
+    resulting fingerprint must rerun all 269 executed Rust tests with two
+    explicit real-runtime diagnostics ignored, all 56+193 Swift tests, both
+    release builds, warnings-as-errors, strict formatting/lint, notices,
+    metadata, plist/scripts, diff/conflict, and bounded secret scanning.
+    Repair24 package and review facts are bound only by a later external
+    immutable receipt; installation, new input, and connected Mission proof
+    remain pending.
+`final1` through `final6` remain invalid historical artifacts. No real
+connected Mission proof is claimed.
+This file neither self-authorizes installation nor claims real-provider
+closure.
+PR #2 remains draft and unmerged; every Developer-ID candidate remains
+unnotarized.
+Notarization and external-user proof are not current competition gates and are
+not claimed.
 
 ## Development
 
@@ -112,31 +264,30 @@ the final App. A process already authorized to use the owner's private signing
 identity can invoke Apple's `codesign` directly; these scripts prove the exact
 candidate output and do not claim to sandbox that already-authorized signer.
 
-The Developer-ID output remains `NOT_NOTARIZED_NOT_RELEASE_PROOF`. Apple
-notarization credentials, submission, stapling, Gatekeeper acceptance, and
-administrator/cross-UID installation are separate required gates.
+The Developer-ID output remains `NOT_NOTARIZED_NOT_RELEASE_PROOF`.
+Administrator/cross-UID runtime identity remains required for the tested
+competition build. Apple notarization, submission, stapling, Gatekeeper public
+release, and clean-machine distribution are post-competition production gates
+and are not claimed.
 
-No credentials belong in this repository. ChatGPT, Discord, and future Slack
-credentials are stored at runtime in the macOS Keychain.
+No credentials belong in this repository. ChatGPT and Discord credentials are
+stored at runtime in the macOS Keychain.
 
 ## Scope
 
-Build Week v1 contains three complete product routes:
+Build Week v1 is one connected adoption loop:
 
-1. Voice to actions in Reminders and the selected chat.
-2. Availability collection across one approved iMessage conversation and one
-   approved Slack channel, with at most one follow-up and owner confirmation.
-3. Receipt images from chat to a locally generated XLSX and a verifiable
-   Receipt.
+`Passport/ZIP → confirmed Memory → proactive suggestion → bounded Mission → reviewed GitHub Skill → iMessage/Discord → Reminders Evidence → Receipt → Workflow Candidate`
 
-The accelerated first milestone remains Hero A with real iMessage and Discord.
-The next judge slice adds the optional Quick Memory Passport, deterministic
-Auto model routing, direct-local Slack Socket Mode, and individually consented
-Slack/iMessage opportunity previews without granting execution authority.
+The first milestone remains Hero A with real iMessage and Discord. The next
+competition stages add Agent Understanding, Quick Passport, complete ChatGPT
+Deep ZIP import, an explicit learning/proactivity contract,
+instruction-only public GitHub Skills, and Workflow Candidate.
 
-Telegram, an OpenOpen cloud, hidden or unapproved ambient surveillance,
-self-bots, private iMessage APIs, payments, and silent model or Skill upgrades
-are intentionally excluded.
+Slack, Auto routing, Hero B/C, Telegram, an OpenOpen cloud, hidden or
+unapproved ambient surveillance, self-bots, arbitrary Skill scripts, private
+iMessage APIs, payments, and silent model or Skill upgrades are intentionally
+excluded from the competition build.
 
 ## Provenance
 

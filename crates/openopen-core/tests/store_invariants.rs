@@ -8,14 +8,15 @@ use openopen_core::{
     channel_receipt_content,
 };
 use openopen_protocol::{
-    ApprovalKind, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision,
-    ChannelKind, ChannelMessageKind, ChannelModelDisposition, ChannelObservation,
-    ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing, EFFECT_PROTOCOL_VERSION,
-    EffectBrokerSession, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
-    EvidenceKind, MissionFileEffect, MissionStatus, OutcomeSuggestion, RuntimeControlAuthorization,
-    RuntimeControlReceipt, WorkItemStatus, effect_noncommit_signing_bytes, effect_permit_hash,
-    effect_receipt_signing_bytes, runtime_control_authorization_hash,
-    runtime_control_receipt_signing_bytes,
+    ApprovalKind, ApprovalStatus, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
+    ChannelInboundDecision, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
+    ChannelMissionEvent, ChannelModelDisposition, ChannelObservation, ChannelOutboundDisposition,
+    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision,
+    ChannelRouteRole, EFFECT_PROTOCOL_VERSION, EffectBrokerSession, EffectNonCommit, EffectPermit,
+    EffectPermitPurpose, EffectReceipt, EvidenceKind, MissionFileEffect, MissionStatus,
+    OutcomeSuggestion, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
+    effect_noncommit_signing_bytes, effect_permit_hash, effect_receipt_signing_bytes,
+    runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -164,7 +165,7 @@ fn broker_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[41_u8; 32])
 }
 
-fn broker_enrollment(authority: &LocalAuthority) -> TrustedBrokerEnrollment {
+fn broker_enrollment_record(authority: &LocalAuthority) -> BrokerEnrollmentRecord {
     let broker_key = broker_signing_key().verifying_key().to_bytes();
     let mut record = BrokerEnrollmentRecord {
         version: 1,
@@ -183,7 +184,15 @@ fn broker_enrollment(authority: &LocalAuthority) -> TrustedBrokerEnrollment {
             .sign(&broker_enrollment_signing_bytes(&record).unwrap())
             .to_bytes(),
     );
-    TrustedBrokerEnrollment::from_signed_install_record(authority, &record).unwrap()
+    record
+}
+
+fn broker_enrollment(authority: &LocalAuthority) -> TrustedBrokerEnrollment {
+    TrustedBrokerEnrollment::from_signed_install_record(
+        authority,
+        &broker_enrollment_record(authority),
+    )
+    .unwrap()
 }
 
 fn effect_store_in_memory(authority: LocalAuthority) -> Store {
@@ -512,6 +521,44 @@ fn observation(id: u64) -> ChannelObservation {
     }
 }
 
+fn imessage_pairing() -> ChannelPairing {
+    ChannelPairing {
+        channel: ChannelKind::IMessage,
+        owner_sender_id: "owner-imessage".into(),
+        conversation_id: "chat-imessage".into(),
+        require_explicit_address: true,
+        discord: None,
+        paired_at_ms: 6,
+    }
+}
+
+fn imessage_observation(id: u64) -> ChannelObservation {
+    let content = format!("imessage-body-{id}");
+    ChannelObservation {
+        envelope: ChannelEnvelope {
+            channel: ChannelKind::IMessage,
+            source_message_id: format!("imessage-{id}"),
+            sender_id: "owner-imessage".into(),
+            conversation_id: "chat-imessage".into(),
+            content_sha256: format!("{:x}", Sha256::digest(&content)),
+            received_at_ms: i64::try_from(id + 10).unwrap(),
+        },
+        cursor: ChannelCursor {
+            channel: ChannelKind::IMessage,
+            conversation_id: "chat-imessage".into(),
+            opaque_value: format!("imessage-cursor-{id}"),
+            order: id,
+            observed_at_ms: i64::try_from(id + 10).unwrap(),
+        },
+        is_bot: false,
+        explicitly_addressed: true,
+    }
+}
+
+fn imessage_body(id: u64) -> String {
+    format!("imessage-body-{id}")
+}
+
 fn persist_channel_active(store: &mut Store) -> MissionCommandResult {
     store.pair_channel(&channel_pairing()).unwrap();
     store
@@ -570,7 +617,7 @@ fn persist_channel_active(store: &mut Store) -> MissionCommandResult {
         })
         .collect::<Vec<_>>();
     let mut active = store
-        .execute_mission_command_batch_with_channel_origin(
+        .execute_mission_command_batch_with_primary_channel_route(
             &envelopes,
             ChannelKind::Discord,
             "message-1",
@@ -582,6 +629,11 @@ fn persist_channel_active(store: &mut Store) -> MissionCommandResult {
         .unwrap();
     active.anchor = store.current_verified_audit_anchor().unwrap().unwrap();
     active
+}
+
+fn primary_route(store: &Store) -> (String, u64) {
+    let route_set = store.channel_route_set("mission-1").unwrap().unwrap();
+    (route_set.primary_route_id, route_set.revision)
 }
 
 #[test]
@@ -1444,7 +1496,7 @@ fn global_off_rejects_observation_without_advancing_durable_dedupe() {
 }
 
 #[test]
-fn accepted_channel_model_dispatch_is_once_only_and_result_survives_restart() {
+fn accepted_channel_model_dispatch_is_once_only_and_result_cannot_cross_global_off() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let path = temp.path().to_path_buf();
     let security = authority();
@@ -1479,30 +1531,694 @@ fn accepted_channel_model_dispatch_is_once_only_and_result_survives_restart() {
         source_refs: vec!["discord:message-1".into()],
     };
     commit_runtime(&mut reopened, false, 2);
+    assert!(matches!(
+        reopened.record_channel_suggestion(ChannelKind::Discord, "message-1", &suggestion, 2),
+        Err(StoreError::RuntimeDisabled)
+    ));
     reopened
-        .record_channel_suggestion(ChannelKind::Discord, "message-1", &suggestion, 2)
+        .fail_channel_model(ChannelKind::Discord, "message-1", 3)
         .unwrap();
     assert!(matches!(
         reopened.begin_channel_model(ChannelKind::Discord, "message-1"),
         Err(StoreError::RuntimeDisabled)
     ));
     commit_runtime(&mut reopened, true, 3);
-    let ready = reopened
+    let failed = reopened
         .begin_channel_model(ChannelKind::Discord, "message-1")
         .unwrap();
-    assert_eq!(ready.disposition, ChannelModelDisposition::SuggestionReady);
-    assert_eq!(ready.suggestion.as_ref(), Some(&suggestion));
+    assert_eq!(failed.disposition, ChannelModelDisposition::RecoverOnly);
+    assert!(failed.suggestion.is_none());
     assert_eq!(
-        reopened.latest_channel_suggestion().unwrap().as_ref(),
-        Some(&suggestion)
+        reopened
+            .latest_failed_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-1")
+    );
+    assert!(reopened.latest_channel_suggestion().unwrap().is_none());
+    assert!(matches!(
+        reopened.record_channel_suggestion(ChannelKind::Discord, "message-1", &suggestion, 4),
+        Err(StoreError::ChannelObservationConflict)
+    ));
+    let correction = "Correction to previous: body-2";
+    let mut correction_observation = observation(2);
+    correction_observation.envelope.content_sha256 =
+        format!("{:x}", Sha256::digest(correction.as_bytes()));
+    assert_eq!(
+        reopened
+            .ingest_channel_message(&correction_observation, correction)
+            .unwrap()
+            .decision,
+        ChannelInboundDecision::Accepted
+    );
+    assert!(
+        reopened
+            .latest_failed_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .is_none()
     );
     assert_eq!(
         reopened
-            .channel_source_for_suggestion(&suggestion.id)
+            .next_queued_channel_model(ChannelKind::Discord)
             .unwrap()
+            .as_deref(),
+        Some("message-2"),
+        "a later explicit correction must supersede persistent Need you without replaying the failed dispatch"
+    );
+}
+
+#[test]
+fn terminal_channel_incident_is_stable_across_one_hundred_reads_and_acknowledges_once() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    let runtime = commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+    store
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
             .unwrap()
-            .source_message_id,
-        "message-1"
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    store
+        .fail_channel_model(ChannelKind::Discord, "message-1", 3)
+        .unwrap();
+    let expected = store
+        .channel_failure_incidents(Some(ChannelKind::Discord))
+        .unwrap();
+    assert_eq!(expected.len(), 1);
+    for _ in 0..100 {
+        assert_eq!(
+            store
+                .channel_failure_incidents(Some(ChannelKind::Discord))
+                .unwrap(),
+            expected
+        );
+    }
+    let anchor = AuditAnchor {
+        sequence: expected[0].incident_audit_anchor.sequence,
+        entry_hash: expected[0].incident_audit_anchor.entry_hash.clone(),
+        signature_hex: expected[0].incident_audit_anchor.signature_hex.clone(),
+    };
+    let acknowledged = store
+        .acknowledge_channel_failure_incident(
+            &expected[0].incident_id,
+            &anchor,
+            runtime.revision,
+            4,
+        )
+        .unwrap();
+    assert!(acknowledged.acknowledgement.is_some());
+    let response_loss_retry = store
+        .acknowledge_channel_failure_incident(
+            &expected[0].incident_id,
+            &anchor,
+            runtime.revision,
+            5,
+        )
+        .unwrap();
+    assert_eq!(response_loss_retry, acknowledged);
+    drop(store);
+    let connection = Connection::open(path).unwrap();
+    let acknowledgement_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger
+             WHERE action = 'channel.failure_incident_acknowledged'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(acknowledgement_audits, 1);
+}
+
+#[test]
+fn incident_projection_reveals_all_unacknowledged_history_without_overbounding_the_ui() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    let runtime = commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+    store.pair_channel(&imessage_pairing()).unwrap();
+
+    for id in 1..=129 {
+        let (channel, source_message_id) = if id % 2 == 0 {
+            store
+                .ingest_channel_message(&imessage_observation(id), &imessage_body(id))
+                .unwrap();
+            (ChannelKind::IMessage, format!("imessage-{id}"))
+        } else {
+            store
+                .ingest_channel_message(&observation(id), &message_body(id))
+                .unwrap();
+            (ChannelKind::Discord, format!("message-{id}"))
+        };
+        assert_eq!(
+            store
+                .begin_channel_model(channel, &source_message_id)
+                .unwrap()
+                .disposition,
+            ChannelModelDisposition::ExecuteNow
+        );
+        store
+            .fail_channel_model(
+                channel,
+                &source_message_id,
+                1_000 + i64::try_from(id).unwrap(),
+            )
+            .unwrap();
+    }
+
+    let complete = store.channel_failure_incidents(None).unwrap();
+    assert_eq!(
+        complete.len(),
+        129,
+        "durable history must never be truncated"
+    );
+    let first_page = store.channel_failure_incident_projection(None).unwrap();
+    assert_eq!(first_page.len(), 128);
+    assert_eq!(first_page, complete[..128]);
+
+    let first = &first_page[0];
+    let first_anchor = AuditAnchor {
+        sequence: first.incident_audit_anchor.sequence,
+        entry_hash: first.incident_audit_anchor.entry_hash.clone(),
+        signature_hex: first.incident_audit_anchor.signature_hex.clone(),
+    };
+    store
+        .acknowledge_channel_failure_incident(
+            &first.incident_id,
+            &first_anchor,
+            runtime.revision,
+            2_000,
+        )
+        .unwrap();
+    let next_page = store.channel_failure_incident_projection(None).unwrap();
+    assert_eq!(next_page.len(), 128);
+    assert!(
+        !next_page
+            .iter()
+            .any(|value| value.incident_id == first.incident_id)
+    );
+    assert!(
+        next_page
+            .iter()
+            .any(|value| value.incident_id == complete[128].incident_id),
+        "acknowledging the oldest row must reveal the next durable incident"
+    );
+
+    drop(store);
+    let reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert_eq!(
+        reopened.channel_failure_incident_projection(None).unwrap(),
+        next_page,
+        "the bounded recoverable projection must survive restart"
+    );
+    assert_eq!(reopened.channel_failure_incidents(None).unwrap().len(), 129);
+}
+
+#[test]
+fn terminal_incident_and_acknowledgement_failures_roll_back_atomically() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    let runtime = commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+    store
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    store
+        .begin_channel_model(ChannelKind::Discord, "message-1")
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_channel_failure_incident
+             BEFORE INSERT ON channel_failure_incident
+             BEGIN SELECT RAISE(ABORT, 'injected incident failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        store
+            .fail_channel_model(ChannelKind::Discord, "message-1", 3)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .started_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-1")
+    );
+    assert!(store.channel_failure_incidents(None).unwrap().is_empty());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER reject_channel_failure_incident")
+        .unwrap();
+    drop(connection);
+    store
+        .fail_channel_model(ChannelKind::Discord, "message-1", 4)
+        .unwrap();
+    let incident = store.channel_failure_incidents(None).unwrap().remove(0);
+    let anchor = AuditAnchor {
+        sequence: incident.incident_audit_anchor.sequence,
+        entry_hash: incident.incident_audit_anchor.entry_hash.clone(),
+        signature_hex: incident.incident_audit_anchor.signature_hex.clone(),
+    };
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_channel_failure_ack
+             BEFORE INSERT ON audit_ledger
+             WHEN NEW.action = 'channel.failure_incident_acknowledged'
+             BEGIN SELECT RAISE(ABORT, 'injected acknowledgement failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        store
+            .acknowledge_channel_failure_incident(
+                &incident.incident_id,
+                &anchor,
+                runtime.revision,
+                5,
+            )
+            .is_err()
+    );
+    assert!(
+        store.channel_failure_incidents(None).unwrap()[0]
+            .acknowledgement
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_failed_dispatch_backfills_only_after_trusted_broker_install() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment_record = broker_enrollment_record(&security);
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    for revision in 1..=33 {
+        commit_runtime(&mut store, revision % 2 == 1, revision);
+    }
+    store.pair_channel(&channel_pairing()).unwrap();
+    store
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    store
+        .begin_channel_model(ChannelKind::Discord, "message-1")
+        .unwrap();
+    store
+        .fail_channel_model(ChannelKind::Discord, "message-1", 34)
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute("DELETE FROM channel_failure_incident", [])
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM audit_ledger
+             WHERE action = 'channel.failure_incident_recorded'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut trustless = Store::open(&path, security).unwrap();
+    assert!(trustless.trusted_broker_enrollment().is_none());
+    trustless
+        .install_trusted_broker(&enrollment_record)
+        .unwrap();
+    let incidents = trustless.channel_failure_incidents(None).unwrap();
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].runtime_revision, 33);
+    assert!(incidents[0].acknowledgement.is_none());
+}
+
+#[test]
+fn started_channel_model_is_recovery_visible_then_terminally_unblocks_later_queue() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+    for id in [1, 2] {
+        store
+            .ingest_channel_message(&observation(id), &message_body(id))
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    drop(store);
+
+    let mut reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert_eq!(
+        reopened
+            .started_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-1")
+    );
+    assert_eq!(
+        reopened
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap(),
+        None,
+        "later queued work must remain closed while recovery surfaces the exact started row"
+    );
+    assert_eq!(
+        reopened
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::RecoverOnly
+    );
+    reopened
+        .fail_channel_model(ChannelKind::Discord, "message-1", 12)
+        .unwrap();
+    assert!(
+        reopened
+            .started_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-2")
+    );
+    assert_eq!(
+        reopened
+            .begin_channel_model(ChannelKind::Discord, "message-2")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+}
+
+#[test]
+fn explicit_model_failure_is_atomic_idempotent_and_never_becomes_a_suggestion() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+    store
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    store
+        .fail_channel_model(ChannelKind::Discord, "message-1", 3)
+        .unwrap();
+    store
+        .fail_channel_model(ChannelKind::Discord, "message-1", 4)
+        .unwrap();
+    let correction = "Correction to previous: keep the same intent but use a three-step checklist";
+    let mut correction_observation = observation(2);
+    correction_observation.envelope.content_sha256 =
+        format!("{:x}", Sha256::digest(correction.as_bytes()));
+    store
+        .ingest_channel_message(&correction_observation, correction)
+        .unwrap();
+    assert!(
+        store
+            .started_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-2")
+    );
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-2")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let context = store
+        .channel_model_context(ChannelKind::Discord, "message-2")
+        .unwrap();
+    assert_eq!(context.len(), 2);
+    assert_eq!(context[0].0.source_message_id, "message-1");
+    assert_eq!(context[1].1, correction);
+    assert!(matches!(
+        store.record_channel_suggestion(
+            ChannelKind::Discord,
+            "message-1",
+            &OutcomeSuggestion {
+                id: "suggestion-must-not-appear".into(),
+                title: "Invalid retry".into(),
+                why_now: "The consumed call failed.".into(),
+                proposed_steps: vec!["Do not publish".into()],
+                source_refs: vec!["channel:failed".into()],
+            },
+            5,
+        ),
+        Err(StoreError::ChannelObservationConflict)
+    ));
+    drop(store);
+    let failed_audits = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE action = 'channel.model_failed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(failed_audits, 1);
+}
+
+#[test]
+fn overlapping_unrelated_channel_intents_never_share_model_context() {
+    fn custom_observation(id: u64, content: &str) -> ChannelObservation {
+        let mut value = observation(id);
+        value.envelope.content_sha256 = format!("{:x}", Sha256::digest(content));
+        value
+    }
+
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+
+    let first_content = "prepare a tax letter";
+    let unrelated_content = "book dinner";
+    store
+        .ingest_channel_message(&custom_observation(1, first_content), first_content)
+        .unwrap();
+    store
+        .ingest_channel_message(&custom_observation(2, unrelated_content), unrelated_content)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let first = OutcomeSuggestion {
+        id: "suggestion-unrelated-first".into(),
+        title: "Prepare the tax letter".into(),
+        why_now: "The owner requested it.".into(),
+        proposed_steps: vec!["Draft the letter".into()],
+        source_refs: vec!["channel:first".into()],
+    };
+    store
+        .record_channel_suggestion(ChannelKind::Discord, "message-1", &first, 3)
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-2")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let context = store
+        .channel_model_context(ChannelKind::Discord, "message-2")
+        .unwrap();
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].0.source_message_id, "message-2");
+    assert_eq!(context[0].1, unrelated_content);
+
+    let second = OutcomeSuggestion {
+        id: "suggestion-unrelated-second".into(),
+        title: "Book dinner".into(),
+        why_now: "The owner requested it separately.".into(),
+        proposed_steps: vec!["Choose a restaurant".into()],
+        source_refs: vec!["channel:second".into()],
+    };
+    store
+        .record_channel_suggestion(ChannelKind::Discord, "message-2", &second, 4)
+        .unwrap();
+    let late_correction = "Correction to previous: choose a quieter restaurant";
+    store
+        .ingest_channel_message(&custom_observation(3, late_correction), late_correction)
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-3")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let late_context = store
+        .channel_model_context(ChannelKind::Discord, "message-3")
+        .unwrap();
+    assert_eq!(late_context.len(), 1);
+    assert_eq!(late_context[0].0.source_message_id, "message-3");
+    assert_eq!(late_context[0].1, late_correction);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One chronological serial-dispatch invariant story.
+fn channel_model_dispatch_is_serial_and_correction_binds_immediate_predecessor() {
+    fn custom_observation(id: u64, content: &str) -> ChannelObservation {
+        let mut value = observation(id);
+        value.envelope.content_sha256 = format!("{:x}", Sha256::digest(content));
+        value
+    }
+
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    commit_runtime(&mut store, true, 1);
+    store.pair_channel(&channel_pairing()).unwrap();
+
+    let first_content = "prepare a tax letter";
+    let immediate_content = "book dinner";
+    let correction_content = "Correction to previous: choose a quiet restaurant";
+    for (id, content) in [
+        (1, first_content),
+        (2, immediate_content),
+        (3, correction_content),
+    ] {
+        store
+            .ingest_channel_message(&custom_observation(id, content), content)
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    store
+        .record_channel_suggestion(
+            ChannelKind::Discord,
+            "message-1",
+            &OutcomeSuggestion {
+                id: "suggestion-serial-first".into(),
+                title: "Prepare a tax letter".into(),
+                why_now: "The owner requested it.".into(),
+                proposed_steps: vec!["Draft the letter".into()],
+                source_refs: vec!["channel:serial-first".into()],
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-2")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap(),
+        None,
+        "a started dispatch must serialize all later work on the channel"
+    );
+    assert!(matches!(
+        store.begin_channel_model(ChannelKind::Discord, "message-3"),
+        Err(StoreError::ChannelObservationConflict)
+    ));
+
+    store
+        .record_channel_suggestion(
+            ChannelKind::Discord,
+            "message-2",
+            &OutcomeSuggestion {
+                id: "suggestion-serial-immediate".into(),
+                title: "Book dinner".into(),
+                why_now: "The owner requested it separately.".into(),
+                proposed_steps: vec!["Choose a restaurant".into()],
+                source_refs: vec!["channel:serial-immediate".into()],
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap()
+            .as_deref(),
+        Some("message-3")
+    );
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-3")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let context = store
+        .channel_model_context(ChannelKind::Discord, "message-3")
+        .unwrap();
+    assert_eq!(
+        context
+            .iter()
+            .map(|(envelope, content)| (envelope.source_message_id.as_str(), content.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("message-2", immediate_content),
+            ("message-3", correction_content),
+        ]
     );
 }
 
@@ -1565,6 +2281,720 @@ fn accepted_observation_cursor_and_model_queue_commit_atomically_before_claim() 
 }
 
 #[test]
+fn mission_and_channel_model_claim_race_has_exactly_one_transactional_winner() {
+    let mut mission_first = effect_store_in_memory(authority());
+    let active = persist_active(&mut mission_first, "mission-1");
+    mission_first.pair_channel(&channel_pairing()).unwrap();
+    mission_first
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    let before_deferred_claim = mission_first
+        .current_verified_audit_anchor()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        mission_first.begin_channel_model(ChannelKind::Discord, "message-1"),
+        Err(StoreError::ChannelModelDeferredByMission)
+    ));
+    assert_eq!(
+        mission_first
+            .current_verified_audit_anchor()
+            .unwrap()
+            .unwrap(),
+        before_deferred_claim
+    );
+    let cancelled = execute(
+        &mut mission_first,
+        "cancel-mission-before-queued-claim",
+        Some(before_deferred_claim),
+        MissionCommand::Cancel {
+            mission_id: active.mission.id,
+            now_ms: 6,
+        },
+    )
+    .unwrap();
+    assert_eq!(cancelled.mission.status, MissionStatus::Cancelled);
+    assert_eq!(
+        mission_first
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+
+    let mut claim_first = effect_store_in_memory(authority());
+    claim_first.pair_channel(&channel_pairing()).unwrap();
+    claim_first
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    assert_eq!(
+        claim_first
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let before_rejected_mission = claim_first
+        .current_verified_audit_anchor()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        execute(
+            &mut claim_first,
+            "mission-create-during-started-channel-model",
+            Some(before_rejected_mission.clone()),
+            create_command("mission-2", 2),
+        ),
+        Err(StoreError::MissionModelInFlight)
+    ));
+    assert_eq!(
+        claim_first
+            .current_verified_audit_anchor()
+            .unwrap()
+            .unwrap(),
+        before_rejected_mission
+    );
+    claim_first
+        .fail_channel_model(ChannelKind::Discord, "message-1", 3)
+        .unwrap();
+    let after_terminal_dispatch = claim_first.current_verified_audit_anchor().unwrap();
+    assert_eq!(
+        execute(
+            &mut claim_first,
+            "mission-create-after-terminal-channel-model",
+            after_terminal_dispatch,
+            create_command("mission-2", 4),
+        )
+        .unwrap()
+        .mission
+        .status,
+        MissionStatus::Proposed
+    );
+}
+
+#[test]
+fn mission_bound_inbound_is_a_typed_participation_and_never_a_free_outcome() {
+    let mut store = effect_store_in_memory(authority());
+    persist_channel_active(&mut store);
+    let accepted = store
+        .ingest_channel_message(&observation(2), &message_body(2))
+        .unwrap();
+    assert_eq!(
+        accepted.decision,
+        ChannelInboundDecision::AcceptedMissionUpdate
+    );
+    let event = accepted.mission_event.unwrap();
+    assert_eq!(event.mission_id, "mission-1");
+    assert_eq!(
+        event.message_class,
+        ChannelInboundMessageClass::MissionParticipation
+    );
+    assert!(event.mission_revision > 0);
+    assert_eq!(event.route_set_revision, 1);
+    let anchor = store.current_verified_audit_anchor().unwrap().unwrap();
+    let mission = store.get_mission("mission-1", &anchor).unwrap().unwrap();
+    assert_eq!(mission.status, MissionStatus::Active);
+    assert!(mission.evidence.is_empty());
+    assert_eq!(mission.updated_at_ms, 5);
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .channel_mission_event(ChannelKind::Discord, "message-2")
+            .unwrap(),
+        Some(event.clone())
+    );
+    let duplicate = store
+        .ingest_channel_message(&observation(2), &message_body(2))
+        .unwrap();
+    assert_eq!(duplicate.decision, ChannelInboundDecision::Duplicate);
+    assert_eq!(duplicate.mission_event, Some(event));
+}
+
+#[test]
+fn need_you_route_event_advances_only_the_mission_revision_without_granting_authority() {
+    let mut store = effect_store_in_memory(authority());
+    let active = persist_channel_active(&mut store);
+    let needs = execute(
+        &mut store,
+        "route-need-you",
+        Some(active.anchor),
+        MissionCommand::RequestScopeChange {
+            mission_id: "mission-1".into(),
+            approval: NewBoundaryApproval {
+                id: "route-boundary".into(),
+                kind: ApprovalKind::NewRecipient,
+                prompt: "Approve the exact recipient?".into(),
+                scope_digest: "recipient-v1".into(),
+                target: None,
+            },
+            needs_me_id: "route-needs-you".into(),
+            now_ms: 6,
+        },
+    )
+    .unwrap();
+    let before = needs.anchor;
+    let accepted = store
+        .ingest_channel_message(&observation(7), &message_body(7))
+        .unwrap();
+    let event = accepted.mission_event.unwrap();
+    assert_eq!(
+        event.message_class,
+        ChannelInboundMessageClass::NeedYouResponse
+    );
+    let after = store.current_verified_audit_anchor().unwrap().unwrap();
+    assert!(after.sequence > before.sequence);
+    let mission = store.get_mission("mission-1", &after).unwrap().unwrap();
+    assert_eq!(mission.status, MissionStatus::NeedsMe);
+    assert_eq!(mission.updated_at_ms, 7);
+    assert!(mission.evidence.is_empty());
+    let approval = mission
+        .approvals
+        .iter()
+        .find(|approval| approval.id == "route-boundary")
+        .unwrap();
+    assert_eq!(approval.status, ApprovalStatus::Pending);
+    assert_eq!(approval.decided_by_id, None);
+}
+
+#[test]
+fn terminal_mission_route_releases_the_conversation_for_a_new_explicit_outcome() {
+    let mut store = effect_store_in_memory(authority());
+    let active = persist_channel_active(&mut store);
+    let cancelled = execute(
+        &mut store,
+        "cancel-routed-mission",
+        Some(active.anchor),
+        MissionCommand::Cancel {
+            mission_id: "mission-1".into(),
+            now_ms: 6,
+        },
+    )
+    .unwrap();
+    assert_eq!(cancelled.mission.status, MissionStatus::Cancelled);
+    let accepted = store
+        .ingest_channel_message(&observation(7), &message_body(7))
+        .unwrap();
+    assert_eq!(accepted.decision, ChannelInboundDecision::Accepted);
+    assert_eq!(accepted.mission_event, None);
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-7")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+}
+
+#[test]
+fn caller_cannot_fabricate_a_channel_participation_command_without_a_durable_event() {
+    let mut store = effect_store_in_memory(authority());
+    let active = persist_channel_active(&mut store);
+    let event = ChannelMissionEvent {
+        event_id: "channel-event-forged".into(),
+        mission_id: "mission-1".into(),
+        mission_revision: active.anchor.sequence,
+        mission_anchor_hash: active.anchor.entry_hash.clone(),
+        route_id: primary_route(&store).0,
+        route_set_revision: 1,
+        message_class: ChannelInboundMessageClass::MissionParticipation,
+        channel: ChannelKind::Discord,
+        source_message_id: "missing-message".into(),
+        content_sha256: "aa".repeat(32),
+        recorded_at_ms: 6,
+    };
+    let before = store.current_verified_audit_anchor().unwrap().unwrap();
+    assert!(matches!(
+        execute(
+            &mut store,
+            "channel-event-forged:mission",
+            Some(before.clone()),
+            MissionCommand::RecordChannelParticipation {
+                mission_id: "mission-1".into(),
+                event,
+            },
+        ),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(store.current_verified_audit_anchor().unwrap(), Some(before));
+}
+
+fn ingest_route_event_twice(
+    store: &mut Store,
+    observation: &ChannelObservation,
+    content: &str,
+) -> bool {
+    let first = store.ingest_channel_message(observation, content).unwrap();
+    let retry = store.ingest_channel_message(observation, content).unwrap();
+    if first.decision == ChannelInboundDecision::AcceptedMissionUpdate {
+        assert_eq!(retry.decision, ChannelInboundDecision::Duplicate);
+        true
+    } else {
+        assert_eq!(first.decision, ChannelInboundDecision::IgnoredStaleCursor);
+        assert_eq!(retry.decision, ChannelInboundDecision::IgnoredStaleCursor);
+        false
+    }
+}
+
+fn bind_imessage_stress_route(store: &mut Store) {
+    store.pair_channel(&imessage_pairing()).unwrap();
+    store
+        .bind_additional_channel_route(&ChannelRouteApproval {
+            approval_id: "route-approval-imessage-stress".into(),
+            mission_id: "mission-1".into(),
+            expected_route_set_revision: 1,
+            channel: ChannelKind::IMessage,
+            conversation_id: "chat-imessage".into(),
+            owner_sender_id: "owner-imessage".into(),
+            provider_identity: None,
+            allowed_inbound_classes: vec![
+                ChannelInboundMessageClass::MissionParticipation,
+                ChannelInboundMessageClass::NeedYouResponse,
+            ],
+            allowed_outbound_classes: Vec::new(),
+            actor_id: "owner-1".into(),
+            decision: ChannelRouteApprovalDecision::Approve,
+            decided_at_ms: 7,
+        })
+        .unwrap();
+}
+
+fn persist_numbered_active_mission(store: &mut Store, index: usize) {
+    let mission_id = format!("mission-{index}");
+    let commands = vec![
+        create_command(&mission_id, 20 + i64::try_from(index).unwrap()),
+        MissionCommand::BeginConfirmation {
+            mission_id: mission_id.clone(),
+            now_ms: 40 + i64::try_from(index).unwrap(),
+        },
+        MissionCommand::DecideApproval {
+            mission_id: mission_id.clone(),
+            approval_id: format!("scope-{mission_id}"),
+            actor_id: "owner-1".into(),
+            decision: ApprovalDecision::Approve,
+            now_ms: 60 + i64::try_from(index).unwrap(),
+        },
+        MissionCommand::Activate {
+            mission_id: mission_id.clone(),
+            now_ms: 80 + i64::try_from(index).unwrap(),
+        },
+        MissionCommand::TransitionWorkItem {
+            mission_id,
+            work_item_id: "work-1".into(),
+            next: WorkItemStatus::Active,
+            evidence_ids: Vec::new(),
+            now_ms: 100 + i64::try_from(index).unwrap(),
+        },
+    ];
+    let expected_anchor = store.current_verified_audit_anchor().unwrap();
+    let envelopes = commands
+        .into_iter()
+        .enumerate()
+        .map(|(command_index, command)| MissionCommandEnvelope {
+            command_id: format!("mission-{index}-active-{command_index}"),
+            expected_anchor: (command_index == 0)
+                .then(|| expected_anchor.clone())
+                .flatten(),
+            command,
+        })
+        .collect::<Vec<_>>();
+    let results = store.execute_mission_command_batch(&envelopes).unwrap();
+    assert_eq!(
+        results.last().unwrap().mission.status,
+        MissionStatus::Active
+    );
+}
+
+#[test]
+fn exact_create_batch_retry_precedes_a_later_started_channel_model_gate() {
+    let mut store = effect_store_in_memory(authority());
+    let create = MissionCommandEnvelope {
+        command_id: "mission-create-before-later-dispatch".into(),
+        expected_anchor: store.current_verified_audit_anchor().unwrap(),
+        command: create_command("mission-retry", 2),
+    };
+    let original = store
+        .execute_mission_command_batch(std::slice::from_ref(&create))
+        .unwrap();
+    let cancelled = execute(
+        &mut store,
+        "cancel-before-later-dispatch",
+        Some(original[0].anchor.clone()),
+        MissionCommand::Cancel {
+            mission_id: "mission-retry".into(),
+            now_ms: 3,
+        },
+    )
+    .unwrap();
+    assert_eq!(cancelled.mission.status, MissionStatus::Cancelled);
+
+    store.pair_channel(&channel_pairing()).unwrap();
+    store
+        .ingest_channel_message(&observation(1), &message_body(1))
+        .unwrap();
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::ExecuteNow
+    );
+    let before_retry = store.current_verified_audit_anchor().unwrap().unwrap();
+
+    assert_eq!(
+        store
+            .execute_mission_command_batch(std::slice::from_ref(&create))
+            .unwrap(),
+        original,
+        "an exact persisted response-loss retry must win before the new-creation race gate"
+    );
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        before_retry,
+        "an exact retry must remain read-only"
+    );
+    assert_eq!(
+        store
+            .begin_channel_model(ChannelKind::Discord, "message-1")
+            .unwrap()
+            .disposition,
+        ChannelModelDisposition::RecoverOnly,
+        "the later started dispatch must remain untouched"
+    );
+}
+
+#[test]
+fn ten_concurrent_missions_reject_cross_route_recipient_and_revision_leakage() {
+    let mut store = effect_store_in_memory(authority());
+    persist_channel_active(&mut store);
+    bind_imessage_stress_route(&mut store);
+    for index in 2..=10 {
+        persist_numbered_active_mission(&mut store, index);
+    }
+
+    let routed = store.channel_route_set("mission-1").unwrap().unwrap();
+    assert_eq!(routed.revision, 2);
+    assert_eq!(routed.routes.len(), 2);
+    for index in 2..=10 {
+        let mission_id = format!("mission-{index}");
+        let before = store.current_verified_audit_anchor().unwrap().unwrap();
+        let rejected = store.bind_additional_channel_route(&ChannelRouteApproval {
+            approval_id: format!("cross-route-approval-{index}"),
+            mission_id: mission_id.clone(),
+            expected_route_set_revision: routed.revision,
+            channel: ChannelKind::IMessage,
+            conversation_id: "chat-imessage".into(),
+            owner_sender_id: "owner-imessage".into(),
+            provider_identity: None,
+            allowed_inbound_classes: vec![ChannelInboundMessageClass::MissionParticipation],
+            allowed_outbound_classes: vec![ChannelMessageKind::Receipt],
+            actor_id: "owner-1".into(),
+            decision: ChannelRouteApprovalDecision::Approve,
+            decided_at_ms: 200 + i64::from(index),
+        });
+        assert!(matches!(rejected, Err(StoreError::ChannelRouteConflict)));
+        assert_eq!(store.current_verified_audit_anchor().unwrap(), Some(before));
+        assert_eq!(store.channel_route_set(&mission_id).unwrap(), None);
+    }
+
+    let before_wrong_owner = store.current_verified_audit_anchor().unwrap().unwrap();
+    let wrong_owner = store.bind_additional_channel_route(&ChannelRouteApproval {
+        approval_id: "wrong-owner-route-approval".into(),
+        mission_id: "mission-1".into(),
+        expected_route_set_revision: routed.revision,
+        channel: ChannelKind::IMessage,
+        conversation_id: "chat-imessage".into(),
+        owner_sender_id: "owner-imessage".into(),
+        provider_identity: None,
+        allowed_inbound_classes: vec![ChannelInboundMessageClass::MissionParticipation],
+        allowed_outbound_classes: Vec::new(),
+        actor_id: "owner-2".into(),
+        decision: ChannelRouteApprovalDecision::Approve,
+        decided_at_ms: 220,
+    });
+    assert!(matches!(wrong_owner, Err(StoreError::ChannelRouteConflict)));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap(),
+        Some(before_wrong_owner)
+    );
+
+    let discord = store
+        .ingest_channel_message(&observation(500), &message_body(500))
+        .unwrap();
+    let imessage = store
+        .ingest_channel_message(&imessage_observation(500), &imessage_body(500))
+        .unwrap();
+    assert_eq!(
+        discord.decision,
+        ChannelInboundDecision::AcceptedMissionUpdate
+    );
+    assert_eq!(
+        imessage.decision,
+        ChannelInboundDecision::AcceptedMissionUpdate
+    );
+    assert_eq!(discord.mission_event.unwrap().mission_id, "mission-1");
+    assert_eq!(imessage.mission_event.unwrap().mission_id, "mission-1");
+
+    let mut crossed_recipient = imessage_observation(501);
+    crossed_recipient.envelope.conversation_id = "channel-1".into();
+    crossed_recipient.cursor.conversation_id = "channel-1".into();
+    let before_crossed_recipient = store.current_verified_audit_anchor().unwrap().unwrap();
+    let ignored = store
+        .ingest_channel_message(&crossed_recipient, &imessage_body(501))
+        .unwrap();
+    assert_eq!(
+        ignored.decision,
+        ChannelInboundDecision::IgnoredConversation
+    );
+    assert_eq!(ignored.mission_event, None);
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap(),
+        Some(before_crossed_recipient)
+    );
+
+    let final_anchor = store.current_verified_audit_anchor().unwrap().unwrap();
+    let missions = store.list_missions(&final_anchor).unwrap();
+    assert_eq!(missions.len(), 10);
+    assert!(
+        missions.iter().all(|mission| {
+            mission.status == MissionStatus::Active && mission.evidence.is_empty()
+        })
+    );
+    assert!(store.list_receipts(&final_anchor).unwrap().is_empty());
+    assert_eq!(store.channel_route_set("mission-1").unwrap(), Some(routed));
+}
+
+#[test]
+fn one_hundred_out_of_order_duplicate_events_across_both_routes_survive_restart() {
+    let database = tempfile::NamedTempFile::new().unwrap();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(database.path(), security.clone(), enrollment.clone())
+            .unwrap();
+    commit_runtime(&mut store, true, 1);
+    persist_channel_active(&mut store);
+    bind_imessage_stress_route(&mut store);
+
+    let mut discord_orders = (2_u64..=51).collect::<Vec<_>>();
+    let mut imessage_orders = (1_u64..=50).collect::<Vec<_>>();
+    for pair in discord_orders.chunks_exact_mut(2) {
+        pair.swap(0, 1);
+    }
+    for pair in imessage_orders.chunks_exact_mut(2) {
+        pair.swap(0, 1);
+    }
+    let mut accepted = Vec::new();
+    for index in 0..50 {
+        let discord_id = discord_orders[index];
+        if ingest_route_event_twice(
+            &mut store,
+            &observation(discord_id),
+            &message_body(discord_id),
+        ) {
+            accepted.push((ChannelKind::Discord, format!("message-{discord_id}")));
+        }
+
+        let imessage_id = imessage_orders[index];
+        if ingest_route_event_twice(
+            &mut store,
+            &imessage_observation(imessage_id),
+            &imessage_body(imessage_id),
+        ) {
+            accepted.push((ChannelKind::IMessage, format!("imessage-{imessage_id}")));
+        }
+    }
+    assert_eq!(accepted.len(), 50);
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::Discord)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::IMessage)
+            .unwrap(),
+        None
+    );
+    let before_restart = store.current_verified_audit_anchor().unwrap().unwrap();
+    drop(store);
+
+    let mut restarted =
+        Store::open_with_trusted_broker(database.path(), security, enrollment).unwrap();
+    for (channel, source_message_id) in accepted {
+        let (observation, content) = match channel {
+            ChannelKind::Discord => {
+                let id = source_message_id
+                    .strip_prefix("message-")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                (observation(id), message_body(id))
+            }
+            ChannelKind::IMessage => {
+                let id = source_message_id
+                    .strip_prefix("imessage-")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                (imessage_observation(id), imessage_body(id))
+            }
+        };
+        let duplicate = restarted
+            .ingest_channel_message(&observation, &content)
+            .unwrap();
+        assert_eq!(duplicate.decision, ChannelInboundDecision::Duplicate);
+        assert_eq!(
+            duplicate.mission_event.unwrap().source_message_id,
+            source_message_id
+        );
+    }
+    assert_eq!(
+        restarted.current_verified_audit_anchor().unwrap().unwrap(),
+        before_restart
+    );
+}
+
+#[test]
+fn additional_route_requires_exact_owner_pairing_revision_and_defaults_outbound_off() {
+    let mut store = effect_store_in_memory(authority());
+    persist_channel_active(&mut store);
+    store.pair_channel(&imessage_pairing()).unwrap();
+    let approval = ChannelRouteApproval {
+        approval_id: "route-approval-imessage-1".into(),
+        mission_id: "mission-1".into(),
+        expected_route_set_revision: 1,
+        channel: ChannelKind::IMessage,
+        conversation_id: "chat-imessage".into(),
+        owner_sender_id: "owner-imessage".into(),
+        provider_identity: None,
+        allowed_inbound_classes: vec![
+            ChannelInboundMessageClass::MissionParticipation,
+            ChannelInboundMessageClass::NeedYouResponse,
+        ],
+        allowed_outbound_classes: Vec::new(),
+        actor_id: "owner-1".into(),
+        decision: ChannelRouteApprovalDecision::Approve,
+        decided_at_ms: 7,
+    };
+    let route_set = store.bind_additional_channel_route(&approval).unwrap();
+    assert_eq!(route_set.revision, 2);
+    assert_eq!(route_set.routes.len(), 2);
+    assert_eq!(route_set.routes[0].role, ChannelRouteRole::Primary);
+    let additional = &route_set.routes[1];
+    assert_eq!(additional.role, ChannelRouteRole::Additional);
+    assert!(additional.allowed_outbound_classes.is_empty());
+    assert_eq!(
+        store.bind_additional_channel_route(&approval).unwrap(),
+        route_set
+    );
+
+    let accepted = store
+        .ingest_channel_message(&imessage_observation(1), &imessage_body(1))
+        .unwrap();
+    assert_eq!(
+        accepted.decision,
+        ChannelInboundDecision::AcceptedMissionUpdate
+    );
+    assert_eq!(
+        accepted.mission_event.unwrap().route_id,
+        additional.route_id
+    );
+    assert_eq!(
+        store
+            .next_queued_channel_model(ChannelKind::IMessage)
+            .unwrap(),
+        None
+    );
+
+    let anchor = store.current_verified_audit_anchor().unwrap().unwrap();
+    let mut changed = approval.clone();
+    changed.allowed_outbound_classes = vec![ChannelMessageKind::Progress];
+    assert!(matches!(
+        store.bind_additional_channel_route(&changed),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        anchor
+    );
+}
+
+#[test]
+fn stale_revision_changed_recipient_wrong_owner_and_off_route_bind_fail_closed() {
+    let mut store = effect_store_in_memory(authority());
+    persist_channel_active(&mut store);
+    store.pair_channel(&imessage_pairing()).unwrap();
+    let base = ChannelRouteApproval {
+        approval_id: "route-approval-imessage-1".into(),
+        mission_id: "mission-1".into(),
+        expected_route_set_revision: 1,
+        channel: ChannelKind::IMessage,
+        conversation_id: "chat-imessage".into(),
+        owner_sender_id: "owner-imessage".into(),
+        provider_identity: None,
+        allowed_inbound_classes: vec![ChannelInboundMessageClass::MissionParticipation],
+        allowed_outbound_classes: Vec::new(),
+        actor_id: "owner-1".into(),
+        decision: ChannelRouteApprovalDecision::Approve,
+        decided_at_ms: 7,
+    };
+    let anchor = store.current_verified_audit_anchor().unwrap().unwrap();
+    let mut wrong_owner = base.clone();
+    wrong_owner.actor_id = "attacker".into();
+    assert!(matches!(
+        store.bind_additional_channel_route(&wrong_owner),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        anchor
+    );
+    let mut stale_revision = base.clone();
+    stale_revision.expected_route_set_revision = 2;
+    assert!(matches!(
+        store.bind_additional_channel_route(&stale_revision),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        anchor
+    );
+    let mut changed_recipient = base.clone();
+    changed_recipient.owner_sender_id = "other-recipient".into();
+    assert!(matches!(
+        store.bind_additional_channel_route(&changed_recipient),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        anchor
+    );
+    let mut rejected = base.clone();
+    rejected.decision = ChannelRouteApprovalDecision::Reject;
+    assert!(matches!(
+        store.bind_additional_channel_route(&rejected),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        anchor
+    );
+    commit_runtime(&mut store, false, 8);
+    let mut approved = rejected;
+    approved.decision = ChannelRouteApprovalDecision::Approve;
+    assert!(matches!(
+        store.bind_additional_channel_route(&approved),
+        Err(StoreError::RuntimeDisabled)
+    ));
+}
+
+#[test]
 fn outbound_authority_is_consumed_once_and_restart_is_recovery_only() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let path = temp.path().to_path_buf();
@@ -1576,9 +3006,12 @@ fn outbound_authority_is_consumed_once_and_restart_is_recovery_only() {
     commit_runtime(&mut store, true, 1);
     let active = persist_channel_active(&mut store);
     persist_channel_send_approvals(&mut store, &active, content);
+    let (route_id, route_set_revision) = primary_route(&store);
     let intent = ChannelOutboundIntent {
         outbound_id: "channel-send-1".into(),
         mission_id: "mission-1".into(),
+        route_id,
+        route_set_revision,
         channel: ChannelKind::Discord,
         conversation_id: "channel-1".into(),
         recipient_id: "owner-1".into(),
@@ -1587,6 +3020,17 @@ fn outbound_authority_is_consumed_once_and_restart_is_recovery_only() {
         created_at_ms: 13,
         recovery_cursor: Some(observation(1).cursor),
     };
+    let before_wrong_recipient = store.current_verified_audit_anchor().unwrap().unwrap();
+    let mut wrong_recipient = intent.clone();
+    wrong_recipient.recipient_id = "other-recipient".into();
+    assert!(matches!(
+        store.begin_channel_outbound(&wrong_recipient, content),
+        Err(StoreError::ChannelRouteConflict)
+    ));
+    assert_eq!(
+        store.current_verified_audit_anchor().unwrap().unwrap(),
+        before_wrong_recipient
+    );
     assert_eq!(
         store
             .begin_channel_outbound(&intent, content)
@@ -1641,14 +3085,102 @@ fn outbound_authority_is_consumed_once_and_restart_is_recovery_only() {
 }
 
 #[test]
+fn outbound_response_loss_survives_unrelated_route_set_append_without_duplicate_authority() {
+    let mut store = effect_store_in_memory(authority());
+    let content = "OpenOpen · AI\nMission progress is ready.".as_bytes();
+    let active = persist_channel_active(&mut store);
+    persist_channel_send_approvals(&mut store, &active, content);
+    let (route_id, route_set_revision) = primary_route(&store);
+    let original = ChannelOutboundIntent {
+        outbound_id: "channel-send-before-route-append".into(),
+        mission_id: "mission-1".into(),
+        route_id,
+        route_set_revision,
+        channel: ChannelKind::Discord,
+        conversation_id: "channel-1".into(),
+        recipient_id: "owner-1".into(),
+        kind: ChannelMessageKind::Progress,
+        content_sha256: format!("{:x}", Sha256::digest(content)),
+        created_at_ms: 13,
+        recovery_cursor: Some(observation(1).cursor),
+    };
+    assert_eq!(
+        store
+            .begin_channel_outbound(&original, content)
+            .unwrap()
+            .disposition,
+        ChannelOutboundDisposition::ExecuteNow
+    );
+
+    store.pair_channel(&imessage_pairing()).unwrap();
+    let appended = store
+        .bind_additional_channel_route(&ChannelRouteApproval {
+            approval_id: "route-approval-after-response-loss".into(),
+            mission_id: "mission-1".into(),
+            expected_route_set_revision: 1,
+            channel: ChannelKind::IMessage,
+            conversation_id: "chat-imessage".into(),
+            owner_sender_id: "owner-imessage".into(),
+            provider_identity: None,
+            allowed_inbound_classes: vec![ChannelInboundMessageClass::MissionParticipation],
+            allowed_outbound_classes: vec![ChannelMessageKind::Progress],
+            actor_id: "owner-1".into(),
+            decision: ChannelRouteApprovalDecision::Approve,
+            decided_at_ms: 14,
+        })
+        .unwrap();
+    assert_eq!(appended.revision, 2);
+
+    let mut retried = original.clone();
+    retried.outbound_id = "fresh-id-from-current-route-set-revision".into();
+    retried.route_set_revision = appended.revision;
+    retried.created_at_ms = 15;
+    retried.recovery_cursor = Some(observation(2).cursor);
+    let recovered = store.begin_channel_outbound(&retried, content).unwrap();
+    assert_eq!(
+        recovered.disposition,
+        ChannelOutboundDisposition::RecoverOnly
+    );
+    assert_eq!(recovered.intent, original);
+
+    let additional = appended
+        .routes
+        .iter()
+        .find(|route| route.channel == ChannelKind::IMessage)
+        .unwrap();
+    let different_route = ChannelOutboundIntent {
+        outbound_id: "genuinely-different-route".into(),
+        mission_id: "mission-1".into(),
+        route_id: additional.route_id.clone(),
+        route_set_revision: appended.revision,
+        channel: ChannelKind::IMessage,
+        conversation_id: additional.conversation_id.clone(),
+        recipient_id: additional.owner_sender_id.clone(),
+        kind: ChannelMessageKind::Progress,
+        content_sha256: format!("{:x}", Sha256::digest(content)),
+        created_at_ms: 15,
+        recovery_cursor: None,
+    };
+    assert_eq!(
+        store
+            .recover_channel_outbound(&different_route, content)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn outbound_changed_payload_target_or_provider_result_conflicts() {
     let mut store = effect_store_in_memory(authority());
     let content = "OpenOpen · AI\nExact progress".as_bytes();
     let active = persist_channel_active(&mut store);
     persist_channel_send_approvals(&mut store, &active, content);
+    let (route_id, route_set_revision) = primary_route(&store);
     let intent = ChannelOutboundIntent {
         outbound_id: "channel-send-1".into(),
         mission_id: "mission-1".into(),
+        route_id,
+        route_set_revision,
         channel: ChannelKind::Discord,
         conversation_id: "channel-1".into(),
         recipient_id: "owner-1".into(),
@@ -1704,9 +3236,12 @@ fn need_you_outbound_accepts_only_the_current_exact_boundary_prompt() {
     let needs_me = requested.mission.needs_me.as_ref().unwrap();
     let content =
         channel_message_payload(ChannelKind::Discord, &channel_need_you_content(needs_me));
+    let (route_id, route_set_revision) = primary_route(&store);
     let intent = ChannelOutboundIntent {
         outbound_id: "need-you-send-1".into(),
         mission_id: "mission-1".into(),
+        route_id,
+        route_set_revision,
         channel: ChannelKind::Discord,
         conversation_id: "channel-1".into(),
         recipient_id: "owner-1".into(),
@@ -1796,9 +3331,12 @@ fn receipt_outbound_requires_completed_evidence_receipt_and_prior_exact_approval
         },
     );
     assert_eq!(completed.receipt.as_ref(), Some(&receipt));
+    let (route_id, route_set_revision) = primary_route(&store);
     let intent = ChannelOutboundIntent {
         outbound_id: "receipt-send-1".into(),
         mission_id: "mission-1".into(),
+        route_id,
+        route_set_revision,
         channel: ChannelKind::Discord,
         conversation_id: "channel-1".into(),
         recipient_id: "owner-1".into(),

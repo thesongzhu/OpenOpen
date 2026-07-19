@@ -23,6 +23,24 @@ final class TypedJSONEnvelopeTests: XCTestCase {
     }
   }
 
+  func testRuntimeHomeRequestHasNoCallerSelectedPathOrUser() {
+    XCTAssertTrue(
+      TypedJSONEnvelope.accepts(
+        Data(#"{"type":"prepareCodexRuntimeHome","version":1}"#.utf8),
+        kind: .prepareCodexRuntimeHome
+      )
+    )
+    for rejected in [
+      #"{"path":"/tmp/home","type":"prepareCodexRuntimeHome","version":1}"#,
+      #"{"auditEuid":501,"type":"prepareCodexRuntimeHome","version":1}"#,
+      #"{"type":"prepareCodexRuntimeHome","version":2}"#,
+    ] {
+      XCTAssertFalse(
+        TypedJSONEnvelope.accepts(Data(rejected.utf8), kind: .prepareCodexRuntimeHome)
+      )
+    }
+  }
+
   func testRuntimeControlRequiresExactSignedMonotonicShape() throws {
     let request: [String: Any] = [
       "control": [
@@ -318,6 +336,14 @@ private final class FailIfCalledBackend: EffectBrokerBackend {
     reply _: @escaping (Data) -> Void
   ) {
     XCTFail("invalid DTO reached enrollCore backend")
+  }
+
+  func prepareCodexRuntimeHome(
+    peer _: AuthenticatedBrokerPeer,
+    requestJSON _: Data,
+    reply _: @escaping (Data) -> Void
+  ) {
+    XCTFail("invalid DTO reached prepareCodexRuntimeHome backend")
   }
 
   func applyRuntimeControl(

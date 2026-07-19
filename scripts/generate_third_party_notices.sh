@@ -315,7 +315,16 @@ printf '%s\n' \
   '' \
   '## Planned but not distributed' \
   '' \
-  '`rust_xlsxwriter` for Hero C is planned after `FRIDAY_ALPHA_READY`; it is not part of this payload or current distribution closure. Its future notices must be generated from the then-locked closure before distribution.' \
+  'The competition plan may adapt minimal parser, fixture, contract, and security-' \
+  'test material from `queelius/ctk@99784b7582a583fbae0725a5288797739dc347dd`,' \
+  '`slyubarskiy/chatgpt-conversation-extractor@b7c4372b518a006df57415b0d4287fbbdf88ed29`,' \
+  'and `openclaw/openclaw@af62abeeef86046daaa284d2eb6eef814aec11f7`.' \
+  'None is part of the current distributed closure. Before any imported file,' \
+  'fixture, or new dependency is distributed, regenerate the closure and record' \
+  'its exact source path, commit, license, copyright, adaptation, and hash.' \
+  '' \
+  'Exact `rust_xlsxwriter 0.96.0` belongs to the excluded Hero C roadmap and is' \
+  'not part of the current competition distribution closure.' \
   > "$GENERATED_DOC"
 
 if [ "$CHECK" -eq 1 ]; then
