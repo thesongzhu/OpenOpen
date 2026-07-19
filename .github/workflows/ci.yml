@@ -92,7 +92,7 @@ jobs:
       - name: Test the Swift app and broker package with warnings as errors
         timeout-minutes: 10
         working-directory: macos/EffectBrokerBridge
-        run: swift test -Xswiftc -warnings-as-errors
+        run: swift test --no-parallel -Xswiftc -warnings-as-errors
 
       - name: Verify tests did not rewrite tracked files
         if: always()
