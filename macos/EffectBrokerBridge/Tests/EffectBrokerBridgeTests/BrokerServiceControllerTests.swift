@@ -30,6 +30,34 @@ final class BrokerServiceControllerTests: XCTestCase {
       XCTAssertTrue(error is RegistrationDenied)
     }
   }
+
+  func testMissingInitialRecordUsesTheOfficialRegistrationRoute() throws {
+    var status = SMAppService.Status.notFound
+    var registrations = 0
+    let controller = BrokerServiceController(
+      statusProvider: { status },
+      registerAction: {
+        registrations += 1
+        status = .requiresApproval
+      },
+      openSettingsAction: {}
+    )
+
+    XCTAssertEqual(try controller.registerIfNeeded(), .requiresApproval)
+    XCTAssertEqual(registrations, 1)
+  }
+
+  func testEnabledServiceDoesNotReregister() throws {
+    var registrations = 0
+    let controller = BrokerServiceController(
+      statusProvider: { .enabled },
+      registerAction: { registrations += 1 },
+      openSettingsAction: {}
+    )
+
+    XCTAssertEqual(try controller.registerIfNeeded(), .enabled)
+    XCTAssertEqual(registrations, 0)
+  }
 }
 
 private struct RegistrationDenied: Error {}

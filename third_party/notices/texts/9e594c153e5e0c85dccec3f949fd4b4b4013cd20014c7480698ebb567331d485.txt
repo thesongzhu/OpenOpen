@@ -1,0 +1,55 @@
+[package]
+name = "rama-http-types"
+description = "rama http type defintions and high level utilities"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = ["http", "headers", "mime", "rama"]
+categories = ["web-programming"]
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.cargo-public-api-crates]
+allowed = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+
+[dependencies]
+ahash = { workspace = true }
+bytes = { workspace = true }
+const_format = { workspace = true }
+fnv = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+itoa = { workspace = true }
+memchr = { workspace = true }
+mime = { workspace = true }
+mime_guess = { workspace = true }
+nom = { workspace = true }
+pin-project-lite = { workspace = true }
+rama-core = { workspace = true }
+rama-error = { workspace = true }
+rama-macros = { workspace = true }
+rama-utils = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sync_wrapper = { workspace = true }
+tokio = { workspace = true, features = ["macros", "io-std"] }
+
+[dev-dependencies]
+hex = { workspace = true }
+quickcheck = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

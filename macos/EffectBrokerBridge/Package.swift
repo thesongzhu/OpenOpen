@@ -9,6 +9,8 @@ let package = Package(
   ],
   products: [
     .library(name: "EffectBrokerBridge", targets: ["EffectBrokerBridge"]),
+    .library(name: "OpenOpenAppSupport", targets: ["OpenOpenAppSupport"]),
+    .executable(name: "OpenOpen", targets: ["OpenOpen"]),
     .executable(name: "OpenOpenEffectBroker", targets: ["OpenOpenEffectBroker"]),
   ],
   targets: [
@@ -18,6 +20,7 @@ let package = Package(
         .copy("Resources/LaunchDaemons")
       ],
       linkerSettings: [
+        .linkedLibrary("bsm"),
         .linkedFramework("Security"),
         .linkedFramework("ServiceManagement"),
       ]
@@ -25,6 +28,23 @@ let package = Package(
     .testTarget(
       name: "EffectBrokerBridgeTests",
       dependencies: ["EffectBrokerBridge"]
+    ),
+    .target(
+      name: "OpenOpenAppSupport",
+      dependencies: ["EffectBrokerBridge"],
+      linkerSettings: [
+        .linkedFramework("EventKit"),
+        .linkedFramework("Security"),
+        .linkedFramework("ServiceManagement"),
+      ]
+    ),
+    .testTarget(
+      name: "OpenOpenAppSupportTests",
+      dependencies: ["OpenOpenAppSupport"]
+    ),
+    .executableTarget(
+      name: "OpenOpen",
+      dependencies: ["OpenOpenAppSupport"]
     ),
     .executableTarget(
       name: "OpenOpenEffectBroker",

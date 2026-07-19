@@ -1,0 +1,920 @@
+diff --git a/Package.swift b/Package.swift
+index 4c46786..3e8d131 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -21,9 +21,32 @@ let package = Package(
+           .product(name: "SQLite", package: "SQLite.swift"),
+           .product(name: "PhoneNumberKit", package: "PhoneNumberKit"),
+         ],
+-        linkerSettings: [
+-          .linkedFramework("ScriptingBridge", .when(platforms: [.macOS])),
+-          .linkedFramework("Contacts", .when(platforms: [.macOS])),
++        sources: [
++          "DatabaseIDs.swift",
++          "Errors.swift",
++          "IMsgEventTailer.swift",
++          "ISO8601.swift",
++          "Message+URLPreview.swift",
++          "MessageFilter.swift",
++          "MessagePolls.swift",
++          "MessageSendStatus.swift",
++          "MessageStore.swift",
++          "MessageStoreSchema.swift",
++          "MessageStore+Chats.swift",
++          "MessageStore+Helpers.swift",
++          "MessageStore+MessageConstruction.swift",
++          "MessageStore+MessageRows.swift",
++          "MessageStore+Messages.swift",
++          "MessageStore+Polls.swift",
++          "MessageStore+Queries.swift",
++          "MessageStore+ReplyContext.swift",
++          "MessageStore+SQLRow.swift",
++          "MessageStore+URLPreviews.swift",
++          "MessageWatcher.swift",
++          "Models.swift",
++          "OpenOpenBasicMessageSender.swift",
++          "OpenOpenRuntimeResourceProbe.swift",
++          "TypedStreamParser.swift",
+         ]
+       ),
+       .executableTarget(
+@@ -35,6 +58,21 @@ let package = Package(
+         exclude: [
+           "Resources/Info.plist"
+         ],
++        sources: [
++          "CommandOutputEmittedError.swift",
++          "CommandRouter.swift",
++          "CommandSignatures.swift",
++          "CommandSpec.swift",
++          "Commands/RpcCommand.swift",
++          "HelpPrinter.swift",
++          "IMsgCLI.swift",
++          "OpenOpenBasicRPCServer.swift",
++          "RPCRequestParser.swift",
++          "RPCStartupErrorServer.swift",
++          "RuntimeOptions.swift",
++          "StdoutWriter.swift",
++          "Version.swift",
++        ],
+         linkerSettings: [
+           .linkedFramework("ImageIO", .when(platforms: [.macOS])),
+           .linkedFramework("LinkPresentation", .when(platforms: [.macOS])),
+@@ -54,20 +92,18 @@ let package = Package(
+ 
+     #if os(macOS)
+       targets.append(contentsOf: [
+-        .testTarget(
+-          name: "IMsgCoreTests",
+-          dependencies: [
+-            "IMsgCore"
+-          ]
+-        ),
+         .testTarget(
+           name: "imsgTests",
+           dependencies: [
+             "imsg",
+             "IMsgCore",
++            .product(name: "SQLite", package: "SQLite.swift"),
+           ],
+           exclude: [
+             "README-live.md"
++          ],
++          sources: [
++            "OpenOpenBasicRPCSurfaceTests.swift"
+           ]
+         ),
+       ])
+diff --git a/Sources/IMsgCore/MessageStore+Helpers.swift b/Sources/IMsgCore/MessageStore+Helpers.swift
+index 2cfe1f3..8d57ec8 100644
+--- a/Sources/IMsgCore/MessageStore+Helpers.swift
++++ b/Sources/IMsgCore/MessageStore+Helpers.swift
+@@ -2,6 +2,15 @@ import Foundation
+ import SQLite
+ 
+ extension MessageStore {
++  func extractCustomEmoji(from text: String) -> String? {
++    for character in text where character.unicodeScalars.contains(where: {
++      $0.properties.isEmojiPresentation || $0.properties.isEmoji
++    }) {
++      return String(character)
++    }
++    return nil
++  }
++
+   struct DecodedReaction: Sendable {
+     let isReaction: Bool
+     let reactionType: ReactionType?
+diff --git a/Sources/IMsgCore/MessageStore+Messages.swift b/Sources/IMsgCore/MessageStore+Messages.swift
+index 7bcc17e..9142a6c 100644
+--- a/Sources/IMsgCore/MessageStore+Messages.swift
++++ b/Sources/IMsgCore/MessageStore+Messages.swift
+@@ -313,10 +313,8 @@ extension MessageStore {
+     let databaseReplyToGUID = try stringValue(row, columns.replyToGUID)
+     let balloonBundleID = try stringValue(row, columns.balloonBundleID)
+ 
+-    var resolvedText = text.isEmpty ? TypedStreamParser.parseAttributedBody(body) : text
+-    if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
+-      resolvedText = transcription
+-    }
++    let resolvedText = text.isEmpty ? TypedStreamParser.parseAttributedBody(body) : text
++    _ = isAudioMessage
+ 
+     var resolvedSender = sender
+     if resolvedSender.isEmpty && !destinationCallerID.isEmpty {
+diff --git a/Sources/IMsgCore/OpenOpenBasicMessageSender.swift b/Sources/IMsgCore/OpenOpenBasicMessageSender.swift
+new file mode 100644
+index 0000000..4f32bc6
+--- /dev/null
++++ b/Sources/IMsgCore/OpenOpenBasicMessageSender.swift
+@@ -0,0 +1,55 @@
++import Foundation
++
++#if os(macOS)
++  import Carbon
++#endif
++
++public struct OpenOpenBasicMessageSender {
++  public init() {}
++
++  public func send(text: String, chatIdentifier: String) throws {
++    let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
++    let chatIdentifier = chatIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
++    guard !text.isEmpty, !chatIdentifier.isEmpty else {
++      throw IMsgError.invalidChatTarget("OpenOpen requires non-empty text and selected chat")
++    }
++    #if os(macOS)
++      let source = """
++        on run argv
++            set theMessage to item 1 of argv
++            set chatId to item 2 of argv
++            tell application "Messages"
++                set targetChat to chat id chatId
++                send theMessage to targetChat
++            end tell
++        end run
++        """
++      guard let script = NSAppleScript(source: source) else {
++        throw IMsgError.appleScriptFailure("Unable to compile AppleScript")
++      }
++      var errorInfo: NSDictionary?
++      let event = NSAppleEventDescriptor(
++        eventClass: AEEventClass(kASAppleScriptSuite),
++        eventID: AEEventID(kASSubroutineEvent),
++        targetDescriptor: nil,
++        returnID: AEReturnID(kAutoGenerateReturnID),
++        transactionID: AETransactionID(kAnyTransactionID)
++      )
++      event.setParam(
++        NSAppleEventDescriptor(string: "run"), forKeyword: AEKeyword(keyASSubroutineName))
++      let arguments = NSAppleEventDescriptor.list()
++      arguments.insert(NSAppleEventDescriptor(string: text), at: 1)
++      arguments.insert(NSAppleEventDescriptor(string: chatIdentifier), at: 2)
++      event.setParam(arguments, forKeyword: keyDirectObject)
++      script.executeAppleEvent(event, error: &errorInfo)
++      if let errorInfo {
++        let message =
++          (errorInfo[NSAppleScript.errorMessage] as? String) ?? "Unknown AppleScript error"
++        throw IMsgError.appleScriptFailure(message)
++      }
++    #else
++      throw IMsgError.appleScriptFailure(
++        "Sending requires Messages.app automation and is only supported on macOS.")
++    #endif
++  }
++}
+diff --git a/Sources/IMsgCore/OpenOpenRuntimeResourceProbe.swift b/Sources/IMsgCore/OpenOpenRuntimeResourceProbe.swift
+new file mode 100644
+index 0000000..ec5cbe2
+--- /dev/null
++++ b/Sources/IMsgCore/OpenOpenRuntimeResourceProbe.swift
+@@ -0,0 +1,12 @@
++import Foundation
++import PhoneNumberKit
++
++public enum OpenOpenRuntimeResourceProbe {
++  public static func verify() throws {
++    let utility = PhoneNumberUtility()
++    let parsed = try utility.parse("202-555-0123", withRegion: "US", ignoreType: true)
++    guard utility.format(parsed, toType: .e164) == "+12025550123" else {
++      throw IMsgError.appleScriptFailure("PhoneNumberKit metadata resource validation failed")
++    }
++  }
++}
+diff --git a/Sources/imsg/CommandRouter.swift b/Sources/imsg/CommandRouter.swift
+index 7332f5c..9d14df2 100644
+--- a/Sources/imsg/CommandRouter.swift
++++ b/Sources/imsg/CommandRouter.swift
+@@ -10,49 +10,11 @@ struct CommandRouter {
+   init() {
+     self.version = CommandRouter.resolveVersion()
+     self.specs = [
+-      ChatsCommand.spec,
+-      StatsCommand.spec,
+-      GroupCommand.spec,
+-      HistoryCommand.spec,
+-      WatchCommand.spec,
+-      SendCommand.spec,
+-      ReactCommand.spec,
+-      ReadCommand.spec,
+-      TypingCommand.spec,
+-      LaunchCommand.spec,
+-      StatusCommand.spec,
+       RpcCommand.spec,
+-      CompletionsCommand.spec,
+-      ScheduledCommand.spec,
+-      ChatBackgroundCommand.spec,
+-      // Bridge-backed (require `imsg launch` + SIP off)
+-      SendRichCommand.spec,
+-      SendMultipartCommand.spec,
+-      SendAttachmentCommand.spec,
+-      StickerCommand.spec,
+-      PollCommand.spec,
+-      BridgeReactCommand.spec,
+-      EditCommand.spec,
+-      UnsendCommand.spec,
+-      DeleteMessageCommand.spec,
+-      NotifyAnywaysCommand.spec,
+-      ChatCreateCommand.spec,
+-      ChatNameCommand.spec,
+-      ChatPhotoCommand.spec,
+-      ChatAddMemberCommand.spec,
+-      ChatRemoveMemberCommand.spec,
+-      ChatLeaveCommand.spec,
+-      ChatDeleteCommand.spec,
+-      ChatMarkCommand.spec,
+-      SearchCommand.spec,
+-      AccountCommand.spec,
+-      WhoisCommand.spec,
+-      NicknameCommand.spec,
+-      NamePhotoCommand.spec,
+     ]
+     let descriptor = CommandDescriptor(
+       name: rootName,
+-      abstract: "Send and read iMessage / SMS from the terminal",
++      abstract: "OpenOpen basic iMessage JSON-RPC/stdio transport",
+       discussion: nil,
+       signature: CommandSignature(),
+       subcommands: specs.map { $0.descriptor }
+@@ -88,8 +50,6 @@ struct CommandRouter {
+       do {
+         try await spec.run(invocation.parsedValues, runtime)
+         return 0
+-      } catch is BridgeOutput.EmittedError {
+-        return 1
+       } catch is CommandOutputEmittedError {
+         return 1
+       } catch {
+diff --git a/Sources/imsg/Commands/RpcCommand.swift b/Sources/imsg/Commands/RpcCommand.swift
+index bff73ee..0ba0f30 100644
+--- a/Sources/imsg/Commands/RpcCommand.swift
++++ b/Sources/imsg/Commands/RpcCommand.swift
+@@ -15,7 +15,13 @@ enum RpcCommand {
+       "imsg rpc --db ~/Library/Messages/chat.db",
+     ]
+   ) { values, runtime in
+-    let dbPath = values.option("db") ?? MessageStore.defaultPath
++    do {
++      try OpenOpenRuntimeResourceProbe.verify()
++    } catch {
++      await RPCStartupErrorServer(error: error).run()
++      throw CommandOutputEmittedError()
++    }
++    let dbPath = values.options["db"]?.last ?? MessageStore.defaultPath
+     let store: MessageStore
+     do {
+       store = try MessageStore(path: dbPath)
+@@ -23,8 +29,7 @@ enum RpcCommand {
+       await RPCStartupErrorServer(error: error).run()
+       throw CommandOutputEmittedError()
+     }
+-    let contacts = await ContactResolver.create()
+-    let server = RPCServer(store: store, verbose: runtime.verbose, contactResolver: contacts)
++    let server = RPCServer(store: store, verbose: runtime.verbose)
+     try await server.run()
+   }
+ }
+diff --git a/Sources/imsg/OpenOpenBasicRPCServer.swift b/Sources/imsg/OpenOpenBasicRPCServer.swift
+new file mode 100644
+index 0000000..f7c6e4d
+--- /dev/null
++++ b/Sources/imsg/OpenOpenBasicRPCServer.swift
+@@ -0,0 +1,472 @@
++import Foundation
++import IMsgCore
++
++protocol RPCOutput: Sendable {
++  func sendResponse(id: Any, result: Any)
++  func sendError(id: Any?, error: RPCError)
++  func sendNotification(method: String, params: Any)
++}
++
++let kSupportedRPCMethods: [String] = [
++  "chats.list",
++  "messages.history",
++  "watch.subscribe",
++  "watch.unsubscribe",
++  "send",
++  "message.send_status",
++]
++
++final class RPCWriter: RPCOutput, Sendable {
++  func sendResponse(id: Any, result: Any) {
++    send(["jsonrpc": "2.0", "id": id, "result": result])
++  }
++
++  func sendError(id: Any?, error: RPCError) {
++    send([
++      "jsonrpc": "2.0",
++      "id": id ?? NSNull(),
++      "error": error.asDictionary(),
++    ])
++  }
++
++  func sendNotification(method: String, params: Any) {
++    send(["jsonrpc": "2.0", "method": method, "params": params])
++  }
++
++  private func send(_ value: Any) {
++    do {
++      let data = try JSONSerialization.data(withJSONObject: value, options: [])
++      guard let line = String(data: data, encoding: .utf8) else { throw RPCWriteError() }
++      StdoutWriter.writeLine(line)
++    } catch {
++      StdoutWriter.writeLine(
++        #"{"jsonrpc":"2.0","error":{"code":-32603,"message":"write failed"}}"#)
++    }
++  }
++
++  private struct RPCWriteError: Error {}
++}
++
++struct RPCError: Error {
++  let code: Int
++  let message: String
++  let data: String?
++
++  static func parseError(_ data: String) -> RPCError {
++    RPCError(code: -32700, message: "Parse error", data: data)
++  }
++
++  static func invalidRequest(_ data: String) -> RPCError {
++    RPCError(code: -32600, message: "Invalid Request", data: data)
++  }
++
++  static func methodNotFound(_ method: String) -> RPCError {
++    RPCError(code: -32601, message: "Method not found", data: method)
++  }
++
++  static func invalidParams(_ data: String) -> RPCError {
++    RPCError(code: -32602, message: "Invalid params", data: data)
++  }
++
++  static func internalError(_ data: String) -> RPCError {
++    RPCError(code: -32603, message: "Internal error", data: data)
++  }
++
++  func asDictionary() -> [String: Any] {
++    var value: [String: Any] = ["code": code, "message": message]
++    if let data { value["data"] = data }
++    return value
++  }
++}
++
++actor OpenOpenSubscriptionStore {
++  private var nextID = 1
++  private var tasks: [Int: Task<Void, Never>] = [:]
++
++  func allocate() -> Int {
++    let value = nextID
++    nextID += 1
++    return value
++  }
++
++  func insert(_ task: Task<Void, Never>, id: Int) { tasks[id] = task }
++  func remove(_ id: Int) -> Task<Void, Never>? { tasks.removeValue(forKey: id) }
++
++  func cancelAll() {
++    for task in tasks.values { task.cancel() }
++    tasks.removeAll()
++  }
++}
++
++struct OpenOpenSentMessage: Sendable, Hashable {
++  let rowID: Int64
++  let guid: String
++}
++
++func openOpenSendAndObserve(
++  window: TimeInterval,
++  send: () throws -> Void,
++  poll: () throws -> [OpenOpenSentMessage],
++  now: () -> Date = Date.init,
++  sleep: (TimeInterval) -> Void = Thread.sleep
++) rethrows -> OpenOpenSentMessage? {
++  try send()
++  let deadline = now().addingTimeInterval(window)
++  var candidates = Set<OpenOpenSentMessage>()
++  var ambiguous = false
++  while true {
++    candidates.formUnion(try poll())
++    if candidates.count > 1 { ambiguous = true }
++    let remaining = deadline.timeIntervalSince(now())
++    if remaining <= 0 { break }
++    sleep(min(0.05, remaining))
++  }
++  guard !ambiguous, candidates.count == 1 else { return nil }
++  return candidates.first
++}
++
++final class RPCServer {
++  private let store: MessageStore
++  private let watcher: MessageWatcher
++  private let output: RPCOutput
++  private let subscriptions = OpenOpenSubscriptionStore()
++  private let sendMessage: @Sendable (String, String, Int64) throws -> OpenOpenSentMessage?
++
++  init(
++    store: MessageStore,
++    verbose: Bool,
++    output: RPCOutput = RPCWriter(),
++    sendMessage: (@Sendable (String, String, Int64) throws -> OpenOpenSentMessage?)? = nil
++  ) {
++    self.store = store
++    self.watcher = MessageWatcher(store: store)
++    self.output = output
++    self.sendMessage = sendMessage ?? { text, chatIdentifier, chatID in
++      let highWater = try store.maxRowID()
++      return try openOpenSendAndObserve(
++        window: 2,
++        send: {
++          try OpenOpenBasicMessageSender().send(text: text, chatIdentifier: chatIdentifier)
++        },
++        poll: {
++          try store.messages(chatID: chatID, limit: 50).compactMap { message in
++            guard message.rowID > highWater, message.isFromMe, message.text == text,
++              !message.guid.isEmpty
++            else { return nil }
++            return OpenOpenSentMessage(rowID: message.rowID, guid: message.guid)
++          }
++        }
++      )
++    }
++    _ = verbose
++  }
++
++  func run() async throws {
++    while let line = readLine() {
++      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
++      if !trimmed.isEmpty { await handleLine(trimmed) }
++    }
++    await subscriptions.cancelAll()
++  }
++
++  func handleLineForTesting(_ line: String) async { await handleLine(line) }
++
++  private func handleLine(_ line: String) async {
++    let request: RPCRequest
++    switch RPCRequestParser.parse(line) {
++    case .success(let parsed): request = parsed
++    case .failure(let failure):
++      output.sendError(id: failure.id, error: failure.error)
++      return
++    }
++    guard request.paramsAreNamed else {
++      output.sendError(id: request.id, error: .invalidParams("params must be an object"))
++      return
++    }
++    if request.method == "send" && (request.id == nil || request.id is NSNull) {
++      output.sendError(id: request.id, error: .invalidRequest("send requires a request id"))
++      return
++    }
++    do {
++      switch request.method {
++      case "chats.list": try handleChatsList(id: request.id, params: request.params)
++      case "messages.history": try handleHistory(id: request.id, params: request.params)
++      case "watch.subscribe": try await handleSubscribe(id: request.id, params: request.params)
++      case "watch.unsubscribe": try await handleUnsubscribe(id: request.id, params: request.params)
++      case "send": try handleSend(id: request.id, params: request.params)
++      case "message.send_status": try handleSendStatus(id: request.id, params: request.params)
++      default: output.sendError(id: request.id, error: .methodNotFound(request.method))
++      }
++    } catch let error as RPCError {
++      output.sendError(id: request.id, error: error)
++    } catch {
++      output.sendError(id: request.id, error: .internalError(error.localizedDescription))
++    }
++  }
++
++  private func handleChatsList(id: Any?, params: [String: Any]) throws {
++    try requireOnly(params, keys: ["limit", "unread_only"])
++    let limit = try boundedInteger(params["limit"], default: 20, range: 1...200, name: "limit")
++    let unreadOnly = try optionalBoolean(params["unread_only"], default: false, name: "unread_only")
++    guard !unreadOnly || store.supportsUnreadState else {
++      throw RPCError.invalidParams("unread_only is unavailable")
++    }
++    let chats = try store.listChats(limit: limit, unreadOnly: unreadOnly)
++    let values = try chats.map { chat -> [String: Any] in
++      let info = try store.chatInfo(chatID: chat.id)
++      let identifier = info?.identifier ?? chat.identifier
++      let guid = info?.guid ?? ""
++      var value: [String: Any] = [
++        "id": chat.id,
++        "identifier": identifier,
++        "guid": guid,
++        "name": info?.name ?? chat.name,
++        "service": info?.service ?? chat.service,
++        "last_message_at": rpcDate(chat.lastMessageAt),
++        "participants": try store.participants(chatID: chat.id),
++        "is_group": isGroup(identifier: identifier, guid: guid),
++      ]
++      if let unreadCount = chat.unreadCount { value["unread_count"] = unreadCount }
++      return value
++    }
++    respond(id: id, result: ["chats": values])
++  }
++
++  private func handleHistory(id: Any?, params: [String: Any]) throws {
++    try requireOnly(params, keys: ["chat_id", "limit", "attachments"])
++    let chatID = try positiveInt64(params["chat_id"], name: "chat_id")
++    let limit = try boundedInteger(params["limit"], default: 50, range: 1...200, name: "limit")
++    guard try optionalBoolean(params["attachments"], default: false, name: "attachments") == false
++    else { throw RPCError.invalidParams("attachments are unavailable") }
++    let values = try store.messages(chatID: chatID, limit: limit).map { message in
++      try messagePayload(message)
++    }
++    respond(id: id, result: ["messages": values])
++  }
++
++  private func handleSubscribe(id: Any?, params: [String: Any]) async throws {
++    try requireOnly(
++      params,
++      keys: ["chat_id", "since_rowid", "attachments", "include_reactions", "debounce_ms"])
++    let chatID = try positiveInt64(params["chat_id"], name: "chat_id")
++    let sinceRowID = try optionalNonnegativeInt64(params["since_rowid"], name: "since_rowid")
++    guard try optionalBoolean(params["attachments"], default: false, name: "attachments") == false,
++      try optionalBoolean(params["include_reactions"], default: false, name: "include_reactions")
++        == false
++    else { throw RPCError.invalidParams("attachments and reactions are unavailable") }
++    let debounce = try boundedInteger(
++      params["debounce_ms"], default: 500, range: 50...5_000, name: "debounce_ms")
++    let subscription = await subscriptions.allocate()
++    let watcher = watcher
++    let output = output
++    let store = store
++    let task = Task {
++      do {
++        let configuration = MessageWatcherConfiguration(
++          debounceInterval: Double(debounce) / 1_000,
++          fallbackPollInterval: 5,
++          batchLimit: 100,
++          includeReactions: false
++        )
++        for try await message in watcher.stream(
++          chatID: chatID,
++          sinceRowID: sinceRowID,
++          configuration: configuration
++        ) {
++          if Task.isCancelled { return }
++          output.sendNotification(
++            method: "message",
++            params: [
++              "subscription": subscription,
++              "message": try openOpenMessagePayload(message, store: store),
++            ]
++          )
++        }
++      } catch {
++        output.sendNotification(
++          method: "error",
++          params: ["subscription": subscription, "error": ["message": error.localizedDescription]]
++        )
++      }
++    }
++    await subscriptions.insert(task, id: subscription)
++    respond(id: id, result: ["subscription": subscription])
++  }
++
++  private func handleUnsubscribe(id: Any?, params: [String: Any]) async throws {
++    try requireOnly(params, keys: ["subscription"])
++    let subscription = try boundedInteger(
++      params["subscription"], default: 0, range: 1...Int.max, name: "subscription")
++    if let task = await subscriptions.remove(subscription) { task.cancel() }
++    respond(id: id, result: ["ok": true])
++  }
++
++  private func handleSend(id: Any?, params: [String: Any]) throws {
++    try requireOnly(params, keys: ["chat_id", "text", "service", "transport"])
++    let chatID = try positiveInt64(params["chat_id"], name: "chat_id")
++    guard let text = params["text"] as? String,
++      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
++    else { throw RPCError.invalidParams("text is required") }
++    guard text.utf8.count <= 32 * 1_024, !text.utf8.contains(0) else {
++      throw RPCError.invalidParams("text exceeds the OpenOpen bound")
++    }
++    guard (params["service"] as? String) == "auto",
++      (params["transport"] as? String) == "applescript"
++    else { throw RPCError.invalidParams("OpenOpen requires service=auto and transport=applescript") }
++    guard let info = try store.chatInfo(chatID: chatID), !info.guid.isEmpty else {
++      throw RPCError.invalidParams("unknown chat_id or missing chat GUID")
++    }
++    let sent = try sendMessage(text, info.guid, chatID)
++    respond(id: id, result: openOpenSendResult(chatGUID: info.guid, sent: sent))
++  }
++
++  private func handleSendStatus(id: Any?, params: [String: Any]) throws {
++    try requireOnly(params, keys: ["guid"])
++    guard let guid = params["guid"] as? String,
++      !guid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++      guid.utf8.count <= 256,
++      !guid.utf8.contains(0)
++    else { throw RPCError.invalidParams("guid is required") }
++    let checkedAt = Date()
++    guard let status = try store.messageSendStatus(guid: guid) else {
++      respond(
++        id: id,
++        result: [
++          "ok": true,
++          "guid": guid,
++          "send_state": MessageSendState.pending.rawValue,
++          "service": NSNull(),
++          "checked_at": rpcDate(checkedAt),
++          "status_fields": NSNull(),
++        ])
++      return
++    }
++    var value: [String: Any] = [
++      "ok": true,
++      "guid": status.guid,
++      "send_state": status.state.rawValue,
++      "service": status.service.isEmpty ? NSNull() : status.service,
++      "checked_at": rpcDate(checkedAt),
++      "status_fields": [
++        "is_sent": status.isSent,
++        "is_delivered": status.isDelivered,
++        "is_finished": status.isFinished,
++        "error": status.error,
++        "date_delivered": status.dateDelivered.map(rpcDate) ?? NSNull(),
++        "date_read": status.dateRead.map(rpcDate) ?? NSNull(),
++        "is_delayed": status.isDelayed,
++        "is_prepared": status.isPrepared,
++        "is_pending_satellite_send": status.isPendingSatelliteSend,
++        "was_downgraded": status.wasDowngraded,
++      ],
++    ]
++    if let deliveredAt = status.dateDelivered { value["delivered_at"] = rpcDate(deliveredAt) }
++    respond(id: id, result: value)
++  }
++
++  private func messagePayload(_ message: Message) throws -> [String: Any] {
++    try openOpenMessagePayload(message, store: store)
++  }
++
++  private func respond(id: Any?, result: Any) {
++    guard let id else { return }
++    output.sendResponse(id: id, result: result)
++  }
++}
++
++func openOpenSendResult(chatGUID: String, sent: OpenOpenSentMessage?) -> [String: Any] {
++  var result: [String: Any] = [
++    "ok": true,
++    "transport": "applescript",
++    "chat_guid": chatGUID,
++  ]
++  if let sent {
++    result["id"] = sent.rowID
++    result["guid"] = sent.guid
++    result["message_id"] = sent.guid
++  }
++  return result
++}
++
++private func openOpenMessagePayload(_ message: Message, store: MessageStore) throws -> [String: Any] {
++  let info = try store.chatInfo(chatID: message.chatID)
++  let identifier = info?.identifier ?? ""
++  let guid = info?.guid ?? ""
++  var value: [String: Any] = [
++    "id": message.rowID,
++    "chat_id": message.chatID,
++    "chat_identifier": identifier,
++    "chat_guid": guid,
++    "chat_name": info?.name ?? "",
++    "participants": try store.participants(chatID: message.chatID),
++    "is_group": isGroup(identifier: identifier, guid: guid),
++    "guid": message.guid,
++    "sender": message.sender,
++    "is_from_me": message.isFromMe,
++    "text": message.text,
++    "created_at": rpcDate(message.date),
++  ]
++  if let reply = message.replyToGUID { value["reply_to_guid"] = reply }
++  if let text = message.replyToText { value["reply_to_text"] = text }
++  if let sender = message.replyToSender { value["reply_to_sender"] = sender }
++  if let callerID = message.destinationCallerID { value["destination_caller_id"] = callerID }
++  if let isRead = message.isRead { value["is_read"] = isRead }
++  if let dateRead = message.dateRead { value["date_read"] = rpcDate(dateRead) }
++  return value
++}
++
++private func requireOnly(_ params: [String: Any], keys: Set<String>) throws {
++  let unexpected = Set(params.keys).subtracting(keys)
++  guard unexpected.isEmpty else {
++    throw RPCError.invalidParams("unsupported params: \(unexpected.sorted().joined(separator: ","))")
++  }
++}
++
++private func boundedInteger(
++  _ value: Any?,
++  default defaultValue: Int,
++  range: ClosedRange<Int>,
++  name: String
++) throws -> Int {
++  let parsed: Int
++  if value == nil { parsed = defaultValue } else if !(value is Bool),
++    let number = value as? NSNumber
++  {
++    parsed = number.intValue
++  } else { throw RPCError.invalidParams("\(name) must be an integer") }
++  guard range.contains(parsed) else { throw RPCError.invalidParams("\(name) is outside the bound") }
++  return parsed
++}
++
++private func positiveInt64(_ value: Any?, name: String) throws -> Int64 {
++  guard !(value is Bool), let number = value as? NSNumber, number.int64Value > 0 else {
++    throw RPCError.invalidParams("\(name) must be positive")
++  }
++  return number.int64Value
++}
++
++private func optionalNonnegativeInt64(_ value: Any?, name: String) throws -> Int64? {
++  guard let value else { return nil }
++  guard !(value is Bool), let number = value as? NSNumber, number.int64Value >= 0 else {
++    throw RPCError.invalidParams("\(name) must be non-negative")
++  }
++  return number.int64Value
++}
++
++private func optionalBoolean(_ value: Any?, default defaultValue: Bool, name: String) throws -> Bool {
++  guard let value else { return defaultValue }
++  guard let boolean = value as? Bool else {
++    throw RPCError.invalidParams("\(name) must be a boolean")
++  }
++  return boolean
++}
++
++private func isGroup(identifier: String, guid: String) -> Bool {
++  guid.contains(";+;") || identifier.contains(";+;")
++}
++
++private func rpcDate(_ date: Date) -> String {
++  let formatter = ISO8601DateFormatter()
++  formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++  return formatter.string(from: date)
++}
+diff --git a/Sources/imsg/RPCRequestParser.swift b/Sources/imsg/RPCRequestParser.swift
+index 78e2c9b..f39e183 100644
+--- a/Sources/imsg/RPCRequestParser.swift
++++ b/Sources/imsg/RPCRequestParser.swift
+@@ -35,7 +35,7 @@ enum RPCRequestParser {
+     }
+     let id = request["id"]
+     let jsonrpc = request["jsonrpc"] as? String
+-    if jsonrpc != nil && jsonrpc != "2.0" {
++    if jsonrpc != "2.0" {
+       return .failure(
+         RPCParseFailure(id: id, error: RPCError.invalidRequest("jsonrpc must be 2.0")))
+     }
+diff --git a/Tests/imsgTests/OpenOpenBasicRPCSurfaceTests.swift b/Tests/imsgTests/OpenOpenBasicRPCSurfaceTests.swift
+new file mode 100644
+index 0000000..48d643d
+--- /dev/null
++++ b/Tests/imsgTests/OpenOpenBasicRPCSurfaceTests.swift
+@@ -0,0 +1,127 @@
++import Foundation
++import SQLite
++import Testing
++
++@testable import IMsgCore
++@testable import imsg
++
++final class OpenOpenTestRPCOutput: RPCOutput, @unchecked Sendable {
++  private let lock = NSLock()
++  private(set) var responses: [[String: Any]] = []
++  private(set) var errors: [[String: Any]] = []
++
++  func sendResponse(id: Any, result: Any) {
++    lock.withLock { responses.append(["id": id, "result": result]) }
++  }
++
++  func sendError(id: Any?, error: RPCError) {
++    lock.withLock { errors.append(["id": id ?? NSNull(), "error": error.asDictionary()]) }
++  }
++
++  func sendNotification(method: String, params: Any) {
++    _ = method
++    _ = params
++  }
++}
++
++@Test
++func openOpenBuildExposesOnlyBasicRPC() {
++  #expect(CommandRouter().specs.map(\.name) == ["rpc"])
++  #expect(
++    kSupportedRPCMethods == [
++      "chats.list",
++      "messages.history",
++      "watch.subscribe",
++      "watch.unsubscribe",
++      "send",
++      "message.send_status",
++    ])
++}
++
++@Test
++func openOpenPhoneNumberKitResourceIsLoadable() throws {
++  try OpenOpenRuntimeResourceProbe.verify()
++}
++
++@Test
++func openOpenRPCRejectsAdvancedAndWidenedSendSurface() async throws {
++  let databaseURL = FileManager.default.temporaryDirectory
++    .appendingPathComponent("openopen-imsg-test-\(UUID().uuidString).sqlite")
++  _ = try Connection(databaseURL.path)
++  defer { try? FileManager.default.removeItem(at: databaseURL) }
++  let store = try MessageStore(path: databaseURL.path)
++  let output = OpenOpenTestRPCOutput()
++  let server = RPCServer(store: store, verbose: false, output: output)
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"advanced","method":"message.delete","params":{"guid":"x"}}"#)
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"auto","method":"send","params":{"chat_id":1,"text":"x"}}"#)
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"bridge","method":"send","params":{"chat_id":1,"text":"x","service":"auto","transport":"bridge"}}"#)
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"file","method":"send","params":{"chat_id":1,"text":"x","service":"auto","transport":"applescript","file":"/tmp/x"}}"#)
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","method":"send","params":{"chat_id":1,"text":"x","service":"auto","transport":"applescript"}}"#)
++  await server.handleLineForTesting(
++    #"{"id":"legacy","method":"chats.list","params":{}}"#)
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"bool","method":"messages.history","params":{"chat_id":true}}"#)
++
++  #expect(output.responses.isEmpty)
++  let codes = output.errors.compactMap { payload in
++    (payload["error"] as? [String: Any])?["code"] as? Int
++  }
++  #expect(codes == [-32601, -32602, -32602, -32602, -32600, -32600, -32602])
++}
++
++@Test
++func openOpenSendResultCarriesTheExactProviderIdentity() {
++  let result = openOpenSendResult(
++    chatGUID: "iMessage;+;chat",
++    sent: OpenOpenSentMessage(rowID: 101, guid: "provider-guid"))
++  #expect(result["ok"] as? Bool == true)
++  #expect(result["transport"] as? String == "applescript")
++  #expect(result["id"] as? Int64 == 101)
++  #expect(result["guid"] as? String == "provider-guid")
++  #expect(result["message_id"] as? String == "provider-guid")
++}
++
++@Test
++func openOpenSendObservationWaitsForTheWholeWindowAndSendsOnce() {
++  let first = OpenOpenSentMessage(rowID: 101, guid: "provider-guid-1")
++  let second = OpenOpenSentMessage(rowID: 102, guid: "provider-guid-2")
++  var clock = Date(timeIntervalSince1970: 0)
++  var sends = 0
++  var polls = 0
++  let ambiguous = openOpenSendAndObserve(
++    window: 0.1,
++    send: { sends += 1 },
++    poll: {
++      polls += 1
++      return polls < 3 ? [first] : [first, second]
++    },
++    now: { clock },
++    sleep: { clock.addTimeInterval($0) })
++  #expect(ambiguous == nil)
++  #expect(sends == 1)
++  #expect(polls >= 3)
++  #expect(clock >= Date(timeIntervalSince1970: 0.1))
++
++  clock = Date(timeIntervalSince1970: 0)
++  sends = 0
++  polls = 0
++  let unique = openOpenSendAndObserve(
++    window: 0.1,
++    send: { sends += 1 },
++    poll: {
++      polls += 1
++      return [first]
++    },
++    now: { clock },
++    sleep: { clock.addTimeInterval($0) })
++  #expect(unique == first)
++  #expect(sends == 1)
++  #expect(polls >= 3)
++  #expect(clock >= Date(timeIntervalSince1970: 0.1))
++}

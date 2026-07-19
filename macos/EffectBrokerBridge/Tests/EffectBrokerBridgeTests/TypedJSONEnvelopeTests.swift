@@ -4,6 +4,67 @@ import XCTest
 @testable import EffectBrokerBridge
 
 final class TypedJSONEnvelopeTests: XCTestCase {
+  func testCoreLeaseRequestAcceptsOnlyCoreCodexPIDsAndFreshCoreNonce() {
+    let exact = Data(
+      #"{"codexPid":43,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":42,"type":"coreLeaseAcquire","version":1}"#
+        .utf8
+    )
+    XCTAssertTrue(TypedJSONEnvelope.accepts(exact, kind: .coreLeaseAcquire))
+    for rejected in [
+      #"{"appPid":7,"codexPid":43,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":42,"type":"coreLeaseAcquire","version":1}"#,
+      #"{"auditEuid":501,"codexPid":43,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":42,"type":"coreLeaseAcquire","version":1}"#,
+      #"{"codexPid":43,"coreInstanceNonce":"aa","corePid":42,"type":"coreLeaseAcquire","version":1}"#,
+      #"{"codexPid":43,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":0,"type":"coreLeaseAcquire","version":1}"#,
+      #"{"codexPid":0,"coreInstanceNonce":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","corePid":42,"type":"coreLeaseAcquire","version":1}"#,
+    ] {
+      XCTAssertFalse(
+        TypedJSONEnvelope.accepts(Data(rejected.utf8), kind: .coreLeaseAcquire)
+      )
+    }
+  }
+
+  func testRuntimeHomeRequestHasNoCallerSelectedPathOrUser() {
+    XCTAssertTrue(
+      TypedJSONEnvelope.accepts(
+        Data(#"{"type":"prepareCodexRuntimeHome","version":1}"#.utf8),
+        kind: .prepareCodexRuntimeHome
+      )
+    )
+    for rejected in [
+      #"{"path":"/tmp/home","type":"prepareCodexRuntimeHome","version":1}"#,
+      #"{"auditEuid":501,"type":"prepareCodexRuntimeHome","version":1}"#,
+      #"{"type":"prepareCodexRuntimeHome","version":2}"#,
+    ] {
+      XCTAssertFalse(
+        TypedJSONEnvelope.accepts(Data(rejected.utf8), kind: .prepareCodexRuntimeHome)
+      )
+    }
+  }
+
+  func testRuntimeControlRequiresExactSignedMonotonicShape() throws {
+    let request: [String: Any] = [
+      "control": [
+        "authorizationSignatureHex": String(repeating: "a", count: 128),
+        "coreKeyId": String(repeating: "b", count: 64),
+        "enabled": false,
+        "protocolVersion": 1,
+        "revision": 2,
+        "updatedAtMs": 10,
+      ],
+      "type": "applyRuntimeControl",
+      "version": 1,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: request)
+    XCTAssertTrue(TypedJSONEnvelope.accepts(data, kind: .applyRuntimeControl))
+
+    let floating = Data(
+      """
+      {"control":{"authorizationSignatureHex":"\(String(repeating: "a", count: 128))","coreKeyId":"\(String(repeating: "b", count: 64))","enabled":false,"protocolVersion":1,"revision":2.0,"updatedAtMs":10},"type":"applyRuntimeControl","version":1}
+      """.utf8
+    )
+    XCTAssertFalse(TypedJSONEnvelope.accepts(floating, kind: .applyRuntimeControl))
+  }
+
   func testAcceptsOnlyMatchingBoundedTypedObjects() {
     XCTAssertTrue(
       TypedJSONEnvelope.accepts(
@@ -13,7 +74,9 @@ final class TypedJSONEnvelopeTests: XCTestCase {
     )
     XCTAssertFalse(
       TypedJSONEnvelope.accepts(
-        Data(#"{"type":"brokerStatus","version":1}"#.utf8),
+        Data(
+          #"{"challenge":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"brokerStatus","version":1}"#
+            .utf8),
         kind: .session
       )
     )
@@ -35,7 +98,7 @@ final class TypedJSONEnvelopeTests: XCTestCase {
     for json in [
       #"{"command":"/bin/sh","type":"session","version":1}"#,
       #"{"destination":"/etc/hosts","type":"session","version":1}"#,
-      #"{"padding":"ignored","type":"brokerStatus","version":1}"#,
+      #"{"challenge":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","padding":"ignored","type":"brokerStatus","version":1}"#,
     ] {
       let kind: BrokerRequestKind =
         json.contains("brokerStatus") ? .brokerStatus : .session
@@ -228,6 +291,7 @@ final class TypedJSONEnvelopeTests: XCTestCase {
         "expiresAtMs": 130,
         "issuedAtMs": 100,
         "purpose": "execute",
+        "runtimeRevision": 1,
         "stableEffectHash": String(repeating: "2", count: 64),
       ],
     ]
@@ -242,6 +306,14 @@ final class TypedJSONEnvelopeTests: XCTestCase {
 }
 
 private final class FailIfCalledBackend: EffectBrokerBackend {
+  func acquireCoreLease(
+    peer _: AuthenticatedBrokerPeer,
+    requestJSON _: Data,
+    reply _: @escaping (Data) -> Void
+  ) {
+    XCTFail("backend must not be called")
+  }
+
   func brokerStatus(
     peer _: AuthenticatedBrokerPeer,
     requestJSON _: Data,
@@ -264,6 +336,22 @@ private final class FailIfCalledBackend: EffectBrokerBackend {
     reply _: @escaping (Data) -> Void
   ) {
     XCTFail("invalid DTO reached enrollCore backend")
+  }
+
+  func prepareCodexRuntimeHome(
+    peer _: AuthenticatedBrokerPeer,
+    requestJSON _: Data,
+    reply _: @escaping (Data) -> Void
+  ) {
+    XCTFail("invalid DTO reached prepareCodexRuntimeHome backend")
+  }
+
+  func applyRuntimeControl(
+    peer _: AuthenticatedBrokerPeer,
+    requestJSON _: Data,
+    reply _: @escaping (Data) -> Void
+  ) {
+    XCTFail("invalid DTO reached applyRuntimeControl backend")
   }
 
   func putMissionFile(

@@ -1,7 +1,7 @@
 use crate::{CryptoError, LocalAuthority};
 use openopen_protocol::{
-    ApprovalKind, ApprovalRequest, ApprovalStatus, EvidenceKind, EvidenceRef, Mission,
-    MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
+    ApprovalKind, ApprovalRequest, ApprovalStatus, ApprovalTarget, ChannelMissionEvent,
+    EvidenceKind, EvidenceRef, Mission, MissionStatus, NeedsMe, Receipt, WorkItem, WorkItemStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -44,6 +44,7 @@ pub struct NewBoundaryApproval {
     pub kind: ApprovalKind,
     pub prompt: String,
     pub scope_digest: String,
+    pub target: Option<ApprovalTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +118,10 @@ pub enum MissionCommand {
         evidence: EvidenceRef,
         now_ms: i64,
     },
+    RecordChannelParticipation {
+        mission_id: String,
+        event: ChannelMissionEvent,
+    },
     Complete {
         mission_id: String,
         receipt: NewReceipt,
@@ -140,6 +145,7 @@ impl MissionCommand {
             | Self::TransitionWorkItem { mission_id, .. }
             | Self::RequestWorkItemBoundary { mission_id, .. }
             | Self::AttachEvidence { mission_id, .. }
+            | Self::RecordChannelParticipation { mission_id, .. }
             | Self::Complete { mission_id, .. } => mission_id,
         }
     }
@@ -159,6 +165,9 @@ impl MissionCommand {
             Self::TransitionWorkItem { .. } => "mission.command.transition_work_item",
             Self::RequestWorkItemBoundary { .. } => "mission.command.request_work_item_boundary",
             Self::AttachEvidence { .. } => "mission.command.attach_evidence",
+            Self::RecordChannelParticipation { .. } => {
+                "mission.command.record_channel_participation"
+            }
             Self::Complete { .. } => "mission.command.complete",
         }
     }
@@ -260,7 +269,9 @@ pub(crate) fn apply_mission_command(
             return Err(MissionError::CommandMissionMismatch);
         }
         let now_ms = command_time(command);
-        if now_ms < mission.updated_at_ms {
+        if !matches!(command, MissionCommand::RecordChannelParticipation { .. })
+            && now_ms < mission.updated_at_ms
+        {
             return Err(MissionError::StaleCommandTime);
         }
         let receipt = apply_existing_command(&mut mission, command, authority)?;
@@ -301,6 +312,7 @@ fn create_mission(input: &CreateMission) -> Result<Mission, MissionError> {
             kind: ApprovalKind::MissionScope,
             prompt: input.scope_approval_prompt.clone(),
             scope_digest: input.scope_digest.clone(),
+            target: None,
             status: ApprovalStatus::Pending,
             requested_by_id: input.owner_id.clone(),
             decided_by_id: None,
@@ -409,6 +421,14 @@ fn apply_existing_command(
         MissionCommand::AttachEvidence {
             evidence, now_ms, ..
         } => add_evidence(mission, evidence.clone(), *now_ms, authority)?,
+        MissionCommand::RecordChannelParticipation { event, .. } => {
+            if event.mission_id != mission.id || mission.status.is_terminal() {
+                return Err(MissionError::InvalidMissionSnapshot(
+                    "channel participation must bind one non-terminal Mission",
+                ));
+            }
+            mission.updated_at_ms = mission.updated_at_ms.max(event.recorded_at_ms);
+        }
         MissionCommand::Complete {
             receipt, now_ms, ..
         } => return complete_mission(mission, receipt, *now_ms, authority).map(Some),
@@ -446,6 +466,7 @@ fn new_approval(
         kind: input.kind,
         prompt: input.prompt.clone(),
         scope_digest: input.scope_digest.clone(),
+        target: input.target.clone(),
         status: ApprovalStatus::Pending,
         requested_by_id: mission.owner_id.clone(),
         decided_by_id: None,
@@ -469,6 +490,7 @@ const fn command_time(command: &MissionCommand) -> i64 {
         | MissionCommand::RequestWorkItemBoundary { now_ms, .. }
         | MissionCommand::AttachEvidence { now_ms, .. }
         | MissionCommand::Complete { now_ms, .. } => *now_ms,
+        MissionCommand::RecordChannelParticipation { event, .. } => event.recorded_at_ms,
     }
 }
 
@@ -920,6 +942,7 @@ fn validate_snapshot_approvals(mission: &Mission) -> Result<(), MissionError> {
             || approval.prompt.trim().is_empty()
             || approval.scope_digest.trim().is_empty()
             || approval.requested_by_id != mission.owner_id
+            || !valid_approval_target(approval)
             || !decision_is_valid
             || approval.work_item_id.as_ref().is_some_and(|work_item_id| {
                 !mission
@@ -933,6 +956,30 @@ fn validate_snapshot_approvals(mission: &Mission) -> Result<(), MissionError> {
         }
     }
     Ok(())
+}
+
+fn valid_approval_target(approval: &ApprovalRequest) -> bool {
+    let Some(target) = approval.target.as_ref() else {
+        return true;
+    };
+    if approval.kind != ApprovalKind::NewExternalWrite {
+        return false;
+    }
+    match target {
+        ApprovalTarget::ReminderList {
+            logical_list_id,
+            source_identifier,
+            calendar_identifier,
+        } => {
+            valid_target_component(logical_list_id)
+                && valid_target_component(source_identifier)
+                && valid_target_component(calendar_identifier)
+        }
+    }
+}
+
+fn valid_target_component(value: &str) -> bool {
+    !value.trim().is_empty() && value == value.trim() && value.len() <= 512
 }
 
 fn validate_snapshot_evidence(

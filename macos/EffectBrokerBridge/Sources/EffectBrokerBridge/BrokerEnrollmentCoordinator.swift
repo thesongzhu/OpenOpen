@@ -76,13 +76,24 @@ public final class KeychainBrokerTrustAnchorStore: DurableBrokerTrustAnchorStore
 public struct CoreEffectIdentity: Equatable, Sendable {
   public let coreKeyID: String
   public let coreVerifyingKeyHex: String
+  public let coreProcessIdentifier: Int32
+  public let coreInstanceNonce: String
+
+  public init(
+    coreKeyID: String,
+    coreVerifyingKeyHex: String,
+    coreProcessIdentifier: Int32 = 1,
+    coreInstanceNonce: String = String(repeating: "a", count: 64)
+  ) {
+    self.coreKeyID = coreKeyID
+    self.coreVerifyingKeyHex = coreVerifyingKeyHex
+    self.coreProcessIdentifier = coreProcessIdentifier
+    self.coreInstanceNonce = coreInstanceNonce
+  }
 }
 
 public struct ProvisionedBrokerEnrollment: Equatable, Sendable {
   public let trustAnchor: EnrolledBrokerTrustAnchor
-  /// Exact signed JSON consumed by Rust Core to construct its opaque trusted
-  /// enrollment. It contains public keys and a signature, never the master.
-  public let coreEnrollmentRecordJSON: Data
 }
 
 public final class KeychainCoreAuthorityStore {
@@ -128,55 +139,12 @@ public final class KeychainCoreAuthorityStore {
     }
   }
 
-  public func loadOrCreateEffectIdentity() throws -> CoreEffectIdentity {
-    let master = try loadOrCreateMasterKey()
-    var derivation = Data("openopen-effect-authorizer-v1".utf8)
-    derivation.append(master)
-    let seed = Data(SHA256.hash(data: derivation))
-    let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-    let verifyingKey = signingKey.publicKey.rawRepresentation
-    return CoreEffectIdentity(
-      coreKeyID: verifyingKey.sha256LowerHex,
-      coreVerifyingKeyHex: verifyingKey.lowerHex
-    )
-  }
-
-  func signedBrokerEnrollmentRecord(
-    anchor: EnrolledBrokerTrustAnchor
-  ) throws -> Data {
-    let master = try loadOrCreateMasterKey()
-    var derivation = Data("openopen-effect-authorizer-v1".utf8)
-    derivation.append(master)
-    let seed = Data(SHA256.hash(data: derivation))
-    let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-    let identity = try loadOrCreateEffectIdentity()
-    let unsigned: [String: Any] = [
-      "brokerKeyId": anchor.brokerKeyID,
-      "brokerVerifyingKeyHex": anchor.brokerVerifyingKeyHex,
-      "coreKeyId": identity.coreKeyID,
-      "helperDesignatedRequirementDigest": anchor.helperDesignatedRequirementDigest,
-      "installedAtMs": anchor.installedAtMilliseconds,
-      "version": 1,
-    ]
-    guard let signingBytes = StrictJSONDocument.canonicalData(from: unsigned) else {
-      throw BrokerEnrollmentError.malformedCoreAuthority
-    }
-    var signed = unsigned
-    signed["coreAuthorizationSignatureHex"] = try signingKey.signature(
-      for: signingBytes
-    ).lowerHex
-    guard let record = StrictJSONDocument.canonicalData(from: signed) else {
-      throw BrokerEnrollmentError.malformedCoreAuthority
-    }
-    return record
-  }
 }
 
 public final class BrokerEnrollmentCoordinator {
   private let serviceController: BrokerServiceController
   private let clientBuilder: PrivilegedBrokerClientBuilder
   private let trustStore: any DurableBrokerTrustAnchorStore
-  private let coreAuthorityStore: KeychainCoreAuthorityStore
   private let identityProvider: any CodeSigningIdentityProviding
   private let nowMilliseconds: () throws -> Int64
 
@@ -185,7 +153,6 @@ public final class BrokerEnrollmentCoordinator {
       serviceController: BrokerServiceController(),
       clientBuilder: PrivilegedBrokerClientBuilder(),
       trustStore: KeychainBrokerTrustAnchorStore(),
-      coreAuthorityStore: KeychainCoreAuthorityStore(),
       identityProvider: SecurityCodeSigningIdentityProvider(),
       nowMilliseconds: Self.systemTimeMilliseconds
     )
@@ -195,14 +162,12 @@ public final class BrokerEnrollmentCoordinator {
     serviceController: BrokerServiceController,
     clientBuilder: PrivilegedBrokerClientBuilder,
     trustStore: any DurableBrokerTrustAnchorStore,
-    coreAuthorityStore: KeychainCoreAuthorityStore,
     identityProvider: any CodeSigningIdentityProviding,
     nowMilliseconds: @escaping () throws -> Int64
   ) {
     self.serviceController = serviceController
     self.clientBuilder = clientBuilder
     self.trustStore = trustStore
-    self.coreAuthorityStore = coreAuthorityStore
     self.identityProvider = identityProvider
     self.nowMilliseconds = nowMilliseconds
   }
@@ -212,6 +177,7 @@ public final class BrokerEnrollmentCoordinator {
   /// the live key is accepted, so this is explicit signed provisioning rather
   /// than request-path TOFU. Exact retries are idempotent; key rotation fails.
   public func provisionAfterAdminApproval(
+    coreIdentity: CoreEffectIdentity,
     completion: @escaping (Result<ProvisionedBrokerEnrollment, Error>) -> Void
   ) {
     do {
@@ -230,7 +196,6 @@ public final class BrokerEnrollmentCoordinator {
         teamIdentifier: identity.teamIdentifier
       )
       let requirementDigest = Data(requirement.utf8).sha256LowerHex
-      let coreIdentity = try coreAuthorityStore.loadOrCreateEffectIdentity()
       let now = try nowMilliseconds()
       let connection = try clientBuilder.makeActivatedConnection()
       let callback = OneShotResult(completion)
@@ -287,14 +252,10 @@ public final class BrokerEnrollmentCoordinator {
                 throw BrokerEnrollmentError.malformedBrokerResponse
               }
               try trustStore.persistProvisionedBrokerTrustAnchor(anchor)
-              let coreRecord = try self.coreAuthorityStore.signedBrokerEnrollmentRecord(
-                anchor: anchor
-              )
               callback.finish(
                 .success(
                   ProvisionedBrokerEnrollment(
-                    trustAnchor: anchor,
-                    coreEnrollmentRecordJSON: coreRecord
+                    trustAnchor: anchor
                   )
                 )
               )
@@ -373,12 +334,16 @@ final class KeychainDataStore {
     }
   }
 
-  private func baseQuery(account: KeychainAccount) -> [String: Any] {
+  func baseQuery(account: KeychainAccount) -> [String: Any] {
+    // OpenOpen is distributed directly with Developer ID. Opting into the
+    // data-protection Keychain requires a provisioning profile and otherwise
+    // fails closed with errSecMissingEntitlement (-34018). Use the single
+    // native macOS login Keychain backend explicitly; never retry against a
+    // second backend after an error.
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: account.rawValue,
-      kSecUseDataProtectionKeychain as String: true,
     ]
   }
 }

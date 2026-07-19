@@ -49,6 +49,15 @@ public final class BrokerServiceController {
     return state
   }
 
+  public func registerIfNeeded() throws -> BrokerServiceState {
+    switch state {
+    case .enabled, .requiresApproval:
+      return state
+    case .notRegistered, .notFound:
+      return try register()
+    }
+  }
+
   public func openLoginItemsSettings() {
     openSettingsAction()
   }

@@ -17,7 +17,7 @@ pub struct OutcomeSuggestion {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MissionStatus {
     Proposed,
@@ -82,6 +82,16 @@ pub enum ApprovalStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum ApprovalTarget {
+    ReminderList {
+        logical_list_id: String,
+        source_identifier: String,
+        calendar_identifier: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
     pub id: String,
@@ -89,6 +99,8 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     pub prompt: String,
     pub scope_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ApprovalTarget>,
     pub status: ApprovalStatus,
     pub requested_by_id: String,
     pub decided_by_id: Option<String>,
@@ -99,6 +111,8 @@ pub struct ApprovalRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EvidenceKind {
+    ReminderDispatchStarted,
+    ReminderMirrored,
     ReminderCompleted,
     ParticipantReply,
     OwnerFinalApproval,
@@ -160,7 +174,7 @@ pub struct Receipt {
     pub completed_at_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChannelKind {
     IMessage,
@@ -168,7 +182,7 @@ pub enum ChannelKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChannelEnvelope {
     pub channel: ChannelKind,
     pub source_message_id: String,
@@ -176,6 +190,267 @@ pub struct ChannelEnvelope {
     pub conversation_id: String,
     pub content_sha256: String,
     pub received_at_ms: i64,
+}
+
+/// One owner-confirmed channel boundary. V1 deliberately permits exactly one
+/// owner and one conversation per channel kind.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelPairing {
+    pub channel: ChannelKind,
+    pub owner_sender_id: String,
+    pub conversation_id: String,
+    pub require_explicit_address: bool,
+    pub discord: Option<DiscordPairingMetadata>,
+    pub paired_at_ms: i64,
+}
+
+/// Immutable setup facts proven by the official Discord bot flow before the
+/// common channel pairing can be persisted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscordPairingMetadata {
+    pub guild_id: String,
+    pub bot_user_id: String,
+    pub application_id: String,
+    pub setup_source_message_id: String,
+    pub setup_candidate_id: String,
+}
+
+/// Adapter-native recovery position plus a monotonically increasing ordering
+/// value. The opaque value is persisted for the adapter; Core compares only
+/// the numeric order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelCursor {
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub opaque_value: String,
+    pub order: u64,
+    pub observed_at_ms: i64,
+}
+
+/// Metadata observed by an adapter before any message body can reach a model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelObservation {
+    pub envelope: ChannelEnvelope,
+    pub cursor: ChannelCursor,
+    pub is_bot: bool,
+    pub explicitly_addressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelInboundDecision {
+    Accepted,
+    AcceptedMissionUpdate,
+    Duplicate,
+    IgnoredUnpaired,
+    IgnoredSender,
+    IgnoredConversation,
+    IgnoredBot,
+    IgnoredNotAddressed,
+    IgnoredMessageClass,
+    IgnoredInactiveMission,
+    IgnoredStaleCursor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelInboundResult {
+    pub decision: ChannelInboundDecision,
+    pub cursor: ChannelCursor,
+    pub mission_event: Option<ChannelMissionEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelModelDisposition {
+    ExecuteNow,
+    RecoverOnly,
+    SuggestionReady,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelModelStart {
+    pub envelope: ChannelEnvelope,
+    pub content: String,
+    pub disposition: ChannelModelDisposition,
+    pub suggestion: Option<OutcomeSuggestion>,
+}
+
+/// Sanitized classification for one terminal channel-model incident. The
+/// failed dispatch remains the immutable authority; this type grants no retry
+/// or provider effect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelFailureClass {
+    ModelResultUnavailable,
+}
+
+/// Durable owner acknowledgement for one exact terminal incident.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelFailureAcknowledgement {
+    pub acknowledged_at_ms: i64,
+    pub runtime_revision: u64,
+    pub audit_anchor: EffectAuditAnchor,
+}
+
+/// One stable, audited presentation record derived from immutable failed-
+/// dispatch correlation. It is informational only and cannot reopen model or
+/// provider authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelFailureIncident {
+    pub incident_id: String,
+    pub channel: ChannelKind,
+    pub failure_class: ChannelFailureClass,
+    pub occurred_at_ms: i64,
+    pub runtime_revision: u64,
+    pub dispatch_state_hash: String,
+    pub source_audit_anchor: EffectAuditAnchor,
+    pub incident_audit_anchor: EffectAuditAnchor,
+    pub acknowledgement: Option<ChannelFailureAcknowledgement>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelInboundMessageClass {
+    MissionParticipation,
+    NeedYouResponse,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelRouteRole {
+    Primary,
+    Additional,
+}
+
+/// One immutable, owner-confirmed Mission route. The Store derives the route
+/// and audit identities and never accepts a caller-assembled route snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRoute {
+    pub route_id: String,
+    pub role: ChannelRouteRole,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub owner_sender_id: String,
+    pub provider_identity: Option<String>,
+    pub source_message_id: Option<String>,
+    pub allowed_inbound_classes: Vec<ChannelInboundMessageClass>,
+    pub allowed_outbound_classes: Vec<ChannelMessageKind>,
+    pub revision: u64,
+    pub approval_id: String,
+    pub audit_id: String,
+    pub bound_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRouteSet {
+    pub mission_id: String,
+    pub revision: u64,
+    pub primary_route_id: String,
+    pub routes: Vec<ChannelRoute>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelRouteApprovalDecision {
+    Approve,
+    Reject,
+}
+
+/// Typed owner decision used only to add one exact durable pairing to an
+/// existing Mission route set. Additional outbound classes are explicit and
+/// callers must send an empty list to retain the safe default.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRouteApproval {
+    pub approval_id: String,
+    pub mission_id: String,
+    pub expected_route_set_revision: u64,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub owner_sender_id: String,
+    pub provider_identity: Option<String>,
+    pub allowed_inbound_classes: Vec<ChannelInboundMessageClass>,
+    pub allowed_outbound_classes: Vec<ChannelMessageKind>,
+    pub actor_id: String,
+    pub decision: ChannelRouteApprovalDecision,
+    pub decided_at_ms: i64,
+}
+
+/// Durable participation bound to one exact Mission and route revision. This
+/// is never completion Evidence and never grants a new Mission or scope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelMissionEvent {
+    pub event_id: String,
+    pub mission_id: String,
+    pub mission_revision: i64,
+    pub mission_anchor_hash: String,
+    pub route_id: String,
+    pub route_set_revision: u64,
+    pub message_class: ChannelInboundMessageClass,
+    pub channel: ChannelKind,
+    pub source_message_id: String,
+    pub content_sha256: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelMessageKind {
+    NeedYou,
+    Progress,
+    Receipt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelOutboundIntent {
+    pub outbound_id: String,
+    pub mission_id: String,
+    pub route_id: String,
+    pub route_set_revision: u64,
+    pub channel: ChannelKind,
+    pub conversation_id: String,
+    pub recipient_id: String,
+    pub kind: ChannelMessageKind,
+    pub content_sha256: String,
+    pub created_at_ms: i64,
+    pub recovery_cursor: Option<ChannelCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelOutboundDisposition {
+    ExecuteNow,
+    RecoverOnly,
+    AlreadySent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelOutboundStart {
+    pub intent: ChannelOutboundIntent,
+    pub disposition: ChannelOutboundDisposition,
+    pub provider_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelDeliveryReceipt {
+    pub outbound_id: String,
+    pub provider_message_id: String,
+    pub delivered_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,6 +505,7 @@ pub struct SkillPackage {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcRequest {
     pub jsonrpc: String,
     pub id: u64,
@@ -345,6 +621,52 @@ pub struct EffectBrokerSession {
     pub expires_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeControlAuthorization {
+    pub protocol_version: u32,
+    pub enabled: bool,
+    pub revision: u64,
+    pub updated_at_ms: i64,
+    pub core_key_id: String,
+    pub authorization_signature_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeControlReceipt {
+    pub protocol_version: u32,
+    pub authorization_hash: String,
+    pub checkpoint_nonce: String,
+    pub request_nonce: Option<String>,
+    pub broker_key_id: String,
+    pub broker_signature_hex: String,
+}
+
+/// Root-broker authorization for exactly one Core process incarnation.
+///
+/// The protected broker persists at most one lease per audit EUID. Process
+/// start times prevent PID-reuse replay, while `core_instance_nonce` binds the
+/// lease to the freshly started Host rather than merely to its PID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CoreInstanceLease {
+    pub protocol_version: u32,
+    pub audit_euid: u32,
+    pub app_pid: i32,
+    pub app_start_time_us: u64,
+    pub core_pid: i32,
+    pub core_start_time_us: u64,
+    pub core_audit_token_hex: String,
+    pub codex_pid: i32,
+    pub codex_start_time_us: u64,
+    pub codex_audit_token_hex: String,
+    pub core_instance_nonce: String,
+    pub issued_at_ms: i64,
+    pub broker_key_id: String,
+    pub broker_signature_hex: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EffectPermitPurpose {
@@ -360,6 +682,7 @@ pub struct EffectPermit {
     pub stable_effect_hash: String,
     pub authorization_anchor: EffectAuditAnchor,
     pub purpose: EffectPermitPurpose,
+    pub runtime_revision: u64,
     pub broker_session_nonce: String,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
@@ -439,6 +762,7 @@ pub fn effect_permit_signing_bytes(permit: &EffectPermit) -> Result<Vec<u8>, ser
         "expiresAtMs": permit.expires_at_ms,
         "issuedAtMs": permit.issued_at_ms,
         "purpose": permit.purpose,
+        "runtimeRevision": permit.runtime_revision,
         "stableEffectHash": permit.stable_effect_hash,
         "version": 1,
     }))
@@ -463,10 +787,88 @@ pub fn effect_permit_hash(permit: &EffectPermit) -> Result<String, serde_json::E
         "expiresAtMs": permit.expires_at_ms,
         "issuedAtMs": permit.issued_at_ms,
         "purpose": permit.purpose,
+        "runtimeRevision": permit.runtime_revision,
         "stableEffectHash": permit.stable_effect_hash,
         "version": 1,
     }))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Produces the canonical bytes signed by Core for one global runtime-control
+/// transition. The protected broker persists the greatest accepted revision.
+///
+/// # Errors
+///
+/// Returns a serialization error if the typed authorization cannot be encoded.
+pub fn runtime_control_authorization_signing_bytes(
+    authorization: &RuntimeControlAuthorization,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "coreKeyId": authorization.core_key_id,
+        "enabled": authorization.enabled,
+        "protocolVersion": authorization.protocol_version,
+        "revision": authorization.revision,
+        "updatedAtMs": authorization.updated_at_ms,
+        "version": 1,
+    }))
+}
+
+/// Hashes the complete signed Core authorization accepted by the broker.
+///
+/// # Errors
+///
+/// Returns a serialization error if the authorization cannot be encoded.
+pub fn runtime_control_authorization_hash(
+    authorization: &RuntimeControlAuthorization,
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(authorization)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Produces the canonical bytes signed by the protected broker after it has
+/// durably accepted a runtime-control authorization.
+///
+/// # Errors
+///
+/// Returns a serialization error if the receipt cannot be encoded.
+pub fn runtime_control_receipt_signing_bytes(
+    receipt: &RuntimeControlReceipt,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "authorizationHash": receipt.authorization_hash,
+        "brokerKeyId": receipt.broker_key_id,
+        "checkpointNonce": receipt.checkpoint_nonce,
+        "protocolVersion": receipt.protocol_version,
+        "requestNonce": receipt.request_nonce,
+        "version": 1,
+    }))
+}
+
+/// Produces the canonical bytes signed by the root effect broker for a Core
+/// instance lease. The signature itself is deliberately excluded.
+///
+/// # Errors
+///
+/// Returns a serialization error if the typed lease cannot be encoded.
+pub fn core_instance_lease_signing_bytes(
+    lease: &CoreInstanceLease,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "appPid": lease.app_pid,
+        "appStartTimeUs": lease.app_start_time_us,
+        "auditEuid": lease.audit_euid,
+        "brokerKeyId": lease.broker_key_id,
+        "coreInstanceNonce": lease.core_instance_nonce,
+        "coreAuditTokenHex": lease.core_audit_token_hex,
+        "corePid": lease.core_pid,
+        "coreStartTimeUs": lease.core_start_time_us,
+        "codexAuditTokenHex": lease.codex_audit_token_hex,
+        "codexPid": lease.codex_pid,
+        "codexStartTimeUs": lease.codex_start_time_us,
+        "issuedAtMs": lease.issued_at_ms,
+        "protocolVersion": lease.protocol_version,
+        "version": 1,
+    }))
 }
 
 /// Produces the versioned, sorted-key JSON covered by the broker Receipt
@@ -518,8 +920,9 @@ pub fn effect_noncommit_signing_bytes(
 #[cfg(test)]
 mod effect_tests {
     use super::{
-        EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectCommand, EffectNonCommit, EffectPermit,
-        EffectPermitPurpose, EffectReceipt, MissionFileEffect, PayloadDescriptor,
+        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectCommand,
+        EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt, MissionFileEffect,
+        PayloadDescriptor, RpcRequest, core_instance_lease_signing_bytes,
         effect_command_signing_bytes, effect_noncommit_signing_bytes, effect_permit_hash,
         effect_permit_signing_bytes, effect_receipt_signing_bytes,
     };
@@ -559,6 +962,20 @@ mod effect_tests {
     }
 
     #[test]
+    fn local_rpc_requests_reject_unknown_authority_fields() {
+        assert!(
+            serde_json::from_value::<RpcRequest>(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "mission.runtime.read",
+                "params": {},
+                "authority": "caller-selected"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn effect_signature_preimages_are_stable_and_exclude_only_the_signature() {
         let command = command();
         let mut permit = EffectPermit {
@@ -566,6 +983,7 @@ mod effect_tests {
             stable_effect_hash: "55".repeat(32),
             authorization_anchor: command.source_anchor.clone(),
             purpose: EffectPermitPurpose::Execute,
+            runtime_revision: 1,
             broker_session_nonce: "66".repeat(32),
             issued_at_ms: 100,
             expires_at_ms: 200,
@@ -633,5 +1051,60 @@ mod effect_tests {
             unsigned_noncommit,
             effect_noncommit_signing_bytes(&noncommit).unwrap()
         );
+    }
+
+    #[test]
+    fn core_instance_lease_preimage_binds_process_incarnation_not_signature() {
+        let mut lease = CoreInstanceLease {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            audit_euid: 501,
+            app_pid: 10,
+            app_start_time_us: 1_000,
+            core_pid: 11,
+            core_start_time_us: 1_001,
+            core_audit_token_hex: "33".repeat(32),
+            codex_pid: 12,
+            codex_start_time_us: 1_002,
+            codex_audit_token_hex: "44".repeat(32),
+            core_instance_nonce: "11".repeat(32),
+            issued_at_ms: 2_000,
+            broker_key_id: "22".repeat(32),
+            broker_signature_hex: String::new(),
+        };
+        let unsigned = core_instance_lease_signing_bytes(&lease).unwrap();
+        lease.broker_signature_hex = "33".repeat(64);
+        assert_eq!(unsigned, core_instance_lease_signing_bytes(&lease).unwrap());
+        for changed in [
+            {
+                let mut changed = lease.clone();
+                changed.core_start_time_us += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.core_audit_token_hex = "55".repeat(32);
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_pid += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_start_time_us += 1;
+                changed
+            },
+            {
+                let mut changed = lease.clone();
+                changed.codex_audit_token_hex = "66".repeat(32);
+                changed
+            },
+        ] {
+            assert_ne!(
+                unsigned,
+                core_instance_lease_signing_bytes(&changed).unwrap()
+            );
+        }
     }
 }

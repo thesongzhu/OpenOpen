@@ -24,6 +24,7 @@ fn approval_with_id(
         kind,
         prompt: "Approve this bounded action?".into(),
         scope_digest: digest.into(),
+        target: None,
         status,
         requested_by_id: "owner-1".into(),
         decided_by_id: (status != ApprovalStatus::Pending).then(|| "owner-1".into()),
@@ -630,22 +631,14 @@ fn channel_proposal(recipients: &[&str]) -> ActionProposal {
     }
 }
 
-fn enabled_gate() -> ActionGate {
-    let mut gate = ActionGate::default();
-    gate.set_enabled(true);
-    gate
-}
-
 #[test]
-fn gate_defaults_off_for_every_effect() {
+fn pure_gate_rejects_mission_mismatch() {
     let value = mission(MissionStatus::Active);
+    let mut proposal = channel_proposal(&["recipient-1"]);
+    proposal.mission_id = "mission-2".into();
     assert_eq!(
-        ActionGate::default().authorize(
-            &value,
-            &channel_proposal(&["recipient-1"]),
-            Some(SUMMARY_PAYLOAD),
-        ),
-        GateDecision::Denied("OpenOpen is off")
+        ActionGate.authorize(&value, &proposal, Some(SUMMARY_PAYLOAD)),
+        GateDecision::Denied("proposal mission mismatch")
     );
 }
 
@@ -653,7 +646,7 @@ fn gate_defaults_off_for_every_effect() {
 fn content_bearing_action_cannot_omit_rust_observed_payload() {
     let value = mission(MissionStatus::Active);
     assert_eq!(
-        enabled_gate().authorize(&value, &channel_proposal(&["recipient-1"]), None),
+        ActionGate.authorize(&value, &channel_proposal(&["recipient-1"]), None),
         GateDecision::Denied("content-bearing action is missing Rust-observed payload")
     );
 }
@@ -661,7 +654,7 @@ fn content_bearing_action_cannot_omit_rust_observed_payload() {
 #[test]
 fn recipient_and_disclosure_approvals_are_exact_and_independent() {
     let mut value = mission(MissionStatus::Active);
-    let gate = enabled_gate();
+    let gate = ActionGate;
     let proposal = channel_proposal(&["recipient-1"]);
     let recipient_digest = proposal
         .approval_digest(ApprovalKind::NewRecipient, Some(SUMMARY_PAYLOAD))
@@ -703,7 +696,7 @@ fn recipient_and_disclosure_approvals_are_exact_and_independent() {
 
 #[test]
 fn model_and_listener_targets_require_exact_action_scope_and_data_share() {
-    let gate = enabled_gate();
+    let gate = ActionGate;
     let mut value = mission(MissionStatus::Active);
     let model = ActionProposal {
         effect: EffectKind::ModelCall,
@@ -761,7 +754,7 @@ fn model_and_listener_targets_require_exact_action_scope_and_data_share() {
 
 #[test]
 fn cost_and_external_write_approvals_are_both_required() {
-    let gate = enabled_gate();
+    let gate = ActionGate;
     let mut value = mission(MissionStatus::Active);
     let payload = b"Pay the invoice";
     let proposal = ActionProposal {
@@ -806,7 +799,7 @@ fn cost_and_external_write_approvals_are_both_required() {
 #[test]
 fn mission_file_target_requires_canonical_broker_components() {
     let value = mission(MissionStatus::Active);
-    let gate = enabled_gate();
+    let gate = ActionGate;
     for relative_path in [
         "../canary",
         "",
@@ -837,7 +830,7 @@ fn mission_file_target_requires_canonical_broker_components() {
 fn outside_export_requires_exact_absolute_path_approval() {
     let destination = tempfile::tempdir().unwrap().path().join("report.xlsx");
     let mut value = mission(MissionStatus::Active);
-    let gate = enabled_gate();
+    let gate = ActionGate;
     let proposal = ActionProposal {
         effect: EffectKind::FileWrite,
         mission_id: value.id.clone(),

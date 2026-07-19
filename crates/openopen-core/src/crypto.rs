@@ -3,10 +3,14 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use openopen_protocol::{EffectPermit, EvidenceKind, EvidenceRef, effect_permit_signing_bytes};
+use openopen_protocol::{
+    EffectPermit, EvidenceKind, EvidenceRef, RuntimeControlAuthorization,
+    effect_permit_signing_bytes, runtime_control_authorization_signing_bytes,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 const NONCE_LENGTH: usize = 12;
 
@@ -57,15 +61,17 @@ impl LocalAuthority {
     /// Derives independent signing and encryption keys from Keychain-owned
     /// master material. The master is not retained after construction.
     #[must_use]
-    pub fn from_master(issuer_id: impl Into<String>, master: [u8; 32]) -> Self {
-        let signing_seed = derive_key(&master, b"openopen-signing-v1");
-        let effect_signing_seed = derive_key(&master, b"openopen-effect-authorizer-v1");
-        let encryption_key = derive_key(&master, b"openopen-encryption-v1");
+    pub fn from_master(issuer_id: impl Into<String>, mut master: [u8; 32]) -> Self {
+        let signing_seed = Zeroizing::new(derive_key(&master, b"openopen-signing-v1"));
+        let effect_signing_seed =
+            Zeroizing::new(derive_key(&master, b"openopen-effect-authorizer-v1"));
+        let encryption_key = Zeroizing::new(derive_key(&master, b"openopen-encryption-v1"));
+        master.zeroize();
         Self {
             issuer_id: issuer_id.into(),
             signing_key: SigningKey::from_bytes(&signing_seed),
             effect_signing_key: SigningKey::from_bytes(&effect_signing_seed),
-            cipher: Aes256Gcm::new((&encryption_key).into()),
+            cipher: Aes256Gcm::new((&*encryption_key).into()),
         }
     }
 
@@ -124,6 +130,29 @@ impl LocalAuthority {
         permit.authorization_signature_hex =
             hex::encode(self.effect_signing_key.sign(&bytes).to_bytes());
         Ok(())
+    }
+
+    pub(crate) fn sign_runtime_control(
+        &self,
+        authorization: &mut RuntimeControlAuthorization,
+    ) -> Result<(), CryptoError> {
+        let bytes = runtime_control_authorization_signing_bytes(authorization)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+        authorization.authorization_signature_hex =
+            hex::encode(self.effect_signing_key.sign(&bytes).to_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn verify_runtime_control(
+        &self,
+        authorization: &RuntimeControlAuthorization,
+    ) -> Result<(), CryptoError> {
+        if authorization.core_key_id != self.effect_key_id() {
+            return Err(CryptoError::UntrustedEffectKey);
+        }
+        let bytes = runtime_control_authorization_signing_bytes(authorization)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+        self.verify_effect_bytes(&bytes, &authorization.authorization_signature_hex)
     }
 
     pub(crate) fn sign_effect_bytes(&self, bytes: &[u8]) -> String {

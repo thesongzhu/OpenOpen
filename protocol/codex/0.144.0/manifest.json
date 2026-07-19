@@ -1,0 +1,13 @@
+{
+  "binarySha256": "978740e6bcbd9af2f850823b723fb74f16d8d1e44de05f7dd6737ae631f72017",
+  "codeModeHostSha256": "067ee7894c49489ca72fc2ca6093f408302241bd22097fcd12d785c9ba40fd43",
+  "codexVersion": "0.144.0",
+  "experimentalApi": false,
+  "generatorCommand": "codex app-server generate-json-schema --out protocol/codex/0.144.0/schema",
+  "schemaFileCount": 267,
+  "schemaDigestAlgorithm": "openopen-schema-set-v1",
+  "schemaSetSha256": "1554153e5396f91a2e596ea171de591b0fc55db7a4cf5e4f0a1c014cadc9ec02",
+  "sourceCommit": "767822446c7a594caa19609ca435281a9ec67e0d",
+  "standalonePackageSha256": "c1b3af67fd28bbf768765357251f7b29d315150068cb41101dc77eb8a42bc7eb",
+  "standaloneRgSha256": "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94"
+}

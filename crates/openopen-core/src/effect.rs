@@ -1,16 +1,24 @@
 use crate::LocalAuthority;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openopen_protocol::{
-    EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectBrokerSession, EffectCommand,
-    EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
+    CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectBrokerSession,
+    EffectCommand, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
+    RuntimeControlAuthorization, RuntimeControlReceipt, core_instance_lease_signing_bytes,
     effect_command_signing_bytes, effect_noncommit_signing_bytes, effect_permit_hash,
-    effect_receipt_signing_bytes,
+    effect_receipt_signing_bytes, runtime_control_authorization_hash,
+    runtime_control_receipt_signing_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub(crate) const EFFECT_PERMIT_TTL_MS: i64 = 30_000;
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimePermitContext {
+    pub revision: u64,
+    pub now_ms: i64,
+}
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum EffectProtocolError {
@@ -36,8 +44,97 @@ pub enum EffectProtocolError {
     InvalidNonCommitSignature,
     #[error("effect noncommit signature verification failed")]
     NonCommitSignatureFailed,
+    #[error("runtime-control broker Receipt does not match the Core authorization")]
+    RuntimeControlMismatch,
+    #[error("runtime-control broker Receipt signature is invalid")]
+    RuntimeControlSignatureFailed,
+    #[error("Core instance lease does not match this process incarnation")]
+    CoreInstanceLeaseMismatch,
+    #[error("Core instance lease broker signature is invalid")]
+    CoreInstanceLeaseSignatureFailed,
     #[error("effect authorization signing failed: {0}")]
     AuthorizationSigning(String),
+}
+
+/// Verifies that a lease was signed by the independently enrolled broker.
+/// Process-incarnation fields are checked by the Host before it installs the
+/// lease; this function proves the protected broker authorized the exact
+/// immutable record.
+///
+/// # Errors
+///
+/// Returns an error when the lease shape, enrolled broker binding, canonical
+/// preimage, or broker signature is invalid.
+pub fn verify_core_instance_lease(
+    enrollment: &TrustedBrokerEnrollment,
+    lease: &CoreInstanceLease,
+) -> Result<(), EffectProtocolError> {
+    if lease.protocol_version != EFFECT_PROTOCOL_VERSION
+        || lease.audit_euid == 0
+        || lease.app_pid <= 0
+        || lease.app_start_time_us == 0
+        || lease.core_pid <= 0
+        || lease.core_start_time_us == 0
+        || !is_lower_hex(&lease.core_audit_token_hex, 64)
+        || lease.codex_pid <= 0
+        || lease.codex_start_time_us == 0
+        || !is_lower_hex(&lease.codex_audit_token_hex, 64)
+        || lease.issued_at_ms <= 0
+        || !is_lower_hex(&lease.core_instance_nonce, 64)
+        || lease.broker_key_id != enrollment.broker_key_id()
+    {
+        return Err(EffectProtocolError::CoreInstanceLeaseMismatch);
+    }
+    let raw_key = hex::decode(enrollment.broker_verifying_key_hex())
+        .map_err(|_| EffectProtocolError::InvalidEnrollment)?;
+    let key_bytes: [u8; 32] = raw_key
+        .try_into()
+        .map_err(|_| EffectProtocolError::InvalidEnrollment)?;
+    let key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| EffectProtocolError::InvalidEnrollment)?;
+    let raw_signature = hex::decode(&lease.broker_signature_hex)
+        .map_err(|_| EffectProtocolError::CoreInstanceLeaseSignatureFailed)?;
+    let signature = Signature::from_slice(&raw_signature)
+        .map_err(|_| EffectProtocolError::CoreInstanceLeaseSignatureFailed)?;
+    let bytes = core_instance_lease_signing_bytes(lease)
+        .map_err(|_| EffectProtocolError::Canonicalization)?;
+    key.verify(&bytes, &signature)
+        .map_err(|_| EffectProtocolError::CoreInstanceLeaseSignatureFailed)
+}
+
+pub(crate) fn verify_runtime_control_receipt(
+    enrollment: &TrustedBrokerEnrollment,
+    authorization: &RuntimeControlAuthorization,
+    receipt: &RuntimeControlReceipt,
+) -> Result<(), EffectProtocolError> {
+    if receipt.protocol_version != EFFECT_PROTOCOL_VERSION
+        || receipt.broker_key_id != enrollment.broker_key_id()
+        || !is_lower_hex(&receipt.checkpoint_nonce, 64)
+        || receipt
+            .request_nonce
+            .as_ref()
+            .is_some_and(|nonce| !is_lower_hex(nonce, 64))
+        || receipt.authorization_hash
+            != runtime_control_authorization_hash(authorization)
+                .map_err(|_| EffectProtocolError::Canonicalization)?
+    {
+        return Err(EffectProtocolError::RuntimeControlMismatch);
+    }
+    let raw_key = hex::decode(enrollment.broker_verifying_key_hex())
+        .map_err(|_| EffectProtocolError::InvalidSession)?;
+    let key_bytes: [u8; 32] = raw_key
+        .try_into()
+        .map_err(|_| EffectProtocolError::InvalidSession)?;
+    let key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| EffectProtocolError::InvalidSession)?;
+    let raw_signature = hex::decode(&receipt.broker_signature_hex)
+        .map_err(|_| EffectProtocolError::RuntimeControlSignatureFailed)?;
+    let signature = Signature::from_slice(&raw_signature)
+        .map_err(|_| EffectProtocolError::RuntimeControlSignatureFailed)?;
+    let bytes = runtime_control_receipt_signing_bytes(receipt)
+        .map_err(|_| EffectProtocolError::Canonicalization)?;
+    key.verify(&bytes, &signature)
+        .map_err(|_| EffectProtocolError::RuntimeControlSignatureFailed)
 }
 
 /// Immutable trust material provisioned only after the signed privileged
@@ -66,8 +163,8 @@ pub struct BrokerEnrollmentRecord {
     pub core_authorization_signature_hex: String,
 }
 
-/// Canonical host/Core enrollment record preimage. The signed Swift host
-/// derives the signing key from the same Keychain master as Core.
+/// Canonical broker enrollment record preimage. Rust Core owns the signing
+/// key and signs this public trust anchor before installation.
 ///
 /// # Errors
 ///
@@ -84,6 +181,36 @@ pub fn broker_enrollment_signing_bytes(
         "version": record.version,
     }))
     .map_err(|_| EffectProtocolError::Canonicalization)
+}
+
+/// Constructs and signs the broker installation record inside Rust Core.
+///
+/// Swift supplies only the broker's public, code-signing-bound trust anchor;
+/// private effect-authority material never crosses back into the app process.
+///
+/// # Errors
+///
+/// Returns an error if the typed record cannot be canonicalized.
+pub fn authorize_broker_enrollment(
+    authority: &LocalAuthority,
+    broker_key_id: String,
+    broker_verifying_key_hex: String,
+    helper_designated_requirement_digest: String,
+    installed_at_ms: i64,
+) -> Result<BrokerEnrollmentRecord, EffectProtocolError> {
+    let mut record = BrokerEnrollmentRecord {
+        version: 1,
+        broker_key_id,
+        broker_verifying_key_hex,
+        helper_designated_requirement_digest,
+        installed_at_ms,
+        core_key_id: authority.effect_key_id(),
+        core_authorization_signature_hex: String::new(),
+    };
+    record.core_authorization_signature_hex =
+        authority.sign_effect_bytes(&broker_enrollment_signing_bytes(&record)?);
+    TrustedBrokerEnrollment::from_signed_install_record(authority, &record)?;
+    Ok(record)
 }
 
 impl TrustedBrokerEnrollment {
@@ -165,13 +292,13 @@ pub(crate) fn issue_effect_permit(
     command: EffectCommand,
     authorization_anchor: EffectAuditAnchor,
     purpose: EffectPermitPurpose,
+    runtime: RuntimePermitContext,
     session: &EffectBrokerSession,
-    now_ms: i64,
 ) -> Result<EffectPermit, EffectProtocolError> {
-    validate_broker_session(enrollment, session, now_ms)?;
+    validate_broker_session(enrollment, session, runtime.now_ms)?;
     let stable_effect_hash = stable_effect_hash(&command)?;
-    let expires_at_ms = (now_ms + EFFECT_PERMIT_TTL_MS).min(session.expires_at_ms);
-    if expires_at_ms <= now_ms {
+    let expires_at_ms = (runtime.now_ms + EFFECT_PERMIT_TTL_MS).min(session.expires_at_ms);
+    if expires_at_ms <= runtime.now_ms {
         return Err(EffectProtocolError::InvalidSession);
     }
     let mut permit = EffectPermit {
@@ -179,8 +306,9 @@ pub(crate) fn issue_effect_permit(
         stable_effect_hash,
         authorization_anchor,
         purpose,
+        runtime_revision: runtime.revision,
         broker_session_nonce: session.session_nonce.clone(),
-        issued_at_ms: now_ms,
+        issued_at_ms: runtime.now_ms,
         expires_at_ms,
         core_key_id: authority.effect_key_id(),
         authorization_signature_hex: String::new(),
