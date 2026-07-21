@@ -92,8 +92,10 @@ public struct OpenOpenRootView: View {
       SettingsView(model: model)
     case .messages:
       EditorialMessagesView(model: model)
-    case .memory, .skills:
-      EditorialUnavailableView(section: section)
+    case .memory:
+      EditorialMemoryView()
+    case .skills:
+      EditorialSkillsView()
     }
   }
 }
@@ -415,30 +417,136 @@ private struct EditorialMessagesView: View {
   }
 }
 
-private struct EditorialUnavailableView: View {
-  let section: EditorialSection
+private struct EditorialMemoryView: View {
+  private let boundaries = [
+    (
+      "Processing consent",
+      "This source will be sent only to the model and effort shown below to produce up to three candidates."
+    ),
+    (
+      "Choose one memory",
+      "Three candidates were extracted. Reject all if none should persist."
+    ),
+    (
+      "Review the exact Memory change",
+      "Review the exact line added to the local Memory file."
+    ),
+    (
+      "Memory receipt",
+      "The confirmed line was written and read back successfully."
+    ),
+  ]
 
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 16) {
         EditorialPageHeader(
-          eyebrow: section.title,
-          title: section.title,
-          detail:
-            "This surface is not active in the current verified phase. It cannot create authority or imply setup is complete."
+          eyebrow: "One careful import",
+          title: "No memories",
+          detail: "Import one source and keep only one card you explicitly approve."
         )
         EditorialEmptyState(
-          title: "Not available yet",
+          title: "Add one useful memory",
           detail:
-            "OpenOpen will show this area only after its typed lifecycle has passed the required review and action-time boundaries.",
-          symbol: section.symbol
+            "Import one source and keep only one card you explicitly approve.",
+          symbol: "notebook"
+        )
+        EditorialBoundaryCard(
+          title: "Choose one file to review",
+          detail: "OpenOpen will not scan other files or folders.",
+          actionTitle: "Choose import",
+          accessibilityIdentifier: "openopen-memory-choose-import",
+          boundaries: boundaries
         )
       }
       .padding(30)
       .frame(maxWidth: 760, alignment: .leading)
     }
     .background(EditorialPalette.background)
-    .accessibilityIdentifier("openopen-editorial-\(section.rawValue)-unavailable")
+    .accessibilityIdentifier("openopen-editorial-memory")
+  }
+}
+
+private struct EditorialSkillsView: View {
+  private let boundaries = [
+    (
+      "Acquire for review",
+      "Acquisition does not enable it. The staged copy remains inactive."
+    ),
+    (
+      "Audit",
+      "Checking instructions, files, network use, credentials, and external effects."
+    ),
+    (
+      "Enable confirmation",
+      "Only the reviewed instruction text will be promoted. No script or external effect is allowed."
+    ),
+    (
+      "Try without external effects",
+      "Ask a question that only needs reasoning and a written recommendation."
+    ),
+  ]
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 16) {
+        EditorialPageHeader(
+          eyebrow: "Reviewed capability",
+          title: "No skills",
+          detail: "Skills can shape how OpenOpen works without gaining hidden permission."
+        )
+        EditorialEmptyState(
+          title: "Add one reviewed instruction-only Skill",
+          detail: "Skills can shape how OpenOpen works without gaining hidden permission.",
+          symbol: "shippingbox"
+        )
+        EditorialBoundaryCard(
+          title: "Find one public instruction-only Skill",
+          detail:
+            "Executable files and external-effect Skills are not eligible for this instruction-only setup.",
+          actionTitle: "Find a Skill",
+          accessibilityIdentifier: "openopen-skills-find",
+          boundaries: boundaries
+        )
+      }
+      .padding(30)
+      .frame(maxWidth: 760, alignment: .leading)
+    }
+    .background(EditorialPalette.background)
+    .accessibilityIdentifier("openopen-editorial-skills")
+  }
+}
+
+private struct EditorialBoundaryCard: View {
+  let title: String
+  let detail: String
+  let actionTitle: String
+  let accessibilityIdentifier: String
+  let boundaries: [(String, String)]
+
+  var body: some View {
+    EditorialCard(title: title, symbol: "lock.shield") {
+      Text(detail)
+        .foregroundStyle(.secondary)
+      VStack(alignment: .leading, spacing: 10) {
+        ForEach(Array(boundaries.enumerated()), id: \.offset) { index, boundary in
+          HStack(alignment: .top, spacing: 10) {
+            Text("\(index + 1)")
+              .font(.caption.monospacedDigit())
+              .foregroundStyle(.secondary)
+              .frame(width: 18, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 2) {
+              Text(boundary.0).font(.subheadline.weight(.medium))
+              Text(boundary.1).font(.caption).foregroundStyle(.secondary)
+            }
+          }
+        }
+      }
+      Button(actionTitle) {}
+        .buttonStyle(.borderedProminent)
+        .disabled(true)
+        .accessibilityIdentifier(accessibilityIdentifier)
+    }
   }
 }
 
