@@ -25,15 +25,15 @@ use openopen_core::{
 use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
 use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, ChannelCursor,
-    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult,
-    ChannelKind, ChannelMessageKind, ChannelModelDisposition, ChannelModelStart,
-    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
-    ChannelRouteApproval, ChoiceBeginAccepted, ChoiceBeginRecord, ChoiceBeginRequest,
-    ChoiceConsolidatedConfirmation, ChoiceDInput, ChoiceDIntakeRecord,
-    ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview,
-    ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption, ChoiceRefinementOperation,
-    ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, C2SkillDemoCommand,
+    C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
+    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
+    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
+    ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
+    ChoiceDIntakeRecord, ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent,
+    ChoiceIMessageReplyPreview, ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption,
+    ChoiceRefinementOperation, ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
     ChoiceReminderScheduleInput, ChoiceResumeResult, ChoiceSession, ChoiceSessionState,
     ConversationTurnBatch, CoreInstanceLease, DiscordPairingMetadata, DocumentManifest,
     DocumentManifestEntry, EffectAuditAnchor, EvidenceKind, InterpretationFrame,
@@ -770,6 +770,8 @@ impl Host {
             "models.selection.read" => self.read_selected_model(&request, responses),
             "models.select" => self.select_model(&request, responses),
             "persona.status" => self.read_persona_status(&request, responses),
+            "skill.demo.read" => self.read_c2_skill_demo(&request, responses),
+            "skill.demo.command" => self.command_c2_skill_demo(&request, responses),
             "choice.loop.read" => self.read_choice_loop(&request, responses),
             "choice.reminder.schedule.read" => {
                 self.read_choice_reminder_schedule(&request, responses);
@@ -1360,6 +1362,40 @@ impl Host {
         let _ = responses.send(result.map_or_else(
             |error| host_failure(request.id, &error),
             |()| success(request.id, json!({"status": "paired"})),
+        ));
+    }
+
+    fn read_c2_skill_demo(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let result = self.store.c2_skill_demo_state();
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |state| success(request.id, C2SkillDemoView { state }),
+        ));
+    }
+
+    fn command_c2_skill_demo(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ApplyC2SkillDemo>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !params.command.is_valid() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = self.store.apply_c2_skill_demo_command(&params.command);
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |(state, receipt)| success(request.id, json!({"state": state, "receipt": receipt})),
         ));
     }
 
@@ -6679,6 +6715,29 @@ impl AwaitLogin {
 struct RuntimeProof {
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyC2SkillDemo {
+    command: C2SkillDemoCommand,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl ApplyC2SkillDemo {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct C2SkillDemoView {
+    state: Option<C2SkillDemoState>,
 }
 
 #[derive(Serialize)]

@@ -8,16 +8,17 @@ use openopen_core::{
     channel_receipt_content,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
-    ChannelMissionEvent, ChannelModelDisposition, ChannelObservation, ChannelOutboundDisposition,
-    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision,
-    ChannelRouteRole, EFFECT_PROTOCOL_VERSION, EffectBrokerSession, EffectNonCommit, EffectPermit,
-    EffectPermitPurpose, EffectReceipt, EvidenceKind, IMessagePairingMetadata, MissionFileEffect,
-    MissionStatus, OutcomeSuggestion, RuntimeControlAuthorization, RuntimeControlReceipt,
-    WorkItemStatus, effect_noncommit_signing_bytes, effect_permit_hash,
-    effect_receipt_signing_bytes, runtime_control_authorization_hash,
-    runtime_control_receipt_signing_bytes,
+    ApprovalKind, ApprovalStatus, C2_INSTRUCTION_ONLY_PERMISSION_DIGEST, C2SkillDemoCommand,
+    C2SkillDemoCommandKind, C2SkillDemoSeal, C2SkillDemoStage, ChannelCursor,
+    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundMessageClass,
+    ChannelKind, ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition,
+    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
+    ChannelRouteApproval, ChannelRouteApprovalDecision, ChannelRouteRole, EFFECT_PROTOCOL_VERSION,
+    EffectBrokerSession, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
+    EvidenceKind, IMessagePairingMetadata, MissionFileEffect, MissionStatus, OutcomeSuggestion,
+    RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
+    effect_noncommit_signing_bytes, effect_permit_hash, effect_receipt_signing_bytes,
+    runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn authority() -> LocalAuthority {
     LocalAuthority::from_master("openopen-core", [9_u8; 32])
+}
+
+fn c2_command(
+    request_id: &str,
+    expected_revision: u64,
+    kind: C2SkillDemoCommandKind,
+    nonce_byte: char,
+) -> C2SkillDemoCommand {
+    C2SkillDemoCommand {
+        request_id: request_id.to_owned(),
+        expected_revision,
+        kind,
+        seal: C2SkillDemoSeal {
+            package_id: "demo-skill".to_owned(),
+            source_url: "https://github.com/example/demo/tree/0123456789abcdef0123456789abcdef01234567/skill".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            package_digest: "a".repeat(64),
+            audit_anchor: "b".repeat(64),
+            permission_digest: C2_INSTRUCTION_ONLY_PERMISSION_DIGEST.to_owned(),
+            license: "MIT".to_owned(),
+        },
+        actor_id: "owner".to_owned(),
+        decision_id: format!("decision-{request_id}"),
+        approval_nonce: nonce_byte.to_string().repeat(64),
+        result_digest: (kind == C2SkillDemoCommandKind::RecordFirstNoEffectUse)
+            .then(|| "e".repeat(64)),
+        explicitly_confirmed: true,
+        decided_at_ms: 10 + i64::try_from(expected_revision).unwrap(),
+    }
 }
 
 fn create_command(mission_id: &str, now_ms: i64) -> MissionCommand {
@@ -4311,4 +4341,66 @@ fn tampered_effect_receipt_state_or_audit_fails_closed() {
         let reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
         assert!(reopened.verify_audit_chain(&receipt_anchor).is_err());
     }
+}
+
+#[test]
+fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    commit_runtime(&mut store, true, 1);
+    let commands = [
+        c2_command(
+            "candidate",
+            0,
+            C2SkillDemoCommandKind::RegisterCandidate,
+            '1',
+        ),
+        c2_command("staged", 1, C2SkillDemoCommandKind::StageReviewed, '2'),
+        c2_command("runnable", 2, C2SkillDemoCommandKind::EnableRunnable, '3'),
+        c2_command(
+            "first-use",
+            3,
+            C2SkillDemoCommandKind::RecordFirstNoEffectUse,
+            '4',
+        ),
+    ];
+    for (index, command) in commands.iter().enumerate() {
+        let (state, receipt) = store.apply_c2_skill_demo_command(command).unwrap();
+        assert_eq!(state.revision, (index + 1) as u64);
+        assert_eq!(receipt.revision, state.revision);
+        let (replayed, replay_receipt) = store.apply_c2_skill_demo_command(command).unwrap();
+        assert_eq!(replayed, state);
+        assert_eq!(replay_receipt, receipt);
+    }
+    assert_eq!(
+        store.c2_skill_demo_state().unwrap().unwrap().stage,
+        C2SkillDemoStage::Used
+    );
+    let mut changed_replay = commands[3].clone();
+    changed_replay.result_digest = Some("f".repeat(64));
+    assert!(matches!(
+        store.apply_c2_skill_demo_command(&changed_replay),
+        Err(StoreError::C2SkillDemoConflict)
+    ));
+    drop(store);
+    let reopened =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    assert_eq!(
+        reopened.c2_skill_demo_state().unwrap().unwrap().stage,
+        C2SkillDemoStage::Used
+    );
+    drop(reopened);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE c2_skill_demo_state SET revision = 2 WHERE singleton_id = 1",
+            [],
+        )
+        .unwrap();
+    let tampered = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert!(tampered.c2_skill_demo_state().is_err());
 }

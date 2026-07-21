@@ -10,7 +10,8 @@ use crate::{
     LocalAuthority, MissionCommand, MissionError, TrustedBrokerEnrollment,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
+    ApprovalKind, ApprovalStatus, C2SkillDemoCommand, C2SkillDemoCommandKind, C2SkillDemoReceipt,
+    C2SkillDemoStage, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
     ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
     ChannelInboundDecision, ChannelInboundMessageClass, ChannelInboundResult, ChannelKind,
     ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition, ChannelModelStart,
@@ -68,6 +69,8 @@ const CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION: &str = "choice.markdown_render_rece
 const CHOICE_REMINDER_SCHEDULE_ACTION: &str = "choice.reminder_schedule_selected";
 const CHOICE_LOOP_STATE_ACTION: &str = "choice.loop_state_changed";
 const CHOICE_IDLE_CLOCK_ACTION: &str = "choice.idle_clock_anchored";
+const C2_SKILL_DEMO_ACTION: &str = "skill.demo_state_changed";
+const C2_SKILL_DEMO_ENTITY: &str = "c2-demo-skill";
 /// The App contract accepts a bounded current incident projection. The full
 /// verified/audited history remains durable in the Store; this limit only
 /// bounds one UI/RPC response.
@@ -233,6 +236,11 @@ CREATE TABLE IF NOT EXISTS choice_loop_state (
  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
  encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS c2_skill_demo_state (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ revision INTEGER NOT NULL CHECK (revision > 0), stage_json TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
  command_id TEXT NOT NULL, command_hash TEXT NOT NULL, actor TEXT NOT NULL,
@@ -308,6 +316,10 @@ pub enum StoreError {
     ChoiceLoopStateConflict,
     #[error("Choice Loop clock continuity is uncertain")]
     ChoiceClockUncertain,
+    #[error(
+        "C2 Skill demo lifecycle is malformed, stale, replayed with changed input, or conflicts with its audit binding"
+    )]
+    C2SkillDemoConflict,
     #[error("Mission confirmation conflicts with already-started channel model work")]
     MissionModelInFlight,
     #[error("audit chain mismatch at sequence {0}")]
@@ -1514,6 +1526,155 @@ impl Store {
     pub fn selected_model_selection(&self) -> Result<Option<ModelSelection>, StoreError> {
         verified_audit_tail(&self.connection, &self.authority)?;
         load_choice_model_selection(&self.connection, &self.authority)
+    }
+
+    /// Loads the one verified, Store-owned instruction-only demo Skill lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted state or its signed audit binding is invalid.
+    pub fn c2_skill_demo_state(&self) -> Result<Option<C2SkillDemoState>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_c2_skill_demo_state(&self.connection, &self.authority)
+    }
+
+    /// Applies one bounded C2 demo lifecycle command atomically with its signed audit row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid, stale, changed-replay, or nonsequential commands and for
+    /// failed runtime, storage, encryption, or audit verification.
+    #[allow(clippy::too_many_lines)] // The transaction intentionally keeps validation, state and audit mutation inseparable.
+    pub fn apply_c2_skill_demo_command(
+        &mut self,
+        command: &C2SkillDemoCommand,
+    ) -> Result<(C2SkillDemoState, C2SkillDemoReceipt), StoreError> {
+        let command_digest = command.digest().ok_or(StoreError::C2SkillDemoConflict)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+
+        let existing = load_c2_skill_demo_state(&transaction, &self.authority)?;
+        if let Some(state) = existing.as_ref()
+            && let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.request_id == command.request_id)
+        {
+            if receipt.command_digest == command_digest {
+                return Ok((state.clone(), receipt.clone()));
+            }
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        let current_revision = existing.as_ref().map_or(0, |state| state.revision);
+        if command.expected_revision != current_revision
+            || existing.as_ref().is_some_and(|state| {
+                state.seal != command.seal
+                    || state.consumed_nonces.contains(&command.approval_nonce)
+            })
+        {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        let next_stage = match (existing.as_ref().map(|state| state.stage), command.kind) {
+            (None, C2SkillDemoCommandKind::RegisterCandidate) => C2SkillDemoStage::Candidate,
+            (Some(C2SkillDemoStage::Candidate), C2SkillDemoCommandKind::StageReviewed) => {
+                C2SkillDemoStage::Staged
+            }
+            (Some(C2SkillDemoStage::Staged), C2SkillDemoCommandKind::EnableRunnable) => {
+                C2SkillDemoStage::Runnable
+            }
+            (Some(C2SkillDemoStage::Runnable), C2SkillDemoCommandKind::RecordFirstNoEffectUse) => {
+                C2SkillDemoStage::Used
+            }
+            _ => return Err(StoreError::C2SkillDemoConflict),
+        };
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or(StoreError::C2SkillDemoConflict)?;
+        let receipt_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&json!({
+                "commandDigest": command_digest,
+                "revision": next_revision,
+                "stage": next_stage,
+                "seal": command.seal,
+                "resultDigest": command.result_digest,
+                }))
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?
+            )
+        );
+        let receipt = C2SkillDemoReceipt {
+            request_id: command.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: next_revision,
+            stage: next_stage,
+            receipt_digest,
+        };
+        let mut state = existing.unwrap_or(C2SkillDemoState {
+            revision: 0,
+            stage: C2SkillDemoStage::Candidate,
+            seal: command.seal.clone(),
+            consumed_nonces: Vec::new(),
+            receipts: Vec::new(),
+            first_use_result_digest: None,
+        });
+        state.revision = next_revision;
+        state.stage = next_stage;
+        state.consumed_nonces.push(command.approval_nonce.clone());
+        state.receipts.push(receipt.clone());
+        if next_stage == C2SkillDemoStage::Used {
+            state
+                .first_use_result_digest
+                .clone_from(&command.result_digest);
+        }
+        validate_c2_skill_demo_state(&state)?;
+        let blob = self
+            .authority
+            .encrypt_json(&state, c2_skill_demo_aad().as_bytes())?;
+        let encrypted_blob_hash = blob_hash(&blob);
+        let encoded_stage = serde_json::to_string(&next_stage)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+        transaction.execute(
+            "INSERT INTO c2_skill_demo_state
+                (singleton_id, revision, stage_json, encrypted_blob, blob_hash)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton_id) DO UPDATE SET revision = excluded.revision,
+                 stage_json = excluded.stage_json, encrypted_blob = excluded.encrypted_blob,
+                 blob_hash = excluded.blob_hash",
+            params![
+                i64::try_from(next_revision).map_err(|_| StoreError::C2SkillDemoConflict)?,
+                encoded_stage,
+                blob,
+                encrypted_blob_hash
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("c2-skill-demo-{}", command.request_id),
+                command_id: &command.request_id,
+                command_hash: &command_digest,
+                actor: &command.actor_id,
+                action: C2_SKILL_DEMO_ACTION,
+                entity_id: C2_SKILL_DEMO_ENTITY,
+                created_at_ms: command.decided_at_ms,
+                state_kind: "skill:demo",
+                state_hash: &encrypted_blob_hash,
+            },
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
     }
 
     /// Returns the complete encrypted foreground Choice Loop state. Its
@@ -8521,6 +8682,7 @@ fn verify_all_bindings(
     verify_effect_resolution_bindings(connection)?;
     verify_channel_bindings(connection, authority)?;
     let _ = load_choice_model_selection(connection, authority)?;
+    let _ = load_c2_skill_demo_state(connection, authority)?;
     let choice_snapshot = load_choice_loop_snapshot(connection, authority)?;
     verify_choice_private_bindings(connection, authority, choice_snapshot.as_ref())?;
     let schedule_ids = connection
@@ -8555,6 +8717,103 @@ fn verify_all_bindings(
             .ok_or(StoreError::ChannelOutboundConflict)?;
     }
     verify_all_mission_and_receipt_bindings(connection, authority)
+}
+
+fn c2_skill_demo_aad() -> &'static str {
+    "openopen-c2-skill-demo-v1"
+}
+
+fn validate_c2_skill_demo_state(state: &C2SkillDemoState) -> Result<(), StoreError> {
+    let expected_stages = [
+        C2SkillDemoStage::Candidate,
+        C2SkillDemoStage::Staged,
+        C2SkillDemoStage::Runnable,
+        C2SkillDemoStage::Used,
+    ];
+    if state.revision == 0
+        || usize::try_from(state.revision).ok() != Some(state.receipts.len())
+        || state.receipts.len() != state.consumed_nonces.len()
+        || state.receipts.len() > expected_stages.len()
+        || !state.seal.is_valid()
+        || state.stage != expected_stages[state.receipts.len() - 1]
+    {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    let mut request_ids = HashSet::new();
+    let mut nonces = HashSet::new();
+    for (index, (receipt, nonce)) in state
+        .receipts
+        .iter()
+        .zip(state.consumed_nonces.iter())
+        .enumerate()
+    {
+        if receipt.revision != (index + 1) as u64
+            || receipt.stage != expected_stages[index]
+            || !is_sha256_hex(&receipt.command_digest)
+            || !is_sha256_hex(&receipt.receipt_digest)
+            || !is_sha256_hex(nonce)
+            || !request_ids.insert(&receipt.request_id)
+            || !nonces.insert(nonce)
+        {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+    }
+    match state.stage {
+        C2SkillDemoStage::Used
+            if state
+                .first_use_result_digest
+                .as_deref()
+                .is_some_and(is_sha256_hex) => {}
+        C2SkillDemoStage::Used => return Err(StoreError::C2SkillDemoConflict),
+        _ if state.first_use_result_digest.is_some() => {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_c2_skill_demo_state(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<C2SkillDemoState>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT revision, stage_json, encrypted_blob, blob_hash
+             FROM c2_skill_demo_state WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, encoded_stage, blob, stored_blob_hash)) = row else {
+        return Ok(None);
+    };
+    let revision = u64::try_from(revision).map_err(|_| StoreError::C2SkillDemoConflict)?;
+    if blob_hash(&blob) != stored_blob_hash {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        C2_SKILL_DEMO_ACTION,
+        C2_SKILL_DEMO_ENTITY,
+        "skill:demo",
+        &blob,
+    )?;
+    let state: C2SkillDemoState = authority.decrypt_json(&blob, c2_skill_demo_aad().as_bytes())?;
+    validate_c2_skill_demo_state(&state)?;
+    let state_stage = serde_json::to_string(&state.stage)
+        .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+    if state.revision != revision || state_stage != encoded_stage {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    Ok(Some(state))
 }
 
 /// Verifies every live or retired private Choice body independently of the
@@ -8889,6 +9148,7 @@ fn verify_audited_state_entities_exist(
     verify_audited_entities_exist(connection, CHOICE_REMINDER_SCHEDULE_ACTION)?;
     verify_audited_entities_exist(connection, CHOICE_LOOP_STATE_ACTION)?;
     verify_audited_entities_exist(connection, CHOICE_IDLE_CLOCK_ACTION)?;
+    verify_audited_entities_exist(connection, C2_SKILL_DEMO_ACTION)?;
     if connection
         .query_row(
             "SELECT 1 FROM choice_idle_clock_anchor WHERE singleton_id = 1",
@@ -9431,6 +9691,10 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
         CHOICE_IDLE_CLOCK_ACTION => {
             "SELECT 1 FROM choice_idle_clock_anchor
              WHERE singleton_id = 1 AND ?1 = 'choice-idle-clock'"
+        }
+        C2_SKILL_DEMO_ACTION => {
+            "SELECT 1 FROM c2_skill_demo_state
+             WHERE singleton_id = 1 AND ?1 = 'c2-demo-skill'"
         }
         CHANNEL_ROUTE_SET_ACTION => "SELECT 1 FROM channel_route_set WHERE mission_id = ?1",
         CHANNEL_MISSION_EVENT_ACTION => "SELECT 1 FROM channel_mission_event WHERE entity_id = ?1",

@@ -2838,6 +2838,121 @@ pub struct SkillPackage {
     pub rollback_commit: Option<String>,
 }
 
+pub const C2_INSTRUCTION_ONLY_PERMISSION_DIGEST: &str =
+    "3cb2dbae054a787c18b5ba9a60ab0e4541fbe6f9c4c165e9de77f84a7363c298";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum C2SkillDemoStage {
+    Candidate,
+    Staged,
+    Runnable,
+    Used,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct C2SkillDemoSeal {
+    pub package_id: String,
+    pub source_url: String,
+    pub commit: String,
+    pub package_digest: String,
+    pub audit_anchor: String,
+    pub permission_digest: String,
+    pub license: String,
+}
+
+impl C2SkillDemoSeal {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.package_id)
+            && self.source_url.starts_with("https://github.com/")
+            && self.source_url.len() <= 512
+            && !self.source_url.chars().any(char::is_control)
+            && self.commit.len() == 40
+            && self
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && sha256_hex(&self.package_digest)
+            && sha256_hex(&self.audit_anchor)
+            && self.permission_digest == C2_INSTRUCTION_ONLY_PERMISSION_DIGEST
+            && matches!(self.license.as_str(), "MIT" | "Apache-2.0")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum C2SkillDemoCommandKind {
+    RegisterCandidate,
+    StageReviewed,
+    EnableRunnable,
+    RecordFirstNoEffectUse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct C2SkillDemoCommand {
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub kind: C2SkillDemoCommandKind,
+    pub seal: C2SkillDemoSeal,
+    pub actor_id: String,
+    pub decision_id: String,
+    pub approval_nonce: String,
+    pub result_digest: Option<String>,
+    pub explicitly_confirmed: bool,
+    pub decided_at_ms: i64,
+}
+
+impl C2SkillDemoCommand {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.request_id)
+            && self.seal.is_valid()
+            && bounded_identifier(&self.actor_id)
+            && bounded_identifier(&self.decision_id)
+            && sha256_hex(&self.approval_nonce)
+            && self.explicitly_confirmed
+            && self.decided_at_ms >= 0
+            && match self.kind {
+                C2SkillDemoCommandKind::RecordFirstNoEffectUse => {
+                    self.result_digest.as_deref().is_some_and(sha256_hex)
+                }
+                _ => self.result_digest.is_none(),
+            }
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Option<String> {
+        self.is_valid()
+            .then(|| serde_json::to_vec(self).ok())
+            .flatten()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct C2SkillDemoReceipt {
+    pub request_id: String,
+    pub command_digest: String,
+    pub revision: u64,
+    pub stage: C2SkillDemoStage,
+    pub receipt_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct C2SkillDemoState {
+    pub revision: u64,
+    pub stage: C2SkillDemoStage,
+    pub seal: C2SkillDemoSeal,
+    pub consumed_nonces: Vec<String>,
+    pub receipts: Vec<C2SkillDemoReceipt>,
+    pub first_use_result_digest: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest {
