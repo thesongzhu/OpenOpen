@@ -492,36 +492,31 @@ private struct EditorialSkillsView: View {
     ScrollView {
       VStack(alignment: .leading, spacing: 16) {
         EditorialPageHeader(
-          eyebrow: "Reviewed capability",
-          title: "No skills",
-          detail: "Skills can shape how OpenOpen works without gaining hidden permission."
+          eyebrow: skillEyebrow,
+          title: skillTitle,
+          detail: skillDetail
         )
-        EditorialEmptyState(
-          title: "Add one reviewed instruction-only Skill",
-          detail: "Skills can shape how OpenOpen works without gaining hidden permission.",
-          symbol: "shippingbox"
-        )
+        if model.c2SkillDemoState == nil {
+          EditorialEmptyState(
+            title: "Add one reviewed instruction-only Skill",
+            detail: "Skills can shape how OpenOpen works without gaining hidden permission.",
+            symbol: "shippingbox"
+          )
+        }
         EditorialBoundaryCard(
-          title: "Find one public instruction-only Skill",
-          detail:
-            "Executable files and external-effect Skills are not eligible for this instruction-only setup.",
-          actionTitle: "Find a Skill",
+          title: skillBoundaryTitle,
+          detail: skillBoundaryDetail,
+          actionTitle: skillActionTitle,
           accessibilityIdentifier: "openopen-skills-find",
           boundaries: boundaries,
           action: { model.requestNextC2SkillDemoAction() },
-          enabled: model.storeControlEnabled && !model.isBusy
+          enabled: model.c2SkillDemoActionAvailable
         )
         if let feedback = model.c2SkillDemoFeedback {
           Text(feedback)
             .font(.caption)
             .foregroundStyle(.secondary)
             .accessibilityIdentifier("openopen-skills-feedback")
-        }
-        if !model.c2SkillDemoRequestIds.isEmpty {
-          Text(model.c2SkillDemoRequestIds.joined(separator: " · "))
-            .font(.caption.monospaced())
-            .foregroundStyle(.secondary)
-            .accessibilityIdentifier("openopen-skills-receipt-identities")
         }
       }
       .padding(30)
@@ -541,6 +536,71 @@ private struct EditorialSkillsView: View {
       }
     } message: {
       Text(skillConfirmationDetail)
+    }
+  }
+
+  private var skillEyebrow: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil: "No skills"
+    case .candidate: "Audit"
+    case .staged: "Enable confirmation"
+    case .runnable: "Decision brief is enabled"
+    case .used: "Result"
+    }
+  }
+
+  private var skillTitle: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil: "No skills"
+    case .candidate: "Reviewing the staged Skill"
+    case .staged: "Enable Decision brief?"
+    case .runnable: "Enabled"
+    case .used: "Finish the Core loop first"
+    }
+  }
+
+  private var skillDetail: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil: "Skills can shape how OpenOpen works without gaining hidden permission."
+    case .candidate:
+      "Checking instructions, files, network use, credentials, and external effects."
+    case .staged:
+      "Only the reviewed instruction text will be promoted. No script or external effect is allowed."
+    case .runnable: "It can now shape eligible answers. Disable it at any time."
+    case .used: "The Skill produced a recommendation with alternatives and explicit tradeoffs."
+    }
+  }
+
+  private var skillBoundaryTitle: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil: "Find one public instruction-only Skill"
+    case .candidate: "Reviewing the staged Skill"
+    case .staged: "Enable Decision brief?"
+    case .runnable: "Try without external effects"
+    case .used: "Finish the Core loop first"
+    }
+  }
+
+  private var skillBoundaryDetail: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil:
+      "Executable files and external-effect Skills are not eligible for this instruction-only setup."
+    case .candidate:
+      "Checking instructions, files, network use, credentials, and external effects."
+    case .staged:
+      "Only the reviewed instruction text will be promoted. No script or external effect is allowed."
+    case .runnable: "Ask a question that only needs reasoning and a written recommendation."
+    case .used: "The Skill produced a recommendation with alternatives and explicit tradeoffs."
+    }
+  }
+
+  private var skillActionTitle: String {
+    switch model.c2SkillDemoState?.stage {
+    case nil: "Find a Skill"
+    case .candidate: "Audit"
+    case .staged: "Enable"
+    case .runnable: "Use Skill"
+    case .used: "Done"
     }
   }
 

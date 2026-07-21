@@ -61,7 +61,7 @@ func frozenSkillSetupUsesOnlyTheTypedLifecycleAuthority() throws {
   #expect(!skills.contains("URLSession"))
   #expect(skills.contains("model.requestNextC2SkillDemoAction()"))
   #expect(skills.contains("model.confirmC2SkillDemoAction()"))
-  #expect(skills.contains("openopen-skills-receipt-identities"))
+  #expect(!skills.contains("c2SkillDemoRequestIds"))
 }
 
 @Test

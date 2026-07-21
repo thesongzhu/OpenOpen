@@ -2733,6 +2733,16 @@ public final class AppModel: ObservableObject {
     c2SkillDemoFeedback = nil
   }
 
+  public var c2SkillDemoActionAvailable: Bool {
+    guard storeControlEnabled, !isBusy, c2SkillDemoPendingAction == nil else { return false }
+    switch c2SkillDemoState?.stage {
+    case nil: return c2SkillDemoApprovedSeal != nil
+    case .candidate, .staged: return true
+    case .runnable: return c2SkillDemoFirstUseResultDigest != nil
+    case .used: return false
+    }
+  }
+
   public func cancelC2SkillDemoAction() {
     c2SkillDemoPendingAction = nil
   }
