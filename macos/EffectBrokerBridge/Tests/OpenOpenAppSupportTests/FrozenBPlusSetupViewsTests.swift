@@ -12,6 +12,15 @@ private func openOpenViewsSource() throws -> String {
   return try String(contentsOf: sourceURL, encoding: .utf8)
 }
 
+private func appModelSource() throws -> String {
+  let sourceURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/OpenOpenAppSupport/AppModel.swift")
+  return try String(contentsOf: sourceURL, encoding: .utf8)
+}
+
 private func sourceSlice(_ source: String, from start: String, to end: String) throws -> String {
   let startIndex = try #require(source.range(of: start)?.lowerBound)
   let endIndex = try #require(
@@ -42,6 +51,14 @@ func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
   #expect(memory.contains("model.requestB2CandidateSelection"))
   #expect(memory.contains("model.requestB2DiffConfirmation"))
   #expect(memory.contains("openopen-memory-confirmed-readback"))
+  #expect(memory.contains("Only this change will be written"))
+  #expect(memory.contains("Review the exact line added to the local Memory file."))
+  #expect(!memory.contains("Nothing changes until you confirm."))
+
+  let appModel = try appModelSource()
+  #expect(!appModel.contains("The Memory Demo state could not be verified."))
+  #expect(!appModel.contains("The Memory Demo command is invalid."))
+  #expect(!appModel.contains("The Memory Demo step was not verified."))
 }
 
 @Test

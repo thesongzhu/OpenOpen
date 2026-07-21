@@ -2716,7 +2716,7 @@ public final class AppModel: ObservableObject {
       b2MemoryFeedback = nil
     } catch {
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
-      b2MemoryFeedback = "The Memory Demo state could not be verified. Nothing changed."
+      b2MemoryFeedback = "Nothing changed"
     }
   }
 
@@ -2774,7 +2774,7 @@ public final class AppModel: ObservableObject {
       explicitlyConfirmed: kind == .selectCandidate || kind == .confirmDiff,
       decidedAtMs: 0)
     guard command.isValid else {
-      b2MemoryFeedback = "The Memory Demo command is invalid. Nothing changed."
+      b2MemoryFeedback = "Nothing changed"
       return
     }
     let generation = runtimeGeneration
@@ -2794,7 +2794,7 @@ public final class AppModel: ObservableObject {
       b2MemoryFeedback = nil
     } catch {
       guard generation == runtimeGeneration else { return }
-      b2MemoryFeedback = "The Memory Demo step was not verified. Nothing changed."
+      b2MemoryFeedback = "Nothing changed"
     }
   }
 

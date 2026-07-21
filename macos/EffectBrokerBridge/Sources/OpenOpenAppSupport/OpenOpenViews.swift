@@ -516,7 +516,9 @@ private struct EditorialMemoryView: View {
         }
       }
     case .confirmed:
-      EditorialCard(title: "Review the exact Memory change", symbol: "checkmark.circle") {
+      EditorialCard(title: "Only this change will be written", symbol: "checkmark.circle") {
+        Text("Review the exact line added to the local Memory file.")
+          .font(.caption).foregroundStyle(.secondary)
         Text(model.b2MemoryDemoState?.markdownDiff?.editedLine ?? "")
           .font(.system(.body, design: .monospaced))
           .accessibilityIdentifier("openopen-memory-confirmed-readback")
@@ -559,7 +561,7 @@ private struct EditorialMemoryView: View {
     switch model.b2MemoryPendingAction {
     case .selectCandidate: boundaries[1].1
     case .confirmDiff: "This confirmation authorizes only the displayed Markdown change."
-    default: "Nothing changes until you confirm."
+    default: "This confirmation authorizes only the displayed Markdown change."
     }
   }
 }
