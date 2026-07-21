@@ -777,10 +777,10 @@ verify_post_stage_identity_receipt() {
       exit 66
     }
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|9d978c5ac0f7cb83502ed9e041276fafbb1ec5afb6d32e3ba4520f562d97d884
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
 EOF
 }
 
@@ -864,14 +864,14 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|9d978c5ac0f7cb83502ed9e041276fafbb1ec5afb6d32e3ba4520f562d97d884
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-
 Contents/Resources/Codex/0.144.0/codex-path/rg|rg|$app_team|b117313f07e30d05462b942c318b1ae0b73b4e5c|ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6
-Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|19de2b3e834adf95fed67c0cfd1a6f6a7759d5de|cdea42cf30e731d52c00524c16db5865fe2d01ef6a3f377cb6e3a3eb65f5f313
+Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|19de2b3e834adf95fed67c0cfd1a6f6a7759d5de|35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a
 EOF
 
   for rel in \
@@ -908,7 +908,7 @@ EOF
     exit 66
   }
 
-  verify_sha c1769b4093faa6e8bde56cdb16ad2c950ee39ea5501630e0ba022901b56a7b3d \
+  verify_sha dc38dd78a8c3bfef736333257335667b8b87e28e205256637b751ac064f65ff7 \
     "$candidate/Contents/Resources/iMessage/0.13.0/BUILD-RECEIPT.json"
   verify_sha 818495226dda3332f711fc6d6408eacf1776e08fcddfa06342ab3f5196417839 \
     "$candidate/Contents/Resources/Notices/third_party/manifest.json"
@@ -1055,7 +1055,7 @@ EOF
   /usr/bin/jq -e --arg team "$app_team" \
     --arg runtime_sha "$runtime_sha" \
     '.schemaVersion == 1
-     and .buildReceiptSha256 == "c1769b4093faa6e8bde56cdb16ad2c950ee39ea5501630e0ba022901b56a7b3d"
+     and .buildReceiptSha256 == "dc38dd78a8c3bfef736333257335667b8b87e28e205256637b751ac064f65ff7"
      and .binarySha256 == $runtime_sha
      and .resourceTreeSha256 == "7a5cb869823a893a7181bcacfef6dfc8be335a5ce2bf14caac579096f78909cc"
      and .signingIdentifier == "com.thesongzhu.OpenOpen.imsg"
