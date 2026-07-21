@@ -12,11 +12,11 @@ use crate::{
 use openopen_protocol::{
     ApprovalKind, ApprovalStatus, B2_MEMORY_MARKDOWN_PATH, B2MemoryCandidateCard, B2MemoryCommand,
     B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoStage, B2MemoryDemoState,
-    B2MemoryImportSeal, B2MemoryMarkdownDiff, B2MemoryPreparedSource, B2MemoryProcessingConsent,
-    B2MemoryProcessingOperation, B2MemoryProcessingResult, B2MemoryRenderIntent,
-    C2SkillDemoCommand, C2SkillDemoCommandKind, C2SkillDemoReceipt, C2SkillDemoStage,
-    C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
+    B2MemoryImportSeal, B2MemoryMarkdownDiff, B2MemoryPreparedSource,
+    B2MemoryProcessingAbortReason, B2MemoryProcessingConsent, B2MemoryProcessingOperation,
+    B2MemoryProcessingResult, B2MemoryRenderIntent, C2SkillDemoCommand, C2SkillDemoCommandKind,
+    C2SkillDemoReceipt, C2SkillDemoStage, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt,
+    ChannelEnvelope, ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
     ChannelInboundDecision, ChannelInboundMessageClass, ChannelInboundResult, ChannelKind,
     ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition, ChannelModelStart,
     ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelOutboundStart,
@@ -429,6 +429,17 @@ mod b2_memory_demo_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    struct ProcessingFixture {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        authority: LocalAuthority,
+        store: Store,
+        authorization: RuntimeControlAuthorization,
+        broker_receipt: RuntimeControlReceipt,
+        consent: B2MemoryProcessingConsent,
+        operation: B2MemoryProcessingOperation,
+    }
+
     fn command(
         request_id: &str,
         expected_revision: u64,
@@ -444,6 +455,182 @@ mod b2_memory_demo_tests {
             explicitly_confirmed: false,
             decided_at_ms: i64::try_from(expected_revision).unwrap_or_default() + 10,
         }
+    }
+
+    fn processing_fixture() -> ProcessingFixture {
+        let directory = tempfile::tempdir().expect("temporary Store");
+        let path = directory.path().join("store.sqlite3");
+        let authority = LocalAuthority::from_master("b2-processing-recovery", [93_u8; 32]);
+        let mut store = Store::open(&path, authority.clone()).expect("open Store");
+        let (authorization, broker_receipt) =
+            super::choice_begin_tests::enable_runtime(&mut store, &authority);
+        let mut source_record = B2MemoryPreparedSourceRecord {
+            source: B2MemoryPreparedSource {
+                request_id: "b2-recovery-prepare".to_owned(),
+                source_identity_digest: "0".repeat(64),
+                byte_length: 128,
+            },
+            selected_path: PathBuf::from("/tmp/synthetic-recovery-chatgpt.zip"),
+            device_id: 7,
+            inode: 8,
+            modified_at_ns: 9,
+            source_digest: "a".repeat(64),
+            prepared_at_ms: 10,
+        };
+        source_record.source.source_identity_digest =
+            b2_memory_source_identity_digest(&source_record).expect("source identity");
+        let prepared = store
+            .prepare_b2_memory_source(&source_record, &authorization, &broker_receipt)
+            .expect("prepared source")
+            .0;
+        let selection = super::choice_begin_tests::selection();
+        store
+            .select_model_selection(&selection, 11)
+            .expect("model selection");
+        let (choice_begin, choice_snapshot) = super::choice_begin_tests::begin_state(
+            "Remember one synthetic preference",
+            "b2-recovery-choice-begin",
+        );
+        store
+            .begin_choice_session(&choice_begin, &choice_snapshot)
+            .expect("Choice begin");
+        store
+            .commit_initial_choice_result(&super::choice_begin_tests::initial_result(&choice_begin))
+            .expect("initial Choice result");
+        let seal = B2MemoryImportSeal {
+            source_digest: source_record.source_digest.clone(),
+            catalog_digest: "b".repeat(64),
+            source_manifest_digest: "c".repeat(64),
+            model_provenance: selection
+                .turn_provenance(
+                    "b2-recovery-provenance".to_owned(),
+                    "b2-recovery-turn".to_owned(),
+                )
+                .expect("model provenance"),
+        };
+        let consent = B2MemoryProcessingConsent {
+            request_id: "b2-recovery-process".to_owned(),
+            expected_revision: prepared.revision,
+            source_identity_digest: source_record.source.source_identity_digest,
+            explicitly_confirmed: true,
+        };
+        let operation = store
+            .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 20)
+            .expect("begin processing");
+        ProcessingFixture {
+            _directory: directory,
+            path,
+            authority,
+            store,
+            authorization,
+            broker_receipt,
+            consent,
+            operation,
+        }
+    }
+
+    #[test]
+    fn definite_failure_cancel_and_off_return_processing_to_restart_safe_prepared() {
+        let mut fixture = processing_fixture();
+        let processing_revision = fixture
+            .store
+            .b2_memory_demo_state()
+            .unwrap()
+            .unwrap()
+            .revision;
+        let prepared = fixture
+            .store
+            .abort_b2_memory_processing(
+                &fixture.operation.operation_id,
+                fixture.authorization.revision,
+                B2MemoryProcessingAbortReason::DefiniteFailure,
+                21,
+            )
+            .expect("abort known failure")
+            .expect("known operation");
+        assert_eq!(prepared.stage, B2MemoryDemoStage::Prepared);
+        assert_eq!(prepared.revision, processing_revision + 1);
+        assert!(prepared.processing_operation.is_none());
+        assert!(prepared.processing_result_digest.is_none());
+        assert!(prepared.seal.is_none());
+        assert!(fixture.store.b2_memory_prepared_source().unwrap().is_some());
+        assert!(
+            load_b2_memory_processing_operation(&fixture.store.connection, &fixture.authority)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .abort_b2_memory_processing(
+                    &fixture.operation.operation_id,
+                    fixture.authorization.revision,
+                    B2MemoryProcessingAbortReason::Cancelled,
+                    22,
+                )
+                .expect("cancel/known-failure race is idempotent")
+                .unwrap(),
+            prepared
+        );
+        let mut late_result = B2MemoryProcessingResult {
+            operation_id: fixture.operation.operation_id.clone(),
+            candidates: vec![B2MemoryCandidateCard {
+                id: "late-card".to_owned(),
+                title: "Late result".to_owned(),
+                rationale: "Must remain rejected".to_owned(),
+                proposed_line: "- Never accept a late result.".to_owned(),
+                source_binding_digest: "d".repeat(64),
+            }],
+            result_digest: String::new(),
+            completed_at_ms: 23,
+        };
+        late_result.result_digest = late_result.canonical_digest().unwrap();
+        assert!(matches!(
+            fixture.store.commit_b2_memory_processing_result(
+                &late_result,
+                &fixture.authorization,
+                &fixture.broker_receipt,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        assert!(matches!(
+            fixture.store.begin_b2_memory_processing(
+                &fixture.consent,
+                &B2MemoryImportSeal {
+                    source_digest: fixture.operation.source_digest.clone(),
+                    catalog_digest: fixture.operation.catalog_digest.clone(),
+                    source_manifest_digest: fixture.operation.source_manifest_digest.clone(),
+                    model_provenance: fixture.operation.model_provenance.clone(),
+                },
+                &fixture.authorization,
+                &fixture.broker_receipt,
+                24,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        drop(fixture.store);
+        let restarted = Store::open(&fixture.path, fixture.authority).expect("restart Store");
+        let restarted_state = restarted.b2_memory_demo_state().unwrap().unwrap();
+        assert_eq!(restarted_state, prepared);
+        assert!(restarted.b2_memory_prepared_source().unwrap().is_some());
+
+        let mut off_fixture = processing_fixture();
+        let off_prepared = off_fixture
+            .store
+            .abort_b2_memory_processing(
+                &off_fixture.operation.operation_id,
+                off_fixture.authorization.revision,
+                B2MemoryProcessingAbortReason::RuntimeOff,
+                21,
+            )
+            .expect("Off abort")
+            .expect("active operation");
+        assert_eq!(off_prepared.stage, B2MemoryDemoStage::Prepared);
+        super::choice_begin_tests::commit_runtime_revision(&mut off_fixture.store, false, 22);
+        assert_eq!(
+            off_fixture.store.b2_memory_demo_state().unwrap().unwrap(),
+            off_prepared
+        );
     }
 
     #[test]
@@ -2583,6 +2770,112 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(operation)
+    }
+
+    /// Returns one definitely failed or explicitly cancelled B2 processing
+    /// operation to its descriptor-pinned prepared source. This is a private
+    /// Host recovery transition: it retains no result, starts no model retry,
+    /// and grants no external-effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/foreign operation, runtime drift, invalid
+    /// timestamp, tampered state, or a non-Processing current state.
+    pub fn abort_b2_memory_processing(
+        &mut self,
+        operation_id: &str,
+        expected_runtime_revision: u64,
+        reason: B2MemoryProcessingAbortReason,
+        aborted_at_ms: i64,
+    ) -> Result<Option<B2MemoryDemoState>, StoreError> {
+        if operation_id.is_empty() || expected_runtime_revision == 0 || aborted_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let Some(mut state) = load_b2_memory_demo_state(&transaction, &self.authority)? else {
+            return Ok(None);
+        };
+        let abort_request_id = format!(
+            "b2-processing-abort-{}",
+            &sha256_json(&json!({"operationId": operation_id}))?[..24]
+        );
+        if state.receipts.iter().any(|receipt| {
+            receipt.request_id == abort_request_id && receipt.stage == B2MemoryDemoStage::Prepared
+        }) {
+            return (state.stage == B2MemoryDemoStage::Prepared
+                && state.processing_operation.is_none()
+                && state.processing_result_digest.is_none()
+                && state.seal.is_none()
+                && load_b2_memory_processing_operation(&transaction, &self.authority)?.is_none()
+                && load_b2_memory_prepared_source(&transaction, &self.authority)?
+                    .is_some_and(|source| state.prepared_source.as_ref() == Some(&source.source)))
+            .then_some(Some(state))
+            .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let operation = load_b2_memory_processing_operation(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if !runtime.enabled
+            || runtime.revision != expected_runtime_revision
+            || operation.runtime_revision != expected_runtime_revision
+            || operation.operation_id != operation_id
+            || aborted_at_ms < operation.started_at_ms
+            || state.stage != B2MemoryDemoStage::Processing
+            || state.processing_operation.as_ref() != Some(&operation)
+            || state.prepared_source.as_ref() != Some(&source.source)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let command_digest = sha256_json(&json!({
+            "operationId": operation_id,
+            "reason": reason,
+        }))?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Prepared;
+        state.processing_operation = None;
+        state.processing_result_digest = None;
+        state.seal = None;
+        state.candidates.clear();
+        let receipt = B2MemoryCommandReceipt {
+            request_id: abort_request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: state.revision,
+            stage: B2MemoryDemoStage::Prepared,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": state.revision,
+                "stage": B2MemoryDemoStage::Prepared,
+            }))?,
+        };
+        state.receipts.push(receipt);
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &abort_request_id,
+            &command_digest,
+            aborted_at_ms,
+        )?;
+        if transaction.execute(
+            "DELETE FROM b2_memory_processing_operation WHERE singleton_id = 1 AND operation_id = ?1",
+            [operation_id],
+        )? != 1
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        transaction.commit()?;
+        Ok(Some(state))
     }
 
     /// Private Host result commit for one explicitly-consented, descriptor-

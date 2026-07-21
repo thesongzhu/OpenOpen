@@ -29,16 +29,16 @@ use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
     ApprovalKind, ApprovalStatus, ApprovalTarget, B2MemoryCandidateCard, B2MemoryCommand,
     B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoState, B2MemoryImportSeal,
-    B2MemoryPrepareSourceRequest, B2MemoryPreparedSource, B2MemoryProcessingConsent,
-    B2MemoryProcessingResult, BatchSealReason, C2SkillDemoCommand, C2SkillDemoState, ChannelCursor,
-    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult,
-    ChannelKind, ChannelMessageKind, ChannelModelDisposition, ChannelModelStart,
-    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
-    ChannelRouteApproval, ChoiceBeginAccepted, ChoiceBeginRecord, ChoiceBeginRequest,
-    ChoiceConsolidatedConfirmation, ChoiceDInput, ChoiceDIntakeRecord,
-    ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview,
-    ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption, ChoiceRefinementOperation,
-    ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
+    B2MemoryPrepareSourceRequest, B2MemoryPreparedSource, B2MemoryProcessingAbortReason,
+    B2MemoryProcessingConsent, B2MemoryProcessingResult, BatchSealReason, C2SkillDemoCommand,
+    C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
+    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
+    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
+    ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
+    ChoiceDIntakeRecord, ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent,
+    ChoiceIMessageReplyPreview, ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption,
+    ChoiceRefinementOperation, ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
     ChoiceReminderScheduleInput, ChoiceResumeResult, ChoiceSession, ChoiceSessionState,
     ConversationTurnBatch, CoreInstanceLease, DiscordPairingMetadata, DocumentManifest,
     DocumentManifestEntry, EffectAuditAnchor, EvidenceKind, InterpretationFrame,
@@ -876,13 +876,18 @@ impl Host {
                 // current signed On revision is still authoritative; leaving
                 // it behind would strand it after Core quiesces with no legal
                 // publication or cancellation route.
+                let runtime = self.store.runtime_control()?;
+                self.abort_active_b2_memory_processing(
+                    B2MemoryProcessingAbortReason::RuntimeOff,
+                    runtime.revision,
+                    now,
+                )?;
                 if let Some(snapshot) = self.store.choice_loop_snapshot()?
                     && !matches!(
                         snapshot.session.state,
                         ChoiceSessionState::Completed | ChoiceSessionState::Cancelled
                     )
                 {
-                    let runtime = self.store.runtime_control()?;
                     self.store.cancel_choice_session(runtime.revision, now)?;
                 }
             }
@@ -3963,6 +3968,11 @@ impl Host {
         self.operations.cancel_active_model_operation();
         let response = now_ms()
             .and_then(|cancelled_at_ms| {
+                self.abort_active_b2_memory_processing(
+                    B2MemoryProcessingAbortReason::Cancelled,
+                    proof.authorization.revision,
+                    cancelled_at_ms,
+                )?;
                 self.store
                     .cancel_choice_session(proof.authorization.revision, cancelled_at_ms)
                     .map_err(Into::into)
@@ -6154,6 +6164,33 @@ impl Host {
         self.operations.finish_operation(token);
     }
 
+    fn abort_active_b2_memory_processing(
+        &mut self,
+        reason: B2MemoryProcessingAbortReason,
+        expected_runtime_revision: u64,
+        aborted_at_ms: i64,
+    ) -> Result<(), HostCallError> {
+        let Some(operation_id) = self
+            .store
+            .b2_memory_demo_state()?
+            .filter(|state| state.stage == openopen_protocol::B2MemoryDemoStage::Processing)
+            .and_then(|state| {
+                state
+                    .processing_operation
+                    .map(|operation| operation.operation_id)
+            })
+        else {
+            return Ok(());
+        };
+        self.store.abort_b2_memory_processing(
+            &operation_id,
+            expected_runtime_revision,
+            reason,
+            aborted_at_ms,
+        )?;
+        Ok(())
+    }
+
     fn background_context(&self, proof: RuntimeProof) -> BackgroundContext {
         BackgroundContext {
             authority: self.authority.clone(),
@@ -6286,6 +6323,26 @@ struct BackgroundContext {
 }
 
 impl BackgroundContext {
+    fn abort_b2_memory_processing(
+        &self,
+        operation_id: &str,
+        reason: B2MemoryProcessingAbortReason,
+    ) -> Result<(), HostCallError> {
+        let broker = self
+            .trusted_broker
+            .clone()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        let mut store =
+            Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+        store.abort_b2_memory_processing(
+            operation_id,
+            self.proof.authorization.revision,
+            reason,
+            now_ms()?,
+        )?;
+        Ok(())
+    }
+
     /// Confirms and publishes the exact Store-owned B2 Markdown journal. The
     /// public command contains no body, path, manifest, or filesystem receipt;
     /// those remain private to Store and the descriptor-safe writer.
@@ -6490,9 +6547,22 @@ impl BackgroundContext {
                 .map_err(Into::into)
         })?;
         if operation.load(Ordering::Acquire) {
+            self.abort_b2_memory_processing(
+                &processing.operation_id,
+                B2MemoryProcessingAbortReason::Cancelled,
+            )?;
             return Err(HostCallError::Codex(CodexError::Cancelled));
         }
-        let (prompt, allowed_source_refs) = b2_memory_candidate_prompt(&memory_context)?;
+        let (prompt, allowed_source_refs) = match b2_memory_candidate_prompt(&memory_context) {
+            Ok(value) => value,
+            Err(error) => {
+                self.abort_b2_memory_processing(
+                    &processing.operation_id,
+                    B2MemoryProcessingAbortReason::DefiniteFailure,
+                )?;
+                return Err(error);
+            }
+        };
         let request = MemoryCandidateGenerationRequest {
             prompt,
             allowed_source_refs,
@@ -6505,43 +6575,86 @@ impl BackgroundContext {
             },
             developer_instructions: MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS.to_owned(),
         };
-        request.validate().map_err(HostCallError::Codex)?;
-        let workspace = ModelWorkspace::create(&self.paths.model_input_root)?;
-        let generated = self.with_client(|client| {
+        if let Err(error) = request.validate().map_err(HostCallError::Codex) {
+            self.abort_b2_memory_processing(
+                &processing.operation_id,
+                B2MemoryProcessingAbortReason::DefiniteFailure,
+            )?;
+            return Err(error);
+        }
+        let workspace = match ModelWorkspace::create(&self.paths.model_input_root) {
+            Ok(value) => value,
+            Err(error) => {
+                self.abort_b2_memory_processing(
+                    &processing.operation_id,
+                    B2MemoryProcessingAbortReason::DefiniteFailure,
+                )?;
+                return Err(error);
+            }
+        };
+        let generated = match self.with_client(|client| {
             client
                 .run_structured_memory_candidate_generation_in_workspace(&request, &workspace.path)
-        })?;
+        }) {
+            Ok(value) => value,
+            Err(error) if b2_model_failure_is_definite(&error) => {
+                let reason = if matches!(&error, HostCallError::Codex(CodexError::Cancelled)) {
+                    B2MemoryProcessingAbortReason::Cancelled
+                } else {
+                    B2MemoryProcessingAbortReason::DefiniteFailure
+                };
+                self.abort_b2_memory_processing(&processing.operation_id, reason)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         self.require_enabled()?;
         if operation.load(Ordering::Acquire) {
+            self.abort_b2_memory_processing(
+                &processing.operation_id,
+                B2MemoryProcessingAbortReason::Cancelled,
+            )?;
             return Err(HostCallError::Codex(CodexError::Cancelled));
         }
-        let candidates = generated
-            .candidates
-            .into_iter()
-            .map(|candidate| {
-                Ok(B2MemoryCandidateCard {
-                    id: candidate.id,
-                    title: candidate.title,
-                    rationale: candidate.rationale,
-                    proposed_line: candidate.proposed_markdown_line,
-                    source_binding_digest: serialized_sha256(&json!({
-                        "operationId": processing.operation_id,
-                        "sourceRefs": candidate.source_refs,
-                    }))?,
+        let result = (|| -> Result<B2MemoryProcessingResult, HostCallError> {
+            let candidates = generated
+                .candidates
+                .into_iter()
+                .map(|candidate| {
+                    Ok(B2MemoryCandidateCard {
+                        id: candidate.id,
+                        title: candidate.title,
+                        rationale: candidate.rationale,
+                        proposed_line: candidate.proposed_markdown_line,
+                        source_binding_digest: serialized_sha256(&json!({
+                            "operationId": processing.operation_id,
+                            "sourceRefs": candidate.source_refs,
+                        }))?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, HostCallError>>()?;
-        let completed_at_ms = now_ms()?;
-        let mut result = B2MemoryProcessingResult {
-            operation_id: processing.operation_id,
-            candidates,
-            result_digest: String::new(),
-            completed_at_ms,
+                .collect::<Result<Vec<_>, HostCallError>>()?;
+            let mut result = B2MemoryProcessingResult {
+                operation_id: processing.operation_id.clone(),
+                candidates,
+                result_digest: String::new(),
+                completed_at_ms: now_ms()?,
+            };
+            result.result_digest = result
+                .canonical_digest()
+                .ok_or(StoreError::B2MemoryDemoConflict)?;
+            Ok(result)
+        })();
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.abort_b2_memory_processing(
+                    &processing.operation_id,
+                    B2MemoryProcessingAbortReason::DefiniteFailure,
+                )?;
+                return Err(error);
+            }
         };
-        result.result_digest = result
-            .canonical_digest()
-            .ok_or(StoreError::B2MemoryDemoConflict)?;
-        self.operations.reconcile_active(operation, || {
+        let committed = self.operations.reconcile_active(operation, || {
             let broker = self
                 .trusted_broker
                 .clone()
@@ -6555,7 +6668,14 @@ impl BackgroundContext {
                     &self.proof.broker_receipt,
                 )
                 .map_err(Into::into)
-        })
+        });
+        if matches!(&committed, Err(HostCallError::Codex(CodexError::Cancelled))) {
+            self.abort_b2_memory_processing(
+                &processing.operation_id,
+                B2MemoryProcessingAbortReason::Cancelled,
+            )?;
+        }
+        committed
     }
 
     /// Executes the private, already-persisted Markdown journal.  A caller
@@ -7064,6 +7184,26 @@ enum HostCallError {
     ChoiceRefreshRequired,
     #[error("internal failure")]
     Internal,
+}
+
+fn b2_model_failure_is_definite(error: &HostCallError) -> bool {
+    matches!(
+        error,
+        HostCallError::Internal
+            | HostCallError::Codex(
+                CodexError::Cancelled
+                    | CodexError::RuntimeMismatch
+                    | CodexError::InvalidPath
+                    | CodexError::SandboxUnavailable
+                    | CodexError::ConfigMismatch
+                    | CodexError::CredentialFilePresent
+                    | CodexError::UnsupportedAccount
+                    | CodexError::WrongRuntimePurpose
+                    | CodexError::RequiredModelUnavailable
+                    | CodexError::AuthorityRequest(_)
+                    | CodexError::InvalidContract(_)
+            )
+    )
 }
 
 fn channel_runtime_failure(error: &ChannelRuntimeError) -> HostCallError {
@@ -10020,10 +10160,11 @@ mod tests {
         CodexClient, CodexError, DEFAULT_REMINDERS_LIST_ID, GptModel, Host, HostCallError,
         HostPaths, ModelCatalogSnapshot, ModelSelectionStatus, OperationState, PollChannel,
         ReminderTarget, RpcRequest, SendChannelMessage, TransportEvent, TransportInbound,
-        boot_scoped_monotonic_ms, channel_outcome_request, decode_params,
-        initial_choice_result_from_generation, is_lower_sha256, mission_command_batch,
-        model_selection_status, new_choice_begin_state, new_choice_begin_state_for_source,
-        pin_b2_memory_source, read_bootstrap, render_choice_imessage_reply,
+        b2_model_failure_is_definite, boot_scoped_monotonic_ms, channel_outcome_request,
+        decode_params, initial_choice_result_from_generation, is_lower_sha256,
+        mission_command_batch, model_selection_status, new_choice_begin_state,
+        new_choice_begin_state_for_source, pin_b2_memory_source, read_bootstrap,
+        render_choice_imessage_reply,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_codex_client::{StructuredChoiceGeneration, StructuredChoiceOption};
@@ -10090,6 +10231,34 @@ mod tests {
         openopen_persona::PersonaBundle::embedded_default(1)
             .unwrap()
             .revision_ref
+    }
+
+    #[test]
+    fn b2_failure_classifier_keeps_ambiguous_provider_results_recover_only() {
+        assert!(b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::RequiredModelUnavailable
+        )));
+        assert!(b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::InvalidContract("invalid structured result")
+        )));
+        assert!(b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::Cancelled
+        )));
+        assert!(!b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::Remote {
+                code: -1,
+                message: "ambiguous provider response".to_owned(),
+            }
+        )));
+        assert!(!b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::TurnFailed("ambiguous terminal observation")
+        )));
+        assert!(!b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::Timeout
+        )));
+        assert!(!b2_model_failure_is_definite(&HostCallError::Codex(
+            CodexError::Protocol("ambiguous protocol loss")
+        )));
     }
 
     #[test]

@@ -2967,6 +2967,16 @@ pub enum B2MemoryDemoStage {
     ReadBack,
 }
 
+/// Private Host/Store reason for retiring a processing operation without a
+/// candidate result. It is not accepted from a public RPC caller.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum B2MemoryProcessingAbortReason {
+    Cancelled,
+    DefiniteFailure,
+    RuntimeOff,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct B2MemoryProcessingOperation {
