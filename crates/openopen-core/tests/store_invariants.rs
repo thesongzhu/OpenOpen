@@ -4351,7 +4351,11 @@ fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
     let enrollment = broker_enrollment(&security);
     let mut store =
         Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
-    commit_runtime(&mut store, true, 1);
+    let authorization = store.prepare_runtime_control(true, 1).unwrap();
+    let runtime_receipt = signed_runtime_control_receipt(&authorization);
+    store
+        .commit_runtime_control(&authorization, &runtime_receipt)
+        .unwrap();
     let commands = [
         c2_command(
             "candidate",
@@ -4369,10 +4373,14 @@ fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
         ),
     ];
     for (index, command) in commands.iter().enumerate() {
-        let (state, receipt) = store.apply_c2_skill_demo_command(command).unwrap();
+        let (state, receipt) = store
+            .apply_c2_skill_demo_command(command, &authorization, &runtime_receipt)
+            .unwrap();
         assert_eq!(state.revision, (index + 1) as u64);
         assert_eq!(receipt.revision, state.revision);
-        let (replayed, replay_receipt) = store.apply_c2_skill_demo_command(command).unwrap();
+        let (replayed, replay_receipt) = store
+            .apply_c2_skill_demo_command(command, &authorization, &runtime_receipt)
+            .unwrap();
         assert_eq!(replayed, state);
         assert_eq!(replay_receipt, receipt);
     }
@@ -4383,7 +4391,7 @@ fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
     let mut changed_replay = commands[3].clone();
     changed_replay.result_digest = Some("f".repeat(64));
     assert!(matches!(
-        store.apply_c2_skill_demo_command(&changed_replay),
+        store.apply_c2_skill_demo_command(&changed_replay, &authorization, &runtime_receipt),
         Err(StoreError::C2SkillDemoConflict)
     ));
     drop(store);
@@ -4403,4 +4411,51 @@ fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
         .unwrap();
     let tampered = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
     assert!(tampered.c2_skill_demo_state().is_err());
+}
+
+#[test]
+fn c2_skill_demo_rejects_stale_runtime_proof_inside_atomic_transition() {
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    let initial_authorization = store.prepare_runtime_control(true, 1).unwrap();
+    let initial_receipt = signed_runtime_control_receipt(&initial_authorization);
+    store
+        .commit_runtime_control(&initial_authorization, &initial_receipt)
+        .unwrap();
+    store
+        .apply_c2_skill_demo_command(
+            &c2_command(
+                "candidate",
+                0,
+                C2SkillDemoCommandKind::RegisterCandidate,
+                '1',
+            ),
+            &initial_authorization,
+            &initial_receipt,
+        )
+        .unwrap();
+
+    let off = store.prepare_runtime_control(false, 2).unwrap();
+    let off_receipt = signed_runtime_control_receipt(&off);
+    store.commit_runtime_control(&off, &off_receipt).unwrap();
+    let current = store.prepare_runtime_control(true, 3).unwrap();
+    let current_receipt = signed_runtime_control_receipt(&current);
+    store
+        .commit_runtime_control(&current, &current_receipt)
+        .unwrap();
+    let stage = c2_command("staged", 1, C2SkillDemoCommandKind::StageReviewed, '2');
+    assert!(matches!(
+        store.apply_c2_skill_demo_command(&stage, &initial_authorization, &initial_receipt),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+    assert_eq!(store.c2_skill_demo_state().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        store
+            .apply_c2_skill_demo_command(&stage, &current, &current_receipt)
+            .unwrap()
+            .0
+            .revision,
+        2
+    );
 }

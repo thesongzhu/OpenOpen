@@ -2953,6 +2953,194 @@ pub struct C2SkillDemoState {
     pub first_use_result_digest: Option<String>,
 }
 
+pub const B2_MEMORY_MARKDOWN_PATH: &str = "sources/chatgpt.md";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum B2MemoryDemoStage {
+    Prepared,
+    Candidates,
+    Selected,
+    DiffReview,
+    Confirmed,
+    ReadBack,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryCandidateCard {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+    pub proposed_line: String,
+    pub source_binding_digest: String,
+}
+
+impl B2MemoryCandidateCard {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.id)
+            && bounded_text(&self.title, 160)
+            && bounded_text(&self.rationale, 512)
+            && bounded_text(&self.proposed_line, 4_096)
+            && sha256_hex(&self.source_binding_digest)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryImportSeal {
+    pub source_digest: String,
+    pub catalog_digest: String,
+    pub source_manifest_digest: String,
+    pub model_provenance: ModelProvenance,
+}
+
+impl B2MemoryImportSeal {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        sha256_hex(&self.source_digest)
+            && sha256_hex(&self.catalog_digest)
+            && sha256_hex(&self.source_manifest_digest)
+            && self.model_provenance.is_valid()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryMarkdownDiff {
+    pub revision: u64,
+    pub selected_candidate_id: String,
+    pub proposed_line: String,
+    pub edited_line: String,
+    pub expected_base: Option<MarkdownBaseIdentity>,
+    pub final_entry: DocumentManifestEntry,
+    pub diff_digest: String,
+}
+
+impl B2MemoryMarkdownDiff {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.revision > 0
+            && bounded_identifier(&self.selected_candidate_id)
+            && bounded_text(&self.proposed_line, 4_096)
+            && bounded_text(&self.edited_line, 4_096)
+            && self
+                .expected_base
+                .as_ref()
+                .is_none_or(MarkdownBaseIdentity::is_valid)
+            && self.final_entry.relative_path == B2_MEMORY_MARKDOWN_PATH
+            && document_manifest_entries_are_valid(std::slice::from_ref(&self.final_entry))
+            && sha256_hex(&self.diff_digest)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum B2MemoryCommandKind {
+    Prepare,
+    SelectCandidate,
+    EditMarkdown,
+    ConfirmDiff,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryCommand {
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub kind: B2MemoryCommandKind,
+    pub selected_candidate_id: Option<String>,
+    pub edited_line: Option<String>,
+    pub expected_diff_digest: Option<String>,
+    pub explicitly_confirmed: bool,
+    pub decided_at_ms: i64,
+}
+
+impl B2MemoryCommand {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.request_id)
+            && self.decided_at_ms >= 0
+            && match self.kind {
+                B2MemoryCommandKind::Prepare => {
+                    self.expected_revision == 0
+                        && self.selected_candidate_id.is_none()
+                        && self.edited_line.is_none()
+                        && self.expected_diff_digest.is_none()
+                        && !self.explicitly_confirmed
+                }
+                B2MemoryCommandKind::SelectCandidate => {
+                    self.expected_revision > 0
+                        && self
+                            .selected_candidate_id
+                            .as_deref()
+                            .is_some_and(bounded_identifier)
+                        && self.edited_line.is_none()
+                        && self.expected_diff_digest.is_none()
+                        && self.explicitly_confirmed
+                }
+                B2MemoryCommandKind::EditMarkdown => {
+                    self.expected_revision > 0
+                        && self.selected_candidate_id.is_none()
+                        && self
+                            .edited_line
+                            .as_deref()
+                            .is_some_and(|line| bounded_text(line, 4_096))
+                        && self.expected_diff_digest.as_deref().is_some_and(sha256_hex)
+                        && !self.explicitly_confirmed
+                }
+                B2MemoryCommandKind::ConfirmDiff => {
+                    self.expected_revision > 0
+                        && self.selected_candidate_id.is_none()
+                        && self.edited_line.is_none()
+                        && self.expected_diff_digest.as_deref().is_some_and(sha256_hex)
+                        && self.explicitly_confirmed
+                }
+            }
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Option<String> {
+        self.is_valid()
+            .then(|| serde_json::to_vec(self).ok())
+            .flatten()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryCommandReceipt {
+    pub request_id: String,
+    pub command_digest: String,
+    pub revision: u64,
+    pub stage: B2MemoryDemoStage,
+    pub receipt_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryReadbackReceipt {
+    pub confirmation_digest: String,
+    pub render_receipt_digest: String,
+    pub receipt_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryDemoState {
+    pub revision: u64,
+    pub stage: B2MemoryDemoStage,
+    pub seal: Option<B2MemoryImportSeal>,
+    pub candidates: Vec<B2MemoryCandidateCard>,
+    pub selected_candidate: Option<B2MemoryCandidateCard>,
+    pub markdown_diff: Option<B2MemoryMarkdownDiff>,
+    pub confirmation_digest: Option<String>,
+    pub readback_receipt: Option<B2MemoryReadbackReceipt>,
+    pub receipts: Vec<B2MemoryCommandReceipt>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest {

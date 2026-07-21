@@ -25,9 +25,9 @@ use openopen_core::{
 use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
 use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, C2SkillDemoCommand,
-    C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, B2MemoryCommand, B2MemoryDemoState,
+    BatchSealReason, C2SkillDemoCommand, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt,
+    ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
     ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
     ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
     ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
@@ -772,6 +772,8 @@ impl Host {
             "persona.status" => self.read_persona_status(&request, responses),
             "skill.demo.read" => self.read_c2_skill_demo(&request, responses),
             "skill.demo.command" => self.command_c2_skill_demo(&request, responses),
+            "memory.demo.read" => self.read_b2_memory_demo(&request, responses),
+            "memory.demo.command" => self.command_b2_memory_demo(&request, responses),
             "choice.loop.read" => self.read_choice_loop(&request, responses),
             "choice.reminder.schedule.read" => {
                 self.read_choice_reminder_schedule(&request, responses);
@@ -1392,7 +1394,49 @@ impl Host {
         if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
             return;
         }
-        let result = self.store.apply_c2_skill_demo_command(&params.command);
+        let result = self.store.apply_c2_skill_demo_command(
+            &params.command,
+            &params.authorization,
+            &params.broker_receipt,
+        );
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |(state, receipt)| success(request.id, json!({"state": state, "receipt": receipt})),
+        ));
+    }
+
+    fn read_b2_memory_demo(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let result = self.store.b2_memory_demo_state();
+        let _ = responses.send(result.map_or_else(
+            |error| host_failure(request.id, &error),
+            |state| success(request.id, B2MemoryDemoView { state }),
+        ));
+    }
+
+    fn command_b2_memory_demo(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ApplyB2MemoryDemo>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !params.command.is_valid() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = self.store.apply_b2_memory_command(
+            &params.command,
+            &params.authorization,
+            &params.broker_receipt,
+        );
         let _ = responses.send(result.map_or_else(
             |error| host_failure(request.id, &error),
             |(state, receipt)| success(request.id, json!({"state": state, "receipt": receipt})),
@@ -6738,6 +6782,29 @@ impl ApplyC2SkillDemo {
 #[serde(rename_all = "camelCase")]
 struct C2SkillDemoView {
     state: Option<C2SkillDemoState>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyB2MemoryDemo {
+    command: B2MemoryCommand,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl ApplyB2MemoryDemo {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct B2MemoryDemoView {
+    state: Option<B2MemoryDemoState>,
 }
 
 #[derive(Serialize)]

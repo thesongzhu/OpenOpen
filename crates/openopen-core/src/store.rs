@@ -10,9 +10,11 @@ use crate::{
     LocalAuthority, MissionCommand, MissionError, TrustedBrokerEnrollment,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, C2SkillDemoCommand, C2SkillDemoCommandKind, C2SkillDemoReceipt,
-    C2SkillDemoStage, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
+    ApprovalKind, ApprovalStatus, B2_MEMORY_MARKDOWN_PATH, B2MemoryCandidateCard, B2MemoryCommand,
+    B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoStage, B2MemoryDemoState,
+    B2MemoryImportSeal, B2MemoryMarkdownDiff, C2SkillDemoCommand, C2SkillDemoCommandKind,
+    C2SkillDemoReceipt, C2SkillDemoStage, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt,
+    ChannelEnvelope, ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
     ChannelInboundDecision, ChannelInboundMessageClass, ChannelInboundResult, ChannelKind,
     ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition, ChannelModelStart,
     ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelOutboundStart,
@@ -71,6 +73,8 @@ const CHOICE_LOOP_STATE_ACTION: &str = "choice.loop_state_changed";
 const CHOICE_IDLE_CLOCK_ACTION: &str = "choice.idle_clock_anchored";
 const C2_SKILL_DEMO_ACTION: &str = "skill.demo_state_changed";
 const C2_SKILL_DEMO_ENTITY: &str = "c2-demo-skill";
+const B2_MEMORY_DEMO_ACTION: &str = "memory.demo_state_changed";
+const B2_MEMORY_DEMO_ENTITY: &str = "b2-demo-memory";
 /// The App contract accepts a bounded current incident projection. The full
 /// verified/audited history remains durable in the Store; this limit only
 /// bounds one UI/RPC response.
@@ -241,6 +245,11 @@ CREATE TABLE IF NOT EXISTS c2_skill_demo_state (
  revision INTEGER NOT NULL CHECK (revision > 0), stage_json TEXT NOT NULL,
  encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS b2_memory_demo_state (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ revision INTEGER NOT NULL CHECK (revision > 0), stage_json TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
  command_id TEXT NOT NULL, command_hash TEXT NOT NULL, actor TEXT NOT NULL,
@@ -320,6 +329,10 @@ pub enum StoreError {
         "C2 Skill demo lifecycle is malformed, stale, replayed with changed input, or conflicts with its audit binding"
     )]
     C2SkillDemoConflict,
+    #[error(
+        "B2 Memory demo lifecycle is malformed, stale, replayed with changed input, or conflicts with its audit binding"
+    )]
+    B2MemoryDemoConflict,
     #[error("Mission confirmation conflicts with already-started channel model work")]
     MissionModelInFlight,
     #[error("audit chain mismatch at sequence {0}")]
@@ -384,6 +397,169 @@ pub enum StoreError {
     RuntimeControlMismatch,
     #[error("OpenOpen is off")]
     RuntimeDisabled,
+}
+
+#[cfg(test)]
+mod b2_memory_demo_tests {
+    use super::*;
+
+    fn command(
+        request_id: &str,
+        expected_revision: u64,
+        kind: B2MemoryCommandKind,
+    ) -> B2MemoryCommand {
+        B2MemoryCommand {
+            request_id: request_id.to_owned(),
+            expected_revision,
+            kind,
+            selected_candidate_id: None,
+            edited_line: None,
+            expected_diff_digest: None,
+            explicitly_confirmed: false,
+            decided_at_ms: i64::try_from(expected_revision).unwrap_or_default() + 10,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn one_import_is_atomic_replay_safe_disposes_unselected_and_detects_tamper() {
+        let authority = LocalAuthority::from_master("b2-memory-demo", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        let (authorization, broker_receipt) =
+            super::choice_begin_tests::enable_runtime(&mut store, &authority);
+
+        let prepare = command("b2-prepare", 0, B2MemoryCommandKind::Prepare);
+        let (prepared, first_receipt) = store
+            .apply_b2_memory_command(&prepare, &authorization, &broker_receipt)
+            .expect("prepare boundary");
+        assert_eq!(prepared.stage, B2MemoryDemoStage::Prepared);
+        assert_eq!(
+            store
+                .apply_b2_memory_command(&prepare, &authorization, &broker_receipt)
+                .unwrap()
+                .1,
+            first_receipt
+        );
+        let mut changed_replay = prepare.clone();
+        changed_replay.decided_at_ms += 1;
+        assert!(matches!(
+            store.apply_b2_memory_command(&changed_replay, &authorization, &broker_receipt),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+
+        let provenance = super::choice_begin_tests::selection()
+            .turn_provenance("b2-provenance".to_owned(), "b2-turn".to_owned())
+            .expect("provenance");
+        let seal = B2MemoryImportSeal {
+            source_digest: "a".repeat(64),
+            catalog_digest: "b".repeat(64),
+            source_manifest_digest: "c".repeat(64),
+            model_provenance: provenance,
+        };
+        let cards = vec![
+            B2MemoryCandidateCard {
+                id: "memory-a".to_owned(),
+                title: "Keep one complete loop".to_owned(),
+                rationale: "Repeated project priority".to_owned(),
+                proposed_line: "- Finish one verified loop before expanding scope.".to_owned(),
+                source_binding_digest: "d".repeat(64),
+            },
+            B2MemoryCandidateCard {
+                id: "memory-b".to_owned(),
+                title: "Prefer concise updates".to_owned(),
+                rationale: "Repeated communication preference".to_owned(),
+                proposed_line: "- Keep progress updates concise.".to_owned(),
+                source_binding_digest: "e".repeat(64),
+            },
+        ];
+        let candidates = store
+            .commit_b2_memory_candidates(prepared.revision, &seal, &cards, 20)
+            .expect("private candidate result");
+        assert_eq!(candidates.candidates.len(), 2);
+
+        let mut select = command(
+            "b2-select",
+            candidates.revision,
+            B2MemoryCommandKind::SelectCandidate,
+        );
+        select.selected_candidate_id = Some("memory-a".to_owned());
+        select.explicitly_confirmed = true;
+        let (selected, _) = store
+            .apply_b2_memory_command(&select, &authorization, &broker_receipt)
+            .expect("select");
+        assert!(selected.candidates.is_empty());
+        assert_eq!(selected.selected_candidate.as_ref().unwrap().id, "memory-a");
+        assert_eq!(
+            selected
+                .markdown_diff
+                .as_ref()
+                .unwrap()
+                .final_entry
+                .relative_path,
+            B2_MEMORY_MARKDOWN_PATH
+        );
+
+        let mut edit = command(
+            "b2-edit",
+            selected.revision,
+            B2MemoryCommandKind::EditMarkdown,
+        );
+        edit.edited_line =
+            Some("- Finish one exact verified loop before expanding scope.".to_owned());
+        edit.expected_diff_digest =
+            Some(selected.markdown_diff.as_ref().unwrap().diff_digest.clone());
+        let (edited, _) = store
+            .apply_b2_memory_command(&edit, &authorization, &broker_receipt)
+            .expect("edit");
+        let mut confirm = command(
+            "b2-confirm",
+            edited.revision,
+            B2MemoryCommandKind::ConfirmDiff,
+        );
+        confirm.expected_diff_digest =
+            Some(edited.markdown_diff.as_ref().unwrap().diff_digest.clone());
+        confirm.explicitly_confirmed = true;
+        let (confirmed, _) = store
+            .apply_b2_memory_command(&confirm, &authorization, &broker_receipt)
+            .expect("confirm");
+        let diff = confirmed.markdown_diff.as_ref().unwrap();
+        let render_receipt = MarkdownRenderReceipt {
+            intent_id: "b2-memory-render".to_owned(),
+            final_entry: diff.final_entry.clone(),
+            final_device: 1,
+            final_inode: 2,
+            displaced_base: None,
+            committed_at_ms: 40,
+        };
+        let read_back = store
+            .commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &render_receipt,
+                40,
+            )
+            .expect("readback");
+        assert_eq!(read_back.stage, B2MemoryDemoStage::ReadBack);
+        assert!(read_back.readback_receipt.is_some());
+
+        let blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_demo_state WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&blob).contains("Finish one exact"));
+        store
+            .connection
+            .execute(
+                "UPDATE b2_memory_demo_state SET blob_hash = ?1 WHERE singleton_id = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        assert!(store.b2_memory_demo_state().is_err());
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1553,12 +1729,20 @@ impl Store {
     pub fn apply_c2_skill_demo_command(
         &mut self,
         command: &C2SkillDemoCommand,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
     ) -> Result<(C2SkillDemoState, C2SkillDemoReceipt), StoreError> {
         let command_digest = command.digest().ok_or(StoreError::C2SkillDemoConflict)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
         require_no_effect_fence(&transaction)?;
         verified_audit_tail(&transaction, &self.authority)?;
         verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
@@ -1675,6 +1859,294 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok((state, receipt))
+    }
+
+    /// Loads the encrypted, audited one-import B2 demo state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted state or signed audit binding is invalid.
+    pub fn b2_memory_demo_state(&self) -> Result<Option<B2MemoryDemoState>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_b2_memory_demo_state(&self.connection, &self.authority)
+    }
+
+    /// Applies a caller-visible B2 transition. Candidate creation and readback
+    /// remain private Host result commits and cannot be minted through this command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid runtime proof, stale revision, changed replay,
+    /// malformed transition, or failed encrypted/audited persistence.
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_b2_memory_command(
+        &mut self,
+        command: &B2MemoryCommand,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), StoreError> {
+        let command_digest = command.digest().ok_or(StoreError::B2MemoryDemoConflict)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let existing = load_b2_memory_demo_state(&transaction, &self.authority)?;
+        if let Some(state) = existing.as_ref()
+            && let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|value| value.request_id == command.request_id)
+        {
+            return (receipt.command_digest == command_digest)
+                .then(|| (state.clone(), receipt.clone()))
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let current_revision = existing.as_ref().map_or(0, |state| state.revision);
+        if command.expected_revision != current_revision {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let mut state = existing.unwrap_or(B2MemoryDemoState {
+            revision: 0,
+            stage: B2MemoryDemoStage::Prepared,
+            seal: None,
+            candidates: Vec::new(),
+            selected_candidate: None,
+            markdown_diff: None,
+            confirmation_digest: None,
+            readback_receipt: None,
+            receipts: Vec::new(),
+        });
+        let next_stage = match (state.stage, command.kind) {
+            (B2MemoryDemoStage::Prepared, B2MemoryCommandKind::Prepare) if state.revision == 0 => {
+                B2MemoryDemoStage::Prepared
+            }
+            (B2MemoryDemoStage::Candidates, B2MemoryCommandKind::SelectCandidate) => {
+                let selected_id = command
+                    .selected_candidate_id
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let selected = state
+                    .candidates
+                    .iter()
+                    .find(|card| &card.id == selected_id)
+                    .cloned()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                state.candidates.clear();
+                state.markdown_diff = Some(b2_memory_diff(
+                    &selected,
+                    1,
+                    selected.proposed_line.clone(),
+                )?);
+                state.selected_candidate = Some(selected);
+                B2MemoryDemoStage::Selected
+            }
+            (
+                B2MemoryDemoStage::Selected | B2MemoryDemoStage::DiffReview,
+                B2MemoryCommandKind::EditMarkdown,
+            ) => {
+                let selected = state
+                    .selected_candidate
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let current = state
+                    .markdown_diff
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                if command.expected_diff_digest.as_deref() != Some(current.diff_digest.as_str()) {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                state.markdown_diff = Some(b2_memory_diff(
+                    selected,
+                    current
+                        .revision
+                        .checked_add(1)
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                    command
+                        .edited_line
+                        .clone()
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                )?);
+                B2MemoryDemoStage::DiffReview
+            }
+            (
+                B2MemoryDemoStage::Selected | B2MemoryDemoStage::DiffReview,
+                B2MemoryCommandKind::ConfirmDiff,
+            ) => {
+                let diff = state
+                    .markdown_diff
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                if command.expected_diff_digest.as_deref() != Some(diff.diff_digest.as_str()) {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                state.confirmation_digest = Some(sha256_json(&json!({
+                    "diffDigest": diff.diff_digest,
+                    "finalEntry": diff.final_entry,
+                    "expectedBase": diff.expected_base,
+                }))?);
+                B2MemoryDemoStage::Confirmed
+            }
+            _ => return Err(StoreError::B2MemoryDemoConflict),
+        };
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let receipt = B2MemoryCommandReceipt {
+            request_id: command.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: next_revision,
+            stage: next_stage,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": next_revision,
+                "stage": next_stage,
+            }))?,
+        };
+        state.revision = next_revision;
+        state.stage = next_stage;
+        state.receipts.push(receipt.clone());
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &command.request_id,
+            &command_digest,
+            command.decided_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
+    }
+
+    /// Private result commit used only by focused Store invariants until the
+    /// operation-bound Host scanner/model pipeline is wired.
+    #[cfg(test)]
+    fn commit_b2_memory_candidates(
+        &mut self,
+        expected_revision: u64,
+        seal: &B2MemoryImportSeal,
+        candidates: &[B2MemoryCandidateCard],
+        completed_at_ms: i64,
+    ) -> Result<B2MemoryDemoState, StoreError> {
+        if !seal.is_valid()
+            || candidates.is_empty()
+            || candidates.len() > 3
+            || candidates.iter().any(|card| !card.is_valid())
+            || candidates
+                .iter()
+                .map(|card| &card.id)
+                .collect::<HashSet<_>>()
+                .len()
+                != candidates.len()
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let result_digest = sha256_json(&json!({"seal": seal, "candidates": candidates}))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if state.stage == B2MemoryDemoStage::Candidates
+            && state.seal.as_ref() == Some(seal)
+            && state.candidates == candidates
+        {
+            return Ok(state);
+        }
+        if state.stage != B2MemoryDemoStage::Prepared || state.revision != expected_revision {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Candidates;
+        state.seal = Some(seal.clone());
+        state.candidates = candidates.to_vec();
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            "b2-private-candidates",
+            &result_digest,
+            completed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    /// Private exact readback test boundary. It is deliberately not reachable
+    /// from Host until the descriptor-bound B2 render journal is implemented.
+    #[cfg(test)]
+    fn commit_b2_memory_readback(
+        &mut self,
+        expected_revision: u64,
+        confirmation_digest: &str,
+        render_receipt: &MarkdownRenderReceipt,
+        completed_at_ms: i64,
+    ) -> Result<B2MemoryDemoState, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if state.stage != B2MemoryDemoStage::Confirmed
+            || state.revision != expected_revision
+            || state.confirmation_digest.as_deref() != Some(confirmation_digest)
+            || !render_receipt.is_valid()
+            || state.markdown_diff.as_ref().map(|diff| &diff.final_entry)
+                != Some(&render_receipt.final_entry)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let render_receipt_digest = sha256_json(
+            &serde_json::to_value(render_receipt)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?,
+        )?;
+        let receipt = openopen_protocol::B2MemoryReadbackReceipt {
+            confirmation_digest: confirmation_digest.to_owned(),
+            render_receipt_digest: render_receipt_digest.clone(),
+            receipt_digest: sha256_json(
+                &json!({"confirmation": confirmation_digest, "renderReceipt": render_receipt_digest}),
+            )?,
+        };
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::ReadBack;
+        state.readback_receipt = Some(receipt);
+        state.candidates.clear();
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            "b2-private-readback",
+            &render_receipt_digest,
+            completed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(state)
     }
 
     /// Returns the complete encrypted foreground Choice Loop state. Its
@@ -4733,32 +5205,13 @@ impl Store {
         authorization: &RuntimeControlAuthorization,
         broker_receipt: &RuntimeControlReceipt,
     ) -> Result<(), StoreError> {
-        self.authority
-            .verify_runtime_control(authorization)
-            .map_err(|_| StoreError::RuntimeControlMismatch)?;
-        let trusted_broker = self
-            .trusted_broker
-            .as_ref()
-            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
-        crate::effect::verify_runtime_control_receipt(
-            trusted_broker,
+        require_runtime_checkpoint_in_connection(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
             authorization,
             broker_receipt,
-        )?;
-        let current =
-            load_runtime_control(&self.connection, &self.authority, Some(trusted_broker))?;
-        if !authorization.enabled
-            || current.enabled != authorization.enabled
-            || current.revision != authorization.revision
-            || current.updated_at_ms != authorization.updated_at_ms
-        {
-            return Err(if authorization.enabled {
-                StoreError::RuntimeControlMismatch
-            } else {
-                StoreError::RuntimeDisabled
-            });
-        }
-        Ok(())
+        )
     }
 
     /// Loads, applies, validates, and persists one typed Mission command and its
@@ -8683,6 +9136,7 @@ fn verify_all_bindings(
     verify_channel_bindings(connection, authority)?;
     let _ = load_choice_model_selection(connection, authority)?;
     let _ = load_c2_skill_demo_state(connection, authority)?;
+    let _ = load_b2_memory_demo_state(connection, authority)?;
     let choice_snapshot = load_choice_loop_snapshot(connection, authority)?;
     verify_choice_private_bindings(connection, authority, choice_snapshot.as_ref())?;
     let schedule_ids = connection
@@ -8814,6 +9268,209 @@ fn load_c2_skill_demo_state(
         return Err(StoreError::C2SkillDemoConflict);
     }
     Ok(Some(state))
+}
+
+fn b2_memory_demo_aad() -> &'static str {
+    "openopen-b2-memory-demo-v1"
+}
+
+fn sha256_json(value: &serde_json::Value) -> Result<String, StoreError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(value)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?
+        )
+    ))
+}
+
+fn b2_memory_diff(
+    selected: &B2MemoryCandidateCard,
+    revision: u64,
+    edited_line: String,
+) -> Result<B2MemoryMarkdownDiff, StoreError> {
+    let body = format!("{edited_line}\n");
+    let final_entry = openopen_protocol::DocumentManifestEntry {
+        relative_path: B2_MEMORY_MARKDOWN_PATH.to_owned(),
+        sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+        byte_length: u64::try_from(body.len()).map_err(|_| StoreError::B2MemoryDemoConflict)?,
+        mode: 0o600,
+    };
+    let diff_digest = sha256_json(&json!({
+        "revision": revision,
+        "selectedCandidateId": selected.id,
+        "proposedLine": selected.proposed_line,
+        "editedLine": edited_line,
+        "expectedBase": null,
+        "finalEntry": final_entry,
+    }))?;
+    let diff = B2MemoryMarkdownDiff {
+        revision,
+        selected_candidate_id: selected.id.clone(),
+        proposed_line: selected.proposed_line.clone(),
+        edited_line,
+        expected_base: None,
+        final_entry,
+        diff_digest,
+    };
+    diff.is_valid()
+        .then_some(diff)
+        .ok_or(StoreError::B2MemoryDemoConflict)
+}
+
+fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreError> {
+    if state.revision == 0
+        || state.receipts.len() > usize::try_from(state.revision).unwrap_or_default()
+        || state.receipts.iter().any(|receipt| {
+            !is_sha256_hex(&receipt.command_digest)
+                || !is_sha256_hex(&receipt.receipt_digest)
+                || receipt.revision == 0
+                || receipt.revision > state.revision
+        })
+        || state
+            .receipts
+            .iter()
+            .map(|receipt| &receipt.request_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != state.receipts.len()
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    match state.stage {
+        B2MemoryDemoStage::Prepared => {
+            if state.seal.is_some()
+                || !state.candidates.is_empty()
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Candidates => {
+            if !state
+                .seal
+                .as_ref()
+                .is_some_and(B2MemoryImportSeal::is_valid)
+                || state.candidates.is_empty()
+                || state.candidates.len() > 3
+                || state.candidates.iter().any(|card| !card.is_valid())
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Selected
+        | B2MemoryDemoStage::DiffReview
+        | B2MemoryDemoStage::Confirmed
+        | B2MemoryDemoStage::ReadBack => {
+            if !state.candidates.is_empty()
+                || !state
+                    .seal
+                    .as_ref()
+                    .is_some_and(B2MemoryImportSeal::is_valid)
+                || !state
+                    .selected_candidate
+                    .as_ref()
+                    .is_some_and(B2MemoryCandidateCard::is_valid)
+                || !state
+                    .markdown_diff
+                    .as_ref()
+                    .is_some_and(B2MemoryMarkdownDiff::is_valid)
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+    }
+    if matches!(
+        state.stage,
+        B2MemoryDemoStage::Confirmed | B2MemoryDemoStage::ReadBack
+    ) != state
+        .confirmation_digest
+        .as_deref()
+        .is_some_and(is_sha256_hex)
+        || (state.stage == B2MemoryDemoStage::ReadBack)
+            != state.readback_receipt.as_ref().is_some_and(|receipt| {
+                is_sha256_hex(&receipt.confirmation_digest)
+                    && is_sha256_hex(&receipt.render_receipt_digest)
+                    && is_sha256_hex(&receipt.receipt_digest)
+            })
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(())
+}
+
+fn load_b2_memory_demo_state(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemoryDemoState>, StoreError> {
+    let row = connection.query_row(
+        "SELECT revision, stage_json, encrypted_blob, blob_hash FROM b2_memory_demo_state WHERE singleton_id = 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?)),
+    ).optional()?;
+    let Some((revision, stage_json, blob, expected_hash)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_DEMO_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:demo",
+        &blob,
+    )?;
+    let state: B2MemoryDemoState =
+        authority.decrypt_json(&blob, b2_memory_demo_aad().as_bytes())?;
+    validate_b2_memory_demo_state(&state)?;
+    if i64::try_from(state.revision).ok() != Some(revision)
+        || serde_json::to_string(&state.stage)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?
+            != stage_json
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(state))
+}
+
+fn persist_b2_memory_demo_state(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    state: &B2MemoryDemoState,
+    command_id: &str,
+    command_hash: &str,
+    created_at_ms: i64,
+) -> Result<(), StoreError> {
+    validate_b2_memory_demo_state(state)?;
+    let blob = authority.encrypt_json(state, b2_memory_demo_aad().as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_demo_state (singleton_id, revision, stage_json, encrypted_blob, blob_hash)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(singleton_id) DO UPDATE SET revision=excluded.revision, stage_json=excluded.stage_json,
+           encrypted_blob=excluded.encrypted_blob, blob_hash=excluded.blob_hash",
+        params![i64::try_from(state.revision).map_err(|_| StoreError::B2MemoryDemoConflict)?, serde_json::to_string(&state.stage).map_err(|error| CryptoError::Serialization(error.to_string()))?, blob, state_hash],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-demo-{command_id}"),
+            command_id,
+            command_hash,
+            actor: "owner",
+            action: B2_MEMORY_DEMO_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms,
+            state_kind: "memory:demo",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
 }
 
 /// Verifies every live or retired private Choice body independently of the
@@ -9390,6 +10047,33 @@ fn require_runtime_enabled(
     }
 }
 
+fn require_runtime_checkpoint_in_connection(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+    authorization: &RuntimeControlAuthorization,
+    broker_receipt: &RuntimeControlReceipt,
+) -> Result<(), StoreError> {
+    authority
+        .verify_runtime_control(authorization)
+        .map_err(|_| StoreError::RuntimeControlMismatch)?;
+    let trusted_broker = trusted_broker.ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+    crate::effect::verify_runtime_control_receipt(trusted_broker, authorization, broker_receipt)?;
+    let current = load_runtime_control(connection, authority, Some(trusted_broker))?;
+    if !authorization.enabled
+        || current.enabled != authorization.enabled
+        || current.revision != authorization.revision
+        || current.updated_at_ms != authorization.updated_at_ms
+    {
+        return Err(if authorization.enabled {
+            StoreError::RuntimeControlMismatch
+        } else {
+            StoreError::RuntimeDisabled
+        });
+    }
+    Ok(())
+}
+
 fn verify_effect_authorization_bindings(
     connection: &Connection,
     authority: &LocalAuthority,
@@ -9695,6 +10379,10 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
         C2_SKILL_DEMO_ACTION => {
             "SELECT 1 FROM c2_skill_demo_state
              WHERE singleton_id = 1 AND ?1 = 'c2-demo-skill'"
+        }
+        B2_MEMORY_DEMO_ACTION => {
+            "SELECT 1 FROM b2_memory_demo_state
+             WHERE singleton_id = 1 AND ?1 = 'b2-demo-memory'"
         }
         CHANNEL_ROUTE_SET_ACTION => "SELECT 1 FROM channel_route_set WHERE mission_id = ?1",
         CHANNEL_MISSION_EVENT_ACTION => "SELECT 1 FROM channel_mission_event WHERE entity_id = ?1",
@@ -14480,7 +15168,11 @@ mod choice_begin_tests {
         runtime_control_receipt_signing_bytes,
     };
 
-    fn commit_runtime_revision(store: &mut Store, enabled: bool, updated_at_ms: i64) {
+    fn commit_runtime_revision(
+        store: &mut Store,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> (RuntimeControlAuthorization, RuntimeControlReceipt) {
         let broker = SigningKey::from_bytes(&[94_u8; 32]);
         let broker_key = broker.verifying_key().to_bytes();
         let authorization = store
@@ -14502,9 +15194,13 @@ mod choice_begin_tests {
         store
             .commit_runtime_control(&authorization, &receipt)
             .unwrap();
+        (authorization, receipt)
     }
 
-    pub(super) fn enable_runtime(store: &mut Store, authority: &LocalAuthority) {
+    pub(super) fn enable_runtime(
+        store: &mut Store,
+        authority: &LocalAuthority,
+    ) -> (RuntimeControlAuthorization, RuntimeControlReceipt) {
         let broker = SigningKey::from_bytes(&[94_u8; 32]);
         let broker_key = broker.verifying_key().to_bytes();
         let mut enrollment = BrokerEnrollmentRecord {
@@ -14525,7 +15221,7 @@ mod choice_begin_tests {
                 .to_bytes(),
         );
         store.install_trusted_broker(&enrollment).unwrap();
-        commit_runtime_revision(store, true, 1);
+        commit_runtime_revision(store, true, 1)
     }
 
     pub(super) fn selection() -> ModelSelection {
