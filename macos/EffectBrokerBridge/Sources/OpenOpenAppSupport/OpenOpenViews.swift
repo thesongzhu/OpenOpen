@@ -47,28 +47,25 @@ public struct OpenOpenRootView: View {
     GeometryReader { geometry in
       if geometry.size.width < 560 {
         VStack(spacing: 0) {
-          EditorialToolbar(model: model, section: $section)
-          Divider()
           EditorialCompactNavigation(section: $section)
           Divider()
           editorialContent
         }
         .background(EditorialPalette.background)
       } else {
-        NavigationSplitView {
-          EditorialSidebar(section: $section)
-        } detail: {
-          VStack(spacing: 0) {
-            EditorialToolbar(model: model, section: $section)
+        VStack(spacing: 0) {
+          HStack(spacing: 0) {
+            EditorialSidebar(section: $section)
+              .frame(width: 180)
             Divider()
             editorialContent
           }
-          .background(EditorialPalette.background)
         }
-        .navigationSplitViewStyle(.balanced)
+        .background(EditorialPalette.background)
       }
     }
     .frame(minWidth: 390, minHeight: 520)
+    .toolbar { EditorialWindowToolbar(model: model, section: $section) }
     // Root presentation can be opened directly into Settings.  It refreshes
     // read-only state only; the Home card below is the sole UI owner-return
     // signal that may resume an already-idle Choice session.
@@ -141,7 +138,7 @@ private enum EditorialSection: String, CaseIterable, Hashable, Identifiable {
 
 private enum EditorialPalette {
   static let background = Color(nsColor: .windowBackgroundColor)
-  static let sidebar = Color(nsColor: .underPageBackgroundColor)
+  static let sidebar = Color.primary.opacity(0.048)
   static let card = Color(nsColor: .controlBackgroundColor).opacity(0.72)
   static let border = Color(nsColor: .separatorColor).opacity(0.65)
   static let accent = Color(red: 51 / 255, green: 156 / 255, blue: 1)
@@ -152,28 +149,34 @@ private enum EditorialPalette {
 private struct EditorialSidebar: View {
   @Binding var section: EditorialSection
 
+  private let destinations: [EditorialSection] = [.home, .activity, .messages, .memory, .skills]
+
   var body: some View {
-    List(selection: $section) {
-      Section {
-        ForEach(
-          [
-            EditorialSection.home,
-            .activity,
-            .messages,
-            .memory,
-            .skills,
-          ]
-        ) { destination in
+    VStack(spacing: 3) {
+      ForEach(destinations) { destination in
+        Button {
+          section = destination
+        } label: {
           Label(destination.title, systemImage: destination.symbol)
-            .tag(destination)
-            .accessibilityIdentifier("openopen-nav-\(destination.rawValue)")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .foregroundStyle(section == destination ? .white : .secondary)
+        .background(
+          section == destination ? EditorialPalette.accent : .clear,
+          in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .accessibilityIdentifier("openopen-nav-\(destination.rawValue)")
       }
+      Spacer(minLength: 0)
     }
-    .listStyle(.sidebar)
-    .scrollContentBackground(.hidden)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 12)
+    .frame(maxHeight: .infinity, alignment: .top)
     .background(EditorialPalette.sidebar)
-    .navigationSplitViewColumnWidth(min: 180, ideal: 180, max: 180)
     .accessibilityIdentifier("openopen-editorial-sidebar")
   }
 }
@@ -209,7 +212,7 @@ private struct EditorialCompactNavigation: View {
   }
 }
 
-private struct EditorialToolbar: View {
+private struct EditorialWindowToolbar: ToolbarContent {
   @ObservedObject var model: AppModel
   @Binding var section: EditorialSection
 
@@ -219,18 +222,30 @@ private struct EditorialToolbar: View {
     return "Needs you"
   }
 
-  var body: some View {
-    ZStack {
+  var body: some ToolbarContent {
+    ToolbarItem(placement: .navigation) {
       HStack(spacing: 9) {
         EditorialOpenMark()
         Text("OpenOpen")
           .font(.headline.weight(.medium))
           .accessibilityIdentifier("openopen-editorial-product-title")
-        Spacer()
-        Label(statusLabel, systemImage: model.runtimeDisplayState.menuBarSymbol)
-          .font(.caption.weight(.medium))
-          .foregroundStyle(statusLabel == "Needs you" ? EditorialPalette.destructive : .secondary)
-          .accessibilityIdentifier("openopen-editorial-runtime-status")
+      }
+    }
+    ToolbarItem(placement: .principal) {
+      Text(section.title)
+        .font(.headline.weight(.medium))
+        .accessibilityIdentifier("openopen-editorial-toolbar-title")
+    }
+    ToolbarItemGroup(placement: .primaryAction) {
+      HStack(spacing: 9) {
+        HStack(spacing: 6) {
+          Image(systemName: model.runtimeDisplayState.menuBarSymbol)
+          Text(statusLabel)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(statusLabel == "Needs you" ? EditorialPalette.destructive : .secondary)
+        .fixedSize()
+        .accessibilityIdentifier("openopen-editorial-runtime-status")
         Button {
           section = .settings
         } label: {
@@ -241,13 +256,7 @@ private struct EditorialToolbar: View {
         .accessibilityLabel("More options")
         .accessibilityIdentifier("openopen-editorial-more-options")
       }
-      Text(section.title)
-        .font(.headline.weight(.medium))
-        .accessibilityIdentifier("openopen-editorial-toolbar-title")
     }
-    .padding(.horizontal, 14)
-    .padding(.vertical, 10)
-    .background(EditorialPalette.background)
   }
 }
 
@@ -512,6 +521,12 @@ private struct EditorialMemoryView: View {
       } message: {
         Text(boundaries[0].1)
       }
+    case .processing:
+      EditorialCard(title: "Finding durable, useful context", symbol: "hourglass") {
+        Text("The source is temporary. It is not memory unless you approve one candidate.")
+          .font(.caption).foregroundStyle(.secondary)
+        ProgressView().accessibilityIdentifier("openopen-memory-processing-progress")
+      }
     case .candidates:
       ForEach(model.b2MemoryDemoState?.candidates ?? []) { card in
         EditorialCard(title: card.title, symbol: "circle") {
@@ -555,6 +570,7 @@ private struct EditorialMemoryView: View {
     switch model.b2MemoryDemoState?.stage {
     case nil: "No memories"
     case .prepared: "Processing consent"
+    case .processing: "Processing"
     case .candidates: "Choose one memory"
     case .selected: "Edit wording"
     case .diffReview, .confirmed: "Review the exact Memory change"

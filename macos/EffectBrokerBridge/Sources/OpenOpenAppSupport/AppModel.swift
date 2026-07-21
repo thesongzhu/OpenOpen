@@ -2731,6 +2731,9 @@ public final class AppModel: ObservableObject {
       let proof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
       let state = try await core.b2MemoryDemo(proof: proof)
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      guard state?.isValid != false else {
+        throw CoreClientError.contractViolation("Core returned an invalid Memory state.")
+      }
       b2MemoryDemoState = state
       b2MemoryPreparedSource = state?.preparedSource
       if state?.preparedSource?.requestId == b2MemoryPendingPrepareRequest?.requestId {
@@ -2751,11 +2754,23 @@ public final class AppModel: ObservableObject {
   }
 
   public var b2MemoryProcessSourceEnabled: Bool {
-    // The Host can safely pin a selected file, but the real semantic
-    // model-processing and descriptor-bound readback route is not complete.
-    // Keep the frozen control visible and fail closed until that authority is
-    // available rather than presenting metadata-derived cards as memories.
-    false
+    Self.b2MemoryProcessSourceIsEnabled(
+      modelEntryEnabled: modelEntryEnabled,
+      isBusy: isBusy,
+      state: b2MemoryDemoState,
+      currentSource: b2MemoryPreparedSource)
+  }
+
+  static func b2MemoryProcessSourceIsEnabled(
+    modelEntryEnabled: Bool,
+    isBusy: Bool,
+    state: B2MemoryDemoState?,
+    currentSource: B2MemoryPreparedSource?
+  ) -> Bool {
+    guard modelEntryEnabled, !isBusy, let state, state.isValid, state.stage == .prepared,
+      let source = state.preparedSource, source.isValid, source == currentSource
+    else { return false }
+    return true
   }
 
   public func chooseB2MemoryImport() async {
@@ -2841,9 +2856,12 @@ public final class AppModel: ObservableObject {
       let proof = try await currentEnabledProof(expectedGeneration: generation)
       let response = try await core.processB2MemorySource(consent, proof: proof)
       try requireCurrentOnGeneration(generation)
-      guard response.state.stage == .candidates,
+      guard response.state.isValid, response.state.stage == .candidates,
+        response.state.processingOperation?.requestId == consent.requestId,
+        response.state.processingOperation?.sourceIdentityDigest == consent.sourceIdentityDigest,
         response.state.candidates.count <= 3,
-        !response.state.candidates.isEmpty
+        !response.state.candidates.isEmpty,
+        response.state.candidates.allSatisfy(\.isValid)
       else {
         throw CoreClientError.contractViolation("Core returned an invalid Memory candidate set.")
       }

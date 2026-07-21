@@ -21,6 +21,15 @@ private func appModelSource() throws -> String {
   return try String(contentsOf: sourceURL, encoding: .utf8)
 }
 
+private func openOpenAppSource() throws -> String {
+  let sourceURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/OpenOpen/main.swift")
+  return try String(contentsOf: sourceURL, encoding: .utf8)
+}
+
 private func sourceSlice(_ source: String, from start: String, to end: String) throws -> String {
   let startIndex = try #require(source.range(of: start)?.lowerBound)
   let endIndex = try #require(
@@ -120,6 +129,21 @@ func frozenSetupActionsRequireTypedHostState() throws {
   #expect(boundary.contains("Button(actionTitle, action: action)"))
   #expect(boundary.contains(".disabled(!enabled)"))
   #expect(!source.contains("EditorialUnavailableView"))
+}
+
+@Test
+func frozenEditorialShellUsesOneToolbarAndAnExplicitStableSidebar() throws {
+  let views = try openOpenViewsSource()
+  let app = try openOpenAppSource()
+
+  #expect(views.contains(".toolbar { EditorialWindowToolbar(model: model, section: $section) }"))
+  #expect(views.contains(".frame(width: 180)"))
+  #expect(views.contains("section == destination ? EditorialPalette.accent : .clear"))
+  #expect(!views.contains("NavigationSplitView"))
+  #expect(!views.contains(".listStyle(.sidebar)"))
+  #expect(app.contains("window.titleVisibility = .hidden"))
+  #expect(app.contains(".windowToolbarStyle(.unifiedCompact)"))
+  #expect(!app.contains(".fullSizeContentView"))
 }
 
 @Test

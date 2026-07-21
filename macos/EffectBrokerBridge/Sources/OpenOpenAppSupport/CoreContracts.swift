@@ -205,7 +205,7 @@ public struct ApplyC2SkillDemoResponse: Codable, Equatable, Sendable {
 }
 
 public enum B2MemoryDemoStage: String, Codable, Equatable, Sendable {
-  case prepared, candidates, selected, diffReview, confirmed, readBack
+  case prepared, processing, candidates, selected, diffReview, confirmed, readBack
 }
 
 public struct B2MemoryPreparedSource: Codable, Equatable, Sendable {
@@ -239,6 +239,32 @@ public struct B2MemoryProcessingConsent: Codable, Equatable, Sendable {
   public var isValid: Bool {
     !requestId.isEmpty && requestId.utf8.count <= 256 && expectedRevision > 0
       && C2SkillDemoSeal.lowerHex(sourceIdentityDigest, count: 64) && explicitlyConfirmed
+  }
+}
+
+public struct B2MemoryProcessingOperation: Codable, Equatable, Sendable {
+  public let operationId: String
+  public let requestId: String
+  public let expectedRevision: UInt64
+  public let runtimeRevision: UInt64
+  public let sourceIdentityDigest: String
+  public let sourceDigest: String
+  public let modelProvenance: ChoiceModelProvenance
+  public let catalogDigest: String
+  public let protocolVersion: UInt32
+  public let personaRevision: PersonaRevisionRef
+  public let documentManifestDigest: String
+  public let sourceManifestDigest: String
+  public let startedAtMs: Int64
+
+  public var isValid: Bool {
+    ChoiceLoopContract.identifier(operationId) && ChoiceLoopContract.identifier(requestId)
+      && expectedRevision > 0 && runtimeRevision > 0
+      && ChoiceLoopContract.sha256(sourceIdentityDigest)
+      && ChoiceLoopContract.sha256(sourceDigest) && modelProvenance.validated()
+      && ChoiceLoopContract.sha256(catalogDigest) && protocolVersion == 1
+      && personaRevision.validated() && ChoiceLoopContract.sha256(documentManifestDigest)
+      && ChoiceLoopContract.sha256(sourceManifestDigest) && startedAtMs >= 0
   }
 }
 
@@ -336,19 +362,86 @@ public struct B2MemoryReadbackReceipt: Codable, Equatable, Sendable {
   public let confirmationDigest: String
   public let renderReceiptDigest: String
   public let receiptDigest: String
+
+  public var isValid: Bool {
+    ChoiceLoopContract.sha256(confirmationDigest)
+      && ChoiceLoopContract.sha256(renderReceiptDigest)
+      && ChoiceLoopContract.sha256(receiptDigest)
+  }
+}
+
+public struct B2MemoryRenderIntent: Codable, Equatable, Sendable {
+  public let intentId: String
+  public let expectedRevision: UInt64
+  public let confirmationDigest: String
+  public let entry: DocumentManifestEntry
+  public let contentDigest: String
+  public let createdAtMs: Int64
+
+  public var isValid: Bool {
+    ChoiceLoopContract.identifier(intentId) && expectedRevision > 0
+      && ChoiceLoopContract.sha256(confirmationDigest)
+      && entry.relativePath == "sources/chatgpt.md" && entry.validated()
+      && contentDigest == entry.sha256 && createdAtMs >= 0
+  }
 }
 
 public struct B2MemoryDemoState: Codable, Equatable, Sendable {
   public let revision: UInt64
   public let stage: B2MemoryDemoStage
   public let preparedSource: B2MemoryPreparedSource?
+  public let processingOperation: B2MemoryProcessingOperation?
+  public let processingResultDigest: String?
   public let seal: B2MemoryImportSeal?
   public let candidates: [B2MemoryCandidateCard]
   public let selectedCandidate: B2MemoryCandidateCard?
   public let markdownDiff: B2MemoryMarkdownDiff?
   public let confirmationDigest: String?
+  public let renderIntent: B2MemoryRenderIntent?
   public let readbackReceipt: B2MemoryReadbackReceipt?
   public let receipts: [B2MemoryCommandReceipt]
+
+  public var isValid: Bool {
+    guard revision > 0, preparedSource?.isValid == true,
+      UInt64(receipts.count) <= revision,
+      Set(receipts.map(\.requestId)).count == receipts.count,
+      receipts.allSatisfy({ receipt in
+        !receipt.requestId.isEmpty && receipt.requestId.utf8.count <= 128
+          && ChoiceLoopContract.sha256(receipt.commandDigest)
+          && receipt.revision > 0 && receipt.revision <= revision
+          && ChoiceLoopContract.sha256(receipt.receiptDigest)
+      })
+    else { return false }
+
+    let hasProcessingOperation = processingOperation?.isValid == true
+    let hasProcessingResult = processingResultDigest.map(ChoiceLoopContract.sha256) == true
+    switch stage {
+    case .prepared:
+      guard processingOperation == nil, processingResultDigest == nil, seal == nil,
+        candidates.isEmpty, selectedCandidate == nil, markdownDiff == nil, renderIntent == nil
+      else { return false }
+    case .processing:
+      guard hasProcessingOperation, processingResultDigest == nil, seal?.isValid == true,
+        candidates.isEmpty, selectedCandidate == nil, markdownDiff == nil, renderIntent == nil
+      else { return false }
+    case .candidates:
+      guard hasProcessingOperation, hasProcessingResult, seal?.isValid == true,
+        (1...3).contains(candidates.count), candidates.allSatisfy(\.isValid),
+        selectedCandidate == nil, markdownDiff == nil, renderIntent == nil
+      else { return false }
+    case .selected, .diffReview, .confirmed, .readBack:
+      guard hasProcessingOperation, hasProcessingResult, seal?.isValid == true,
+        candidates.isEmpty, selectedCandidate?.isValid == true, markdownDiff?.isValid == true
+      else { return false }
+    }
+
+    let isConfirmed = stage == .confirmed || stage == .readBack
+    guard isConfirmed == (confirmationDigest.map(ChoiceLoopContract.sha256) == true),
+      (stage == .readBack) == (readbackReceipt?.isValid == true),
+      (stage == .confirmed) == (renderIntent?.isValid == true)
+    else { return false }
+    return true
+  }
 }
 
 public struct PrepareB2MemorySourceParameters: Codable, Sendable {
