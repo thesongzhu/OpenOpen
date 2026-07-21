@@ -204,6 +204,7 @@ normalize_app_modes() {
     "$candidate/Contents/MacOS/OpenOpenCore" \
     "$candidate/Contents/MacOS/OpenOpenEffectBroker" \
     "$candidate/Contents/MacOS/OpenOpenEffectBrokerWorker" \
+    "$candidate/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
     "$candidate/Contents/Resources/Codex/0.144.0/bin/codex" \
     "$candidate/Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host" \
     "$candidate/Contents/Resources/Codex/0.144.0/codex-path/rg" \
@@ -592,24 +593,26 @@ done
   exit 66
 }
 /usr/bin/jq -e . "$imsg_receipt" >/dev/null
-readonly expected_imsg_receipt_sha="c1769b4093faa6e8bde56cdb16ad2c950ee39ea5501630e0ba022901b56a7b3d"
-readonly expected_imsg_binary_sha="635c99814fc3dbefffacaeb5222d4bf2ed340d019e726751ead909addc9122a1"
+readonly expected_imsg_receipt_sha="dc38dd78a8c3bfef736333257335667b8b87e28e205256637b751ac064f65ff7"
+readonly expected_imsg_binary_sha="771597c621709ffdbe040ac24c0fe44d044c757001afda6dd6b58ce3fc679a46"
 readonly expected_imsg_binary_size="2703768"
 readonly expected_imsg_patch_sha="94b4b09ad605d8d6e1ff9c112897f730578cb3c4c8a1571340b92e1b0710717c"
-readonly expected_imsg_runtime_tree_sha="df28709875c9cbae922f13a5974368c7a02b5d750a4552ed79ff7aa6c9180704"
+readonly expected_imsg_runtime_tree_sha="f1a6ebe86563a083f3d33b14418abb11b111eb465788dae7e556ea441a2530d0"
 readonly expected_imsg_resource_tree_sha="7a5cb869823a893a7181bcacfef6dfc8be335a5ce2bf14caac579096f78909cc"
 readonly expected_imsg_core_sources_sha="3da18561485472996b3d74d820d87fc936580f9b05d3c5c2c3ab3e45f0323d27"
 readonly expected_imsg_cli_sources_sha="2f39e12fcf0879359c3f16a60061d7ab9fadcf14e4bd7e2109b76e49b764a7c6"
-readonly expected_imsg_unsigned_sha="cdea42cf30e731d52c00524c16db5865fe2d01ef6a3f377cb6e3a3eb65f5f313"
+readonly expected_imsg_unsigned_sha="35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a"
 readonly expected_rg_unsigned_before_sha="7894fcced308b247aee2315d133e0670d73e608bfb41d8bb003665cc31328c47"
 readonly expected_rg_unsigned_sha="ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6"
-readonly expected_app_unsigned_before_sha="0518f4cb2ffb30211892d55fd7475fbfee40e1a056b10c257fa61d69fcdf9027"
-readonly expected_app_unsigned_sha="d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c"
-readonly expected_core_unsigned_before_sha="63602d67ebb952ba02228ad5dc4df8517a4fb4ea4ffd6a5facc20ba7edd3e714"
-readonly expected_core_unsigned_sha="160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed"
-readonly expected_broker_unsigned_before_sha="07d566ba598dad22194372ba16c8f49b97f18e69e3b67d179d2dad276d7c5cf9"
-readonly expected_broker_unsigned_sha="c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee"
-readonly expected_worker_unsigned_sha="4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208"
+readonly expected_app_unsigned_before_sha="32aaa32e558a967460b65ab5724dfe592b7ec3a3cbab89859141b63f890770d3"
+readonly expected_app_unsigned_sha="0c8d8013405d75c06ac4d18211d5a6d994b0733383ef10dc1eda4cf5f4e38c10"
+readonly expected_core_unsigned_before_sha="2665f5d32b9fb9eaed44bef811dc87e472d4c3928f271aaec1324c609d6c1011"
+readonly expected_core_unsigned_sha="19518aeba40579f85dd358351837a3a8f4792e4acbf812194c0c28259c98987f"
+readonly expected_broker_unsigned_before_sha="e4d01892570bd48b7d34d5d206defae9c05fb1dba85fa6cd0e226d6291b3b4ad"
+readonly expected_broker_unsigned_sha="3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78"
+readonly expected_worker_unsigned_sha="4788bb2cd6e3f4615c3b042d78b4f25dfd8ff29da94a997a53208bedb3eceec2"
+readonly expected_deep_zip_unsigned_before_sha="8db22f7c03273c453933f03ea23233ae589e85f6976b9fbf460cbfe4173c2e30"
+readonly expected_deep_zip_unsigned_sha="b0099bc496205e4e69174de1a30a2c3716493f5bb39e02acd10e084cf0055017"
 verify_sha "$expected_imsg_receipt_sha" "$imsg_receipt"
 imsg_receipt_sha="$expected_imsg_receipt_sha"
 receipt_value() {
@@ -750,7 +753,8 @@ prebuild_source_snapshot="$staging/prebuild-source-snapshot.tsv"
 write_source_snapshot_manifest "$repo_root" "$prebuild_source_snapshot"
 
 cd "$repo_root"
-cargo build --release -p openopen-host -p openopen-effect-broker
+cargo build --release -p openopen-host -p openopen-effect-broker \
+  -p openopen-deep-zip-worker
 swift build \
   --package-path macos/EffectBrokerBridge \
   --product OpenOpen \
@@ -766,6 +770,7 @@ app="$staging/OpenOpen.app"
 mkdir -p \
   "$app/Contents/MacOS" \
   "$app/Contents/Resources/Codex/0.144.0" \
+  "$app/Contents/Resources/DeepZip" \
   "$app/Contents/Resources/iMessage/0.13.0/bin" \
   "$app/Contents/Resources/Notices" \
   "$app/Contents/Library/LaunchDaemons"
@@ -776,6 +781,9 @@ mkdir -p \
 /usr/bin/ditto \
   target/release/OpenOpenEffectBrokerWorker \
   "$app/Contents/MacOS/OpenOpenEffectBrokerWorker"
+/usr/bin/ditto \
+  target/release/openopen-deep-zip-worker \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker"
 /usr/bin/ditto \
   macos/EffectBrokerBridge/Sources/EffectBrokerBridge/Resources/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist \
   "$app/Contents/Library/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist"
@@ -846,6 +854,11 @@ sign_owned_code \
   com.thesongzhu.OpenOpen.imsg \
   "$imsg_entitlements" \
   "$expected_imsg_unsigned_sha"
+sign_owned_code \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
+  com.thesongzhu.OpenOpen.DeepZipWorker "" \
+  "$expected_deep_zip_unsigned_before_sha" \
+  "$expected_deep_zip_unsigned_sha"
 imsg_signed_sha="$(/usr/bin/shasum -a 256 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" | /usr/bin/awk '{print $1}')"
 imsg_cdhash="$(/usr/bin/codesign -d --verbose=4 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>&1 | /usr/bin/awk -F= '$1 == "CDHash" {print $2}')"
 imsg_team="$(/usr/bin/codesign -d --verbose=4 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>&1 | /usr/bin/awk -F= '$1 == "TeamIdentifier" {print $2}')"
@@ -910,6 +923,9 @@ verify_signing_field "$app/Contents/MacOS/OpenOpenEffectBrokerWorker" Identifier
   com.thesongzhu.OpenOpen.EffectBroker.Worker
 verify_signing_field "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" Identifier \
   com.thesongzhu.OpenOpen.imsg
+verify_signing_field \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" Identifier \
+  com.thesongzhu.OpenOpen.DeepZipWorker
 imsg_automation="$({ /usr/bin/codesign -d --entitlements :- \
   "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>/dev/null || true; } \
   | /usr/bin/plutil -extract 'com\.apple\.security\.automation\.apple-events' raw - \
@@ -928,6 +944,7 @@ if [[ "$signing_mode" == "developer-id" ]]; then
     "$app/Contents/MacOS/OpenOpenCore" \
     "$app/Contents/MacOS/OpenOpenEffectBroker" \
     "$app/Contents/MacOS/OpenOpenEffectBrokerWorker" \
+    "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
     "$app/Contents/Resources/iMessage/0.13.0/bin/imsg"; do
     verify_signing_field "$owned" TeamIdentifier "$imsg_team"
     verify_hardened_timestamped "$owned"
@@ -978,6 +995,9 @@ verify_signing_field "$output/Contents/MacOS/OpenOpenEffectBrokerWorker" Identif
   com.thesongzhu.OpenOpen.EffectBroker.Worker
 verify_signing_field "$output/Contents/Resources/iMessage/0.13.0/bin/imsg" Identifier \
   com.thesongzhu.OpenOpen.imsg
+verify_signing_field \
+  "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker" Identifier \
+  com.thesongzhu.OpenOpen.DeepZipWorker
 verify_sha "$imsg_receipt_sha" "$output/Contents/Resources/iMessage/0.13.0/BUILD-RECEIPT.json"
 verify_sha "$imsg_signed_sha" "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
 /usr/bin/jq -e --arg build "$imsg_receipt_sha" --arg binary "$imsg_signed_sha" \
@@ -999,12 +1019,16 @@ if [[ "$signing_mode" == "developer-id" ]]; then
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenCore"
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenEffectBroker"
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenEffectBrokerWorker"
+  verify_owner_certificate \
+    "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker"
   verify_owner_certificate "$output/Contents/Resources/Codex/0.144.0/codex-path/rg"
   verify_owner_certificate "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
   verify_unsigned_macho_sha "$expected_app_unsigned_sha" "$output/Contents/MacOS/OpenOpen"
   verify_unsigned_macho_sha "$expected_core_unsigned_sha" "$output/Contents/MacOS/OpenOpenCore"
   verify_unsigned_macho_sha "$expected_broker_unsigned_sha" "$output/Contents/MacOS/OpenOpenEffectBroker"
   verify_unsigned_macho_sha "$expected_worker_unsigned_sha" "$output/Contents/MacOS/OpenOpenEffectBrokerWorker"
+  verify_unsigned_macho_sha "$expected_deep_zip_unsigned_sha" \
+    "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker"
   verify_unsigned_macho_sha "$expected_rg_unsigned_sha" "$output/Contents/Resources/Codex/0.144.0/codex-path/rg"
   verify_unsigned_macho_sha "$expected_imsg_unsigned_sha" "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
   /usr/bin/jq -e \
@@ -1040,7 +1064,7 @@ if [[ "$signing_mode" == "developer-id" ]]; then
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
   app_file_count="$(/usr/bin/find -P "$output" -type f -print \
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "$app_directory_count" == "18" && "$app_file_count" == "617" ]] || {
+  [[ "$app_directory_count" == "19" && "$app_file_count" == "618" ]] || {
     echo "post-stage App shape changed before identity receipt" >&2
     exit 66
   }
@@ -1092,6 +1116,7 @@ Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$expected_app_unsigned_sha
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$expected_core_unsigned_sha
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$expected_broker_unsigned_sha
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$expected_worker_unsigned_sha
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$expected_deep_zip_unsigned_sha
 EOF
 
   source_head="$(git rev-parse HEAD)"
@@ -1171,7 +1196,7 @@ EOF
     '.schemaVersion == 2
       and .receiptKind == "com.thesongzhu.OpenOpen.post-stage-identity"
       and .app.manifestSha256 == $manifest_sha
-      and (.app.components | length) == 4' "$identity_json" >/dev/null
+      and (.app.components | length) == 5' "$identity_json" >/dev/null
 
   claimed_receipt=1
   /usr/bin/ditto "$receipt_staging" "$identity_receipt_output"

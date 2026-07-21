@@ -1,21 +1,63 @@
 # OpenOpen
 
-OpenOpen is a local-first outcome distribution layer for people who know AI
-exists but do not yet know what to ask it to do. Within sources the user has
-approved, it learns what matters, notices one concrete opportunity, prepares
-one bounded help proposal, asks at most one decision-changing question, and
-remains responsible through an evidence-backed Receipt in apps the user
-already knows.
+OpenOpen is a private, local-first personal agent for non-developers. A person
+can describe what is happening in ordinary language, choose from three useful
+next directions or keep talking, refine the plan, confirm one exact payload,
+and receive Evidence-backed completion without learning prompting or project-
+management vocabulary.
 
 The Build Week product targets macOS 14+ on Apple Silicon and uses the user's
 own ChatGPT plan through an embedded Codex App Server. OpenOpen has no cloud
 service and no central telemetry.
 
-Competition V1 is OpenAI-only: ChatGPT is the only AI account, Memory/Passport
-source, and Deep ZIP source. Claude, Anthropic integrations, and cross-provider
-import are excluded and are not claimed.
+The current UI is macOS-only. Mac is the setup/review home; the B+ Hero channel is
+the dedicated same-account iMessage self-chat. A locally hosted personal
+Discord Bot DM and one additional one-to-one iMessage read-only source are
+post-B+ integrations.
+Channel setup is not the first-run value proposition. OpenOpen is OpenAI-only
+in the current slice; Claude/Anthropic is excluded.
 
 ## Current status
+
+Repair24 source `ca26036…` is merged as `c86e590…`; CI run `29707715009`
+passed both Rust and Swift jobs. That proves source/CI identity only, not a
+package, installed runtime, provider send, Mission, Reminder, Receipt, or
+release.
+
+The Owner-approved current route is documented in
+[the Master Plan](docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md),
+[Choice Loop design](docs/OPENOPEN_PRIVATE_AGENT_CHOICE_LOOP_DESIGN.md), and
+[10-hour B+ execution control](docs/OPENOPEN_30H_EXECUTION_CONTROL.md).
+The protected Hero path is PR1 Choice Core+Mac, PR2 iMessage same-account self-
+chat, and a same-main Core+iMessage checkpoint App/DMG that proves one complete
+real outcome loop. Minimal B2 and then minimal C2 follow as narrow proof
+chapters in the final B+ App/DMG. The extra read-only iMessage source, Discord,
+broader Memory/Skills, and product-wide presentation are post-B+. Ten hours is
+the latest-safe delivery target and execution deadline, never a reason to skip
+a gate; any external blocker that threatens it is surfaced immediately.
+
+The product scans the account's compatible GPT/Codex models and requires an
+explicit model and supported-effort selection. A model without an effort
+control uses `not_applicable`. It has no fixed Sol, Auto route, hidden default,
+or silent fallback. Account plans, models, and limits are shown from the live
+catalog; OpenOpen does not promise unlimited free use or a particular model.
+
+First launch is English-only welcome/account scan → explicit model and effort
+choice → one simple question → the first dynamic A/B/C plus D. No model work
+occurs before selection, and product UI never displays a second language.
+Host-owned `choice.begin` is the sole public first-local-question intake route;
+it atomically creates the initial interpreting session/audit state before model
+work and accepts the first ChoiceSet only through a private revision- and
+provenance-bound result commit.
+Reactive replies use only the most recently accepted owner-active connected
+channel; Mac mirrors local state without copying chat output. Proactive, new-
+recipient, and cross-channel delivery requires exact confirmation.
+
+## Repair history snapshot — non-normative
+
+Everything in this section records the earlier Repair path. Present-tense
+phrases here are historical evidence and cannot override the current Choice
+Loop contract or current GitHub state.
 
 Implementation is in progress. A green unit test or mock is not release proof.
 The current competition product must not be described as
@@ -275,19 +317,25 @@ stored at runtime in the macOS Keychain.
 
 ## Scope
 
-Build Week v1 is one connected adoption loop:
+The current route is:
 
-`Passport/ZIP → confirmed Memory → proactive suggestion → bounded Mission → reviewed GitHub Skill → iMessage/Discord → Reminders Evidence → Receipt → Workflow Candidate`
+`Natural expression → understanding → dynamic A/B/C + D → refinement → exact confirmation → Reminders → Evidence → Receipt → Markdown update → next choices`
 
-The first milestone remains Hero A with real iMessage and Discord. The next
-competition stages add Agent Understanding, Quick Passport, complete ChatGPT
-Deep ZIP import, an explicit learning/proactivity contract,
-instruction-only public GitHub Skills, and Workflow Candidate.
+PR1 builds Choice Core, Mac, explicit model selection, bounded Markdown, and
+Reminders/Evidence/Receipt. Reminder schedules are proposed only from explicit
+user time information; missing time requires user selection, and every exact
+future schedule edit reconfirms without authorizing the separate real write.
+PR2 adds only the same-account iMessage self-chat private inbox and earns a
+Hero checkpoint. B+ then completes one-import/one-card B2 and one public
+instruction-only/no-effect-use C2 before the final package. A revocable extra
+iMessage read-only source, Discord, and broader expansion are post-B+. B2 may use the
+supplied export automatically only for the separately bounded, non-gating,
+local/read-only/no-network/no-retention diagnostic; semantic model processing
+requires later exact Owner consent.
 
-Slack, Auto routing, Hero B/C, Telegram, an OpenOpen cloud, hidden or
-unapproved ambient surveillance, self-bots, arbitrary Skill scripts, private
-iMessage APIs, payments, and silent model or Skill upgrades are intentionally
-excluded from the competition build.
+Groups, Slack, Auto routing, fixed Sol, shared/cloud Discord Bot, ambient
+surveillance, unrelated Discord DMs, offline auto-replay, Hero B/C, arbitrary
+Skill scripts, mobile UI, and silent model/Skill upgrades are excluded.
 
 ## Provenance
 

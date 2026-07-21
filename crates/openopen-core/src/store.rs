@@ -3,32 +3,48 @@ use crate::channel::{
     validate_delivery, validate_mission_event, validate_observation, validate_outbound,
     validate_pairing, validate_route_approval, validate_route_set,
 };
+use crate::markdown::{MarkdownRenderOutcome, MarkdownRoot};
 use crate::mission::{apply_mission_command, validate_mission_snapshot, validate_receipt};
 use crate::{
     ActionGate, ActionProposal, ActionTarget, CryptoError, EffectKind, GateDecision,
     LocalAuthority, MissionCommand, MissionError, TrustedBrokerEnrollment,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
+    ApprovalKind, ApprovalStatus, B2_MEMORY_MARKDOWN_PATH, B2MemoryCandidateCard, B2MemoryCommand,
+    B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoStage, B2MemoryDemoState,
+    B2MemoryImportSeal, B2MemoryMarkdownDiff, B2MemoryPreparedSource,
+    B2MemoryProcessingAbortReason, B2MemoryProcessingConsent, B2MemoryProcessingOperation,
+    B2MemoryProcessingResult, B2MemoryRenderIntent, C2SkillDemoCommand, C2SkillDemoCommandKind,
+    C2SkillDemoReceipt, C2SkillDemoStage, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt,
+    ChannelEnvelope, ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
     ChannelInboundDecision, ChannelInboundMessageClass, ChannelInboundResult, ChannelKind,
     ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition, ChannelModelStart,
     ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelOutboundStart,
     ChannelPairing, ChannelRoute, ChannelRouteApproval, ChannelRouteApprovalDecision,
-    ChannelRouteRole, ChannelRouteSet, EFFECT_PROTOCOL_VERSION, EffectAuditAnchor,
-    EffectBrokerSession, EffectCommand, EffectNonCommit, EffectPermit, EffectPermitPurpose,
-    EffectReceipt, MAX_EFFECT_APPROVAL_IDS, MAX_EFFECT_PAYLOAD_BYTES,
-    MAX_EFFECT_SCOPE_DIGEST_BYTES, Mission, MissionFileEffect, MissionStatus, OutcomeSuggestion,
-    PayloadDescriptor, Receipt, RuntimeControlAuthorization, RuntimeControlReceipt,
+    ChannelRouteRole, ChannelRouteSet, ChoiceBeginAccepted, ChoiceBeginRecord,
+    ChoiceConsolidatedConfirmation, ChoiceDIntakeRecord, ChoiceIMessageReplyDisposition,
+    ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview, ChoiceIMessageReplyStart,
+    ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceRefinementContext, ChoiceRefinementOperation,
+    ChoiceRefinementResult, ChoiceReminderSchedule, ChoiceReminderScheduleInput,
+    ChoiceResumeResult, ChoiceSession, ChoiceSessionState, ChoiceSet, DocumentManifest,
+    EFFECT_PROTOCOL_VERSION, EffectAuditAnchor, EffectBrokerSession, EffectCommand,
+    EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt, InterpretationFrame,
+    MAX_EFFECT_APPROVAL_IDS, MAX_EFFECT_PAYLOAD_BYTES, MAX_EFFECT_SCOPE_DIGEST_BYTES,
+    MarkdownBaseIdentity, MarkdownRenderIntent, MarkdownRenderReceipt, Mission, MissionFileEffect,
+    MissionStatus, ModelSelection, ModelSelectionState, OptionSelection, OutcomeSuggestion,
+    PayloadDescriptor, Receipt, RuntimeControlAuthorization, RuntimeControlReceipt, Selection,
+    canonical_choice_set_digest, canonical_document_manifest_digest,
     is_canonical_effect_identifier,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const MISSION_COMMAND_ACTION: &str = "mission.command";
 const RECEIPT_COMMIT_ACTION: &str = "receipt.created";
@@ -43,6 +59,29 @@ const CHANNEL_MODEL_ACTION: &str = "channel.model_started";
 const CHANNEL_MODEL_FAILED_ACTION: &str = "channel.model_failed";
 const CHANNEL_FAILURE_INCIDENT_ACTION: &str = "channel.failure_incident_recorded";
 const CHANNEL_FAILURE_ACK_ACTION: &str = "channel.failure_incident_acknowledged";
+const CHOICE_MODEL_SELECTION_ACTION: &str = "choice.model_selected";
+const CHOICE_BEGIN_ACTION: &str = "choice.begin_accepted";
+const CHOICE_D_INTAKE_ACTION: &str = "choice.d_intake_accepted";
+const CHOICE_REFINEMENT_CONTEXT_ACTION: &str = "choice.refinement_context_accepted";
+const CHOICE_REFINEMENT_RESULT_ACTION: &str = "choice.refinement_result_committed";
+const CHOICE_BODY_RETIREMENT_ACTION: &str = "choice.private_body_retired";
+const CHOICE_IMESSAGE_REPLY_PREPARED_ACTION: &str = "choice.imessage_reply_prepared";
+const CHOICE_IMESSAGE_REPLY_AUTHORIZED_ACTION: &str = "choice.imessage_reply_authorized";
+const CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION: &str = "choice.imessage_reply_delivered";
+const CHOICE_MARKDOWN_RENDER_INTENT_ACTION: &str = "choice.markdown_render_intent";
+const CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION: &str = "choice.markdown_render_receipt";
+const CHOICE_REMINDER_SCHEDULE_ACTION: &str = "choice.reminder_schedule_selected";
+const CHOICE_LOOP_STATE_ACTION: &str = "choice.loop_state_changed";
+const CHOICE_IDLE_CLOCK_ACTION: &str = "choice.idle_clock_anchored";
+const C2_SKILL_DEMO_ACTION: &str = "skill.demo_state_changed";
+const C2_SKILL_DEMO_ENTITY: &str = "c2-demo-skill";
+const B2_MEMORY_DEMO_ACTION: &str = "memory.demo_state_changed";
+const B2_MEMORY_DEMO_ENTITY: &str = "b2-demo-memory";
+const B2_MEMORY_SOURCE_ACTION: &str = "memory.source_prepared";
+const B2_MEMORY_SOURCE_ENTITY: &str = "b2-demo-memory-source";
+const B2_MEMORY_SOURCE_RETIRED_ACTION: &str = "memory.source_retired";
+const B2_MEMORY_PROCESSING_ACTION: &str = "memory.processing_started";
+const B2_MEMORY_RENDER_ACTION: &str = "memory.render_intent_created";
 /// The App contract accepts a bounded current incident projection. The full
 /// verified/audited history remains durable in the Store; this limit only
 /// bounds one UI/RPC response.
@@ -133,6 +172,109 @@ CREATE TABLE IF NOT EXISTS channel_outbound (
  encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
  UNIQUE(channel_json, provider_message_id)
 );
+CREATE TABLE IF NOT EXISTS choice_imessage_reply (
+ reply_id TEXT PRIMARY KEY, source_message_id TEXT NOT NULL UNIQUE,
+ choice_session_id TEXT NOT NULL, choice_set_id TEXT NOT NULL,
+ preview_revision INTEGER NOT NULL CHECK (preview_revision > 0),
+ confirmation_digest TEXT NOT NULL, status_json TEXT NOT NULL,
+ provider_message_id TEXT UNIQUE, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_model_selection (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, selected_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_begin_request (
+ request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, choice_session_id TEXT NOT NULL UNIQUE,
+ operation_id TEXT NOT NULL UNIQUE, source_envelope_id TEXT NOT NULL,
+ conversation_turn_batch_id TEXT NOT NULL, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ accepted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_d_request (
+ request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
+ operation_id TEXT NOT NULL UNIQUE, choice_session_id TEXT NOT NULL,
+ source_envelope_id TEXT NOT NULL, conversation_turn_batch_id TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, accepted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_refinement_context (
+ operation_id TEXT PRIMARY KEY, selection_id TEXT NOT NULL, choice_session_id TEXT NOT NULL,
+ source_envelope_id TEXT NOT NULL, conversation_turn_batch_id TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_private_body_tombstone (
+ source_kind TEXT NOT NULL CHECK (source_kind IN ('begin', 'd')),
+ request_id TEXT NOT NULL, request_digest TEXT NOT NULL, body_digest TEXT NOT NULL,
+ choice_session_id TEXT NOT NULL, retired_at_ms INTEGER NOT NULL,
+ PRIMARY KEY(source_kind, request_id)
+);
+CREATE TABLE IF NOT EXISTS choice_refinement_result (
+ operation_id TEXT PRIMARY KEY, selection_id TEXT NOT NULL, choice_session_id TEXT NOT NULL,
+ source_envelope_id TEXT NOT NULL, conversation_turn_batch_id TEXT NOT NULL,
+ result_digest TEXT NOT NULL, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ completed_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_refinement_body_tombstone (
+ operation_id TEXT PRIMARY KEY, result_digest TEXT NOT NULL, choice_session_id TEXT NOT NULL,
+ retired_at_ms INTEGER NOT NULL
+);
+-- The legacy tombstone tables are deliberately only lookup indexes.  The
+-- encrypted record below is the authoritative, locally authenticated proof
+-- that a private body was retired.  Keeping the index supports bounded
+-- replay rejection without retaining the body itself.
+CREATE TABLE IF NOT EXISTS choice_private_body_retirement (
+ source_kind TEXT NOT NULL CHECK (source_kind IN ('begin', 'd', 'refinement')),
+ entity_id TEXT NOT NULL, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ retired_at_ms INTEGER NOT NULL,
+ PRIMARY KEY(source_kind, entity_id)
+);
+CREATE TABLE IF NOT EXISTS choice_markdown_render_intent (
+ intent_id TEXT PRIMARY KEY, intent_digest TEXT NOT NULL, encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_markdown_render_receipt (
+ intent_id TEXT PRIMARY KEY, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ committed_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_reminder_schedule (
+ schedule_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, choice_session_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK (revision > 0), encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, accepted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_idle_clock_anchor (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS choice_loop_state (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS c2_skill_demo_state (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ revision INTEGER NOT NULL CHECK (revision > 0), stage_json TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS b2_memory_demo_state (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+ revision INTEGER NOT NULL CHECK (revision > 0), stage_json TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS b2_memory_prepared_source (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), request_id TEXT NOT NULL UNIQUE,
+ source_identity_digest TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, prepared_at_ms INTEGER NOT NULL CHECK (prepared_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_source_tombstone (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), request_id TEXT NOT NULL UNIQUE,
+ source_identity_digest TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, retired_at_ms INTEGER NOT NULL CHECK (retired_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_processing_operation (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), operation_id TEXT NOT NULL UNIQUE,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_render_journal (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), intent_id TEXT NOT NULL UNIQUE,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+);
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
  command_id TEXT NOT NULL, command_hash TEXT NOT NULL, actor TEXT NOT NULL,
@@ -198,6 +340,24 @@ pub enum StoreError {
     ChannelFailureIncidentConflict(String),
     #[error("channel model work is deferred while a Mission is nonterminal")]
     ChannelModelDeferredByMission,
+    #[error("Choice model selection is missing, malformed, or conflicts with its audit binding")]
+    ChoiceModelSelectionConflict,
+    #[error(
+        "Choice begin request is missing, malformed, stale, or conflicts with its audit binding"
+    )]
+    ChoiceBeginConflict,
+    #[error("Choice Loop state is malformed, stale, or conflicts with its audit binding")]
+    ChoiceLoopStateConflict,
+    #[error("Choice Loop clock continuity is uncertain")]
+    ChoiceClockUncertain,
+    #[error(
+        "C2 Skill demo lifecycle is malformed, stale, replayed with changed input, or conflicts with its audit binding"
+    )]
+    C2SkillDemoConflict,
+    #[error(
+        "B2 Memory demo lifecycle is malformed, stale, replayed with changed input, or conflicts with its audit binding"
+    )]
+    B2MemoryDemoConflict,
     #[error("Mission confirmation conflicts with already-started channel model work")]
     MissionModelInFlight,
     #[error("audit chain mismatch at sequence {0}")]
@@ -264,6 +424,523 @@ pub enum StoreError {
     RuntimeDisabled,
 }
 
+#[cfg(test)]
+mod b2_memory_demo_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct ProcessingFixture {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        authority: LocalAuthority,
+        store: Store,
+        authorization: RuntimeControlAuthorization,
+        broker_receipt: RuntimeControlReceipt,
+        consent: B2MemoryProcessingConsent,
+        operation: B2MemoryProcessingOperation,
+    }
+
+    fn command(
+        request_id: &str,
+        expected_revision: u64,
+        kind: B2MemoryCommandKind,
+    ) -> B2MemoryCommand {
+        B2MemoryCommand {
+            request_id: request_id.to_owned(),
+            expected_revision,
+            kind,
+            selected_candidate_id: None,
+            edited_line: None,
+            expected_diff_digest: None,
+            explicitly_confirmed: false,
+            decided_at_ms: i64::try_from(expected_revision).unwrap_or_default() + 10,
+        }
+    }
+
+    fn processing_fixture() -> ProcessingFixture {
+        let directory = tempfile::tempdir().expect("temporary Store");
+        let path = directory.path().join("store.sqlite3");
+        let authority = LocalAuthority::from_master("b2-processing-recovery", [93_u8; 32]);
+        let mut store = Store::open(&path, authority.clone()).expect("open Store");
+        let (authorization, broker_receipt) =
+            super::choice_begin_tests::enable_runtime(&mut store, &authority);
+        let mut source_record = B2MemoryPreparedSourceRecord {
+            source: B2MemoryPreparedSource {
+                request_id: "b2-recovery-prepare".to_owned(),
+                source_identity_digest: "0".repeat(64),
+                byte_length: 128,
+            },
+            selected_path: PathBuf::from("/tmp/synthetic-recovery-chatgpt.zip"),
+            device_id: 7,
+            inode: 8,
+            modified_at_ns: 9,
+            source_digest: "a".repeat(64),
+            prepared_at_ms: 10,
+        };
+        source_record.source.source_identity_digest =
+            b2_memory_source_identity_digest(&source_record).expect("source identity");
+        let prepared = store
+            .prepare_b2_memory_source(&source_record, &authorization, &broker_receipt)
+            .expect("prepared source")
+            .0;
+        let selection = super::choice_begin_tests::selection();
+        store
+            .select_model_selection(&selection, 11)
+            .expect("model selection");
+        let (choice_begin, choice_snapshot) = super::choice_begin_tests::begin_state(
+            "Remember one synthetic preference",
+            "b2-recovery-choice-begin",
+        );
+        store
+            .begin_choice_session(&choice_begin, &choice_snapshot)
+            .expect("Choice begin");
+        store
+            .commit_initial_choice_result(&super::choice_begin_tests::initial_result(&choice_begin))
+            .expect("initial Choice result");
+        let seal = B2MemoryImportSeal {
+            source_digest: source_record.source_digest.clone(),
+            catalog_digest: "b".repeat(64),
+            source_manifest_digest: "c".repeat(64),
+            model_provenance: selection
+                .turn_provenance(
+                    "b2-recovery-provenance".to_owned(),
+                    "b2-recovery-turn".to_owned(),
+                )
+                .expect("model provenance"),
+        };
+        let consent = B2MemoryProcessingConsent {
+            request_id: "b2-recovery-process".to_owned(),
+            expected_revision: prepared.revision,
+            source_identity_digest: source_record.source.source_identity_digest,
+            explicitly_confirmed: true,
+        };
+        let operation = store
+            .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 20)
+            .expect("begin processing");
+        ProcessingFixture {
+            _directory: directory,
+            path,
+            authority,
+            store,
+            authorization,
+            broker_receipt,
+            consent,
+            operation,
+        }
+    }
+
+    #[test]
+    fn definite_failure_cancel_and_off_return_processing_to_restart_safe_prepared() {
+        let mut fixture = processing_fixture();
+        let processing_revision = fixture
+            .store
+            .b2_memory_demo_state()
+            .unwrap()
+            .unwrap()
+            .revision;
+        let prepared = fixture
+            .store
+            .abort_b2_memory_processing(
+                &fixture.operation.operation_id,
+                fixture.authorization.revision,
+                B2MemoryProcessingAbortReason::DefiniteFailure,
+                21,
+            )
+            .expect("abort known failure")
+            .expect("known operation");
+        assert_eq!(prepared.stage, B2MemoryDemoStage::Prepared);
+        assert_eq!(prepared.revision, processing_revision + 1);
+        assert!(prepared.processing_operation.is_none());
+        assert!(prepared.processing_result_digest.is_none());
+        assert!(prepared.seal.is_none());
+        assert!(fixture.store.b2_memory_prepared_source().unwrap().is_some());
+        assert!(
+            load_b2_memory_processing_operation(&fixture.store.connection, &fixture.authority)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .abort_b2_memory_processing(
+                    &fixture.operation.operation_id,
+                    fixture.authorization.revision,
+                    B2MemoryProcessingAbortReason::Cancelled,
+                    22,
+                )
+                .expect("cancel/known-failure race is idempotent")
+                .unwrap(),
+            prepared
+        );
+        let mut late_result = B2MemoryProcessingResult {
+            operation_id: fixture.operation.operation_id.clone(),
+            candidates: vec![B2MemoryCandidateCard {
+                id: "late-card".to_owned(),
+                title: "Late result".to_owned(),
+                rationale: "Must remain rejected".to_owned(),
+                proposed_line: "- Never accept a late result.".to_owned(),
+                source_binding_digest: "d".repeat(64),
+            }],
+            result_digest: String::new(),
+            completed_at_ms: 23,
+        };
+        late_result.result_digest = late_result.canonical_digest().unwrap();
+        assert!(matches!(
+            fixture.store.commit_b2_memory_processing_result(
+                &late_result,
+                &fixture.authorization,
+                &fixture.broker_receipt,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        assert!(matches!(
+            fixture.store.begin_b2_memory_processing(
+                &fixture.consent,
+                &B2MemoryImportSeal {
+                    source_digest: fixture.operation.source_digest.clone(),
+                    catalog_digest: fixture.operation.catalog_digest.clone(),
+                    source_manifest_digest: fixture.operation.source_manifest_digest.clone(),
+                    model_provenance: fixture.operation.model_provenance.clone(),
+                },
+                &fixture.authorization,
+                &fixture.broker_receipt,
+                24,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        drop(fixture.store);
+        let restarted = Store::open(&fixture.path, fixture.authority).expect("restart Store");
+        let restarted_state = restarted.b2_memory_demo_state().unwrap().unwrap();
+        assert_eq!(restarted_state, prepared);
+        assert!(restarted.b2_memory_prepared_source().unwrap().is_some());
+
+        let mut off_fixture = processing_fixture();
+        let off_prepared = off_fixture
+            .store
+            .abort_b2_memory_processing(
+                &off_fixture.operation.operation_id,
+                off_fixture.authorization.revision,
+                B2MemoryProcessingAbortReason::RuntimeOff,
+                21,
+            )
+            .expect("Off abort")
+            .expect("active operation");
+        assert_eq!(off_prepared.stage, B2MemoryDemoStage::Prepared);
+        super::choice_begin_tests::commit_runtime_revision(&mut off_fixture.store, false, 22);
+        assert_eq!(
+            off_fixture.store.b2_memory_demo_state().unwrap().unwrap(),
+            off_prepared
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn one_import_is_atomic_replay_safe_disposes_unselected_and_detects_tamper() {
+        let authority = LocalAuthority::from_master("b2-memory-demo", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        let (authorization, broker_receipt) =
+            super::choice_begin_tests::enable_runtime(&mut store, &authority);
+
+        let mut source_record = B2MemoryPreparedSourceRecord {
+            source: B2MemoryPreparedSource {
+                request_id: "b2-prepare".to_owned(),
+                source_identity_digest: "0".repeat(64),
+                byte_length: 128,
+            },
+            selected_path: PathBuf::from("/tmp/synthetic-chatgpt.zip"),
+            device_id: 1,
+            inode: 2,
+            modified_at_ns: 3,
+            source_digest: "a".repeat(64),
+            prepared_at_ms: 10,
+        };
+        source_record.source.source_identity_digest =
+            b2_memory_source_identity_digest(&source_record).unwrap();
+        let (prepared, first_receipt) = store
+            .prepare_b2_memory_source(&source_record, &authorization, &broker_receipt)
+            .expect("prepare boundary");
+        assert_eq!(prepared.stage, B2MemoryDemoStage::Prepared);
+        assert_eq!(
+            store
+                .prepare_b2_memory_source(&source_record, &authorization, &broker_receipt)
+                .unwrap()
+                .1,
+            first_receipt
+        );
+        let mut changed_replay = source_record.clone();
+        changed_replay.prepared_at_ms += 1;
+        assert!(matches!(
+            store.prepare_b2_memory_source(&changed_replay, &authorization, &broker_receipt),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+
+        let selection = super::choice_begin_tests::selection();
+        store.select_model_selection(&selection, 11).unwrap();
+        let (choice_begin, choice_snapshot) = super::choice_begin_tests::begin_state(
+            "Remember one synthetic preference",
+            "b2-choice-begin",
+        );
+        store
+            .begin_choice_session(&choice_begin, &choice_snapshot)
+            .unwrap();
+        store
+            .commit_initial_choice_result(&super::choice_begin_tests::initial_result(&choice_begin))
+            .unwrap();
+        let provenance = selection
+            .turn_provenance("b2-provenance".to_owned(), "b2-turn".to_owned())
+            .expect("provenance");
+        let seal = B2MemoryImportSeal {
+            source_digest: "a".repeat(64),
+            catalog_digest: "b".repeat(64),
+            source_manifest_digest: "c".repeat(64),
+            model_provenance: provenance,
+        };
+        let cards = vec![
+            B2MemoryCandidateCard {
+                id: "memory-a".to_owned(),
+                title: "Keep one complete loop".to_owned(),
+                rationale: "Repeated project priority".to_owned(),
+                proposed_line: "- Finish one verified loop before expanding scope.".to_owned(),
+                source_binding_digest: "d".repeat(64),
+            },
+            B2MemoryCandidateCard {
+                id: "memory-b".to_owned(),
+                title: "Prefer concise updates".to_owned(),
+                rationale: "Repeated communication preference".to_owned(),
+                proposed_line: "- Keep progress updates concise.".to_owned(),
+                source_binding_digest: "e".repeat(64),
+            },
+        ];
+        let consent = B2MemoryProcessingConsent {
+            request_id: "b2-process".to_owned(),
+            expected_revision: prepared.revision,
+            source_identity_digest: source_record.source.source_identity_digest.clone(),
+            explicitly_confirmed: true,
+        };
+        let operation = store
+            .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 20)
+            .expect("durable processing operation");
+        assert_eq!(
+            store
+                .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 21,)
+                .unwrap(),
+            operation
+        );
+        let mut changed_seal = seal.clone();
+        changed_seal.source_manifest_digest = "9".repeat(64);
+        assert!(matches!(
+            store.begin_b2_memory_processing(
+                &consent,
+                &changed_seal,
+                &authorization,
+                &broker_receipt,
+                21,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        let mut result = B2MemoryProcessingResult {
+            operation_id: operation.operation_id.clone(),
+            candidates: cards,
+            result_digest: String::new(),
+            completed_at_ms: 22,
+        };
+        result.result_digest = result.canonical_digest().unwrap();
+        let candidates = store
+            .commit_b2_memory_processing_result(&result, &authorization, &broker_receipt)
+            .expect("private candidate result");
+        assert_eq!(candidates.0.candidates.len(), 2);
+        assert!(store.b2_memory_prepared_source().unwrap().is_none());
+        assert_eq!(
+            store
+                .commit_b2_memory_processing_result(&result, &authorization, &broker_receipt)
+                .unwrap(),
+            candidates
+        );
+        let mut changed_result = result.clone();
+        changed_result.completed_at_ms += 1;
+        changed_result.result_digest = changed_result.canonical_digest().unwrap();
+        assert!(matches!(
+            store.commit_b2_memory_processing_result(
+                &changed_result,
+                &authorization,
+                &broker_receipt,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        let tombstone_blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_source_tombstone WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&tombstone_blob).contains("synthetic-chatgpt.zip"));
+
+        let mut select = command(
+            "b2-select",
+            candidates.0.revision,
+            B2MemoryCommandKind::SelectCandidate,
+        );
+        select.selected_candidate_id = Some("memory-a".to_owned());
+        select.explicitly_confirmed = true;
+        let (selected, _) = store
+            .apply_b2_memory_command(&select, &authorization, &broker_receipt)
+            .expect("select");
+        assert!(selected.candidates.is_empty());
+        assert_eq!(selected.selected_candidate.as_ref().unwrap().id, "memory-a");
+        assert_eq!(
+            selected
+                .markdown_diff
+                .as_ref()
+                .unwrap()
+                .final_entry
+                .relative_path,
+            B2_MEMORY_MARKDOWN_PATH
+        );
+
+        let mut edit = command(
+            "b2-edit",
+            selected.revision,
+            B2MemoryCommandKind::EditMarkdown,
+        );
+        edit.edited_line =
+            Some("- Finish one exact verified loop before expanding scope.".to_owned());
+        edit.expected_diff_digest =
+            Some(selected.markdown_diff.as_ref().unwrap().diff_digest.clone());
+        let (edited, _) = store
+            .apply_b2_memory_command(&edit, &authorization, &broker_receipt)
+            .expect("edit");
+        let mut confirm = command(
+            "b2-confirm",
+            edited.revision,
+            B2MemoryCommandKind::ConfirmDiff,
+        );
+        confirm.expected_diff_digest =
+            Some(edited.markdown_diff.as_ref().unwrap().diff_digest.clone());
+        confirm.explicitly_confirmed = true;
+        let (confirmed, _) = store
+            .apply_b2_memory_command(&confirm, &authorization, &broker_receipt)
+            .expect("confirm");
+        let diff = confirmed.markdown_diff.as_ref().unwrap();
+        let journal_blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_render_journal WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&journal_blob).contains("Finish one exact"));
+        let markdown_home = tempfile::tempdir().unwrap();
+        let markdown_root = markdown_home.path().join("Documents/OpenOpen");
+        std::fs::create_dir_all(&markdown_root).unwrap();
+        std::fs::set_permissions(
+            markdown_home.path().join("Documents"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&markdown_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(markdown_root.join("sources")).unwrap();
+        std::fs::set_permissions(
+            markdown_root.join("sources"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        store
+            .bind_choice_markdown_root(markdown_home.path())
+            .unwrap();
+        let render_receipt = match store
+            .publish_b2_memory_render_intent(
+                &confirmed.render_intent.as_ref().unwrap().intent_id,
+                &authorization,
+                &broker_receipt,
+                40,
+            )
+            .expect("publish exact B2 journal")
+            .expect("known journal")
+        {
+            MarkdownRenderPublication::Committed(receipt) => receipt,
+            MarkdownRenderPublication::ReconciliationRequired => {
+                panic!("fresh B2 path unexpectedly required reconciliation")
+            }
+        };
+        let mut conflict_receipt = render_receipt.clone();
+        conflict_receipt.displaced_base = Some(MarkdownBaseIdentity {
+            entry: diff.final_entry.clone(),
+            device: 9,
+            inode: 9,
+        });
+        assert!(matches!(
+            store.commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &conflict_receipt,
+                &authorization,
+                &broker_receipt,
+                40,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        let read_back = store
+            .commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &render_receipt,
+                &authorization,
+                &broker_receipt,
+                40,
+            )
+            .expect("readback");
+        assert_eq!(read_back.stage, B2MemoryDemoStage::ReadBack);
+        assert!(read_back.readback_receipt.is_some());
+        assert_eq!(
+            store
+                .commit_b2_memory_readback(
+                    confirmed.revision,
+                    confirmed.confirmation_digest.as_deref().unwrap(),
+                    &render_receipt,
+                    &authorization,
+                    &broker_receipt,
+                    41,
+                )
+                .unwrap(),
+            read_back
+        );
+        let (off_authorization, off_receipt) =
+            super::choice_begin_tests::commit_runtime_revision(&mut store, false, 50);
+        assert!(matches!(
+            store.commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &render_receipt,
+                &off_authorization,
+                &off_receipt,
+                51,
+            ),
+            Err(StoreError::RuntimeDisabled | StoreError::RuntimeControlMismatch)
+        ));
+
+        let blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_demo_state WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&blob).contains("Finish one exact"));
+        store
+            .connection
+            .execute(
+                "UPDATE b2_memory_demo_state SET blob_hash = ?1 WHERE singleton_id = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        assert!(store.b2_memory_demo_state().is_err());
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditAnchor {
@@ -294,6 +971,88 @@ pub struct RuntimeControl {
     pub enabled: bool,
     pub revision: u64,
     pub updated_at_ms: i64,
+}
+
+/// Store-private source locator plus its immutable descriptor identity.  The
+/// public projection deliberately omits the local path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryPreparedSourceRecord {
+    pub source: B2MemoryPreparedSource,
+    pub selected_path: PathBuf,
+    pub device_id: u64,
+    pub inode: u64,
+    pub modified_at_ns: i64,
+    pub source_digest: String,
+    pub prepared_at_ms: i64,
+}
+
+impl B2MemoryPreparedSourceRecord {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.source.is_valid()
+            && self.selected_path.is_absolute()
+            && self.device_id > 0
+            && self.inode > 0
+            && self.modified_at_ns >= 0
+            && is_sha256_hex(&self.source_digest)
+            && self.prepared_at_ms >= 0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct B2MemorySourceTombstone {
+    source: B2MemoryPreparedSource,
+    source_digest: String,
+    processing_request_id: String,
+    retired_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredB2MemoryRenderIntent {
+    intent: B2MemoryRenderIntent,
+    plaintext_body: Option<String>,
+    #[serde(default)]
+    render_receipt: Option<MarkdownRenderReceipt>,
+    retired: bool,
+}
+
+impl StoredB2MemoryRenderIntent {
+    fn is_valid(&self) -> bool {
+        self.intent.is_valid()
+            && match (&self.plaintext_body, &self.render_receipt, self.retired) {
+                (Some(body), _, false) => {
+                    !body.contains('\0')
+                        && u64::try_from(body.len()).ok() == Some(self.intent.entry.byte_length)
+                        && sha256_hex(body.as_bytes()) == self.intent.content_digest
+                        && self.render_receipt.as_ref().is_none_or(|receipt| {
+                            receipt.is_valid()
+                                && receipt.intent_id == self.intent.intent_id
+                                && receipt.final_entry == self.intent.entry
+                                && receipt.displaced_base.is_none()
+                        })
+                }
+                (None, Some(receipt), true) => {
+                    receipt.is_valid()
+                        && receipt.intent_id == self.intent.intent_id
+                        && receipt.final_entry == self.intent.entry
+                        && receipt.displaced_base.is_none()
+                }
+                _ => false,
+            }
+    }
+}
+
+impl B2MemorySourceTombstone {
+    fn is_valid(&self) -> bool {
+        self.source.is_valid()
+            && is_sha256_hex(&self.source_digest)
+            && !self.processing_request_id.is_empty()
+            && self.processing_request_id.len() <= 256
+            && self.retired_at_ms >= 0
+    }
 }
 
 struct AuditRecord<'a> {
@@ -431,6 +1190,216 @@ struct StoredChannelFailureIncident {
     acknowledgement: Option<StoredChannelFailureAcknowledgement>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredMarkdownRenderIntent {
+    intent: MarkdownRenderIntent,
+    plaintext_body: Option<String>,
+    #[serde(default)]
+    reconciliation: Option<StoredMarkdownReconciliation>,
+}
+
+/// A body-free, authenticated record that publication needs explicit owner
+/// review. It never contains a path outside the sealed intent or any private
+/// Markdown bytes, and it prevents a generic retry loop after a conflict.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredMarkdownReconciliation {
+    reason: String,
+    recorded_at_ms: i64,
+}
+
+impl StoredMarkdownReconciliation {
+    fn is_valid(&self) -> bool {
+        self.reason == "descriptor-conflict" && self.recorded_at_ms >= 0
+    }
+}
+
+/// Body-free, locally authenticated retirement evidence.  This deliberately
+/// stores only stable identity and digest material: the original encrypted
+/// blob is gone, but an attacker cannot alter the replay/cancellation marker
+/// without failing AEAD verification and the bound audit record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChoicePrivateBodyRetirement {
+    source_kind: String,
+    entity_id: String,
+    request_digest: Option<String>,
+    body_digest: String,
+    choice_session_id: String,
+    source_blob_hash: String,
+    retired_at_ms: i64,
+    /// A pre-attestation plaintext tombstone cannot be promoted into trusted
+    /// provenance. It is retained only as an authenticated *blocked* replay
+    /// marker, whose marker digest must still match the legacy row.
+    #[serde(default)]
+    legacy_blocked: bool,
+}
+
+struct ChoicePrivateBodyTombstoneArgs<'a> {
+    source_kind: &'a str,
+    request_id: &'a str,
+    request_digest: &'a str,
+    body_digest: &'a str,
+    choice_session_id: &'a str,
+    source_blob_hash: &'a str,
+    retired_at_ms: i64,
+}
+
+impl ChoicePrivateBodyRetirement {
+    fn is_valid(&self) -> bool {
+        matches!(self.source_kind.as_str(), "begin" | "d" | "refinement")
+            && !self.entity_id.is_empty()
+            && self
+                .request_digest
+                .as_ref()
+                .is_none_or(|digest| is_sha256_hex(digest))
+            && is_sha256_hex(&self.body_digest)
+            && is_sha256_hex(&self.source_blob_hash)
+            && !self.choice_session_id.is_empty()
+            && self.retired_at_ms >= 0
+    }
+}
+
+/// Body-free outcome of publishing an already command-owned Markdown intent.
+/// The Store owns decryption and the descriptor writer; external callers can
+/// neither provide plaintext nor obtain it from this capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarkdownRenderPublication {
+    Committed(MarkdownRenderReceipt),
+    ReconciliationRequired,
+}
+
+/// Body-free result of verifying a durable render receipt and disposing its
+/// retained displaced base. The only success path permits the separate Store
+/// retirement transaction; it never recreates or exposes a Markdown body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MarkdownReceiptCleanup {
+    ReadyForRetirement,
+    ReconciliationRequired,
+}
+
+/// Terminal body-free result of the sealed Markdown cleanup transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarkdownRenderCleanup {
+    Retired(Box<ChoiceLoopSnapshot>),
+    ReconciliationRequired,
+}
+
+fn confirmed_choice_markdown_body(confirmation: &ChoiceConsolidatedConfirmation) -> String {
+    let mut body = String::from("# Confirmed choice\n\n## Goal\n\n");
+    body.push_str(&confirmation.goal);
+    body.push_str("\n\n## Steps\n");
+    for step in &confirmation.steps {
+        body.push_str("\n- ");
+        body.push_str(step);
+    }
+    // The immutable confirmation seals the entry digest.  Do not embed its
+    // digest in the body: that would create a circular preimage in which the
+    // body digest depends on the confirmation that itself binds that digest.
+    body.push('\n');
+    body
+}
+
+fn markdown_render_intent_id(
+    confirmation: &ChoiceConsolidatedConfirmation,
+    session_revision: u64,
+    generation: u64,
+    content_digest: &str,
+) -> String {
+    let digest = sha256_hex(
+        serde_json::to_string(&json!({
+            "confirmation": confirmation.id,
+            "session": confirmation.choice_session_id,
+            "revision": session_revision,
+            "entry": content_digest,
+            "generation": generation,
+        }))
+        .expect("fixed Markdown render identity serializes")
+        .as_bytes(),
+    );
+    format!("choice-markdown-render-{}", &digest[..32])
+}
+
+fn markdown_render_record_for_confirmation(
+    confirmation: &ChoiceConsolidatedConfirmation,
+    session_revision: u64,
+    generation: u64,
+    created_at_ms: i64,
+) -> Result<StoredMarkdownRenderIntent, StoreError> {
+    let plaintext_body = confirmed_choice_markdown_body(confirmation);
+    let entry = confirmation.markdown_entry.clone();
+    if !confirmation.is_valid()
+        || session_revision == 0
+        || generation == 0
+        || created_at_ms < 0
+        || entry.relative_path != format!("sessions/{}/CHOICE.md", confirmation.choice_session_id)
+        || entry.sha256 != sha256_hex(plaintext_body.as_bytes())
+        || entry.byte_length
+            != u64::try_from(plaintext_body.len())
+                .map_err(|_| StoreError::ChoiceLoopStateConflict)?
+        || entry.mode != 0o600
+    {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let intent = MarkdownRenderIntent {
+        id: markdown_render_intent_id(confirmation, session_revision, generation, &entry.sha256),
+        choice_session_id: confirmation.choice_session_id.clone(),
+        expected_session_revision: session_revision,
+        expected_generation: generation,
+        entry: entry.clone(),
+        expected_base: confirmation.markdown_expected_base.clone(),
+        content_digest: entry.sha256,
+        created_at_ms,
+    };
+    Ok(StoredMarkdownRenderIntent {
+        intent,
+        plaintext_body: Some(plaintext_body),
+        reconciliation: None,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChoiceIdleClockEvidence {
+    pub boot_id: String,
+    pub wall_clock_ms: i64,
+    pub monotonic_ms: i64,
+}
+
+impl ChoiceIdleClockEvidence {
+    fn is_valid(&self) -> bool {
+        !self.boot_id.is_empty()
+            && self.boot_id.len() <= 128
+            && self
+                .boot_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && self.wall_clock_ms >= 0
+            && self.monotonic_ms >= 0
+    }
+}
+
+/// Store-owned classification for one Host clock sample. A calibration point
+/// is intentionally distinct from a continuous no-op: reads may establish the
+/// anchor, but an authority-consuming command must require a later continuous
+/// sample before it may use the current `ChoiceSet`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChoiceIdleAdvance {
+    Calibrated(ChoiceLoopSnapshot),
+    Unchanged(ChoiceLoopSnapshot),
+    Transitioned(ChoiceLoopSnapshot),
+}
+
+impl ChoiceIdleAdvance {
+    #[must_use]
+    pub fn snapshot(&self) -> &ChoiceLoopSnapshot {
+        match self {
+            Self::Calibrated(snapshot)
+            | Self::Unchanged(snapshot)
+            | Self::Transitioned(snapshot) => snapshot,
+        }
+    }
+}
+
 struct LoadedChannelFailureIncident {
     stored: StoredChannelFailureIncident,
     incident_anchor: AuditAnchor,
@@ -461,6 +1430,10 @@ pub struct Store {
     connection: Connection,
     authority: LocalAuthority,
     trusted_broker: Option<TrustedBrokerEnrollment>,
+    // Bound once by the Host from its canonical, signed-in account path.
+    // Never re-read HOME for an effectful Markdown operation: a mutable
+    // process environment must not redirect a previously validated journal.
+    choice_markdown_root: Option<PathBuf>,
 }
 
 impl Store {
@@ -475,6 +1448,7 @@ impl Store {
             connection,
             authority,
             trusted_broker: None,
+            choice_markdown_root: None,
         };
         store.migrate()?;
         Ok(store)
@@ -491,6 +1465,7 @@ impl Store {
             connection,
             authority,
             trusted_broker: None,
+            choice_markdown_root: None,
         };
         store.migrate()?;
         Ok(store)
@@ -512,6 +1487,7 @@ impl Store {
             connection,
             authority,
             trusted_broker: Some(trusted_broker),
+            choice_markdown_root: None,
         };
         store.migrate()?;
         store.migrate_channel_failure_incidents()?;
@@ -532,6 +1508,7 @@ impl Store {
             connection,
             authority,
             trusted_broker: Some(trusted_broker),
+            choice_markdown_root: None,
         };
         store.migrate()?;
         store.migrate_channel_failure_incidents()?;
@@ -546,6 +1523,30 @@ impl Store {
     #[must_use]
     pub const fn trusted_broker_enrollment(&self) -> Option<&TrustedBrokerEnrollment> {
         self.trusted_broker.as_ref()
+    }
+
+    /// Binds command-owned Markdown publication to the exact canonical home
+    /// validated by the Host at startup. A later `HOME` environment change or
+    /// a second caller cannot redirect an existing journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Host-provided canonical home is unsafe or a
+    /// different root was previously bound to this Store instance. Production
+    /// `HostPaths` validates this home before Store construction; test Hosts
+    /// may bind an isolated temporary home without consulting process `HOME`.
+    pub fn bind_choice_markdown_root(&mut self, user_home: &Path) -> Result<(), StoreError> {
+        let supplied_home =
+            std::fs::canonicalize(user_home).map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+        let root = supplied_home.join("Documents").join("OpenOpen");
+        match &self.choice_markdown_root {
+            Some(existing) if existing != &root => Err(StoreError::ChoiceLoopStateConflict),
+            Some(_) => Ok(()),
+            None => {
+                self.choice_markdown_root = Some(root);
+                Ok(())
+            }
+        }
     }
 
     /// Loads the exact Core-signed broker enrollment produced by the signed
@@ -581,6 +1582,8 @@ impl Store {
 
     fn migrate(&mut self) -> Result<(), StoreError> {
         self.connection.execute_batch(STORE_SCHEMA)?;
+        self.require_current_choice_private_identity_schema()?;
+        self.require_current_choice_idle_clock_schema()?;
         let mut columns = self.connection.prepare("PRAGMA table_info(audit_ledger)")?;
         let column_names = columns
             .query_map([], |row| row.get::<_, String>(1))?
@@ -626,6 +1629,290 @@ impl Store {
         self.connection
             .prepare("SELECT checkpoint_nonce FROM runtime_control_recovery_checkpoint LIMIT 0")?;
         self.migrate_legacy_channel_origins()?;
+        self.migrate_choice_loop_delivery_bindings()?;
+        self.migrate_choice_private_body_retirements()?;
+        // Migration-blocked markers remain tied to their old body-free row;
+        // validate them at open time as well as at each command boundary so a
+        // tampered legacy row cannot hide until a later foreground action.
+        verify_choice_private_body_retirements(&self.connection, &self.authority)?;
+        Ok(())
+    }
+
+    /// The PR1 clock anchor originally existed as unauthenticated plaintext.
+    /// An empty development table can be replaced mechanically, but a
+    /// populated legacy anchor is not promoted into time authority.
+    fn require_current_choice_idle_clock_schema(&mut self) -> Result<(), StoreError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(choice_idle_clock_anchor)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.iter().any(|name| name == "encrypted_blob")
+            && columns.iter().any(|name| name == "blob_hash")
+            && !columns.iter().any(|name| name == "boot_id")
+        {
+            return Ok(());
+        }
+        let row_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM choice_idle_clock_anchor",
+            [],
+            |row| row.get(0),
+        )?;
+        if row_count != 0 {
+            return Err(StoreError::ChoiceClockUncertain);
+        }
+        self.connection.execute_batch(
+            "DROP TABLE choice_idle_clock_anchor;
+             CREATE TABLE choice_idle_clock_anchor (
+               singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+               encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL
+             );",
+        )?;
+        Ok(())
+    }
+
+    /// The private Choice intake/result tables were introduced only on the
+    /// unshipped PR1 branch. An older development database may therefore have
+    /// rows whose ciphertext was created before the complete identity tuple
+    /// was part of its AAD. Re-encrypting those rows would promote data that
+    /// was never authenticated under the stronger contract, so opening fails
+    /// closed unless the old table is empty; empty tables are upgraded in
+    /// place without retaining or inferring any private body identity.
+    fn require_current_choice_private_identity_schema(&mut self) -> Result<(), StoreError> {
+        for (table, required_columns) in [
+            (
+                "choice_begin_request",
+                &["source_envelope_id", "conversation_turn_batch_id"][..],
+            ),
+            (
+                "choice_d_request",
+                &[
+                    "choice_session_id",
+                    "source_envelope_id",
+                    "conversation_turn_batch_id",
+                ][..],
+            ),
+            (
+                "choice_refinement_context",
+                &["source_envelope_id", "conversation_turn_batch_id"][..],
+            ),
+            (
+                "choice_refinement_result",
+                &[
+                    "choice_session_id",
+                    "source_envelope_id",
+                    "conversation_turn_batch_id",
+                ][..],
+            ),
+        ] {
+            let column_names = self
+                .connection
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let missing = required_columns
+                .iter()
+                .copied()
+                .filter(|column| !column_names.iter().any(|name| name == column))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                continue;
+            }
+            let row_count: i64 =
+                self.connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            if row_count != 0 {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            for column in missing {
+                self.connection.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upgrades the previous plaintext-only retirement indexes into encrypted
+    /// `LocalAuthority` records. The original signed audit state hash is copied
+    /// as provenance; no private body is reconstructed or inferred. If that
+    /// historic audit row is absent, opening fails closed rather than silently
+    /// treating the old marker as a valid replay boundary.
+    #[allow(clippy::too_many_lines)] // One IMMEDIATE migration must retain every fail-closed branch together.
+    fn migrate_choice_private_body_retirements(&mut self) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_legacy_rows: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM choice_private_body_tombstone)
+                 OR EXISTS(SELECT 1 FROM choice_refinement_body_tombstone)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_legacy_rows {
+            transaction.commit()?;
+            return Ok(());
+        }
+        // A migration changes authenticated retirement state. Verify the
+        // complete existing audit chain before inspecting or writing any row,
+        // so a tampered tail cannot be laundered into a newly signed marker.
+        verified_audit_tail(&transaction, &self.authority)?;
+        let private_rows = transaction
+            .prepare(
+                "SELECT source_kind, request_id, request_digest, body_digest,
+                        choice_session_id, retired_at_ms
+                 FROM choice_private_body_tombstone",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (
+            source_kind,
+            entity_id,
+            request_digest,
+            body_digest,
+            choice_session_id,
+            retired_at_ms,
+        ) in private_rows
+        {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM choice_private_body_retirement
+                 WHERE source_kind = ?1 AND entity_id = ?2)",
+                params![&source_kind, &entity_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            if retirement_audit_exists(&transaction, &source_kind, &entity_id)? {
+                // A previously authenticated retirement was deleted. Never
+                // re-seal mutable legacy metadata over that missing record.
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            // These old plaintext rows were not encrypted or bound to their
+            // source request. Do not upgrade mutable metadata into source
+            // provenance. Instead create an authenticated, body-free blocked
+            // marker whose digest is rechecked against the legacy row at each
+            // load. It keeps replay/effect authority closed while allowing
+            // the Store (and Global Off/recovery) to remain reachable.
+            let marker = legacy_private_body_marker_digest(&json!({
+                "sourceKind": source_kind,
+                "entityId": entity_id,
+                "requestDigest": request_digest,
+                "bodyDigest": body_digest,
+                "choiceSessionId": choice_session_id,
+                "retiredAtMs": retired_at_ms,
+            }));
+            persist_choice_private_body_retirement(
+                &transaction,
+                &self.authority,
+                &ChoicePrivateBodyRetirement {
+                    source_kind,
+                    entity_id,
+                    request_digest: None,
+                    body_digest: marker.clone(),
+                    choice_session_id: "legacy-retirement-blocked".to_owned(),
+                    source_blob_hash: marker,
+                    retired_at_ms: 0,
+                    legacy_blocked: true,
+                },
+            )?;
+        }
+        let refinement_rows = transaction
+            .prepare(
+                "SELECT operation_id, result_digest, choice_session_id, retired_at_ms
+                 FROM choice_refinement_body_tombstone",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (entity_id, body_digest, choice_session_id, retired_at_ms) in refinement_rows {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM choice_private_body_retirement
+                 WHERE source_kind = 'refinement' AND entity_id = ?1)",
+                [&entity_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            if retirement_audit_exists(&transaction, "refinement", &entity_id)? {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            let marker = legacy_private_body_marker_digest(&json!({
+                "sourceKind": "refinement",
+                "entityId": entity_id,
+                "bodyDigest": body_digest,
+                "choiceSessionId": choice_session_id,
+                "retiredAtMs": retired_at_ms,
+            }));
+            persist_choice_private_body_retirement(
+                &transaction,
+                &self.authority,
+                &ChoicePrivateBodyRetirement {
+                    source_kind: "refinement".to_owned(),
+                    entity_id,
+                    request_digest: None,
+                    body_digest: marker.clone(),
+                    choice_session_id: "legacy-retirement-blocked".to_owned(),
+                    source_blob_hash: marker,
+                    retired_at_ms: 0,
+                    legacy_blocked: true,
+                },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// A pre-Choice-binding snapshot cannot safely be resumed. Persist one
+    /// typed blocked recovery projection rather than inferring a delivery
+    /// binding from owner, provider, body, timestamp, or another mutable
+    /// field. This runs inside the Store migration transaction so restart
+    /// observes the same audited blocked state instead of repeatedly deriving
+    /// a transient UI-only warning.
+    fn migrate_choice_loop_delivery_bindings(&mut self) -> Result<(), StoreError> {
+        let raw = load_raw_choice_loop_snapshot(&self.connection, &self.authority)?;
+        if !raw
+            .as_ref()
+            .is_some_and(raw_choice_loop_batch_lacks_delivery_binding)
+        {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        let raw = load_raw_choice_loop_snapshot(&transaction, &self.authority)?;
+        if !raw
+            .as_ref()
+            .is_some_and(raw_choice_loop_batch_lacks_delivery_binding)
+        {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let snapshot = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let updated_at_ms = current_unix_ms()?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &snapshot, updated_at_ms)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -799,6 +2086,3939 @@ impl Store {
             &self.authority,
             self.trusted_broker.as_ref(),
         )
+    }
+
+    /// Persists the explicit user-owned model selection with its catalog and
+    /// account provenance. Exact retries are idempotent; a changed selection
+    /// creates a new audited state and never silently substitutes a model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed selection data, failed Store/audit
+    /// verification, or a failed atomic commit.
+    pub fn select_model_selection(
+        &mut self,
+        selection: &ModelSelection,
+        selected_at_ms: i64,
+    ) -> Result<ModelSelection, StoreError> {
+        if selected_at_ms < 0 || !selection.is_valid() {
+            return Err(StoreError::ChoiceModelSelectionConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) = load_choice_model_selection(&transaction, &self.authority)?
+            && existing == *selection
+        {
+            return Ok(existing);
+        }
+        let blob = self
+            .authority
+            .encrypt_json(selection, choice_model_selection_aad().as_bytes())?;
+        let selection_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(selection)
+                    .map_err(|error| CryptoError::Serialization(error.to_string()))?
+            )
+        );
+        let encrypted_blob_hash = blob_hash(&blob);
+        let audit_id = format!("choice-model-selection-{selection_hash}-{selected_at_ms}");
+        transaction.execute(
+            "INSERT INTO choice_model_selection (singleton_id, encrypted_blob, blob_hash, selected_at_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton_id) DO UPDATE SET encrypted_blob = excluded.encrypted_blob,
+                 blob_hash = excluded.blob_hash, selected_at_ms = excluded.selected_at_ms",
+            params![blob, encrypted_blob_hash, selected_at_ms],
+        )?;
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &audit_id,
+                command_id: &audit_id,
+                command_hash: &selection_hash,
+                actor: "owner",
+                action: CHOICE_MODEL_SELECTION_ACTION,
+                entity_id: "choice-model-selection",
+                created_at_ms: selected_at_ms,
+                state_kind: "choice:model_selection",
+                state_hash: &encrypted_blob_hash,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(selection.clone())
+    }
+
+    /// Loads a verified persisted model selection. An absent record means the
+    /// product must ask the owner to choose; it never falls back to a fixed
+    /// model or effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed encrypted record or audit binding.
+    pub fn selected_model_selection(&self) -> Result<Option<ModelSelection>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        load_choice_model_selection(&self.connection, &self.authority)
+    }
+
+    /// Loads the one verified, Store-owned instruction-only demo Skill lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted state or its signed audit binding is invalid.
+    pub fn c2_skill_demo_state(&self) -> Result<Option<C2SkillDemoState>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_c2_skill_demo_state(&self.connection, &self.authority)
+    }
+
+    /// Applies one bounded C2 demo lifecycle command atomically with its signed audit row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid, stale, changed-replay, or nonsequential commands and for
+    /// failed runtime, storage, encryption, or audit verification.
+    #[allow(clippy::too_many_lines)] // The transaction intentionally keeps validation, state and audit mutation inseparable.
+    pub fn apply_c2_skill_demo_command(
+        &mut self,
+        command: &C2SkillDemoCommand,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(C2SkillDemoState, C2SkillDemoReceipt), StoreError> {
+        let command_digest = command.digest().ok_or(StoreError::C2SkillDemoConflict)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+
+        let existing = load_c2_skill_demo_state(&transaction, &self.authority)?;
+        if let Some(state) = existing.as_ref()
+            && let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.request_id == command.request_id)
+        {
+            if receipt.command_digest == command_digest {
+                return Ok((state.clone(), receipt.clone()));
+            }
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        let current_revision = existing.as_ref().map_or(0, |state| state.revision);
+        if command.expected_revision != current_revision
+            || existing.as_ref().is_some_and(|state| {
+                state.seal != command.seal
+                    || state.consumed_nonces.contains(&command.approval_nonce)
+            })
+        {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        let next_stage = match (existing.as_ref().map(|state| state.stage), command.kind) {
+            (None, C2SkillDemoCommandKind::RegisterCandidate) => C2SkillDemoStage::Candidate,
+            (Some(C2SkillDemoStage::Candidate), C2SkillDemoCommandKind::StageReviewed) => {
+                C2SkillDemoStage::Staged
+            }
+            (Some(C2SkillDemoStage::Staged), C2SkillDemoCommandKind::EnableRunnable) => {
+                C2SkillDemoStage::Runnable
+            }
+            (Some(C2SkillDemoStage::Runnable), C2SkillDemoCommandKind::RecordFirstNoEffectUse) => {
+                C2SkillDemoStage::Used
+            }
+            _ => return Err(StoreError::C2SkillDemoConflict),
+        };
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or(StoreError::C2SkillDemoConflict)?;
+        let receipt_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&json!({
+                "commandDigest": command_digest,
+                "revision": next_revision,
+                "stage": next_stage,
+                "seal": command.seal,
+                "resultDigest": command.result_digest,
+                }))
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?
+            )
+        );
+        let receipt = C2SkillDemoReceipt {
+            request_id: command.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: next_revision,
+            stage: next_stage,
+            receipt_digest,
+        };
+        let mut state = existing.unwrap_or(C2SkillDemoState {
+            revision: 0,
+            stage: C2SkillDemoStage::Candidate,
+            seal: command.seal.clone(),
+            consumed_nonces: Vec::new(),
+            receipts: Vec::new(),
+            first_use_result_digest: None,
+        });
+        state.revision = next_revision;
+        state.stage = next_stage;
+        state.consumed_nonces.push(command.approval_nonce.clone());
+        state.receipts.push(receipt.clone());
+        if next_stage == C2SkillDemoStage::Used {
+            state
+                .first_use_result_digest
+                .clone_from(&command.result_digest);
+        }
+        validate_c2_skill_demo_state(&state)?;
+        let blob = self
+            .authority
+            .encrypt_json(&state, c2_skill_demo_aad().as_bytes())?;
+        let encrypted_blob_hash = blob_hash(&blob);
+        let encoded_stage = serde_json::to_string(&next_stage)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+        transaction.execute(
+            "INSERT INTO c2_skill_demo_state
+                (singleton_id, revision, stage_json, encrypted_blob, blob_hash)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton_id) DO UPDATE SET revision = excluded.revision,
+                 stage_json = excluded.stage_json, encrypted_blob = excluded.encrypted_blob,
+                 blob_hash = excluded.blob_hash",
+            params![
+                i64::try_from(next_revision).map_err(|_| StoreError::C2SkillDemoConflict)?,
+                encoded_stage,
+                blob,
+                encrypted_blob_hash
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("c2-skill-demo-{}", command.request_id),
+                command_id: &command.request_id,
+                command_hash: &command_digest,
+                actor: &command.actor_id,
+                action: C2_SKILL_DEMO_ACTION,
+                entity_id: C2_SKILL_DEMO_ENTITY,
+                created_at_ms: command.decided_at_ms,
+                state_kind: "skill:demo",
+                state_hash: &encrypted_blob_hash,
+            },
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
+    }
+
+    /// Loads the encrypted, audited one-import B2 demo state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted state or signed audit binding is invalid.
+    pub fn b2_memory_demo_state(&self) -> Result<Option<B2MemoryDemoState>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        load_b2_memory_demo_state(&self.connection, &self.authority)
+    }
+
+    /// Returns the verified Store-private source record for the Host worker.
+    /// The selected path never crosses the public RPC boundary after prepare.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the audit chain, encrypted record, or indexed
+    /// descriptor identity is malformed or has been changed.
+    pub fn b2_memory_prepared_source(
+        &self,
+    ) -> Result<Option<B2MemoryPreparedSourceRecord>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        load_b2_memory_prepared_source(&self.connection, &self.authority)
+    }
+
+    /// Atomically persists one descriptor-pinned source without reading or
+    /// processing archive members. Exact replay returns the existing state;
+    /// a changed replay or a second source fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity, protected-runtime drift,
+    /// changed replay, failed encryption, or failed atomic persistence.
+    pub fn prepare_b2_memory_source(
+        &mut self,
+        record: &B2MemoryPreparedSourceRecord,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), StoreError> {
+        if !record.is_valid()
+            || b2_memory_source_identity_digest(record)? != record.source.source_identity_digest
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let command_digest = sha256_json(record)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) = load_b2_memory_prepared_source(&transaction, &self.authority)? {
+            if existing != *record {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+            let state = load_b2_memory_demo_state(&transaction, &self.authority)?
+                .ok_or(StoreError::B2MemoryDemoConflict)?;
+            let receipt = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.request_id == record.source.request_id)
+                .cloned()
+                .ok_or(StoreError::B2MemoryDemoConflict)?;
+            return (receipt.command_digest == command_digest)
+                .then_some((state, receipt))
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        if load_b2_memory_demo_state(&transaction, &self.authority)?.is_some() {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        persist_b2_memory_prepared_source(&transaction, &self.authority, record, &command_digest)?;
+        let receipt = B2MemoryCommandReceipt {
+            request_id: record.source.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: 1,
+            stage: B2MemoryDemoStage::Prepared,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": 1,
+                "stage": B2MemoryDemoStage::Prepared,
+            }))?,
+        };
+        let state = B2MemoryDemoState {
+            revision: 1,
+            stage: B2MemoryDemoStage::Prepared,
+            prepared_source: Some(record.source.clone()),
+            processing_operation: None,
+            processing_result_digest: None,
+            seal: None,
+            candidates: Vec::new(),
+            selected_candidate: None,
+            markdown_diff: None,
+            confirmation_digest: None,
+            render_intent: None,
+            readback_receipt: None,
+            receipts: vec![receipt.clone()],
+        };
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &record.source.request_id,
+            &receipt.command_digest,
+            record.prepared_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
+    }
+
+    /// Applies a caller-visible B2 transition. Candidate creation and readback
+    /// remain private Host result commits and cannot be minted through this command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid runtime proof, stale revision, changed replay,
+    /// malformed transition, or failed encrypted/audited persistence.
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_b2_memory_command(
+        &mut self,
+        command: &B2MemoryCommand,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), StoreError> {
+        let command_digest = command.digest().ok_or(StoreError::B2MemoryDemoConflict)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let existing = load_b2_memory_demo_state(&transaction, &self.authority)?;
+        if let Some(state) = existing.as_ref()
+            && let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|value| value.request_id == command.request_id)
+        {
+            return (receipt.command_digest == command_digest)
+                .then(|| (state.clone(), receipt.clone()))
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let current_revision = existing.as_ref().map_or(0, |state| state.revision);
+        if command.expected_revision != current_revision {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let mut state = existing.unwrap_or(B2MemoryDemoState {
+            revision: 0,
+            stage: B2MemoryDemoStage::Prepared,
+            prepared_source: None,
+            processing_operation: None,
+            processing_result_digest: None,
+            seal: None,
+            candidates: Vec::new(),
+            selected_candidate: None,
+            markdown_diff: None,
+            confirmation_digest: None,
+            render_intent: None,
+            readback_receipt: None,
+            receipts: Vec::new(),
+        });
+        let next_stage = match (state.stage, command.kind) {
+            (B2MemoryDemoStage::Candidates, B2MemoryCommandKind::SelectCandidate) => {
+                let selected_id = command
+                    .selected_candidate_id
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let selected = state
+                    .candidates
+                    .iter()
+                    .find(|card| &card.id == selected_id)
+                    .cloned()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                state.candidates.clear();
+                state.markdown_diff = Some(b2_memory_diff(
+                    &selected,
+                    1,
+                    selected.proposed_line.clone(),
+                )?);
+                state.selected_candidate = Some(selected);
+                B2MemoryDemoStage::Selected
+            }
+            (
+                B2MemoryDemoStage::Selected | B2MemoryDemoStage::DiffReview,
+                B2MemoryCommandKind::EditMarkdown,
+            ) => {
+                let selected = state
+                    .selected_candidate
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let current = state
+                    .markdown_diff
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                if command.expected_diff_digest.as_deref() != Some(current.diff_digest.as_str()) {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                state.markdown_diff = Some(b2_memory_diff(
+                    selected,
+                    current
+                        .revision
+                        .checked_add(1)
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                    command
+                        .edited_line
+                        .clone()
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                )?);
+                B2MemoryDemoStage::DiffReview
+            }
+            (
+                B2MemoryDemoStage::Selected | B2MemoryDemoStage::DiffReview,
+                B2MemoryCommandKind::ConfirmDiff,
+            ) => {
+                let diff = state
+                    .markdown_diff
+                    .as_ref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                if command.expected_diff_digest.as_deref() != Some(diff.diff_digest.as_str()) {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                state.confirmation_digest = Some(sha256_json(&json!({
+                    "diffDigest": diff.diff_digest,
+                    "finalEntry": diff.final_entry,
+                    "expectedBase": diff.expected_base,
+                }))?);
+                if diff.expected_base.is_some() {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                let confirmation_digest = state
+                    .confirmation_digest
+                    .clone()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let body = format!("{}\n", diff.edited_line);
+                let intent = B2MemoryRenderIntent {
+                    intent_id: format!(
+                        "b2-render-{}",
+                        &sha256_json(&json!({
+                            "confirmation": confirmation_digest,
+                            "entry": diff.final_entry,
+                            "revision": current_revision.checked_add(1),
+                        }))?[..32]
+                    ),
+                    expected_revision: current_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                    confirmation_digest,
+                    entry: diff.final_entry.clone(),
+                    content_digest: diff.final_entry.sha256.clone(),
+                    created_at_ms: command.decided_at_ms,
+                };
+                let stored = StoredB2MemoryRenderIntent {
+                    intent: intent.clone(),
+                    plaintext_body: Some(body),
+                    render_receipt: None,
+                    retired: false,
+                };
+                if !stored.is_valid() {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                persist_b2_memory_render_intent(&transaction, &self.authority, &stored)?;
+                state.render_intent = Some(intent);
+                B2MemoryDemoStage::Confirmed
+            }
+            _ => return Err(StoreError::B2MemoryDemoConflict),
+        };
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let receipt = B2MemoryCommandReceipt {
+            request_id: command.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: next_revision,
+            stage: next_stage,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": next_revision,
+                "stage": next_stage,
+            }))?,
+        };
+        state.revision = next_revision;
+        state.stage = next_stage;
+        state.receipts.push(receipt.clone());
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &command.request_id,
+            &command_digest,
+            command.decided_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
+    }
+
+    /// Starts the sole durable processing operation before any source excerpt
+    /// may reach the selected model. All provenance other than the explicit
+    /// consent and Host-derived source seal is re-derived from current Store
+    /// state inside this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale consent, runtime/model/persona/manifest
+    /// drift, changed replay, or failed encrypted/audited persistence.
+    #[allow(clippy::too_many_lines)] // One transaction keeps every authority binding atomic.
+    pub fn begin_b2_memory_processing(
+        &mut self,
+        consent: &B2MemoryProcessingConsent,
+        seal: &B2MemoryImportSeal,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+        started_at_ms: i64,
+    ) -> Result<B2MemoryProcessingOperation, StoreError> {
+        if !consent.is_valid() || !seal.is_valid() || started_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let selection = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceModelSelectionConflict)?;
+        let choice = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let persona_revision = choice
+            .active_choice_set
+            .as_ref()
+            .map(|choice_set| choice_set.persona_revision.clone())
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if let Some(existing) = load_b2_memory_processing_operation(&transaction, &self.authority)?
+        {
+            let expected_request = sha256_json(consent)?;
+            return (existing.request_id == consent.request_id
+                && existing.runtime_revision == authorization.revision
+                && existing.source_identity_digest == source.source.source_identity_digest
+                && existing.source_digest == seal.source_digest
+                && existing.model_provenance == seal.model_provenance
+                && existing.catalog_digest == seal.catalog_digest
+                && existing.source_manifest_digest == seal.source_manifest_digest
+                && existing.persona_revision == persona_revision
+                && existing.document_manifest_digest == choice.document_manifest.aggregate_digest
+                && model_provenance_matches_selection(&existing.model_provenance, &selection)
+                && state.processing_operation.as_ref() == Some(&existing)
+                && state.stage == B2MemoryDemoStage::Processing
+                && state.receipts.iter().any(|receipt| {
+                    receipt.request_id == consent.request_id
+                        && receipt.command_digest == expected_request
+                }))
+            .then_some(existing)
+            .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        if state.stage != B2MemoryDemoStage::Prepared
+            || state.revision != consent.expected_revision
+            || state.prepared_source.as_ref() != Some(&source.source)
+            || source.source.source_identity_digest != consent.source_identity_digest
+            || seal.source_digest != source.source_digest
+            || !model_provenance_matches_selection(&seal.model_provenance, &selection)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let operation_id = format!(
+            "b2-processing-{}",
+            &sha256_json(&json!({
+                "request": consent,
+                "runtimeRevision": authorization.revision,
+                "seal": seal,
+                "persona": persona_revision,
+                "documentManifest": choice.document_manifest.aggregate_digest,
+            }))?[..32]
+        );
+        let operation = B2MemoryProcessingOperation {
+            operation_id,
+            request_id: consent.request_id.clone(),
+            expected_revision: consent.expected_revision,
+            runtime_revision: authorization.revision,
+            source_identity_digest: source.source.source_identity_digest.clone(),
+            source_digest: source.source_digest.clone(),
+            model_provenance: seal.model_provenance.clone(),
+            catalog_digest: seal.catalog_digest.clone(),
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            persona_revision,
+            document_manifest_digest: choice.document_manifest.aggregate_digest.clone(),
+            source_manifest_digest: seal.source_manifest_digest.clone(),
+            started_at_ms,
+        };
+        if !operation.is_valid() {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Processing;
+        state.processing_operation = Some(operation.clone());
+        state.seal = Some(seal.clone());
+        let command_digest = sha256_json(consent)?;
+        let receipt = B2MemoryCommandReceipt {
+            request_id: consent.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: state.revision,
+            stage: B2MemoryDemoStage::Processing,
+            receipt_digest: sha256_json(&json!({
+                "operationId": operation.operation_id,
+                "revision": state.revision,
+            }))?,
+        };
+        state.receipts.push(receipt);
+        persist_b2_memory_processing_operation(&transaction, &self.authority, &operation)?;
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &consent.request_id,
+            &command_digest,
+            started_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
+    /// Returns one definitely failed or explicitly cancelled B2 processing
+    /// operation to its descriptor-pinned prepared source. This is a private
+    /// Host recovery transition: it retains no result, starts no model retry,
+    /// and grants no external-effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/foreign operation, runtime drift, invalid
+    /// timestamp, tampered state, or a non-Processing current state.
+    pub fn abort_b2_memory_processing(
+        &mut self,
+        operation_id: &str,
+        expected_runtime_revision: u64,
+        reason: B2MemoryProcessingAbortReason,
+        aborted_at_ms: i64,
+    ) -> Result<Option<B2MemoryDemoState>, StoreError> {
+        if operation_id.is_empty() || expected_runtime_revision == 0 || aborted_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let Some(mut state) = load_b2_memory_demo_state(&transaction, &self.authority)? else {
+            return Ok(None);
+        };
+        let abort_request_id = format!(
+            "b2-processing-abort-{}",
+            &sha256_json(&json!({"operationId": operation_id}))?[..24]
+        );
+        if state.receipts.iter().any(|receipt| {
+            receipt.request_id == abort_request_id && receipt.stage == B2MemoryDemoStage::Prepared
+        }) {
+            return (state.stage == B2MemoryDemoStage::Prepared
+                && state.processing_operation.is_none()
+                && state.processing_result_digest.is_none()
+                && state.seal.is_none()
+                && load_b2_memory_processing_operation(&transaction, &self.authority)?.is_none()
+                && load_b2_memory_prepared_source(&transaction, &self.authority)?
+                    .is_some_and(|source| state.prepared_source.as_ref() == Some(&source.source)))
+            .then_some(Some(state))
+            .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let operation = load_b2_memory_processing_operation(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if !runtime.enabled
+            || runtime.revision != expected_runtime_revision
+            || operation.runtime_revision != expected_runtime_revision
+            || operation.operation_id != operation_id
+            || aborted_at_ms < operation.started_at_ms
+            || state.stage != B2MemoryDemoStage::Processing
+            || state.processing_operation.as_ref() != Some(&operation)
+            || state.prepared_source.as_ref() != Some(&source.source)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let command_digest = sha256_json(&json!({
+            "operationId": operation_id,
+            "reason": reason,
+        }))?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Prepared;
+        state.processing_operation = None;
+        state.processing_result_digest = None;
+        state.seal = None;
+        state.candidates.clear();
+        let receipt = B2MemoryCommandReceipt {
+            request_id: abort_request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: state.revision,
+            stage: B2MemoryDemoStage::Prepared,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": state.revision,
+                "stage": B2MemoryDemoStage::Prepared,
+            }))?,
+        };
+        state.receipts.push(receipt);
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &abort_request_id,
+            &command_digest,
+            aborted_at_ms,
+        )?;
+        if transaction.execute(
+            "DELETE FROM b2_memory_processing_operation WHERE singleton_id = 1 AND operation_id = ?1",
+            [operation_id],
+        )? != 1
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        transaction.commit()?;
+        Ok(Some(state))
+    }
+
+    /// Private Host result commit for one explicitly-consented, descriptor-
+    /// pinned scan. The result is accepted only for the exact durable operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale consent, source/model drift, changed replay,
+    /// invalid candidates, protected Off, or failed atomic persistence.
+    #[allow(clippy::too_many_lines)] // One transaction keeps validation, commit, retirement, and audit atomic.
+    pub fn commit_b2_memory_processing_result(
+        &mut self,
+        result: &B2MemoryProcessingResult,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), StoreError> {
+        if !result.is_valid()
+            || result
+                .candidates
+                .iter()
+                .map(|card| &card.id)
+                .collect::<HashSet<_>>()
+                .len()
+                != result.candidates.len()
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let command_digest = result.result_digest.clone();
+        if let Some(receipt) = state
+            .receipts
+            .iter()
+            .find(|receipt| receipt.request_id == result.operation_id)
+            .cloned()
+        {
+            return (receipt.command_digest == command_digest
+                && receipt.stage == B2MemoryDemoStage::Candidates
+                && state.stage == B2MemoryDemoStage::Candidates
+                && state.processing_result_digest.as_ref() == Some(&result.result_digest)
+                && state.candidates == result.candidates)
+                .then_some((state, receipt))
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let operation = load_b2_memory_processing_operation(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if operation.operation_id != result.operation_id
+            || source.source.source_identity_digest != operation.source_identity_digest
+            || state.prepared_source.as_ref() != Some(&source.source)
+            || operation.source_digest != source.source_digest
+            || authorization.revision != operation.runtime_revision
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let selection = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceModelSelectionConflict)?;
+        if !model_provenance_matches_selection(&operation.model_provenance, &selection) {
+            return Err(StoreError::ChoiceModelSelectionConflict);
+        }
+        let choice = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let current_persona = choice
+            .active_choice_set
+            .as_ref()
+            .map(|choice_set| &choice_set.persona_revision)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if state.stage != B2MemoryDemoStage::Processing
+            || state.processing_operation.as_ref() != Some(&operation)
+            || state.revision
+                != operation
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::B2MemoryDemoConflict)?
+            || current_persona != &operation.persona_revision
+            || choice.document_manifest.aggregate_digest != operation.document_manifest_digest
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Candidates;
+        state.processing_result_digest = Some(result.result_digest.clone());
+        state.candidates.clone_from(&result.candidates);
+        let receipt = B2MemoryCommandReceipt {
+            request_id: result.operation_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: state.revision,
+            stage: B2MemoryDemoStage::Candidates,
+            receipt_digest: sha256_json(&json!({
+                "commandDigest": command_digest,
+                "revision": state.revision,
+                "stage": B2MemoryDemoStage::Candidates,
+            }))?,
+        };
+        state.receipts.push(receipt.clone());
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &result.operation_id,
+            &command_digest,
+            result.completed_at_ms,
+        )?;
+        persist_b2_memory_source_tombstone(
+            &transaction,
+            &self.authority,
+            &B2MemorySourceTombstone {
+                source: source.source,
+                source_digest: source.source_digest,
+                processing_request_id: operation.request_id,
+                retired_at_ms: result.completed_at_ms,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM b2_memory_prepared_source WHERE singleton_id = 1",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM b2_memory_processing_operation WHERE singleton_id = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok((state, receipt))
+    }
+
+    /// Publishes the exact command-owned B2 journal through the same
+    /// descriptor-safe no-clobber boundary as Choice Markdown. The body and
+    /// path never leave Store, and the exact filesystem receipt is sealed into
+    /// the encrypted journal before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for runtime drift, a stale/tampered journal, or a
+    /// filesystem result that cannot be verified exactly.
+    pub fn publish_b2_memory_render_intent(
+        &mut self,
+        intent_id: &str,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+        committed_at_ms: i64,
+    ) -> Result<Option<MarkdownRenderPublication>, StoreError> {
+        if committed_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let root = self.open_choice_markdown_root()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let mut journal = load_b2_memory_render_intent(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if journal.retired
+            || state.stage != B2MemoryDemoStage::Confirmed
+            || state.revision != journal.intent.expected_revision
+            || state.render_intent.as_ref() != Some(&journal.intent)
+            || state.confirmation_digest.as_deref()
+                != Some(journal.intent.confirmation_digest.as_str())
+            || journal.intent.intent_id != intent_id
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let adapter = b2_markdown_render_adapter(&journal.intent);
+        if let Some(receipt) = journal.render_receipt.as_ref() {
+            return root
+                .verify_committed_receipt(&adapter, receipt)
+                .map(|()| Some(MarkdownRenderPublication::Committed(receipt.clone())))
+                .map_err(|_| StoreError::B2MemoryDemoConflict);
+        }
+        let plaintext_body = journal
+            .plaintext_body
+            .as_ref()
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if let Some(receipt) = root
+            .recover_exact_fresh_publication(&adapter, committed_at_ms)
+            .map_err(|_| StoreError::B2MemoryDemoConflict)?
+        {
+            journal.render_receipt = Some(receipt.clone());
+            update_b2_memory_render_intent(
+                &transaction,
+                &self.authority,
+                &journal,
+                committed_at_ms,
+            )?;
+            transaction.commit()?;
+            return Ok(Some(MarkdownRenderPublication::Committed(receipt)));
+        }
+        let outcome = root
+            .render_no_clobber(
+                &adapter,
+                Zeroizing::new(plaintext_body.clone()).as_bytes(),
+                None,
+                committed_at_ms,
+            )
+            .map_err(|_| StoreError::B2MemoryDemoConflict)?;
+        match outcome {
+            MarkdownRenderOutcome::ReconciliationRequired => {
+                transaction.commit()?;
+                Ok(Some(MarkdownRenderPublication::ReconciliationRequired))
+            }
+            MarkdownRenderOutcome::Committed(receipt) => {
+                root.verify_committed_receipt(&adapter, &receipt)
+                    .map_err(|_| StoreError::B2MemoryDemoConflict)?;
+                journal.render_receipt = Some(receipt.clone());
+                update_b2_memory_render_intent(
+                    &transaction,
+                    &self.authority,
+                    &journal,
+                    committed_at_ms,
+                )?;
+                transaction.commit()?;
+                Ok(Some(MarkdownRenderPublication::Committed(receipt)))
+            }
+        }
+    }
+
+    /// Commits readback only for the exact command-owned fresh-file render
+    /// journal. Callers cannot supply a body, path, or alternate manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale or changed receipt, an existing/replaced
+    /// target, runtime drift, or failed encrypted/audited persistence.
+    pub fn commit_b2_memory_readback(
+        &mut self,
+        expected_revision: u64,
+        confirmation_digest: &str,
+        render_receipt: &MarkdownRenderReceipt,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+        completed_at_ms: i64,
+    ) -> Result<B2MemoryDemoState, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let supplied_render_digest = sha256_json(
+            &serde_json::to_value(render_receipt)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?,
+        )?;
+        if state.stage == B2MemoryDemoStage::ReadBack {
+            return state
+                .readback_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    receipt.confirmation_digest == confirmation_digest
+                        && receipt.render_receipt_digest == supplied_render_digest
+                })
+                .then_some(state)
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let journal = load_b2_memory_render_intent(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if state.stage != B2MemoryDemoStage::Confirmed
+            || state.revision != expected_revision
+            || state.confirmation_digest.as_deref() != Some(confirmation_digest)
+            || !render_receipt.is_valid()
+            || state.render_intent.as_ref() != Some(&journal.intent)
+            || journal.intent.expected_revision != expected_revision
+            || journal.intent.confirmation_digest != confirmation_digest
+            || render_receipt.intent_id != journal.intent.intent_id
+            || journal.render_receipt.as_ref() != Some(render_receipt)
+            || render_receipt.displaced_base.is_some()
+            || state.markdown_diff.as_ref().map(|diff| &diff.final_entry)
+                != Some(&render_receipt.final_entry)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let render_receipt_digest = supplied_render_digest;
+        let receipt = openopen_protocol::B2MemoryReadbackReceipt {
+            confirmation_digest: confirmation_digest.to_owned(),
+            render_receipt_digest: render_receipt_digest.clone(),
+            receipt_digest: sha256_json(
+                &json!({"confirmation": confirmation_digest, "renderReceipt": render_receipt_digest}),
+            )?,
+        };
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::ReadBack;
+        state.readback_receipt = Some(receipt);
+        state.candidates.clear();
+        state.render_intent = None;
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            "b2-private-readback",
+            &render_receipt_digest,
+            completed_at_ms,
+        )?;
+        retire_b2_memory_render_intent(
+            &transaction,
+            &self.authority,
+            &journal.intent,
+            completed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    /// Returns the complete encrypted foreground Choice Loop state. Its
+    /// contents are continuity data only; callers must still pass the normal
+    /// typed confirmation and broker gates before any external effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed encrypted state or audit binding.
+    pub fn choice_loop_snapshot(&self) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?;
+        verify_choice_private_bindings(&self.connection, &self.authority, snapshot.as_ref())?;
+        verify_choice_markdown_bindings(&self.connection, &self.authority, snapshot.as_ref())?;
+        Ok(snapshot)
+    }
+
+    /// Derives and persists the encrypted Markdown body and command-owned
+    /// render intent before the Host touches the filesystem. Production
+    /// callers supply only the already sealed confirmation and the
+    /// descriptor-observed replacement baseline; the Store derives the body,
+    /// entry, digest, and intent identity itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or stale intent, a mismatched body,
+    /// runtime/Choice state drift, audit failure, or a transaction conflict.
+    #[cfg(test)]
+    pub fn begin_confirmed_markdown_render(
+        &mut self,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        expected_generation: u64,
+        expected_base: Option<MarkdownBaseIdentity>,
+        created_at_ms: i64,
+    ) -> Result<MarkdownRenderIntent, StoreError> {
+        if !confirmation.is_valid() || expected_generation == 0 || created_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled
+            || runtime.revision != expected_generation
+            || current.session.id != confirmation.choice_session_id
+            || current.session.state != ChoiceSessionState::AwaitingConfirmation
+            || current.confirmation.as_ref() != Some(confirmation)
+            || current.session.pending_confirmation_id.as_deref() != Some(&confirmation.id)
+            || confirmation.expected_session_revision.checked_add(1)
+                != Some(current.session.revision)
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let plaintext_body = confirmed_choice_markdown_body(confirmation);
+        let entry = confirmation.markdown_entry.clone();
+        if entry.relative_path != format!("sessions/{}/CHOICE.md", current.session.id)
+            || entry.sha256 != sha256_hex(plaintext_body.as_bytes())
+            || entry.byte_length
+                != u64::try_from(plaintext_body.len())
+                    .map_err(|_| StoreError::ChoiceLoopStateConflict)?
+            || entry.mode != 0o600
+            || expected_base != confirmation.markdown_expected_base
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let intent = MarkdownRenderIntent {
+            id: markdown_render_intent_id(
+                confirmation,
+                current.session.revision,
+                expected_generation,
+                &entry.sha256,
+            ),
+            choice_session_id: current.session.id.clone(),
+            expected_session_revision: current.session.revision,
+            expected_generation,
+            entry: entry.clone(),
+            expected_base,
+            content_digest: entry.sha256.clone(),
+            created_at_ms,
+        };
+        if let Some(existing) =
+            load_markdown_render_intent(&transaction, &self.authority, &intent.id)?
+        {
+            return if existing.intent == intent
+                && existing.plaintext_body.as_deref() == Some(&plaintext_body)
+            {
+                Ok(intent)
+            } else {
+                Err(StoreError::ChoiceLoopStateConflict)
+            };
+        }
+        persist_markdown_render_intent(
+            &transaction,
+            &self.authority,
+            &StoredMarkdownRenderIntent {
+                intent: intent.clone(),
+                plaintext_body: Some(plaintext_body),
+                reconciliation: None,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(intent)
+    }
+
+    /// Lower-level fixture seam. Production callers must use the sealed
+    /// confirmation variant above; this is not compiled into the product.
+    #[cfg(test)]
+    fn begin_markdown_render_for_test(
+        &mut self,
+        intent: &MarkdownRenderIntent,
+        plaintext_body: &str,
+    ) -> Result<MarkdownRenderIntent, StoreError> {
+        self.begin_markdown_render_inner(intent, plaintext_body, None)
+    }
+
+    #[cfg(test)]
+    fn begin_markdown_render_inner(
+        &mut self,
+        intent: &MarkdownRenderIntent,
+        plaintext_body: &str,
+        confirmation: Option<&ChoiceConsolidatedConfirmation>,
+    ) -> Result<MarkdownRenderIntent, StoreError> {
+        if !intent.is_valid()
+            || plaintext_body.len() as u64 != intent.entry.byte_length
+            || sha256_hex(plaintext_body.as_bytes()) != intent.content_digest
+            || plaintext_body.contains('\0')
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) =
+            load_markdown_render_intent(&transaction, &self.authority, &intent.id)?
+        {
+            return if existing.intent == *intent
+                && existing.plaintext_body.as_deref() == Some(plaintext_body)
+            {
+                Ok(intent.clone())
+            } else {
+                Err(StoreError::ChoiceLoopStateConflict)
+            };
+        }
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled
+            || runtime.revision != intent.expected_generation
+            || current.session.id != intent.choice_session_id
+            || current.session.revision != intent.expected_session_revision
+            || confirmation.is_some_and(|value| {
+                current.session.state != ChoiceSessionState::AwaitingConfirmation
+                    || current.confirmation.as_ref() != Some(value)
+                    || current.session.pending_confirmation_id.as_deref() != Some(&value.id)
+                    || value.expected_session_revision.checked_add(1)
+                        != Some(current.session.revision)
+            })
+            || (confirmation.is_some()
+                && (current.session.state != ChoiceSessionState::AwaitingConfirmation
+                    || current.confirmation.is_none()))
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_markdown_render_intent(
+            &transaction,
+            &self.authority,
+            &StoredMarkdownRenderIntent {
+                intent: intent.clone(),
+                plaintext_body: Some(plaintext_body.to_owned()),
+                reconciliation: None,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(intent.clone())
+    }
+
+    /// Loads the encrypted render body for the private Host renderer.  This
+    /// is not a product RPC and never returns a filesystem path supplied by a
+    /// caller.  The intent remains durable until a verified receipt exists so
+    /// a crash can resume or reconcile without recreating user text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing, malformed, or audit-unbound intent.
+    #[cfg(test)]
+    fn private_markdown_body_available_for_test(
+        &self,
+        intent_id: &str,
+        allow_reconciliation: bool,
+    ) -> Result<bool, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        load_markdown_render_intent(&self.connection, &self.authority, intent_id).and_then(
+            |record| {
+                record
+                    .map(|record| {
+                        if record.reconciliation.is_some() && !allow_reconciliation {
+                            return Err(StoreError::ChoiceLoopStateConflict);
+                        }
+                        if record.plaintext_body.is_some() {
+                            Ok(true)
+                        } else {
+                            Err(StoreError::ChoiceLoopStateConflict)
+                        }
+                    })
+                    .transpose()
+                    .map(|value| value.unwrap_or(false))
+            },
+        )
+    }
+
+    /// Publishes one durable Store-owned render intent through a descriptor
+    /// root. The plaintext never crosses the Store boundary: it is decrypted
+    /// into a bounded zeroizing buffer only for this internal writer call.
+    ///
+    /// This is deliberately not a raw filesystem API. `intent_id` must name
+    /// an existing encrypted command-owned journal, and the final path and
+    /// manifest are derived from that journal rather than caller input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal, audit, private root, or descriptor
+    /// publication cannot be verified without retaining or exposing plaintext.
+    pub fn publish_markdown_render_intent(
+        &mut self,
+        intent_id: &str,
+        allow_reconciliation: bool,
+        committed_at_ms: i64,
+    ) -> Result<Option<MarkdownRenderPublication>, StoreError> {
+        if committed_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let root = self.open_choice_markdown_root()?;
+        // Keep the IMMEDIATE transaction open across publication. This is not
+        // merely a preflight: Global Off and all competing Choice transitions
+        // are serialized until the descriptor-bound publication either gains
+        // its receipt or fails closed.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let Some(record) = load_markdown_render_intent(&transaction, &self.authority, intent_id)?
+        else {
+            return Ok(None);
+        };
+        if record.reconciliation.is_some() && !allow_reconciliation {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        require_current_markdown_render_authority(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            &record.intent,
+        )?;
+        let plaintext_body = record
+            .plaintext_body
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let outcome = root
+            .render_no_clobber(
+                &record.intent,
+                Zeroizing::new(plaintext_body).as_bytes(),
+                None,
+                committed_at_ms,
+            )
+            .map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+        Ok(Some(match outcome {
+            MarkdownRenderOutcome::Committed(receipt) => {
+                // Publication is not a receipt. Re-open the exact final/base
+                // descriptors while the Store still owns the only plaintext
+                // capability, then persist the receipt in its own protected
+                // transaction. No external caller can manufacture this step.
+                if root
+                    .verify_committed_receipt(&record.intent, &receipt)
+                    .is_err()
+                {
+                    transaction.commit()?;
+                    self.record_markdown_reconciliation(intent_id, committed_at_ms)?;
+                    MarkdownRenderPublication::ReconciliationRequired
+                } else {
+                    persist_markdown_render_receipt(
+                        &transaction,
+                        &self.authority,
+                        &record.intent,
+                        &receipt,
+                    )?;
+                    transaction.commit()?;
+                    MarkdownRenderPublication::Committed(receipt)
+                }
+            }
+            MarkdownRenderOutcome::ReconciliationRequired => {
+                transaction.commit()?;
+                self.record_markdown_reconciliation(intent_id, committed_at_ms)?;
+                MarkdownRenderPublication::ReconciliationRequired
+            }
+        }))
+    }
+
+    /// Re-opens and verifies an already durable receipt through the Store's
+    /// descriptor boundary, then removes only its retained displaced base.
+    /// A mismatched final/base becomes durable typed reconciliation instead of
+    /// an externally callable journal mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal cannot be authenticated or retained
+    /// base cleanup cannot complete without an ambiguous filesystem state.
+    fn verify_and_cleanup_markdown_render_receipt(
+        &mut self,
+        intent_id: &str,
+        recorded_at_ms: i64,
+    ) -> Result<MarkdownReceiptCleanup, StoreError> {
+        let root = self.open_choice_markdown_root()?;
+        // Validate all signed authority and the exact receipt/session binding
+        // before touching the retained Owner base. A corrupted row must leave
+        // both files and encrypted bodies intact for typed reconciliation.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let intent = load_markdown_render_intent(&transaction, &self.authority, intent_id)?
+            .map(|record| record.intent)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let receipt = load_markdown_render_receipt(&transaction, &self.authority, intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        require_current_markdown_cleanup_authority(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            &intent,
+            &receipt,
+        )?;
+        if root.verify_committed_receipt(&intent, &receipt).is_err() {
+            transaction.commit()?;
+            self.record_markdown_reconciliation(intent_id, recorded_at_ms)?;
+            return Ok(MarkdownReceiptCleanup::ReconciliationRequired);
+        }
+        root.cleanup_displaced_base(&intent, &receipt)
+            .map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+        transaction.commit()?;
+        Ok(MarkdownReceiptCleanup::ReadyForRetirement)
+    }
+
+    /// Completes only the already-receipted Markdown cleanup path. It derives
+    /// the fixed private root, re-verifies final/base descriptors, performs
+    /// retained-base cleanup, and retires private bodies as one sealed Store
+    /// authority chain. Callers never receive a raw receipt, root, or body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unauthenticated journal, failed durable state
+    /// transition, or a filesystem state that cannot be safely classified.
+    pub fn complete_verified_markdown_render_cleanup(
+        &mut self,
+        intent_id: &str,
+        completed_at_ms: i64,
+    ) -> Result<MarkdownRenderCleanup, StoreError> {
+        match self.verify_and_cleanup_markdown_render_receipt(intent_id, completed_at_ms)? {
+            MarkdownReceiptCleanup::ReconciliationRequired => {
+                Ok(MarkdownRenderCleanup::ReconciliationRequired)
+            }
+            MarkdownReceiptCleanup::ReadyForRetirement => self
+                .retire_choice_private_bodies_after_render(intent_id, completed_at_ms)
+                .map(|snapshot| MarkdownRenderCleanup::Retired(Box::new(snapshot))),
+        }
+    }
+
+    /// Observes only the exact Host-created `~/Documents/OpenOpen` entry that
+    /// a command-owned confirmation may replace. The root is derived from the
+    /// current signed-in local account, never from RPC or a caller path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the canonical private root or its descriptor-bound
+    /// entry cannot be verified.
+    pub fn observe_choice_markdown_base(
+        &self,
+        relative_path: &str,
+    ) -> Result<Option<MarkdownBaseIdentity>, StoreError> {
+        let root = self
+            .choice_markdown_root
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        // Confirmation preview is read-only. A missing private root is an
+        // ordinary absent base, not permission for preview to create
+        // `~/Documents/OpenOpen`; only the confirmed render worker may do
+        // that. An existing but malformed root remains fail-closed.
+        match std::fs::symlink_metadata(root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(StoreError::ChoiceLoopStateConflict),
+            Ok(_) => MarkdownRoot::open(root)
+                .and_then(|markdown_root| markdown_root.observe_existing_entry(relative_path))
+                .map_err(|_| StoreError::ChoiceLoopStateConflict),
+        }
+    }
+
+    fn open_choice_markdown_root(&self) -> Result<MarkdownRoot, StoreError> {
+        let root = self
+            .choice_markdown_root
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        MarkdownRoot::open(root).map_err(|_| StoreError::ChoiceLoopStateConflict)
+    }
+
+    /// Records one durable, body-free reconciliation requirement. It does not
+    /// overwrite an Owner edit or retry publication; only the dedicated Host
+    /// reconciliation command can clear this marker for one explicit retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/tampered intent, audit failure, or an
+    /// attempt to replace a different durable reconciliation marker.
+    fn record_markdown_reconciliation(
+        &mut self,
+        intent_id: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        if recorded_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut record = load_markdown_render_intent(&transaction, &self.authority, intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let exact_pre_receipt_intent = current.session.id == record.intent.choice_session_id
+            && current.session.revision == record.intent.expected_session_revision
+            && matches!(
+                current.session.state,
+                ChoiceSessionState::Active | ChoiceSessionState::AwaitingConfirmation
+            );
+        let executing_after_receipt = current.session.id == record.intent.choice_session_id
+            && current.session.revision
+                == record
+                    .intent
+                    .expected_session_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?
+            && current.session.state == ChoiceSessionState::Executing;
+        if !exact_pre_receipt_intent && !executing_after_receipt {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let marker = StoredMarkdownReconciliation {
+            reason: "descriptor-conflict".to_owned(),
+            recorded_at_ms,
+        };
+        if record.reconciliation.as_ref() == Some(&marker) {
+            return Ok(());
+        }
+        if record.reconciliation.is_some() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        record.reconciliation = Some(marker);
+        update_markdown_render_intent(
+            &transaction,
+            &self.authority,
+            &record,
+            "reconciliation",
+            recorded_at_ms,
+        )?;
+        if current.session.state == ChoiceSessionState::AwaitingConfirmation {
+            let mut next = current.clone();
+            next.session.revision = next
+                .session
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            next.session.state = ChoiceSessionState::Active;
+            next.session.last_input_at_ms = recorded_at_ms.max(next.session.last_input_at_ms);
+            next.session.soft_idle_at_ms = next.session.last_input_at_ms + 1_800_000;
+            next.session.stale_review_at_ms = next.session.last_input_at_ms + 86_400_000;
+            next.session.pending_confirmation_id = None;
+            next.confirmation = None;
+            let mut recovery_set = current
+                .active_choice_set
+                .clone()
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            recovery_set.id = format!(
+                "reconfirm-{}",
+                &sha256_hex(format!("{}:{}", record.intent.id, next.session.revision).as_bytes())
+                    [..32]
+            );
+            recovery_set.session_revision = next.session.revision;
+            recovery_set.generated_at_ms = recorded_at_ms;
+            recovery_set.expires_on_revision = next.session.revision;
+            next.session.active_choice_set_id = Some(recovery_set.id.clone());
+            next.active_choice_set = Some(recovery_set);
+            if !next.is_permitted_successor_of(&current) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            persist_choice_loop_snapshot(&transaction, &self.authority, &next, recorded_at_ms)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads only command-owned metadata for restart cleanup after the raw
+    /// render body has been retired.  It is not a caller-supplied filesystem
+    /// API and cannot recreate a render without a retained encrypted body.
+    /// Returns the durable metadata for one command-owned render intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Store cannot open or validate the protected
+    /// render record.
+    pub fn markdown_render_intent(
+        &self,
+        intent_id: &str,
+    ) -> Result<Option<MarkdownRenderIntent>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        load_markdown_render_intent(&self.connection, &self.authority, intent_id)
+            .map(|record| record.map(|record| record.intent))
+    }
+
+    /// Returns the sole pending private render intent for a Choice session.
+    /// It exposes metadata only; callers never receive the encrypted body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unauditable/malformed journal or more than one
+    /// pending journal for the same foreground session.
+    pub fn pending_markdown_render_intent_for_session(
+        &self,
+        choice_session_id: &str,
+    ) -> Result<Option<MarkdownRenderIntent>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let intent_ids = self
+            .connection
+            .prepare("SELECT intent_id FROM choice_markdown_render_intent")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut matched = Vec::new();
+        for intent_id in intent_ids {
+            let stored =
+                load_markdown_render_intent(&self.connection, &self.authority, &intent_id)?
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            if stored.intent.choice_session_id == choice_session_id
+                && stored.plaintext_body.is_some()
+            {
+                matched.push(stored.intent);
+            }
+        }
+        match matched.len() {
+            0 => Ok(None),
+            1 => Ok(matched.pop()),
+            _ => Err(StoreError::ChoiceLoopStateConflict),
+        }
+    }
+
+    /// Loads an already durable receipt for idempotent private render replay.
+    /// It does not imply that the retained displaced base has been cleaned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed encrypted receipt or audit binding.
+    pub fn markdown_render_receipt(
+        &self,
+        intent_id: &str,
+    ) -> Result<Option<MarkdownRenderReceipt>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        load_markdown_render_receipt(&self.connection, &self.authority, intent_id)
+    }
+
+    /// Lower-level fixture seam. Production receipt commits always require a
+    /// sealed awaiting confirmation.
+    #[cfg(test)]
+    fn commit_markdown_render_receipt_for_test(
+        &mut self,
+        receipt: &MarkdownRenderReceipt,
+    ) -> Result<MarkdownRenderReceipt, StoreError> {
+        self.commit_markdown_render_receipt_inner(receipt, false)
+    }
+
+    #[cfg(test)]
+    fn commit_markdown_render_receipt_inner(
+        &mut self,
+        receipt: &MarkdownRenderReceipt,
+        require_confirmation: bool,
+    ) -> Result<MarkdownRenderReceipt, StoreError> {
+        if !receipt.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) =
+            load_markdown_render_receipt(&transaction, &self.authority, &receipt.intent_id)?
+        {
+            return if existing == *receipt {
+                Ok(receipt.clone())
+            } else {
+                Err(StoreError::ChoiceLoopStateConflict)
+            };
+        }
+        let stored =
+            load_markdown_render_intent(&transaction, &self.authority, &receipt.intent_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if receipt.final_entry != stored.intent.entry
+            || receipt.displaced_base != stored.intent.expected_base
+            || receipt.committed_at_ms < stored.intent.created_at_ms
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if !runtime.enabled
+            || runtime.revision != stored.intent.expected_generation
+            || current.session.id != stored.intent.choice_session_id
+            || current.session.revision != stored.intent.expected_session_revision
+            || (require_confirmation
+                && (current.session.state != ChoiceSessionState::AwaitingConfirmation
+                    || current.confirmation.is_none()
+                    || current.session.pending_confirmation_id.is_none()))
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_markdown_render_receipt(&transaction, &self.authority, &stored.intent, receipt)?;
+        transaction.commit()?;
+        Ok(receipt.clone())
+    }
+
+    /// Retires raw begin/D input only after a matching receipt has committed
+    /// under the current signed runtime.  The renderer calls this only after
+    /// its descriptor-relative cleanup has completed; a failure leaves the
+    /// encrypted body and receipt available for safe restart reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing receipt, runtime/session drift, or an
+    /// incomplete render journal.  It never deletes bodies on ambiguity.
+    #[allow(clippy::too_many_lines)] // One IMMEDIATE transaction keeps receipt verification, retirement, and the next state atomic.
+    fn retire_choice_private_bodies_after_render(
+        &mut self,
+        intent_id: &str,
+        retired_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if retired_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let stored = load_markdown_render_intent(&transaction, &self.authority, intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let receipt = load_markdown_render_receipt(&transaction, &self.authority, intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if stored.plaintext_body.is_none() {
+            let already_retired = current.session.id == stored.intent.choice_session_id
+                && matches!(
+                    current.session.state,
+                    ChoiceSessionState::Executing | ChoiceSessionState::SoftIdle
+                )
+                && current.session.revision
+                    == stored
+                        .intent
+                        .expected_session_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?
+                && receipt.final_entry == stored.intent.entry
+                && retired_at_ms >= receipt.committed_at_ms;
+            let cancelled_after_off = current.session.id == stored.intent.choice_session_id
+                && current.session.state == ChoiceSessionState::Cancelled
+                && current.session.revision
+                    == stored
+                        .intent
+                        .expected_session_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?
+                && receipt.final_entry == stored.intent.entry
+                && retired_at_ms >= receipt.committed_at_ms;
+            if !already_retired && !cancelled_after_off {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if current.session.id != stored.intent.choice_session_id
+            || current.session.revision != stored.intent.expected_session_revision
+            || receipt.final_entry != stored.intent.entry
+            || retired_at_ms < receipt.committed_at_ms
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        // Receipt-authenticated body retirement is a local deletion-only
+        // cleanup. It must remain resumable after protected Off/revision
+        // advancement; it neither starts work nor grants any effect.
+        purge_choice_private_bodies(
+            &transaction,
+            &self.authority,
+            &stored.intent.choice_session_id,
+            retired_at_ms,
+        )?;
+        retire_choice_refinement_results(
+            &transaction,
+            &self.authority,
+            &stored.intent.choice_session_id,
+            retired_at_ms,
+        )?;
+        retire_choice_refinement_contexts(
+            &transaction,
+            &self.authority,
+            &stored.intent.choice_session_id,
+            retired_at_ms,
+        )?;
+        persist_retired_markdown_render_intent(
+            &transaction,
+            &self.authority,
+            &stored.intent,
+            retired_at_ms,
+        )?;
+        // A successful confirmation journal must not leave the foreground
+        // path in a completed-looking but actionless confirmation state. A
+        // lower-level Store fixture may exercise journal retirement without a
+        // confirmation; that metadata-only path stays in its current state.
+        let next = if current.session.state == ChoiceSessionState::AwaitingConfirmation
+            && current.confirmation.is_some()
+        {
+            let mut next = current.clone();
+            let confirmation = current
+                .confirmation
+                .as_ref()
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            let rendered_entries = vec![receipt.final_entry.clone()];
+            let rendered_digest = canonical_document_manifest_digest(&rendered_entries)
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            if confirmation.markdown_manifest_digests.get(1) != Some(&rendered_digest) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            next.session.revision = next
+                .session
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            next.session.state = ChoiceSessionState::SoftIdle;
+            next.session.active_choice_set_id = None;
+            next.session.active_interpretation_revision = None;
+            next.interpretation = None;
+            next.active_choice_set = None;
+            // The verified Receipt and Markdown publication complete the
+            // confirmed direction. The next menu must come from a new private
+            // typed result, never from a revision-rewritten old ChoiceSet.
+            next.session.active_choice_set_id = None;
+            next.active_choice_set = None;
+            next.active_batch = None;
+            next.document_manifest = DocumentManifest {
+                root_version: current
+                    .document_manifest
+                    .root_version
+                    .checked_add(1)
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?,
+                generated_at_ms: retired_at_ms,
+                entries: rendered_entries,
+                aggregate_digest: rendered_digest,
+            };
+            // Keep the sealed, effect-free confirmation as a durable replay
+            // and separately-gated Reminder preparation reference. It is not
+            // a Mission/effect grant, but losing it would make an ambiguous
+            // confirmation response unrecoverable after the Markdown receipt.
+            if !next.is_permitted_successor_of(&current) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            persist_choice_loop_snapshot(&transaction, &self.authority, &next, retired_at_ms)?;
+            next
+        } else {
+            current
+        };
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Private Host timer transition. The scheduler supplies only an opaque
+    /// wake hint; this Store command rechecks the protected runtime, exact
+    /// revision, persisted deadline, and clock continuity before changing
+    /// state. It never starts model or effect work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid clock evidence, protected-runtime or
+    /// session drift, ambiguous time continuity, audit failure, or a
+    /// transaction conflict.
+    #[cfg(test)]
+    pub fn advance_choice_idle_state(
+        &mut self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+        expected_generation: u64,
+        clock: &ChoiceIdleClockEvidence,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        self.advance_choice_idle_state_classified(
+            choice_session_id,
+            expected_session_revision,
+            expected_generation,
+            clock,
+        )
+        .map(|outcome| outcome.snapshot().clone())
+    }
+
+    /// Applies the same private idle transition while preserving whether this
+    /// sample merely calibrated, proved a continuous no-op, or changed the
+    /// session. Host read and consuming paths use that distinction to prevent
+    /// a first/ambiguous clock sample from authorizing a stale `ChoiceSet`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid clock evidence, runtime/session drift,
+    /// ambiguous continuity, audit failure, or a transaction conflict.
+    pub fn advance_choice_idle_state_classified(
+        &mut self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+        expected_generation: u64,
+        clock: &ChoiceIdleClockEvidence,
+    ) -> Result<ChoiceIdleAdvance, StoreError> {
+        if !clock.is_valid() || expected_session_revision == 0 || expected_generation == 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if !runtime.enabled
+            || runtime.revision != expected_generation
+            || current.session.id != choice_session_id
+            || current.session.revision != expected_session_revision
+            || !matches!(
+                current.session.state,
+                ChoiceSessionState::Active | ChoiceSessionState::SoftIdle
+            )
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        // A first read after Store creation or a clock discontinuity is a
+        // calibration point, never elapsed-time evidence. It also cannot leave
+        // an old active ChoiceSet consumable: otherwise the first request would
+        // fail closed, then an immediate retry could treat the new anchor as
+        // continuous and consume pre-sleep/reboot authority. Invalid
+        // runtime/session callers are rejected above and therefore cannot
+        // launder an untrusted clock into either the anchor or session state.
+        let trusted_now_ms = match classify_choice_idle_clock(&transaction, &self.authority, clock)?
+        {
+            ChoiceIdleClockContinuity::Calibrate { trusted_now_ms } => {
+                return calibrate_choice_idle_state(
+                    transaction,
+                    &self.authority,
+                    current,
+                    clock,
+                    trusted_now_ms,
+                );
+            }
+            ChoiceIdleClockContinuity::Continuous { trusted_now_ms } => trusted_now_ms,
+            ChoiceIdleClockContinuity::Uncertain => {
+                return Err(StoreError::ChoiceClockUncertain);
+            }
+        };
+        let next_state = match current.session.state {
+            ChoiceSessionState::Active | ChoiceSessionState::SoftIdle
+                if trusted_now_ms >= current.session.stale_review_at_ms =>
+            {
+                ChoiceSessionState::StaleReview
+            }
+            ChoiceSessionState::Active if trusted_now_ms >= current.session.soft_idle_at_ms => {
+                ChoiceSessionState::SoftIdle
+            }
+            // A repeated scheduler wake has no authority to manufacture a
+            // new revision or audit entry after the one permitted soft-idle
+            // transition. Only a later stale deadline may advance it again.
+            ChoiceSessionState::SoftIdle | ChoiceSessionState::Active => {
+                transaction.commit()?;
+                return Ok(ChoiceIdleAdvance::Unchanged(current));
+            }
+            _ => return Err(StoreError::ChoiceLoopStateConflict),
+        };
+        let mut next = current.clone();
+        next.session.revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = next_state;
+        match next_state {
+            ChoiceSessionState::SoftIdle => {
+                // A timer has no authority to relabel old model output as a
+                // fresh recap. Retire the old set; an explicit authenticated
+                // owner-return command must create any later ChoiceSet.
+                next.session.active_choice_set_id = None;
+                next.active_choice_set = None;
+            }
+            ChoiceSessionState::StaleReview => {
+                // Twenty-four-hour staleness retires every old option. A
+                // timer cannot manufacture a fresh authenticated ChoiceSet,
+                // and the prior menu must not remain selectable.
+                next.session.active_choice_set_id = None;
+                next.active_choice_set = None;
+            }
+            _ => return Err(StoreError::ChoiceLoopStateConflict),
+        }
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_idle_clock_anchor(&transaction, &self.authority, clock, trusted_now_ms)?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, trusted_now_ms)?;
+        transaction.commit()?;
+        Ok(ChoiceIdleAdvance::Transitioned(next))
+    }
+
+    /// Resolves an existing `choice.begin` request before the Host constructs
+    /// any new session state. It exposes only the replay-safe acceptance
+    /// projection; the encrypted local question remains Store-private.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted/audited intake record is malformed,
+    /// has a changed idempotency digest, or cannot be verified.
+    pub fn choice_begin_replay(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<ChoiceBeginAccepted>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        match load_choice_begin_record(&self.connection, &self.authority, request_id)? {
+            Some(record) if record.request_digest == request_digest => Ok(Some(record.accepted)),
+            Some(_) => Err(StoreError::ChoiceBeginConflict),
+            None if choice_private_body_tombstone_exists(
+                &self.connection,
+                &self.authority,
+                "begin",
+                request_id,
+            )? =>
+            {
+                // A retired request is deliberately non-replayable. Its body
+                // is gone, but the idempotency identity remains durable so a
+                // restart cannot turn the same request ID into new intake.
+                Err(StoreError::ChoiceBeginConflict)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Commits the sole public first-local-question transition. The Host has
+    /// already derived every trusted envelope, batch, session, and operation
+    /// field; this Store boundary accepts no caller-provided snapshot route.
+    ///
+    /// Exact request replays return their original accepted operation. A
+    /// changed request ID, model/catalog/protocol mismatch, unresolved session,
+    /// malformed initial state, or audit conflict leaves no partial record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the begin record cannot be atomically bound to
+    /// the persisted current model selection and foreground Choice state.
+    #[cfg(test)]
+    pub fn begin_choice_session(
+        &mut self,
+        record: &ChoiceBeginRecord,
+        snapshot: &ChoiceLoopSnapshot,
+    ) -> Result<ChoiceBeginAccepted, StoreError> {
+        self.begin_choice_session_with_clock(
+            record,
+            snapshot,
+            &ChoiceIdleClockEvidence {
+                boot_id: "test-boot".to_owned(),
+                wall_clock_ms: record.accepted_at_ms,
+                monotonic_ms: record.accepted_at_ms,
+            },
+        )
+    }
+
+    /// Commits a new first-question session together with its Host-owned clock
+    /// calibration. This prevents the immediate continuity read from treating
+    /// a just-accepted local question as an untrusted post-reboot sample.
+    /// Exact request replay returns before the anchor write and remains
+    /// strictly read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid clock evidence, request/session drift,
+    /// protected-runtime mismatch, replay conflict, or an atomic Store/audit
+    /// failure.
+    pub fn begin_choice_session_with_clock(
+        &mut self,
+        record: &ChoiceBeginRecord,
+        snapshot: &ChoiceLoopSnapshot,
+        clock: &ChoiceIdleClockEvidence,
+    ) -> Result<ChoiceBeginAccepted, StoreError> {
+        self.begin_choice_session_with_clock_and_cursor(record, snapshot, clock, None)
+            .map(|(accepted, _)| accepted)
+    }
+
+    /// Atomically accepts one Host-derived iMessage Choice intake and advances
+    /// its exact recovery cursor. Cursor validation happens before any Choice
+    /// mutation so an out-of-order row cannot strand or partially create a
+    /// foreground session. The boolean is true only while the exact durable
+    /// initial operation still requires its private worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any Choice, pairing, cursor, runtime, or replay
+    /// conflict without committing a partial intake.
+    pub fn begin_imessage_choice_session_with_clock(
+        &mut self,
+        record: &ChoiceBeginRecord,
+        snapshot: &ChoiceLoopSnapshot,
+        clock: &ChoiceIdleClockEvidence,
+        cursor: &ChannelCursor,
+    ) -> Result<(ChoiceBeginAccepted, bool), StoreError> {
+        if cursor.channel != ChannelKind::IMessage {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        self.begin_choice_session_with_clock_and_cursor(record, snapshot, clock, Some(cursor))
+    }
+
+    /// Atomically recognizes an exact durable self-chat intake replay,
+    /// advances its cursor, and reports whether the private initial worker is
+    /// still required. No caller-supplied body or identity is accepted here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for pairing, cursor, runtime, audit, or replay drift.
+    pub fn replay_imessage_choice_begin_with_cursor(
+        &mut self,
+        request_id: &str,
+        request_digest: &str,
+        cursor: &ChannelCursor,
+    ) -> Result<Option<(ChoiceBeginRecord, bool)>, StoreError> {
+        if request_id.is_empty()
+            || request_id.len() > 256
+            || request_id.as_bytes().contains(&0)
+            || !is_sha256_hex(request_digest)
+            || cursor.channel != ChannelKind::IMessage
+            || validate_cursor(cursor).is_err()
+        {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let Some(record) = load_choice_begin_record(&transaction, &self.authority, request_id)?
+        else {
+            return Ok(None);
+        };
+        if record.request_digest != request_digest
+            || record.source_envelope.provider_message_id.is_none()
+        {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        let pairing = load_channel_pairing(&transaction, &self.authority, cursor.channel)?
+            .ok_or(StoreError::ChoiceBeginConflict)?;
+        if pairing.conversation_id != cursor.conversation_id || pairing.imessage.is_none() {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        if let Some(current) = load_channel_cursor(
+            &transaction,
+            &self.authority,
+            cursor.channel,
+            &cursor.conversation_id,
+        )? {
+            if current != *cursor && cursor.order <= current.order {
+                return Err(StoreError::ChannelObservationConflict);
+            }
+            if current != *cursor {
+                write_channel_cursor(&transaction, &self.authority, cursor)?;
+            }
+        } else {
+            write_channel_cursor(&transaction, &self.authority, cursor)?;
+        }
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?;
+        let requires_worker = current.as_ref().is_some_and(|value| {
+            value.session.id == record.accepted.choice_session_id
+                && value.session.state == ChoiceSessionState::Interpreting
+                && value.session.revision == record.accepted.accepted_session_revision
+                && value.active_choice_set.is_none()
+        });
+        transaction.commit()?;
+        Ok(Some((record, requires_worker)))
+    }
+
+    #[allow(clippy::too_many_lines)] // Atomic intake, replay, audit, clock, and optional cursor ownership remain one transaction.
+    fn begin_choice_session_with_clock_and_cursor(
+        &mut self,
+        record: &ChoiceBeginRecord,
+        snapshot: &ChoiceLoopSnapshot,
+        clock: &ChoiceIdleClockEvidence,
+        cursor: Option<&ChannelCursor>,
+    ) -> Result<(ChoiceBeginAccepted, bool), StoreError> {
+        if !record.is_valid()
+            || !snapshot.is_valid()
+            || !choice_begin_matches_snapshot(record, snapshot)
+            || !clock.is_valid()
+            || clock.wall_clock_ms != record.accepted_at_ms
+            || cursor.is_some_and(|value| validate_cursor(value).is_err())
+        {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled || runtime.revision != record.runtime_revision {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+
+        if let Some(cursor) = cursor {
+            let pairing = load_channel_pairing(&transaction, &self.authority, cursor.channel)?
+                .ok_or(StoreError::ChoiceBeginConflict)?;
+            if pairing.conversation_id != cursor.conversation_id
+                || pairing.imessage.is_none()
+                || record.source_envelope.provider_message_id.is_none()
+                || record.source_envelope.delivery_binding_id
+                    != snapshot
+                        .session
+                        .primary_delivery_binding_id
+                        .clone()
+                        .ok_or(StoreError::ChoiceBeginConflict)?
+            {
+                return Err(StoreError::ChoiceBeginConflict);
+            }
+            if let Some(current) = load_channel_cursor(
+                &transaction,
+                &self.authority,
+                cursor.channel,
+                &cursor.conversation_id,
+            )? && current != *cursor
+                && cursor.order <= current.order
+            {
+                return Err(StoreError::ChannelObservationConflict);
+            }
+        }
+
+        if let Some(existing) =
+            load_choice_begin_record(&transaction, &self.authority, &record.accepted.request_id)?
+        {
+            if existing.request_digest == record.request_digest {
+                if let Some(cursor) = cursor
+                    && load_channel_cursor(
+                        &transaction,
+                        &self.authority,
+                        cursor.channel,
+                        &cursor.conversation_id,
+                    )?
+                    .as_ref()
+                        != Some(cursor)
+                {
+                    write_channel_cursor(&transaction, &self.authority, cursor)?;
+                }
+                let current = load_choice_loop_snapshot(&transaction, &self.authority)?;
+                let requires_worker = current.as_ref().is_some_and(|value| {
+                    value.session.id == existing.accepted.choice_session_id
+                        && value.session.state == ChoiceSessionState::Interpreting
+                        && value.session.revision == existing.accepted.accepted_session_revision
+                        && value.active_choice_set.is_none()
+                });
+                transaction.commit()?;
+                return Ok((existing.accepted, requires_worker));
+            }
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+
+        let selected = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceBeginConflict)?;
+        if selected != record.model_selection {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+
+        match load_choice_loop_snapshot(&transaction, &self.authority)? {
+            Some(current)
+                if !matches!(
+                    current.session.state,
+                    ChoiceSessionState::Completed
+                        | ChoiceSessionState::Cancelled
+                        | ChoiceSessionState::Executing
+                ) || !snapshot.is_permitted_successor_of(&current) =>
+            {
+                return Err(StoreError::ChoiceBeginConflict);
+            }
+            None if snapshot.session.revision != 1 => return Err(StoreError::ChoiceBeginConflict),
+            Some(_) | None => {}
+        }
+
+        persist_choice_begin_record(&transaction, &self.authority, record)?;
+        persist_choice_loop_snapshot(
+            &transaction,
+            &self.authority,
+            snapshot,
+            record.accepted_at_ms,
+        )?;
+        persist_choice_idle_clock_anchor(
+            &transaction,
+            &self.authority,
+            clock,
+            clock.wall_clock_ms,
+        )?;
+        if let Some(cursor) = cursor {
+            write_channel_cursor(&transaction, &self.authority, cursor)?;
+        }
+        transaction.commit()?;
+        Ok((record.accepted.clone(), true))
+    }
+
+    /// Commits the first Choice result through the Host-only operation path.
+    /// There is intentionally no RPC accepting this shape: the Host supplies
+    /// the operation/generation fence after it has validated a terminal model
+    /// result, while this transaction binds it to the durable intake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any stale, replayed-with-different-content,
+    /// provenance, runtime, audit, or snapshot-transition mismatch.
+    pub fn commit_initial_choice_result(
+        &mut self,
+        result: &ChoiceInitialResult,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if !result.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+
+        let record = load_choice_begin_record_by_operation(
+            &transaction,
+            &self.authority,
+            &result.operation_id,
+        )?
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled
+            || runtime.revision != record.runtime_revision
+            || result.expected_generation != record.runtime_revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if load_choice_model_selection(&transaction, &self.authority)?.as_ref()
+            != Some(&record.model_selection)
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+
+        if current.session.id == record.accepted.choice_session_id
+            && current.session.state == ChoiceSessionState::Active
+            && current.interpretation.as_ref() == Some(&result.interpretation)
+            && current.active_choice_set.as_ref() == Some(&result.choice_set)
+        {
+            return Ok(current);
+        }
+        if current.session.id != record.accepted.choice_session_id
+            || current.session.state != ChoiceSessionState::Interpreting
+            || current.session.revision != result.expected_session_revision
+            || current.active_batch.as_ref() != Some(&record.batch)
+            || current.interpretation.is_some()
+            || current.active_choice_set.is_some()
+            || current.last_selection.is_some()
+            || current.confirmation.is_some()
+            || current.document_manifest != record.source_manifest
+            || result.source_manifest_digest != record.source_manifest.aggregate_digest
+            || result.persona_revision != record.persona_revision
+            || result.completed_at_ms < record.accepted_at_ms
+            || !model_provenance_matches_selection(
+                &result.model_provenance,
+                &record.model_selection,
+            )
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+
+        let next_revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if result.choice_set.choice_session_id != current.session.id
+            || result.interpretation.choice_session_id != current.session.id
+            || result.choice_set.session_revision != next_revision
+            || result.choice_set.expires_on_revision != next_revision
+            || result.choice_set.interpretation_revision != result.interpretation.revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+
+        let mut next = current.clone();
+        next.session.revision = next_revision;
+        next.session.state = ChoiceSessionState::Active;
+        next.session.last_input_at_ms =
+            result.completed_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.active_interpretation_revision = Some(result.interpretation.revision);
+        next.session.active_choice_set_id = Some(result.choice_set.id.clone());
+        next.session.model_selection_state = ModelSelectionState::Selected {
+            model_provenance_ref: result.model_provenance.id.clone(),
+        };
+        next.active_batch = None;
+        next.interpretation = Some(result.interpretation.clone());
+        next.active_choice_set = Some(result.choice_set.clone());
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, result.completed_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Records a bounded, durable fail-closed result for the one private
+    /// initial Choice generation. This is deliberately not a retry route: it
+    /// only retires the sealed intake batch so a stalled or malformed model
+    /// result cannot leave a foreground session indefinitely interpreting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the exact accepted operation is still the
+    /// current protected-On interpreting session. A cancelled, Off, stale, or
+    /// replayed operation therefore cannot change durable continuity.
+    pub fn block_initial_choice_operation(
+        &mut self,
+        operation_id: &str,
+        expected_generation: u64,
+        blocked_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if blocked_at_ms < 0 || operation_id.is_empty() || expected_generation == 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let record =
+            load_choice_begin_record_by_operation(&transaction, &self.authority, operation_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled
+            || runtime.revision != record.runtime_revision
+            || expected_generation != record.runtime_revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if current.session.id != record.accepted.choice_session_id {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if current.session.state == ChoiceSessionState::Blocked {
+            return Ok(current);
+        }
+        if current.session.state != ChoiceSessionState::Interpreting
+            || current.session.revision != record.accepted.accepted_session_revision
+            || current.active_batch.as_ref() != Some(&record.batch)
+            || current.interpretation.is_some()
+            || current.active_choice_set.is_some()
+            || current.last_selection.is_some()
+            || current.confirmation.is_some()
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let mut next = current.clone();
+        next.session.revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = ChoiceSessionState::Blocked;
+        next.session.last_input_at_ms = blocked_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.active_batch = None;
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, blocked_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Cancels the current foreground Choice session without granting or
+    /// performing any external effect. The Host calls this only after it has
+    /// retired the active generation token, so a late model result cannot
+    /// replace the durable terminal snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/off runtime revision, invalid audited
+    /// Store state, or any transition that cannot atomically retire the
+    /// current foreground session.
+    pub fn cancel_choice_session(
+        &mut self,
+        expected_runtime_revision: u64,
+        cancelled_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if cancelled_at_ms < 0 || expected_runtime_revision == 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled || runtime.revision != expected_runtime_revision {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if matches!(
+            current.session.state,
+            ChoiceSessionState::Completed | ChoiceSessionState::Cancelled
+        ) {
+            return Ok(current);
+        }
+        let mut next = current.clone();
+        next.session.revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = ChoiceSessionState::Cancelled;
+        next.session.last_input_at_ms = cancelled_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.active_choice_set_id = None;
+        next.session.active_interpretation_revision = None;
+        next.session.pending_confirmation_id = None;
+        next.active_batch = None;
+        next.interpretation = None;
+        next.active_choice_set = None;
+        next.last_selection = None;
+        next.pending_refinement_operation = None;
+        next.confirmation = None;
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, cancelled_at_ms)?;
+        purge_choice_private_bodies(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            cancelled_at_ms,
+        )?;
+        retire_choice_refinement_results(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            cancelled_at_ms,
+        )?;
+        retire_choice_refinement_contexts(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            cancelled_at_ms,
+        )?;
+        retire_choice_markdown_intents_on_cancel(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            cancelled_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Atomically replaces the one global foreground Choice Loop snapshot.
+    /// Exact retries are idempotent. Any revision, stale `ChoiceSet`, document
+    /// manifest, or encrypted/audit binding mismatch fails closed before a
+    /// partial session state can become visible after restart.
+    #[cfg(test)]
+    pub(crate) fn save_choice_loop_snapshot(
+        &mut self,
+        snapshot: &ChoiceLoopSnapshot,
+        updated_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if updated_at_ms < 0 || !snapshot.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) = load_choice_loop_snapshot(&transaction, &self.authority)? {
+            if existing == *snapshot {
+                return Ok(existing);
+            }
+            let existing_updated_at_ms: i64 = transaction.query_row(
+                "SELECT updated_at_ms FROM choice_loop_state WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if updated_at_ms < existing_updated_at_ms
+                || !snapshot.is_permitted_successor_of(&existing)
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        }
+        persist_choice_loop_snapshot(&transaction, &self.authority, snapshot, updated_at_ms)?;
+        transaction.commit()?;
+        Ok(snapshot.clone())
+    }
+
+    /// Commits the sole production Selection transition. UI and adapters never
+    /// receive whole-snapshot write authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale, replayed, cross-session, model-provenance,
+    /// Store, audit, or transaction conflicts.
+    pub fn commit_choice_selection(
+        &mut self,
+        selection: &Selection,
+        expected_generation: u64,
+        updated_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        self.commit_choice_selection_inner(selection, None, expected_generation, updated_at_ms)
+    }
+
+    /// Commits the Host-derived D path.  The plaintext remains only in the
+    /// encrypted request record; callers cannot supply its batch identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or stale intake, runtime/session or
+    /// provenance drift, audit failure, or a transaction conflict.
+    pub fn commit_choice_d_selection(
+        &mut self,
+        record: &ChoiceDIntakeRecord,
+        expected_generation: u64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        self.commit_choice_selection_inner(
+            &Selection::NaturalConversationSelection(record.selection.clone()),
+            Some(record),
+            expected_generation,
+            record.selection.selected_at_ms,
+        )
+    }
+
+    /// Records one authenticated owner re-entry from a durable idle review.
+    /// This has no caller-supplied session, `ChoiceSet`, context, provenance, or
+    /// time fields: the Host supplies only its protected runtime generation.
+    /// An exact already-pending resume is an idempotent recovery read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, drifted, off, missing-private-context,
+    /// audit, or transaction-conflicting state.
+    #[allow(clippy::too_many_lines)] // One IMMEDIATE transaction binds every resume fence.
+    pub fn begin_choice_resume(
+        &mut self,
+        expected_generation: u64,
+        resumed_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if expected_generation == 0 || resumed_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if !runtime.enabled || runtime.revision != expected_generation {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let selected_model = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if current.session.state == ChoiceSessionState::Refining {
+            let operation = current
+                .pending_refinement_operation
+                .as_ref()
+                .filter(|operation| operation.is_owner_resume())
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            if operation.expected_generation == expected_generation
+                && operation.choice_session_id == current.session.id
+                && operation.expected_session_revision == current.session.revision
+                && model_provenance_matches_selection(&operation.model_provenance, &selected_model)
+            {
+                return Ok(current);
+            }
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let prior_state = current.session.state;
+        if !matches!(
+            prior_state,
+            ChoiceSessionState::SoftIdle | ChoiceSessionState::StaleReview
+        ) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let begin = load_choice_begin_record_by_session(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+        )?;
+        let (source_envelope_id, conversation_turn_batch_id, persona_revision, interpretation) =
+            if let Some(begin) = begin {
+                if begin.source_manifest.aggregate_digest
+                    != current.document_manifest.aggregate_digest
+                    || begin.accepted.choice_session_id != current.session.id
+                    || begin.runtime_revision == 0
+                {
+                    return Err(StoreError::ChoiceLoopStateConflict);
+                }
+                (
+                    begin.accepted.source_envelope_id,
+                    begin.accepted.conversation_turn_batch_id,
+                    begin.persona_revision,
+                    current
+                        .interpretation
+                        .clone()
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?,
+                )
+            } else {
+                // After a verified Receipt + Markdown publication, private raw
+                // intake has been retired. The sealed confirmation is the only
+                // bounded typed context allowed to mint the next-choice worker.
+                let confirmation = current
+                    .confirmation
+                    .as_ref()
+                    .filter(|_| prior_state == ChoiceSessionState::SoftIdle)
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                let marker = sha256_hex(
+                    format!("{}:{}", confirmation.id, confirmation.payload_digest).as_bytes(),
+                );
+                let interpretation = InterpretationFrame {
+                    choice_session_id: current.session.id.clone(),
+                    revision: confirmation.interpretation_revision,
+                    understood_goal: confirmation.goal.clone(),
+                    current_context: format!(
+                        "The confirmed plan is complete. {} ordered step(s) were recorded in {}.",
+                        confirmation.steps.len(),
+                        confirmation.markdown_entry.relative_path
+                    ),
+                    assumptions: Vec::new(),
+                    constraints: confirmation.permissions.clone(),
+                    uncertainties: Vec::new(),
+                    what_to_avoid: confirmation.effect_classes.clone(),
+                    source_manifest_digest: current.document_manifest.aggregate_digest.clone(),
+                };
+                if !interpretation.is_valid() {
+                    return Err(StoreError::ChoiceLoopStateConflict);
+                }
+                (
+                    format!("post-receipt-envelope-{}", &marker[..24]),
+                    format!("post-receipt-batch-{}", &marker[..24]),
+                    confirmation.persona_revision.clone(),
+                    interpretation,
+                )
+            };
+        let next_revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let state_marker = match prior_state {
+            ChoiceSessionState::SoftIdle => "soft-idle",
+            ChoiceSessionState::StaleReview => "stale-review",
+            _ => return Err(StoreError::ChoiceLoopStateConflict),
+        };
+        let operation_id = format!("resume-{}-{}", current.session.id, next_revision);
+        let selection_id = format!(
+            "resume-{}-{}-{}",
+            state_marker, current.session.id, next_revision
+        );
+        let model_provenance = selected_model
+            .turn_provenance(
+                format!("resume-provenance-{next_revision}"),
+                format!("resume-turn-{next_revision}"),
+            )
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let operation = ChoiceRefinementOperation {
+            id: operation_id.clone(),
+            selection_id: selection_id.clone(),
+            choice_session_id: current.session.id.clone(),
+            source_envelope_id: source_envelope_id.clone(),
+            conversation_turn_batch_id: conversation_turn_batch_id.clone(),
+            expected_session_revision: next_revision,
+            expected_generation,
+            model_provenance,
+            source_manifest_digest: current.document_manifest.aggregate_digest.clone(),
+            persona_revision,
+            d_request_id: None,
+            d_input_digest: None,
+            created_at_ms: resumed_at_ms,
+        };
+        let context = ChoiceRefinementContext {
+            operation_id,
+            selection_id,
+            choice_session_id: current.session.id.clone(),
+            source_envelope_id,
+            conversation_turn_batch_id,
+            expected_session_revision: next_revision,
+            interpretation,
+            selected_option: None,
+        };
+        if !operation.is_valid() || !operation.is_owner_resume() || !context.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let mut next = current.clone();
+        next.session.revision = next_revision;
+        next.session.state = ChoiceSessionState::Refining;
+        next.session.last_input_at_ms = resumed_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.active_choice_set_id = None;
+        next.active_choice_set = None;
+        next.active_batch = None;
+        next.pending_refinement_operation = Some(operation);
+        next.session.pending_confirmation_id = None;
+        next.confirmation = None;
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_refinement_context(&transaction, &self.authority, &context, resumed_at_ms)?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, resumed_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Resolves an exact durable D request before the Host reserves a model
+    /// operation. This makes an ambiguous transport retry return the same
+    /// snapshot whether refinement is pending or already complete, without
+    /// reopening work or accepting a changed request digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid encrypted request/audit binding or a
+    /// changed request identity. Retired inputs remain non-replayable.
+    pub fn choice_d_replay(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let Some(record) = load_choice_d_record(&self.connection, &self.authority, request_id)?
+        else {
+            return if choice_private_body_tombstone_exists(
+                &self.connection,
+                &self.authority,
+                "d",
+                request_id,
+            )? {
+                Err(StoreError::ChoiceLoopStateConflict)
+            } else {
+                Ok(None)
+            };
+        };
+        if record.request_digest != request_digest {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let expected_selection = Selection::NaturalConversationSelection(record.selection.clone());
+        let pending_matches = snapshot
+            .pending_refinement_operation
+            .as_ref()
+            .is_some_and(|operation| operation.d_request_id.as_deref() == Some(request_id));
+        if snapshot.last_selection.as_ref() != Some(&expected_selection) && !pending_matches {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Loads the Host-private semantic context for the exact pending
+    /// refinement operation. It is never part of a UI snapshot or RPC write
+    /// shape, and authenticated audit/blob bindings are verified before the
+    /// worker can construct its bounded model brief.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a retired, stale, tampered, or mismatched context.
+    pub fn choice_refinement_context(
+        &self,
+        operation: &ChoiceRefinementOperation,
+    ) -> Result<ChoiceRefinementContext, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if snapshot.pending_refinement_operation.as_ref() != Some(operation)
+            || snapshot.session.state != ChoiceSessionState::Refining
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let context =
+            load_choice_refinement_context(&self.connection, &self.authority, &operation.id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if context.operation_id != operation.id
+            || context.selection_id != operation.selection_id
+            || context.choice_session_id != operation.choice_session_id
+            || context.source_envelope_id != operation.source_envelope_id
+            || context.conversation_turn_batch_id != operation.conversation_turn_batch_id
+            || context.expected_session_revision != operation.expected_session_revision
+            || context.interpretation.choice_session_id != operation.choice_session_id
+            || (!operation.is_owner_resume()
+                && (operation.d_request_id.is_some()) != context.selected_option.is_none())
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        Ok(context)
+    }
+
+    /// Returns the encrypted D body only for its exact pending Host operation.
+    /// A/B/C operations have no D body, and no public RPC can query this
+    /// record by arbitrary request ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale, retired, malformed, or audit-unbound D
+    /// intake state.
+    pub fn choice_d_intake_for_refinement(
+        &self,
+        operation: &ChoiceRefinementOperation,
+    ) -> Result<Option<ChoiceDIntakeRecord>, StoreError> {
+        let Some(request_id) = operation.d_request_id.as_deref() else {
+            return Ok(None);
+        };
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if snapshot.pending_refinement_operation.as_ref() != Some(operation)
+            || snapshot.session.state != ChoiceSessionState::Refining
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let record = load_choice_d_record(&self.connection, &self.authority, request_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if record.selection.id != operation.selection_id
+            || record.selection.choice_session_id != operation.choice_session_id
+            || record.selection.expected_session_revision.checked_add(1)
+                != Some(operation.expected_session_revision)
+            || record.input.request_id != request_id
+            || record.input.bounded_text.is_empty()
+            || record.source_envelope.id != operation.source_envelope_id
+            || record.batch.id != operation.conversation_turn_batch_id
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        Ok(Some(record))
+    }
+
+    /// Reads an exact A/B/C replay before a Host worker slot is acquired.
+    /// A different selection never receives this shortcut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid selection or an unauditable durable
+    /// Choice snapshot.
+    pub fn choice_selection_replay(
+        &self,
+        selection: &Selection,
+    ) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+        if !selection.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?;
+        Ok(snapshot.filter(|snapshot| snapshot.last_selection.as_ref() == Some(selection)))
+    }
+
+    /// Reads an exact A/B/C replay using only caller-owned selection identity.
+    /// The accepted clock is deliberately excluded: the Host records it when
+    /// first accepting the selection and an RPC caller must never be able to
+    /// steer idle/stale deadlines by changing a timestamp on retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed selection or an unauditable snapshot.
+    pub fn choice_option_selection_replay(
+        &self,
+        selection: &OptionSelection,
+    ) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+        if !Selection::OptionSelection(selection.clone()).is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verified_audit_tail(&self.connection, &self.authority)?;
+        let snapshot = load_choice_loop_snapshot(&self.connection, &self.authority)?;
+        Ok(snapshot.filter(|snapshot| {
+            matches!(snapshot.last_selection.as_ref(), Some(Selection::OptionSelection(stored))
+                if stored.id == selection.id
+                    && stored.choice_session_id == selection.choice_session_id
+                    && stored.choice_set_id == selection.choice_set_id
+                    && stored.selected_option_id == selection.selected_option_id
+                    && stored.expected_session_revision == selection.expected_session_revision)
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)] // One transaction must visibly bind selection, operation, snapshot, and audit.
+    fn commit_choice_selection_inner(
+        &mut self,
+        selection: &Selection,
+        d_record: Option<&ChoiceDIntakeRecord>,
+        expected_generation: u64,
+        updated_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if updated_at_ms < 0 || expected_generation == 0 || !selection.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if matches!(selection, Selection::NaturalConversationSelection(_)) != d_record.is_some()
+            || d_record.is_some_and(|record| !record.is_valid())
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let existing_updated_at_ms: i64 = transaction.query_row(
+            "SELECT updated_at_ms FROM choice_loop_state WHERE singleton_id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if updated_at_ms < existing_updated_at_ms
+            || !runtime.enabled
+            || runtime.revision != expected_generation
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let selected_at_ms = match selection {
+            Selection::OptionSelection(value) => value.selected_at_ms,
+            Selection::NaturalConversationSelection(value) => value.selected_at_ms,
+        };
+        if selected_at_ms != updated_at_ms {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if current.last_selection.as_ref() == Some(selection) {
+            if let Some(record) = d_record {
+                let stored =
+                    load_choice_d_record(&transaction, &self.authority, &record.input.request_id)?
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                if stored != *record {
+                    return Err(StoreError::ChoiceLoopStateConflict);
+                }
+            }
+            return Ok(current);
+        }
+        if current.session.state != ChoiceSessionState::Active {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let choice_set = current
+            .active_choice_set
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let (session_id, choice_set_id, expected_revision) = match selection {
+            Selection::OptionSelection(value) => (
+                &value.choice_session_id,
+                &value.choice_set_id,
+                value.expected_session_revision,
+            ),
+            Selection::NaturalConversationSelection(value) => (
+                &value.choice_session_id,
+                &value.choice_set_id,
+                value.expected_session_revision,
+            ),
+        };
+        if session_id != &current.session.id
+            || choice_set_id != &choice_set.id
+            || expected_revision != current.session.revision
+            || choice_set.expires_on_revision != current.session.revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        match selection {
+            Selection::OptionSelection(value)
+                if choice_set
+                    .options
+                    .iter()
+                    .any(|option| option.id == value.selected_option_id) => {}
+            Selection::NaturalConversationSelection(value)
+                if choice_set.d_available
+                    && d_record.is_some_and(|record| {
+                        record.selection == *value
+                            && current.session.primary_delivery_binding_id.as_deref()
+                                == Some(&record.batch.delivery_binding_id)
+                    }) => {}
+            _ => return Err(StoreError::ChoiceLoopStateConflict),
+        }
+        let selected_model = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if !session_model_matches_choice_set(&current.session, choice_set)
+            || !selected_model_matches_choice_set(&selected_model, choice_set)
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        // `active_batch` is intentionally retired by the selection state
+        // transition. Capture the complete Host-authenticated source tuple
+        // first, from the D intake for D or the still-encrypted initial begin
+        // record for A/B/C. Never reconstruct it from a delivery binding or
+        // another mutable snapshot field.
+        let (source_envelope_id, conversation_turn_batch_id) = if let Some(record) = d_record {
+            (record.source_envelope.id.clone(), record.batch.id.clone())
+        } else {
+            let record = load_choice_begin_record_by_session(
+                &transaction,
+                &self.authority,
+                &current.session.id,
+            )?;
+            if let Some(record) = record {
+                if record.accepted.choice_session_id != current.session.id
+                    || record.accepted.source_envelope_id != record.source_envelope.id
+                    || record.accepted.conversation_turn_batch_id != record.batch.id
+                {
+                    return Err(StoreError::ChoiceLoopStateConflict);
+                }
+                (
+                    record.accepted.source_envelope_id,
+                    record.accepted.conversation_turn_batch_id,
+                )
+            } else {
+                // This narrow compatibility shape is only valid while the
+                // authenticated sealed batch remains in the current signed
+                // snapshot. It does not infer identity after the batch is
+                // retired, and production begin flow always uses the
+                // encrypted begin record above.
+                let batch = current
+                    .active_batch
+                    .as_ref()
+                    .filter(|batch| {
+                        batch.choice_session_id == current.session.id
+                            && batch.source_envelope_ids.len() == 1
+                            && batch.delivery_binding_id
+                                == current
+                                    .session
+                                    .primary_delivery_binding_id
+                                    .as_deref()
+                                    .unwrap_or_default()
+                    })
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                (batch.source_envelope_ids[0].clone(), batch.id.clone())
+            }
+        };
+        let mut next = current.clone();
+        next.session.revision = next
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = ChoiceSessionState::Refining;
+        next.session.last_input_at_ms = updated_at_ms.max(next.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.active_choice_set_id = None;
+        next.active_choice_set = None;
+        next.active_batch = None;
+        next.last_selection = Some(selection.clone());
+        let refinement_operation = ChoiceRefinementOperation {
+            id: format!("refinement-{}", choice_selection_id(selection)),
+            selection_id: choice_selection_id(selection).to_owned(),
+            choice_session_id: next.session.id.clone(),
+            source_envelope_id: source_envelope_id.clone(),
+            conversation_turn_batch_id: conversation_turn_batch_id.clone(),
+            expected_session_revision: next.session.revision,
+            expected_generation,
+            model_provenance: choice_set.model_provenance.clone(),
+            source_manifest_digest: next.document_manifest.aggregate_digest.clone(),
+            persona_revision: choice_set.persona_revision.clone(),
+            d_request_id: d_record.map(|record| record.input.request_id.clone()),
+            d_input_digest: d_record.map(|record| {
+                format!("{:x}", Sha256::digest(record.input.bounded_text.as_bytes()))
+            }),
+            created_at_ms: updated_at_ms,
+        };
+        // The worker must receive the selected semantic direction, not merely
+        // an opaque Selection identifier. Keep it in a private encrypted
+        // record; D plaintext remains exclusively in the D intake record.
+        let refinement_context = ChoiceRefinementContext {
+            operation_id: refinement_operation.id.clone(),
+            selection_id: refinement_operation.selection_id.clone(),
+            choice_session_id: next.session.id.clone(),
+            source_envelope_id,
+            conversation_turn_batch_id,
+            expected_session_revision: next.session.revision,
+            interpretation: current
+                .interpretation
+                .clone()
+                .ok_or(StoreError::ChoiceLoopStateConflict)?,
+            selected_option: match selection {
+                Selection::OptionSelection(value) => choice_set
+                    .options
+                    .iter()
+                    .find(|option| option.id == value.selected_option_id)
+                    .cloned(),
+                Selection::NaturalConversationSelection(_) => None,
+            },
+        };
+        if !refinement_context.is_valid()
+            || matches!(selection, Selection::OptionSelection(_))
+                != refinement_context.selected_option.is_some()
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        next.pending_refinement_operation = Some(refinement_operation);
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if let Some(record) = d_record {
+            persist_choice_d_record(
+                &transaction,
+                &self.authority,
+                record,
+                next.pending_refinement_operation
+                    .as_ref()
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?,
+            )?;
+        }
+        persist_choice_refinement_context(
+            &transaction,
+            &self.authority,
+            &refinement_context,
+            updated_at_ms,
+        )?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, updated_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Commits a private refinement result only when it is still bound to the
+    /// exact durable selection operation.  No adapter or UI has a route to
+    /// this transition, and the result creates neither a Mission nor an
+    /// external effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, stale, cancelled, or drifted result,
+    /// audit/encrypted binding failure, or a transaction conflict.
+    pub fn commit_choice_refinement_result(
+        &mut self,
+        result: &ChoiceRefinementResult,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if !result.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let Some(operation) = current.pending_refinement_operation.as_ref() else {
+            let existing =
+                load_choice_refinement_result(&transaction, &self.authority, &result.operation_id)?;
+            if existing.as_ref() == Some(result) {
+                return Ok(current);
+            }
+            return Err(StoreError::ChoiceLoopStateConflict);
+        };
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let selected_model = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let result_is_resume = result.selection_id.starts_with("resume-soft-idle-")
+            || result.selection_id.starts_with("resume-stale-review-");
+        if result.operation_id != operation.id
+            || result.selection_id != operation.selection_id
+            || result.expected_generation != operation.expected_generation
+            || result.expected_session_revision != operation.expected_session_revision
+            || result.source_envelope_id != operation.source_envelope_id
+            || result.conversation_turn_batch_id != operation.conversation_turn_batch_id
+            || current.session.id != operation.choice_session_id
+            || current.session.revision != operation.expected_session_revision
+            || current.session.state != ChoiceSessionState::Refining
+            || !runtime.enabled
+            || runtime.revision != operation.expected_generation
+            || result.model_provenance != operation.model_provenance
+            || !model_provenance_matches_selection(&result.model_provenance, &selected_model)
+            || result.source_manifest_digest != operation.source_manifest_digest
+            || result.persona_revision != operation.persona_revision
+            || result_is_resume != operation.is_owner_resume()
+            || result.interpretation.choice_session_id != current.session.id
+            || result.choice_set.choice_session_id != current.session.id
+            || result.choice_set.session_revision
+                != current
+                    .session
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let mut next = current.clone();
+        next.session.revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = ChoiceSessionState::Active;
+        next.session.last_input_at_ms =
+            result.completed_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next.session.last_input_at_ms + 1_800_000;
+        next.session.stale_review_at_ms = next.session.last_input_at_ms + 86_400_000;
+        next.session.active_interpretation_revision = Some(result.interpretation.revision);
+        next.session.active_choice_set_id = Some(result.choice_set.id.clone());
+        next.interpretation = Some(result.interpretation.clone());
+        next.active_choice_set = Some(result.choice_set.clone());
+        next.pending_refinement_operation = None;
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_choice_refinement_result(&transaction, &self.authority, result)?;
+        retire_choice_refinement_contexts(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            result.completed_at_ms,
+        )?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, result.completed_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// The only Store entrypoint for a Host-owned idle/stale recap result.
+    /// It is deliberately separate from selected A/B/C/D refinement even
+    /// though both reuse the same encrypted result persistence primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-resume result, stale operation, audit
+    /// mismatch, protected-runtime drift, or transaction conflict.
+    pub fn commit_choice_resume_result(
+        &mut self,
+        resume: &ChoiceResumeResult,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if !resume.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let snapshot = self
+            .choice_loop_snapshot()?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if snapshot.session.state == ChoiceSessionState::Refining {
+            if snapshot
+                .pending_refinement_operation
+                .as_ref()
+                .is_none_or(|operation| {
+                    !operation.is_owner_resume() || operation.id != resume.result.operation_id
+                })
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        } else {
+            // The shared result primitive verifies the retained encrypted
+            // result and returns only an exact idempotent replay.  Keep this
+            // resume wrapper typed so a normal refinement can never enter it.
+            return self.commit_choice_refinement_result(&resume.result);
+        }
+        self.commit_choice_refinement_result(&resume.result)
+    }
+
+    /// Retires a private refinement that could not produce a verified result.
+    /// This is a durable fail-closed recovery transition, not a retry or a
+    /// result publication path.  It exists so a cancelled or unavailable
+    /// private worker cannot strand the foreground session in `Refining`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the protected runtime, pending operation, audit
+    /// chain, or current session revision no longer match the exact worker.
+    pub fn block_choice_refinement_operation(
+        &mut self,
+        operation_id: &str,
+        expected_generation: u64,
+        blocked_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        if operation_id.is_empty() || expected_generation == 0 || blocked_at_ms < 0 {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let operation = current
+            .pending_refinement_operation
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        // A replacement protected-On generation must retire an interrupted
+        // owner-resume operation from the preceding generation. It cannot
+        // restart it: the transition only returns to the recorded idle/stale
+        // review state with a fresh revision and no ChoiceSet. Ordinary
+        // refinements remain bound to their exact generation.
+        let stale_owner_resume =
+            operation.is_owner_resume() && operation.expected_generation != expected_generation;
+        if operation.id != operation_id
+            || (operation.expected_generation != expected_generation && !stale_owner_resume)
+            || !runtime.enabled
+            || runtime.revision != expected_generation
+            || current.session.state != ChoiceSessionState::Refining
+            || current.session.revision != operation.expected_session_revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let mut next = current.clone();
+        next.session.revision = current
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        // A failed owner re-entry is not a terminal model retry route. Return
+        // to the recorded idle review state with a fresh revision and no
+        // ChoiceSet, so only a later authenticated foreground re-entry can
+        // request a new resume operation.
+        next.session.state = operation
+            .resume_prior_state()
+            .unwrap_or(ChoiceSessionState::Blocked);
+        next.session.last_input_at_ms = blocked_at_ms.max(current.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(1_800_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.stale_review_at_ms = next
+            .session
+            .last_input_at_ms
+            .checked_add(86_400_000)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.active_choice_set_id = None;
+        // A failed owner-resume intentionally returns to the prior idle review
+        // state. Preserve the already authenticated interpretation so the
+        // next *new* foreground re-entry can construct its bounded recap;
+        // all pending operation/context state is still retired below.
+        if !operation.is_owner_resume() {
+            next.session.active_interpretation_revision = None;
+        }
+        next.active_batch = None;
+        if !operation.is_owner_resume() {
+            next.interpretation = None;
+        }
+        next.active_choice_set = None;
+        next.pending_refinement_operation = None;
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        retire_choice_refinement_contexts(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            blocked_at_ms,
+        )?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, blocked_at_ms)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Converts an interrupted in-process Choice worker into a durable,
+    /// fail-closed recovery state after Host restart. Callers supply no
+    /// operation identity or snapshot, so this cannot become a public retry
+    /// or whole-state replacement route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for runtime drift, malformed bindings, or a state
+    /// that cannot be proved to be the sole interrupted foreground worker.
+    pub fn recover_interrupted_choice_operation(
+        &mut self,
+        expected_generation: u64,
+        blocked_at_ms: i64,
+    ) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+        let snapshot = self.choice_loop_snapshot()?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        match snapshot.session.state {
+            ChoiceSessionState::Interpreting => {
+                let record = load_choice_begin_record_by_session(
+                    &self.connection,
+                    &self.authority,
+                    &snapshot.session.id,
+                )?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                self.block_initial_choice_operation(
+                    &record.accepted.operation_id,
+                    expected_generation,
+                    blocked_at_ms,
+                )
+                .map(Some)
+            }
+            ChoiceSessionState::Refining => {
+                let operation = snapshot
+                    .pending_refinement_operation
+                    .as_ref()
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                self.block_choice_refinement_operation(
+                    &operation.id,
+                    expected_generation,
+                    blocked_at_ms,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolves an exact durable schedule request before any clock-consuming
+    /// work. Changed reuse fails closed; an exact lost-response retry remains
+    /// read-only even when current clock continuity is uncertain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, changed, unauditable, or corrupt state.
+    pub fn choice_reminder_schedule_replay(
+        &self,
+        input: &ChoiceReminderScheduleInput,
+    ) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+        if !input.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verified_audit_tail(&self.connection, &self.authority)?;
+        match load_choice_reminder_schedule_by_request(
+            &self.connection,
+            &self.authority,
+            &input.request_id,
+        )? {
+            Some(existing) if existing.input == *input => Ok(Some(existing)),
+            Some(_) => Err(StoreError::ChoiceLoopStateConflict),
+            None => Ok(None),
+        }
+    }
+
+    /// Persists one explicit user schedule selection before confirmation.
+    /// This command records only a revisioned local proposal; it never
+    /// creates a `Reminder` or grants any external authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale, changed, unbound, Store, audit, or
+    /// transaction conflicts.
+    pub fn record_choice_reminder_schedule(
+        &mut self,
+        input: &ChoiceReminderScheduleInput,
+        expected_generation: u64,
+        accepted_at_ms: i64,
+    ) -> Result<ChoiceReminderSchedule, StoreError> {
+        if !input.is_valid()
+            || !valid_choice_reminder_time_zone(&input.time_zone)
+            || expected_generation == 0
+            || accepted_at_ms < 0
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some(existing) = load_choice_reminder_schedule_by_request(
+            &transaction,
+            &self.authority,
+            &input.request_id,
+        )? {
+            if existing.input == *input {
+                return Ok(existing);
+            }
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if input.due_at_ms <= accepted_at_ms {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if !runtime.enabled
+            || runtime.revision != expected_generation
+            || current.session.state != ChoiceSessionState::Active
+            || current.session.id != input.choice_session_id
+            || current.session.revision != input.expected_session_revision
+            || current.active_choice_set.is_none()
+            || current.last_selection.is_none()
+            || accepted_at_ms < current.session.last_input_at_ms
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let revision = u64::try_from(transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM choice_reminder_schedule WHERE choice_session_id = ?1",
+            [&input.choice_session_id], |row| row.get::<_, i64>(0),
+        )?).map_err(|_| StoreError::ChoiceLoopStateConflict)?
+        .checked_add(1).ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let id = format!("reminder-schedule-{}-{revision}", input.choice_session_id);
+        let schedule = ChoiceReminderSchedule {
+            id,
+            input: input.clone(),
+            revision,
+            accepted_at_ms,
+        };
+        persist_choice_reminder_schedule(&transaction, &self.authority, &schedule)?;
+        transaction.commit()?;
+        Ok(schedule)
+    }
+
+    /// Reads the current durable local proposal for one Choice session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted record or its signed audit binding
+    /// cannot be verified.
+    pub fn current_choice_reminder_schedule(
+        &self,
+        choice_session_id: &str,
+    ) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+        load_current_choice_reminder_schedule(&self.connection, &self.authority, choice_session_id)
+    }
+
+    /// Reads a schedule only when it belongs to the exact current Choice
+    /// revision. Older proposals are legitimate history, not malformed
+    /// continuity data, and must never make a later Choice state look broken.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted record or its signed audit binding
+    /// cannot be verified.
+    pub fn current_choice_reminder_schedule_for_revision(
+        &self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+    ) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+        load_current_choice_reminder_schedule_for_revision(
+            &self.connection,
+            &self.authority,
+            choice_session_id,
+            expected_session_revision,
+        )
+    }
+
+    /// Commits a prepared Choice confirmation and its Store-owned Markdown
+    /// journal in one transaction. This is deliberately not the legacy
+    /// Mission route and performs no external effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale, changed, unbound, model-provenance,
+    /// schedule, Store, audit, or transaction conflicts.
+    #[allow(clippy::too_many_lines)] // One IMMEDIATE transaction keeps confirmation, journal, snapshot, and audit binding visible together.
+    pub fn commit_choice_confirmation_and_render_intent(
+        &mut self,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        expected_generation: u64,
+        updated_at_ms: i64,
+    ) -> Result<(ChoiceLoopSnapshot, MarkdownRenderIntent), StoreError> {
+        if updated_at_ms < 0 || expected_generation == 0 || !confirmation.is_valid() {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let current = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let runtime =
+            load_runtime_control(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let existing_updated_at_ms: i64 = transaction.query_row(
+            "SELECT updated_at_ms FROM choice_loop_state WHERE singleton_id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if updated_at_ms < existing_updated_at_ms
+            || !runtime.enabled
+            || runtime.revision != expected_generation
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if current.confirmation.as_ref() == Some(confirmation) {
+            let intent_id = markdown_render_intent_id(
+                confirmation,
+                current.session.revision,
+                expected_generation,
+                &confirmation.markdown_entry.sha256,
+            );
+            let stored = load_markdown_render_intent(&transaction, &self.authority, &intent_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            let expected = markdown_render_record_for_confirmation(
+                confirmation,
+                current.session.revision,
+                expected_generation,
+                stored.intent.created_at_ms,
+            )?;
+            if stored != expected {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            transaction.commit()?;
+            return Ok((current, stored.intent));
+        }
+        let choice_set = current
+            .active_choice_set
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let selection = current
+            .last_selection
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let selected_model = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let schedule = load_current_choice_reminder_schedule_for_revision(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            current.session.revision,
+        )?
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if confirmation.choice_session_id != current.session.id
+            || confirmation.choice_set_id != choice_set.id
+            || selection.id() != confirmation.selection_id
+            || confirmation.expected_session_revision != current.session.revision
+            || confirmation.interpretation_revision != choice_set.interpretation_revision
+            || confirmation.model_provenance != choice_set.model_provenance
+            || confirmation.persona_revision != choice_set.persona_revision
+            || !session_model_matches_choice_set(&current.session, choice_set)
+            || !selected_model_matches_choice_set(&selected_model, choice_set)
+            || confirmation.markdown_manifest_digests.len() != 2
+            || confirmation.markdown_manifest_digests[0]
+                != current.document_manifest.aggregate_digest
+            || canonical_document_manifest_digest(std::slice::from_ref(
+                &confirmation.markdown_entry,
+            ))
+            .as_deref()
+                != confirmation
+                    .markdown_manifest_digests
+                    .get(1)
+                    .map(String::as_str)
+            || !confirmation_delivery_is_bound(confirmation, &current.session)
+            || confirmation.canonical_payload_revision(schedule.revision)
+                != Some(confirmation.payload_revision)
+            || confirmation.reminder_list_id != schedule.input.reminder_list_id
+            || confirmation.reminder_count != schedule.input.reminder_count
+            || confirmation.reminder_count as usize != confirmation.reminder_items.len()
+            || confirmation.reminder_items.iter().any(|item| {
+                item.due_at_ms != schedule.input.due_at_ms
+                    || item.time_zone != schedule.input.time_zone
+            })
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let mut next = current.clone();
+        next.session.revision = next
+            .session
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        next.session.state = ChoiceSessionState::AwaitingConfirmation;
+        next.session.last_input_at_ms = updated_at_ms.max(next.session.last_input_at_ms);
+        next.session.soft_idle_at_ms = next.session.last_input_at_ms + 1_800_000;
+        next.session.stale_review_at_ms = next.session.last_input_at_ms + 86_400_000;
+        next.session.pending_confirmation_id = Some(confirmation.id.clone());
+        // Keep a revision-bound, hidden recovery copy of the exact ChoiceSet.
+        // It is not selectable while AwaitingConfirmation, but a later
+        // descriptor conflict can return to an explicit re-review without a
+        // model retry or reconstructed alternatives.
+        let mut recovery_choice_set = choice_set.clone();
+        recovery_choice_set.id = format!(
+            "confirm-recovery-{}",
+            &sha256_hex(format!("{}:{}", choice_set.id, next.session.revision).as_bytes())[..32]
+        );
+        recovery_choice_set.session_revision = next.session.revision;
+        recovery_choice_set.generated_at_ms = updated_at_ms;
+        recovery_choice_set.expires_on_revision = next.session.revision;
+        next.session.active_choice_set_id = Some(recovery_choice_set.id.clone());
+        next.active_choice_set = Some(recovery_choice_set);
+        // Confirmation is an immediate batching boundary. Retiring the batch
+        // prevents an older quiet-window envelope from being rebound to the
+        // new confirmation revision after restart.
+        next.active_batch = None;
+        next.confirmation = Some(confirmation.clone());
+        if !next.is_permitted_successor_of(&current) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let render_record = markdown_render_record_for_confirmation(
+            confirmation,
+            next.session.revision,
+            expected_generation,
+            updated_at_ms,
+        )?;
+        retire_reconciled_markdown_intents_for_session(
+            &transaction,
+            &self.authority,
+            &current.session.id,
+            updated_at_ms,
+        )?;
+        persist_choice_loop_snapshot(&transaction, &self.authority, &next, updated_at_ms)?;
+        persist_markdown_render_intent(&transaction, &self.authority, &render_record)?;
+        transaction.commit()?;
+        Ok((next, render_record.intent))
+    }
+
+    /// Test and internal compatibility projection for callers that need only
+    /// the committed snapshot. The journal is still created atomically by the
+    /// same command and can never be omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns any validation, runtime, replay, Store, or audit error from the
+    /// atomic confirmation-and-render-intent command.
+    pub fn commit_choice_confirmation(
+        &mut self,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        expected_generation: u64,
+        updated_at_ms: i64,
+    ) -> Result<ChoiceLoopSnapshot, StoreError> {
+        self.commit_choice_confirmation_and_render_intent(
+            confirmation,
+            expected_generation,
+            updated_at_ms,
+        )
+        .map(|(snapshot, _)| snapshot)
     }
 
     /// Signs but does not persist the next runtime-control transition. The
@@ -1052,32 +6272,13 @@ impl Store {
         authorization: &RuntimeControlAuthorization,
         broker_receipt: &RuntimeControlReceipt,
     ) -> Result<(), StoreError> {
-        self.authority
-            .verify_runtime_control(authorization)
-            .map_err(|_| StoreError::RuntimeControlMismatch)?;
-        let trusted_broker = self
-            .trusted_broker
-            .as_ref()
-            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
-        crate::effect::verify_runtime_control_receipt(
-            trusted_broker,
+        require_runtime_checkpoint_in_connection(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
             authorization,
             broker_receipt,
-        )?;
-        let current =
-            load_runtime_control(&self.connection, &self.authority, Some(trusted_broker))?;
-        if !authorization.enabled
-            || current.enabled != authorization.enabled
-            || current.revision != authorization.revision
-            || current.updated_at_ms != authorization.updated_at_ms
-        {
-            return Err(if authorization.enabled {
-                StoreError::RuntimeControlMismatch
-            } else {
-                StoreError::RuntimeDisabled
-            });
-        }
-        Ok(())
+        )
     }
 
     /// Loads, applies, validates, and persists one typed Mission command and its
@@ -1601,6 +6802,322 @@ impl Store {
         .transpose()
     }
 
+    /// Persists one deterministic reactive-reply preview bound to the exact
+    /// active self-chat-origin `ChoiceSet`. This creates no transport authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the preview and every current runtime, Choice,
+    /// source-message, and self-chat binding are exact and auditable.
+    pub fn prepare_choice_imessage_reply(
+        &mut self,
+        intent: &ChoiceIMessageReplyIntent,
+    ) -> Result<(ChoiceIMessageReplyPreview, String), StoreError> {
+        if !intent.is_valid() {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        if let Some((existing, status, _)) = load_choice_imessage_reply_by_source(
+            &transaction,
+            &self.authority,
+            &intent.source_message_id,
+        )? {
+            let mut replay = intent.clone();
+            replay.created_at_ms = existing.created_at_ms;
+            replay.approved_at_ms = existing.approved_at_ms;
+            replay.recovery_cursor.clone_from(&existing.recovery_cursor);
+            return (existing == replay)
+                .then_some((existing.preview, status))
+                .ok_or(StoreError::ChannelOutboundConflict);
+        }
+        validate_choice_imessage_reply_current(&transaction, &self.authority, intent)?;
+        let blob = self.authority.encrypt_json(
+            intent,
+            choice_imessage_reply_aad(
+                &intent.preview.reply_id,
+                &intent.source_message_id,
+                &intent.choice_session_id,
+                &intent.choice_set_id,
+                intent.preview.preview_revision,
+                &intent.preview.confirmation_digest,
+            )
+            .as_bytes(),
+        )?;
+        let hash = blob_hash(&blob);
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("choice-imessage-reply-prepared-{}", intent.preview.reply_id),
+                command_id: &intent.preview.reply_id,
+                command_hash: &intent.preview.confirmation_digest,
+                actor: "owner",
+                action: CHOICE_IMESSAGE_REPLY_PREPARED_ACTION,
+                entity_id: &intent.preview.reply_id,
+                created_at_ms: intent.created_at_ms,
+                state_kind: "choice:imessage_reply",
+                state_hash: &hash,
+            },
+        )?;
+        transaction.execute(
+            "INSERT INTO choice_imessage_reply
+             (reply_id, source_message_id, choice_session_id, choice_set_id,
+              preview_revision, confirmation_digest, status_json,
+              provider_message_id, encrypted_blob, blob_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', NULL, ?7, ?8)",
+            params![
+                &intent.preview.reply_id,
+                &intent.source_message_id,
+                &intent.choice_session_id,
+                &intent.choice_set_id,
+                i64::try_from(intent.preview.preview_revision)
+                    .map_err(|_| StoreError::ChannelOutboundConflict)?,
+                &intent.preview.confirmation_digest,
+                blob,
+                hash,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((intent.preview.clone(), "prepared".to_owned()))
+    }
+
+    /// Returns only the body-free Host inputs needed to derive a reactive
+    /// reply. The raw inbound body remains Store-private.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable bindings cannot be verified.
+    pub fn current_choice_imessage_reply_context(
+        &self,
+    ) -> Result<Option<(ChoiceLoopSnapshot, ChannelPairing, String, String)>, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let Some(snapshot) = load_choice_loop_snapshot(&self.connection, &self.authority)? else {
+            return Ok(None);
+        };
+        let Some(begin) = load_choice_begin_record_by_session(
+            &self.connection,
+            &self.authority,
+            &snapshot.session.id,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(source_message_id) = begin.source_envelope.provider_message_id else {
+            return Ok(None);
+        };
+        if begin.source_envelope.surface != "imessage-self-chat" {
+            return Ok(None);
+        }
+        let pairing =
+            load_channel_pairing(&self.connection, &self.authority, ChannelKind::IMessage)?
+                .ok_or(StoreError::ChannelOutboundConflict)?;
+        Ok(Some((
+            snapshot,
+            pairing,
+            source_message_id,
+            begin.source_envelope.delivery_binding_id,
+        )))
+    }
+
+    /// Consumes exactly one visible local approval for one persisted Choice
+    /// reply. Only the first exact prepared transition can return `ExecuteNow`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing approval or any runtime, preview, source,
+    /// pairing, provenance, or audit drift.
+    pub fn authorize_choice_imessage_reply(
+        &mut self,
+        reply_id: &str,
+        preview_revision: u64,
+        confirmation_digest: &str,
+        explicitly_approved: bool,
+        approved_at_ms: i64,
+    ) -> Result<ChoiceIMessageReplyStart, StoreError> {
+        if !explicitly_approved || approved_at_ms < 0 {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let (mut intent, status, _) =
+            load_choice_imessage_reply_by_id(&transaction, &self.authority, reply_id)?
+                .ok_or(StoreError::ChannelOutboundConflict)?;
+        if intent.preview.preview_revision != preview_revision
+            || intent.preview.confirmation_digest != confirmation_digest
+        {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let disposition = match status.as_str() {
+            "delivered" => ChoiceIMessageReplyDisposition::AlreadySent,
+            "authorized" => ChoiceIMessageReplyDisposition::RecoverOnly,
+            "prepared" => {
+                require_runtime_enabled(
+                    &transaction,
+                    &self.authority,
+                    self.trusted_broker.as_ref(),
+                )?;
+                validate_choice_imessage_reply_current(&transaction, &self.authority, &intent)?;
+                intent.approved_at_ms = Some(approved_at_ms.max(intent.created_at_ms));
+                intent.recovery_cursor = load_channel_cursor(
+                    &transaction,
+                    &self.authority,
+                    ChannelKind::IMessage,
+                    &intent.pairing.conversation_id,
+                )?;
+                let blob = self.authority.encrypt_json(
+                    &intent,
+                    choice_imessage_reply_aad(
+                        reply_id,
+                        &intent.source_message_id,
+                        &intent.choice_session_id,
+                        &intent.choice_set_id,
+                        intent.preview.preview_revision,
+                        &intent.preview.confirmation_digest,
+                    )
+                    .as_bytes(),
+                )?;
+                let hash = blob_hash(&blob);
+                append_audit(
+                    &transaction,
+                    &self.authority,
+                    &AuditRecord {
+                        id: &format!("choice-imessage-reply-authorized-{reply_id}"),
+                        command_id: reply_id,
+                        command_hash: confirmation_digest,
+                        actor: "owner",
+                        action: CHOICE_IMESSAGE_REPLY_AUTHORIZED_ACTION,
+                        entity_id: reply_id,
+                        created_at_ms: intent.approved_at_ms.unwrap_or(approved_at_ms),
+                        state_kind: "choice:imessage_reply",
+                        state_hash: &hash,
+                    },
+                )?;
+                transaction.execute(
+                    "UPDATE choice_imessage_reply
+                     SET status_json = 'authorized', encrypted_blob = ?1, blob_hash = ?2
+                     WHERE reply_id = ?3 AND status_json = 'prepared'",
+                    params![blob, hash, reply_id],
+                )?;
+                ChoiceIMessageReplyDisposition::ExecuteNow
+            }
+            _ => return Err(StoreError::ChannelOutboundConflict),
+        };
+        transaction.commit()?;
+        Ok(ChoiceIMessageReplyStart {
+            intent,
+            disposition,
+        })
+    }
+
+    /// Records the provider GUID returned by the single authorized send. An
+    /// uncertain result intentionally leaves the row authorized/recover-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the exact reply has consumed its one authority
+    /// and the provider GUID is valid and unchanged.
+    pub fn record_choice_imessage_reply_delivery(
+        &mut self,
+        reply_id: &str,
+        provider_message_id: &str,
+        delivered_at_ms: i64,
+    ) -> Result<ChoiceIMessageReplyIntent, StoreError> {
+        if provider_message_id.is_empty() || delivered_at_ms < 0 {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let (intent, status, existing_provider) =
+            load_choice_imessage_reply_by_id(&transaction, &self.authority, reply_id)?
+                .ok_or(StoreError::ChannelOutboundConflict)?;
+        if status == "delivered" {
+            return (existing_provider.as_deref() == Some(provider_message_id))
+                .then_some(intent)
+                .ok_or(StoreError::ChannelOutboundConflict);
+        }
+        if status != "authorized" || intent.approved_at_ms.is_none() {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("choice-imessage-reply-delivered-{reply_id}"),
+                command_id: reply_id,
+                command_hash: &intent.canonical_payload_sha256,
+                actor: "imessage",
+                action: CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION,
+                entity_id: reply_id,
+                created_at_ms: delivered_at_ms,
+                state_kind: "choice:imessage_reply",
+                state_hash: &blob_hash(provider_message_id.as_bytes()),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE choice_imessage_reply
+             SET status_json = 'delivered', provider_message_id = ?1
+             WHERE reply_id = ?2 AND status_json = 'authorized'",
+            params![provider_message_id, reply_id],
+        )?;
+        transaction.commit()?;
+        Ok(intent)
+    }
+
+    /// Verifies only the exact durable GUID and exact selected self-chat.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable reply or audit bindings are invalid.
+    pub fn verify_choice_imessage_reply_echo(
+        &self,
+        conversation_id: &str,
+        provider_message_id: &str,
+    ) -> Result<bool, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let row: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT reply_id FROM choice_imessage_reply
+                 WHERE status_json = 'delivered' AND provider_message_id = ?1",
+                [provider_message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(reply_id) = row else {
+            return Ok(false);
+        };
+        let Some((intent, _, _)) =
+            load_choice_imessage_reply_by_id(&self.connection, &self.authority, &reply_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(intent.pairing.conversation_id == conversation_id)
+    }
+
     /// Persists the one owner-confirmed V1 pairing for a channel. Exact retries
     /// are idempotent; changing either owner or conversation requires a future
     /// explicit disconnect flow and never rotates this boundary implicitly.
@@ -1620,6 +7137,46 @@ impl Store {
             load_channel_pairing(&transaction, &self.authority, pairing.channel)?
         {
             if existing == *pairing {
+                return Ok(());
+            }
+            if pairing.channel == ChannelKind::IMessage
+                && existing.imessage.is_none()
+                && pairing.imessage.is_some()
+                && pairing.owner_sender_id == existing.owner_sender_id
+                && pairing.conversation_id == existing.conversation_id
+                && pairing.paired_at_ms >= existing.paired_at_ms
+            {
+                let channel = channel_json(pairing.channel)?;
+                let blob = self
+                    .authority
+                    .encrypt_json(pairing, channel_pairing_aad(&channel).as_bytes())?;
+                let state_hash = blob_hash(&blob);
+                let suffix = &state_hash[..16];
+                append_audit(
+                    &transaction,
+                    &self.authority,
+                    &AuditRecord {
+                        id: &format!("channel:{channel}:pairing-upgrade:{suffix}"),
+                        command_id: &format!("channel-pair-upgrade-{channel}-{suffix}"),
+                        command_hash: &state_hash,
+                        actor: &pairing.owner_sender_id,
+                        action: CHANNEL_PAIRING_ACTION,
+                        entity_id: &channel,
+                        created_at_ms: pairing.paired_at_ms,
+                        state_kind: "channelPairing",
+                        state_hash: &state_hash,
+                    },
+                )?;
+                if transaction.execute(
+                    "UPDATE channel_pairing
+                     SET encrypted_blob = ?1, paired_at_ms = ?2, blob_hash = ?3
+                     WHERE channel_json = ?4",
+                    params![blob, pairing.paired_at_ms, state_hash, channel,],
+                )? != 1
+                {
+                    return Err(StoreError::ChannelPairingConflict);
+                }
+                transaction.commit()?;
                 return Ok(());
             }
             return Err(StoreError::ChannelPairingConflict);
@@ -2975,6 +8532,60 @@ impl Store {
             disposition: ChannelOutboundDisposition::AlreadySent,
             provider_message_id: Some(receipt.provider_message_id.clone()),
         })
+    }
+
+    /// Verifies that one self-chat row is the exact durable echo of a
+    /// previously recorded iMessage delivery. This read grants no send,
+    /// model, Mission, or effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, ambiguous matches, or any
+    /// invalid audit/encryption binding.
+    pub fn verify_imessage_echo(
+        &self,
+        conversation_id: &str,
+        provider_message_id: &str,
+    ) -> Result<bool, StoreError> {
+        if conversation_id.trim() != conversation_id
+            || conversation_id.is_empty()
+            || provider_message_id.trim() != provider_message_id
+            || provider_message_id.is_empty()
+        {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT outbound_id FROM channel_outbound
+             WHERE channel_json = 'iMessage' AND conversation_id = ?1
+               AND status_json = 'delivered' AND provider_message_id = ?2
+             ORDER BY outbound_id LIMIT 2",
+        )?;
+        let outbound_ids = statement
+            .query_map(params![conversation_id, provider_message_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let [outbound_id] = outbound_ids.as_slice() else {
+            return if outbound_ids.is_empty() {
+                Ok(false)
+            } else {
+                Err(StoreError::ChannelOutboundConflict)
+            };
+        };
+        let stored = load_channel_outbound(&self.connection, &self.authority, outbound_id)?
+            .ok_or(StoreError::ChannelOutboundConflict)?;
+        Ok(stored.intent.channel == ChannelKind::IMessage
+            && stored.intent.conversation_id == conversation_id
+            && stored
+                .delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.provider_message_id == provider_message_id))
     }
 
     /// Reports whether any verified Mission has not reached a terminal state.
@@ -4583,6 +10194,1207 @@ fn verify_all_bindings(
     trusted_broker: Option<&TrustedBrokerEnrollment>,
 ) -> Result<(), StoreError> {
     load_runtime_control(connection, authority, trusted_broker)?;
+    verify_audited_state_entities_exist(connection, authority)?;
+    verify_command_audit_reconciliation(connection, authority)?;
+    verify_effect_authorization_bindings(connection, authority)?;
+    verify_effect_receipt_bindings(connection, authority, trusted_broker)?;
+    verify_effect_noncommit_bindings(connection, authority, trusted_broker)?;
+    verify_effect_resolution_bindings(connection)?;
+    verify_channel_bindings(connection, authority)?;
+    let _ = load_choice_model_selection(connection, authority)?;
+    let _ = load_c2_skill_demo_state(connection, authority)?;
+    let _ = load_b2_memory_prepared_source(connection, authority)?;
+    let _ = load_b2_memory_source_tombstone(connection, authority)?;
+    let _ = load_b2_memory_processing_operation(connection, authority)?;
+    let _ = load_b2_memory_render_intent(connection, authority)?;
+    let _ = load_b2_memory_demo_state(connection, authority)?;
+    let choice_snapshot = load_choice_loop_snapshot(connection, authority)?;
+    verify_choice_private_bindings(connection, authority, choice_snapshot.as_ref())?;
+    let schedule_ids = connection
+        .prepare("SELECT schedule_id FROM choice_reminder_schedule")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for schedule_id in schedule_ids {
+        let _ = load_choice_reminder_schedule(connection, authority, &schedule_id)?;
+    }
+    let intent_ids = connection
+        .prepare("SELECT intent_id FROM choice_markdown_render_intent")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for intent_id in intent_ids {
+        let _ = load_markdown_render_intent(connection, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    }
+    let receipt_ids = connection
+        .prepare("SELECT intent_id FROM choice_markdown_render_receipt")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for intent_id in receipt_ids {
+        let _ = load_markdown_render_receipt(connection, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    }
+    let reply_ids = connection
+        .prepare("SELECT reply_id FROM choice_imessage_reply ORDER BY reply_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for reply_id in reply_ids {
+        let _ = load_choice_imessage_reply_by_id(connection, authority, &reply_id)?
+            .ok_or(StoreError::ChannelOutboundConflict)?;
+    }
+    verify_all_mission_and_receipt_bindings(connection, authority)
+}
+
+fn c2_skill_demo_aad() -> &'static str {
+    "openopen-c2-skill-demo-v1"
+}
+
+fn validate_c2_skill_demo_state(state: &C2SkillDemoState) -> Result<(), StoreError> {
+    let expected_stages = [
+        C2SkillDemoStage::Candidate,
+        C2SkillDemoStage::Staged,
+        C2SkillDemoStage::Runnable,
+        C2SkillDemoStage::Used,
+    ];
+    if state.revision == 0
+        || usize::try_from(state.revision).ok() != Some(state.receipts.len())
+        || state.receipts.len() != state.consumed_nonces.len()
+        || state.receipts.len() > expected_stages.len()
+        || !state.seal.is_valid()
+        || state.stage != expected_stages[state.receipts.len() - 1]
+    {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    let mut request_ids = HashSet::new();
+    let mut nonces = HashSet::new();
+    for (index, (receipt, nonce)) in state
+        .receipts
+        .iter()
+        .zip(state.consumed_nonces.iter())
+        .enumerate()
+    {
+        if receipt.revision != (index + 1) as u64
+            || receipt.stage != expected_stages[index]
+            || !is_sha256_hex(&receipt.command_digest)
+            || !is_sha256_hex(&receipt.receipt_digest)
+            || !is_sha256_hex(nonce)
+            || !request_ids.insert(&receipt.request_id)
+            || !nonces.insert(nonce)
+        {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+    }
+    match state.stage {
+        C2SkillDemoStage::Used
+            if state
+                .first_use_result_digest
+                .as_deref()
+                .is_some_and(is_sha256_hex) => {}
+        C2SkillDemoStage::Used => return Err(StoreError::C2SkillDemoConflict),
+        _ if state.first_use_result_digest.is_some() => {
+            return Err(StoreError::C2SkillDemoConflict);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_c2_skill_demo_state(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<C2SkillDemoState>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT revision, stage_json, encrypted_blob, blob_hash
+             FROM c2_skill_demo_state WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, encoded_stage, blob, stored_blob_hash)) = row else {
+        return Ok(None);
+    };
+    let revision = u64::try_from(revision).map_err(|_| StoreError::C2SkillDemoConflict)?;
+    if blob_hash(&blob) != stored_blob_hash {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        C2_SKILL_DEMO_ACTION,
+        C2_SKILL_DEMO_ENTITY,
+        "skill:demo",
+        &blob,
+    )?;
+    let state: C2SkillDemoState = authority.decrypt_json(&blob, c2_skill_demo_aad().as_bytes())?;
+    validate_c2_skill_demo_state(&state)?;
+    let state_stage = serde_json::to_string(&state.stage)
+        .map_err(|error| CryptoError::Serialization(error.to_string()))?;
+    if state.revision != revision || state_stage != encoded_stage {
+        return Err(StoreError::C2SkillDemoConflict);
+    }
+    Ok(Some(state))
+}
+
+fn b2_memory_demo_aad() -> &'static str {
+    "openopen-b2-memory-demo-v1"
+}
+
+fn sha256_json(value: &(impl Serialize + ?Sized)) -> Result<String, StoreError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(value)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?
+        )
+    ))
+}
+
+fn b2_memory_diff(
+    selected: &B2MemoryCandidateCard,
+    revision: u64,
+    edited_line: String,
+) -> Result<B2MemoryMarkdownDiff, StoreError> {
+    let body = format!("{edited_line}\n");
+    let final_entry = openopen_protocol::DocumentManifestEntry {
+        relative_path: B2_MEMORY_MARKDOWN_PATH.to_owned(),
+        sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+        byte_length: u64::try_from(body.len()).map_err(|_| StoreError::B2MemoryDemoConflict)?,
+        mode: 0o600,
+    };
+    let diff_digest = sha256_json(&json!({
+        "revision": revision,
+        "selectedCandidateId": selected.id,
+        "proposedLine": selected.proposed_line,
+        "editedLine": edited_line,
+        "expectedBase": null,
+        "finalEntry": final_entry,
+    }))?;
+    let diff = B2MemoryMarkdownDiff {
+        revision,
+        selected_candidate_id: selected.id.clone(),
+        proposed_line: selected.proposed_line.clone(),
+        edited_line,
+        expected_base: None,
+        final_entry,
+        diff_digest,
+    };
+    diff.is_valid()
+        .then_some(diff)
+        .ok_or(StoreError::B2MemoryDemoConflict)
+}
+
+#[allow(clippy::too_many_lines)] // Keep the complete stage invariant visible in one validator.
+fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreError> {
+    if state.revision == 0
+        || !state
+            .prepared_source
+            .as_ref()
+            .is_some_and(B2MemoryPreparedSource::is_valid)
+        || state.receipts.len() > usize::try_from(state.revision).unwrap_or_default()
+        || state.receipts.iter().any(|receipt| {
+            !is_sha256_hex(&receipt.command_digest)
+                || !is_sha256_hex(&receipt.receipt_digest)
+                || receipt.revision == 0
+                || receipt.revision > state.revision
+        })
+        || state
+            .receipts
+            .iter()
+            .map(|receipt| &receipt.request_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != state.receipts.len()
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    match state.stage {
+        B2MemoryDemoStage::Prepared => {
+            if state.processing_operation.is_some()
+                || state.processing_result_digest.is_some()
+                || state.seal.is_some()
+                || !state.candidates.is_empty()
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+                || state.render_intent.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Processing => {
+            if !state
+                .processing_operation
+                .as_ref()
+                .is_some_and(B2MemoryProcessingOperation::is_valid)
+                || state.processing_result_digest.is_some()
+                || !state
+                    .seal
+                    .as_ref()
+                    .is_some_and(B2MemoryImportSeal::is_valid)
+                || !state.candidates.is_empty()
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+                || state.render_intent.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Candidates => {
+            if !state
+                .seal
+                .as_ref()
+                .is_some_and(B2MemoryImportSeal::is_valid)
+                || state.candidates.is_empty()
+                || state.candidates.len() > 3
+                || state.candidates.iter().any(|card| !card.is_valid())
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+                || !state
+                    .processing_result_digest
+                    .as_deref()
+                    .is_some_and(is_sha256_hex)
+                || !state
+                    .processing_operation
+                    .as_ref()
+                    .is_some_and(B2MemoryProcessingOperation::is_valid)
+                || state.render_intent.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Selected
+        | B2MemoryDemoStage::DiffReview
+        | B2MemoryDemoStage::Confirmed
+        | B2MemoryDemoStage::ReadBack => {
+            if !state.candidates.is_empty()
+                || !state
+                    .seal
+                    .as_ref()
+                    .is_some_and(B2MemoryImportSeal::is_valid)
+                || !state
+                    .selected_candidate
+                    .as_ref()
+                    .is_some_and(B2MemoryCandidateCard::is_valid)
+                || !state
+                    .markdown_diff
+                    .as_ref()
+                    .is_some_and(B2MemoryMarkdownDiff::is_valid)
+                || !state
+                    .processing_result_digest
+                    .as_deref()
+                    .is_some_and(is_sha256_hex)
+                || !state
+                    .processing_operation
+                    .as_ref()
+                    .is_some_and(B2MemoryProcessingOperation::is_valid)
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+    }
+    if matches!(
+        state.stage,
+        B2MemoryDemoStage::Confirmed | B2MemoryDemoStage::ReadBack
+    ) != state
+        .confirmation_digest
+        .as_deref()
+        .is_some_and(is_sha256_hex)
+        || (state.stage == B2MemoryDemoStage::ReadBack)
+            != state.readback_receipt.as_ref().is_some_and(|receipt| {
+                is_sha256_hex(&receipt.confirmation_digest)
+                    && is_sha256_hex(&receipt.render_receipt_digest)
+                    && is_sha256_hex(&receipt.receipt_digest)
+            })
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    if (state.stage == B2MemoryDemoStage::Confirmed)
+        != state
+            .render_intent
+            .as_ref()
+            .is_some_and(B2MemoryRenderIntent::is_valid)
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(())
+}
+
+fn load_b2_memory_demo_state(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemoryDemoState>, StoreError> {
+    let row = connection.query_row(
+        "SELECT revision, stage_json, encrypted_blob, blob_hash FROM b2_memory_demo_state WHERE singleton_id = 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?)),
+    ).optional()?;
+    let Some((revision, stage_json, blob, expected_hash)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_DEMO_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:demo",
+        &blob,
+    )?;
+    let state: B2MemoryDemoState =
+        authority.decrypt_json(&blob, b2_memory_demo_aad().as_bytes())?;
+    validate_b2_memory_demo_state(&state)?;
+    if i64::try_from(state.revision).ok() != Some(revision)
+        || serde_json::to_string(&state.stage)
+            .map_err(|error| CryptoError::Serialization(error.to_string()))?
+            != stage_json
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(state))
+}
+
+fn b2_memory_source_identity_digest(
+    record: &B2MemoryPreparedSourceRecord,
+) -> Result<String, StoreError> {
+    sha256_json(&json!({
+        "deviceId": record.device_id,
+        "inode": record.inode,
+        "byteLength": record.source.byte_length,
+        "modifiedAtNs": record.modified_at_ns,
+        "sourceDigest": record.source_digest,
+    }))
+}
+
+fn b2_memory_source_aad(request_id: &str, identity_digest: &str) -> String {
+    format!("memory:prepared-source:{request_id}:{identity_digest}")
+}
+
+fn load_b2_memory_prepared_source(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemoryPreparedSourceRecord>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT request_id, source_identity_digest, encrypted_blob, blob_hash,
+                    prepared_at_ms
+             FROM b2_memory_prepared_source WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((request_id, identity_digest, blob, expected_hash, prepared_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_SOURCE_ACTION,
+        B2_MEMORY_SOURCE_ENTITY,
+        "memory:prepared_source",
+        &blob,
+    )?;
+    let record: B2MemoryPreparedSourceRecord = authority.decrypt_json(
+        &blob,
+        b2_memory_source_aad(&request_id, &identity_digest).as_bytes(),
+    )?;
+    if !record.is_valid()
+        || record.source.request_id != request_id
+        || record.source.source_identity_digest != identity_digest
+        || record.prepared_at_ms != prepared_at_ms
+        || b2_memory_source_identity_digest(&record)? != identity_digest
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(record))
+}
+
+fn persist_b2_memory_prepared_source(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &B2MemoryPreparedSourceRecord,
+    command_digest: &str,
+) -> Result<(), StoreError> {
+    let blob = authority.encrypt_json(
+        record,
+        b2_memory_source_aad(
+            &record.source.request_id,
+            &record.source.source_identity_digest,
+        )
+        .as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_prepared_source
+            (singleton_id, request_id, source_identity_digest, encrypted_blob, blob_hash,
+             prepared_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            record.source.request_id,
+            record.source.source_identity_digest,
+            blob,
+            state_hash,
+            record.prepared_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-source-{}", record.source.request_id),
+            command_id: &record.source.request_id,
+            command_hash: command_digest,
+            actor: "owner",
+            action: B2_MEMORY_SOURCE_ACTION,
+            entity_id: B2_MEMORY_SOURCE_ENTITY,
+            created_at_ms: record.prepared_at_ms,
+            state_kind: "memory:prepared_source",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn b2_memory_source_tombstone_aad(identity_digest: &str) -> String {
+    format!("memory:source-tombstone:{identity_digest}")
+}
+
+fn load_b2_memory_source_tombstone(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemorySourceTombstone>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT request_id, source_identity_digest, encrypted_blob, blob_hash, retired_at_ms
+             FROM b2_memory_source_tombstone WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((request_id, identity_digest, blob, expected_hash, retired_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_SOURCE_RETIRED_ACTION,
+        B2_MEMORY_SOURCE_ENTITY,
+        "memory:source_tombstone",
+        &blob,
+    )?;
+    let tombstone: B2MemorySourceTombstone = authority.decrypt_json(
+        &blob,
+        b2_memory_source_tombstone_aad(&identity_digest).as_bytes(),
+    )?;
+    if !tombstone.is_valid()
+        || tombstone.source.request_id != request_id
+        || tombstone.source.source_identity_digest != identity_digest
+        || tombstone.retired_at_ms != retired_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(tombstone))
+}
+
+fn persist_b2_memory_source_tombstone(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    tombstone: &B2MemorySourceTombstone,
+) -> Result<(), StoreError> {
+    if !tombstone.is_valid() {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        tombstone,
+        b2_memory_source_tombstone_aad(&tombstone.source.source_identity_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_source_tombstone
+            (singleton_id, request_id, source_identity_digest, encrypted_blob, blob_hash,
+             retired_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            tombstone.source.request_id,
+            tombstone.source.source_identity_digest,
+            blob,
+            state_hash,
+            tombstone.retired_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!(
+                "b2-memory-source-retired-{}",
+                tombstone.processing_request_id
+            ),
+            command_id: &tombstone.processing_request_id,
+            command_hash: &tombstone.source.source_identity_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_SOURCE_RETIRED_ACTION,
+            entity_id: B2_MEMORY_SOURCE_ENTITY,
+            created_at_ms: tombstone.retired_at_ms,
+            state_kind: "memory:source_tombstone",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn b2_memory_processing_aad(operation_id: &str) -> String {
+    format!("memory:processing-operation:{operation_id}")
+}
+
+fn load_b2_memory_processing_operation(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemoryProcessingOperation>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT operation_id, encrypted_blob, blob_hash, started_at_ms
+             FROM b2_memory_processing_operation WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((operation_id, blob, expected_hash, started_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_PROCESSING_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:processing_operation",
+        &blob,
+    )?;
+    let operation: B2MemoryProcessingOperation =
+        authority.decrypt_json(&blob, b2_memory_processing_aad(&operation_id).as_bytes())?;
+    if !operation.is_valid()
+        || operation.operation_id != operation_id
+        || operation.started_at_ms != started_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(operation))
+}
+
+fn persist_b2_memory_processing_operation(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    operation: &B2MemoryProcessingOperation,
+) -> Result<(), StoreError> {
+    if !operation.is_valid() {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        operation,
+        b2_memory_processing_aad(&operation.operation_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_processing_operation
+            (singleton_id, operation_id, encrypted_blob, blob_hash, started_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            operation.operation_id,
+            blob,
+            state_hash,
+            operation.started_at_ms
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-processing-{}", operation.operation_id),
+            command_id: &operation.request_id,
+            command_hash: &sha256_json(operation)?,
+            actor: "owner",
+            action: B2_MEMORY_PROCESSING_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: operation.started_at_ms,
+            state_kind: "memory:processing_operation",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn b2_memory_render_aad(intent_id: &str) -> String {
+    format!("memory:render-intent:{intent_id}")
+}
+
+fn b2_markdown_render_adapter(intent: &B2MemoryRenderIntent) -> MarkdownRenderIntent {
+    // `MarkdownRoot` is an internal descriptor primitive. Choice-only fields
+    // are non-authorizing there; B2 authority is checked against its encrypted
+    // Store journal immediately before this adapter is constructed.
+    MarkdownRenderIntent {
+        id: intent.intent_id.clone(),
+        choice_session_id: "b2-memory-demo".to_owned(),
+        expected_session_revision: intent.expected_revision,
+        expected_generation: 1,
+        entry: intent.entry.clone(),
+        expected_base: None,
+        content_digest: intent.content_digest.clone(),
+        created_at_ms: intent.created_at_ms,
+    }
+}
+
+fn load_b2_memory_render_intent(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<StoredB2MemoryRenderIntent>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT intent_id, encrypted_blob, blob_hash, created_at_ms
+             FROM b2_memory_render_journal WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((intent_id, blob, expected_hash, created_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_RENDER_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:render_intent",
+        &blob,
+    )?;
+    let record: StoredB2MemoryRenderIntent =
+        authority.decrypt_json(&blob, b2_memory_render_aad(&intent_id).as_bytes())?;
+    if !record.is_valid()
+        || record.intent.intent_id != intent_id
+        || record.intent.created_at_ms != created_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(record))
+}
+
+fn persist_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredB2MemoryRenderIntent,
+) -> Result<(), StoreError> {
+    if !record.is_valid() || record.intent.entry.relative_path != B2_MEMORY_MARKDOWN_PATH {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    if let Some(existing) = load_b2_memory_render_intent(transaction, authority)? {
+        return (existing == *record)
+            .then_some(())
+            .ok_or(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        record,
+        b2_memory_render_aad(&record.intent.intent_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_render_journal
+            (singleton_id, intent_id, encrypted_blob, blob_hash, created_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            record.intent.intent_id,
+            blob,
+            state_hash,
+            record.intent.created_at_ms
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-{}", record.intent.intent_id),
+            command_id: &record.intent.intent_id,
+            command_hash: &record.intent.confirmation_digest,
+            actor: "owner",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: record.intent.created_at_ms,
+            state_kind: "memory:render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn update_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredB2MemoryRenderIntent,
+    recorded_at_ms: i64,
+) -> Result<(), StoreError> {
+    if !record.is_valid() || record.render_receipt.is_none() || recorded_at_ms < 0 {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        record,
+        b2_memory_render_aad(&record.intent.intent_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    if transaction.execute(
+        "UPDATE b2_memory_render_journal SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE singleton_id = 1 AND intent_id = ?1",
+        params![record.intent.intent_id, blob, state_hash],
+    )? != 1
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-published-{}", record.intent.intent_id),
+            command_id: &record.intent.intent_id,
+            command_hash: &record.intent.confirmation_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: recorded_at_ms,
+            state_kind: "memory:render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn retire_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    intent: &B2MemoryRenderIntent,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let record = StoredB2MemoryRenderIntent {
+        intent: intent.clone(),
+        plaintext_body: None,
+        render_receipt: load_b2_memory_render_intent(transaction, authority)?
+            .and_then(|record| record.render_receipt),
+        retired: true,
+    };
+    if !record.is_valid() || retired_at_ms < intent.created_at_ms {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob =
+        authority.encrypt_json(&record, b2_memory_render_aad(&intent.intent_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    if transaction.execute(
+        "UPDATE b2_memory_render_journal SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE singleton_id = 1 AND intent_id = ?1",
+        params![intent.intent_id, blob, state_hash],
+    )? != 1
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-retired-{}", intent.intent_id),
+            command_id: &intent.intent_id,
+            command_hash: &intent.confirmation_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: retired_at_ms,
+            state_kind: "memory:render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_b2_memory_demo_state(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    state: &B2MemoryDemoState,
+    command_id: &str,
+    command_hash: &str,
+    created_at_ms: i64,
+) -> Result<(), StoreError> {
+    validate_b2_memory_demo_state(state)?;
+    let blob = authority.encrypt_json(state, b2_memory_demo_aad().as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_demo_state (singleton_id, revision, stage_json, encrypted_blob, blob_hash)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(singleton_id) DO UPDATE SET revision=excluded.revision, stage_json=excluded.stage_json,
+           encrypted_blob=excluded.encrypted_blob, blob_hash=excluded.blob_hash",
+        params![i64::try_from(state.revision).map_err(|_| StoreError::B2MemoryDemoConflict)?, serde_json::to_string(&state.stage).map_err(|error| CryptoError::Serialization(error.to_string()))?, blob, state_hash],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-demo-{command_id}"),
+            command_id,
+            command_hash,
+            actor: "owner",
+            action: B2_MEMORY_DEMO_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms,
+            state_kind: "memory:demo",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+/// Verifies every live or retired private Choice body independently of the
+/// broader effect/channel graph. Continuity reads use this bounded boundary so
+/// a tampered worker row can never be presented as a healthy Choice session,
+/// while Core can still open far enough to expose Off and typed recovery.
+#[allow(clippy::too_many_lines)] // One bounded verifier keeps every live/retired private-row class in the same continuity gate.
+fn verify_choice_private_bindings(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    snapshot: Option<&ChoiceLoopSnapshot>,
+) -> Result<(), StoreError> {
+    for action in [
+        CHOICE_BEGIN_ACTION,
+        CHOICE_D_INTAKE_ACTION,
+        CHOICE_REFINEMENT_CONTEXT_ACTION,
+        CHOICE_REFINEMENT_RESULT_ACTION,
+        CHOICE_BODY_RETIREMENT_ACTION,
+    ] {
+        verify_audited_entities_exist(connection, action)?;
+    }
+    let mut live_rows = 0_usize;
+    let begin_ids = connection
+        .prepare("SELECT request_id FROM choice_begin_request")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for request_id in begin_ids {
+        let record = load_choice_begin_record(connection, authority, &request_id)?
+            .ok_or(StoreError::ChoiceBeginConflict)?;
+        let current = snapshot.ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if record.accepted.choice_session_id != current.session.id {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        live_rows += 1;
+    }
+    let d_ids = connection
+        .prepare("SELECT request_id FROM choice_d_request")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for request_id in d_ids {
+        let record = load_choice_d_record(connection, authority, &request_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let current = snapshot.ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if record.input.choice_session_id != current.session.id {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        live_rows += 1;
+    }
+    // These encrypted rows are private worker inputs/results rather than
+    // snapshot fields.  They still remain live until their typed retirement,
+    // so every transaction must reject a tampered row before it can advance
+    // unrelated durable state.
+    let refinement_context_ids = connection
+        .prepare("SELECT operation_id FROM choice_refinement_context")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for operation_id in refinement_context_ids {
+        let context = load_choice_refinement_context(connection, authority, &operation_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let current = snapshot.ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let pending = current
+            .pending_refinement_operation
+            .as_ref()
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if current.session.state != ChoiceSessionState::Refining
+            || context.choice_session_id != current.session.id
+            || context.operation_id != pending.id
+            || context.selection_id != pending.selection_id
+            || context.expected_session_revision != pending.expected_session_revision
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        live_rows += 1;
+    }
+    let refinement_result_ids = connection
+        .prepare("SELECT operation_id FROM choice_refinement_result")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for operation_id in refinement_result_ids {
+        let result = load_choice_refinement_result(connection, authority, &operation_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let current = snapshot.ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if result.interpretation.choice_session_id != current.session.id {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        live_rows += 1;
+    }
+    if live_rows > 0
+        && snapshot.is_some_and(|current| {
+            matches!(
+                current.session.state,
+                ChoiceSessionState::Executing
+                    | ChoiceSessionState::Cancelled
+                    | ChoiceSessionState::Completed
+            )
+        })
+    {
+        let current = snapshot.ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let intent_ids = connection
+            .prepare("SELECT intent_id FROM choice_markdown_render_intent")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut resumable_receipted_cleanup = false;
+        for intent_id in intent_ids {
+            let stored = load_markdown_render_intent(connection, authority, &intent_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            if stored.intent.choice_session_id == current.session.id
+                && stored.plaintext_body.is_some()
+                && load_markdown_render_receipt(connection, authority, &intent_id)?.is_some()
+            {
+                resumable_receipted_cleanup = true;
+            }
+        }
+        if !resumable_receipted_cleanup {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+    }
+    verify_choice_private_body_retirements(connection, authority)
+}
+
+/// Verifies every command-owned Markdown journal row and the exact journal
+/// required by an awaiting/executing foreground confirmation. This remains a
+/// bounded continuity check: it reads no filesystem path and grants no effect.
+#[allow(clippy::too_many_lines)] // One verifier keeps row/audit and foreground journal relationships in a single fail-closed boundary.
+fn verify_choice_markdown_bindings(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    snapshot: Option<&ChoiceLoopSnapshot>,
+) -> Result<(), StoreError> {
+    verify_audited_entities_exist(connection, CHOICE_MARKDOWN_RENDER_INTENT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION)?;
+
+    let intent_ids = connection
+        .prepare("SELECT intent_id FROM choice_markdown_render_intent ORDER BY intent_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut journals = Vec::with_capacity(intent_ids.len());
+    for intent_id in intent_ids {
+        let stored = load_markdown_render_intent(connection, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        let receipt = load_markdown_render_receipt(connection, authority, &intent_id)?;
+        if receipt.as_ref().is_some_and(|receipt| {
+            receipt.final_entry != stored.intent.entry
+                || receipt.displaced_base != stored.intent.expected_base
+                || receipt.committed_at_ms < stored.intent.created_at_ms
+        }) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        journals.push((stored, receipt));
+    }
+
+    // An orphan receipt cannot be loaded through the intent-bound AAD join.
+    // Check the receipt table independently so a direct row delete never hides
+    // a previously audited proof from foreground continuity.
+    let receipt_ids = connection
+        .prepare("SELECT intent_id FROM choice_markdown_render_receipt ORDER BY intent_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for intent_id in receipt_ids {
+        load_markdown_render_receipt(connection, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    }
+
+    let Some(current) = snapshot else {
+        return Ok(());
+    };
+    if !matches!(
+        current.session.state,
+        ChoiceSessionState::AwaitingConfirmation | ChoiceSessionState::Executing
+    ) {
+        return Ok(());
+    }
+    let confirmation = current
+        .confirmation
+        .as_ref()
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    let matching = journals
+        .iter()
+        .filter(|(stored, _)| markdown_intent_matches_confirmation(&stored.intent, confirmation))
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let (stored, receipt) = matching[0];
+    match current.session.state {
+        ChoiceSessionState::AwaitingConfirmation => {
+            if current.session.revision != stored.intent.expected_session_revision
+                || stored.plaintext_body.is_none()
+                || stored.reconciliation.is_some()
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        }
+        ChoiceSessionState::Executing => {
+            if current.session.revision
+                != stored
+                    .intent
+                    .expected_session_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?
+                || stored.plaintext_body.is_some()
+                || stored.reconciliation.is_some()
+                || receipt.is_none()
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        }
+        _ => unreachable!("foreground journal state was filtered above"),
+    }
+    Ok(())
+}
+
+fn require_current_markdown_render_authority(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+    intent: &MarkdownRenderIntent,
+) -> Result<(), StoreError> {
+    let runtime = load_runtime_control(connection, authority, trusted_broker)?;
+    let current = load_choice_loop_snapshot(connection, authority)?
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    let confirmation = current
+        .confirmation
+        .as_ref()
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    if !runtime.enabled
+        || runtime.revision != intent.expected_generation
+        || current.session.id != intent.choice_session_id
+        || current.session.revision != intent.expected_session_revision
+        || current.session.state != ChoiceSessionState::AwaitingConfirmation
+        || current.session.pending_confirmation_id.as_deref() != Some(&confirmation.id)
+        || !markdown_intent_matches_confirmation(intent, confirmation)
+    {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    Ok(())
+}
+
+fn markdown_intent_matches_confirmation(
+    intent: &MarkdownRenderIntent,
+    confirmation: &ChoiceConsolidatedConfirmation,
+) -> bool {
+    confirmation.choice_session_id == intent.choice_session_id
+        && confirmation.markdown_entry == intent.entry
+        && confirmation.markdown_expected_base == intent.expected_base
+        && markdown_render_intent_id(
+            confirmation,
+            intent.expected_session_revision,
+            intent.expected_generation,
+            &intent.content_digest,
+        ) == intent.id
+}
+
+fn require_current_markdown_cleanup_authority(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+    intent: &MarkdownRenderIntent,
+    receipt: &MarkdownRenderReceipt,
+) -> Result<(), StoreError> {
+    // Cleanup is deliberately allowed after protected Off, but it must still
+    // verify the signed runtime row and every receipt/session identity before
+    // deleting the retained Owner base.
+    let runtime = load_runtime_control(connection, authority, trusted_broker)?;
+    let current = load_choice_loop_snapshot(connection, authority)?
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    let confirmation_matches = current
+        .confirmation
+        .as_ref()
+        .is_some_and(|confirmation| markdown_intent_matches_confirmation(intent, confirmation));
+    let pre_retirement = current.session.id == intent.choice_session_id
+        && current.session.revision == intent.expected_session_revision
+        && current.session.state == ChoiceSessionState::AwaitingConfirmation
+        && current.confirmation.is_some()
+        && current.session.pending_confirmation_id.is_some();
+    let exact_replay = current.session.id == intent.choice_session_id
+        && current.session.revision
+            == intent
+                .expected_session_revision
+                .checked_add(1)
+                .ok_or(StoreError::ChoiceLoopStateConflict)?
+        && current.session.state == ChoiceSessionState::Executing;
+    // Global Off can cancel the session after this exact receipt has become
+    // durable but before the retained base is removed. That successor may
+    // finish only receipt-verified deletion; it never re-enters publication.
+    let cancelled_after_off = current.session.id == intent.choice_session_id
+        && current.session.revision
+            == intent
+                .expected_session_revision
+                .checked_add(1)
+                .ok_or(StoreError::ChoiceLoopStateConflict)?
+        && current.session.state == ChoiceSessionState::Cancelled
+        && !runtime.enabled;
+    if (!pre_retirement && !exact_replay && !cancelled_after_off)
+        || (current.confirmation.is_some() && !confirmation_matches)
+        || receipt.intent_id != intent.id
+        || receipt.final_entry != intent.entry
+        || receipt.displaced_base != intent.expected_base
+        || receipt.committed_at_ms < intent.created_at_ms
+    {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    Ok(())
+}
+
+fn verify_audited_state_entities_exist(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<(), StoreError> {
     verify_audited_entities_exist(connection, MISSION_COMMAND_ACTION)?;
     verify_audited_entities_exist(connection, RECEIPT_COMMIT_ACTION)?;
     verify_audited_entities_exist(connection, EFFECT_AUTHORIZATION_ACTION)?;
@@ -4597,6 +11409,33 @@ fn verify_all_bindings(
     verify_audited_entities_exist(connection, CHANNEL_SUGGESTION_ACTION)?;
     verify_audited_entities_exist(connection, CHANNEL_FAILURE_INCIDENT_ACTION)?;
     verify_audited_entities_exist(connection, CHANNEL_FAILURE_ACK_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_MODEL_SELECTION_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_BEGIN_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_D_INTAKE_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_REFINEMENT_CONTEXT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_REFINEMENT_RESULT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_BODY_RETIREMENT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_MARKDOWN_RENDER_INTENT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_REMINDER_SCHEDULE_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_LOOP_STATE_ACTION)?;
+    verify_audited_entities_exist(connection, CHOICE_IDLE_CLOCK_ACTION)?;
+    verify_audited_entities_exist(connection, C2_SKILL_DEMO_ACTION)?;
+    verify_audited_entities_exist(connection, B2_MEMORY_SOURCE_ACTION)?;
+    verify_audited_entities_exist(connection, B2_MEMORY_SOURCE_RETIRED_ACTION)?;
+    verify_audited_entities_exist(connection, B2_MEMORY_DEMO_ACTION)?;
+    if connection
+        .query_row(
+            "SELECT 1 FROM choice_idle_clock_anchor WHERE singleton_id = 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        load_choice_idle_clock_anchor(connection, authority)?
+            .ok_or(StoreError::ChoiceClockUncertain)?;
+    }
     verify_audited_entities_exist(connection, CHANNEL_ROUTE_SET_ACTION)?;
     verify_audited_entities_exist(connection, CHANNEL_MISSION_EVENT_ACTION)?;
     if connection.query_row(
@@ -4608,12 +11447,13 @@ fn verify_all_bindings(
     }
     verify_audited_entities_exist(connection, CHANNEL_OUTBOUND_ACTION)?;
     verify_audited_entities_exist(connection, CHANNEL_DELIVERY_ACTION)?;
-    verify_command_audit_reconciliation(connection, authority)?;
-    verify_effect_authorization_bindings(connection, authority)?;
-    verify_effect_receipt_bindings(connection, authority, trusted_broker)?;
-    verify_effect_noncommit_bindings(connection, authority, trusted_broker)?;
-    verify_effect_resolution_bindings(connection)?;
-    verify_channel_bindings(connection, authority)?;
+    Ok(())
+}
+
+fn verify_all_mission_and_receipt_bindings(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<(), StoreError> {
     let missions = {
         let mut statement = connection.prepare(
             "SELECT mission_id, status_json, scope_digest, encrypted_blob,
@@ -4823,6 +11663,33 @@ fn require_runtime_enabled(
     } else {
         Err(StoreError::RuntimeDisabled)
     }
+}
+
+fn require_runtime_checkpoint_in_connection(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    trusted_broker: Option<&TrustedBrokerEnrollment>,
+    authorization: &RuntimeControlAuthorization,
+    broker_receipt: &RuntimeControlReceipt,
+) -> Result<(), StoreError> {
+    authority
+        .verify_runtime_control(authorization)
+        .map_err(|_| StoreError::RuntimeControlMismatch)?;
+    let trusted_broker = trusted_broker.ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+    crate::effect::verify_runtime_control_receipt(trusted_broker, authorization, broker_receipt)?;
+    let current = load_runtime_control(connection, authority, Some(trusted_broker))?;
+    if !authorization.enabled
+        || current.enabled != authorization.enabled
+        || current.revision != authorization.revision
+        || current.updated_at_ms != authorization.updated_at_ms
+    {
+        return Err(if authorization.enabled {
+            StoreError::RuntimeControlMismatch
+        } else {
+            StoreError::RuntimeDisabled
+        });
+    }
+    Ok(())
 }
 
 fn verify_effect_authorization_bindings(
@@ -5063,6 +11930,7 @@ fn verify_channel_bindings(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Central action-to-authoritative-row mapping is intentionally auditable.
 fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Result<(), StoreError> {
     let lookup = match action {
         MISSION_COMMAND_ACTION => "SELECT 1 FROM mission_state WHERE mission_id = ?1",
@@ -5079,6 +11947,70 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
         | CHANNEL_SUGGESTION_ACTION => "SELECT 1 FROM channel_model_dispatch WHERE entity_id = ?1",
         CHANNEL_FAILURE_INCIDENT_ACTION | CHANNEL_FAILURE_ACK_ACTION => {
             "SELECT 1 FROM channel_failure_incident WHERE incident_id = ?1"
+        }
+        CHOICE_MODEL_SELECTION_ACTION => {
+            "SELECT 1 FROM choice_model_selection
+             WHERE singleton_id = 1 AND ?1 = 'choice-model-selection'"
+        }
+        CHOICE_BEGIN_ACTION => {
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM choice_begin_request WHERE request_id = ?1)
+             OR EXISTS(SELECT 1 FROM choice_private_body_retirement
+                       WHERE source_kind = 'begin' AND entity_id = ?1)"
+        }
+        CHOICE_D_INTAKE_ACTION => {
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM choice_d_request WHERE request_id = ?1)
+             OR EXISTS(SELECT 1 FROM choice_private_body_retirement
+                       WHERE source_kind = 'd' AND entity_id = ?1)"
+        }
+        CHOICE_REFINEMENT_CONTEXT_ACTION => {
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM choice_refinement_context
+                                   WHERE operation_id = ?1)
+             OR EXISTS(SELECT 1 FROM choice_private_body_retirement
+                       WHERE source_kind = 'refinement'
+                         AND entity_id = 'context:' || ?1)"
+        }
+        CHOICE_REFINEMENT_RESULT_ACTION => {
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM choice_refinement_result WHERE operation_id = ?1)
+             OR EXISTS(SELECT 1 FROM choice_private_body_retirement
+                       WHERE source_kind = 'refinement' AND entity_id = ?1)"
+        }
+        CHOICE_BODY_RETIREMENT_ACTION => {
+            "SELECT 1 FROM choice_private_body_retirement
+             WHERE source_kind || ':' || entity_id = ?1"
+        }
+        CHOICE_MARKDOWN_RENDER_INTENT_ACTION => {
+            "SELECT 1 FROM choice_markdown_render_intent WHERE intent_id = ?1"
+        }
+        CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION => {
+            "SELECT 1 FROM choice_markdown_render_receipt WHERE intent_id = ?1"
+        }
+        CHOICE_REMINDER_SCHEDULE_ACTION => {
+            "SELECT 1 FROM choice_reminder_schedule WHERE schedule_id = ?1"
+        }
+        CHOICE_LOOP_STATE_ACTION => {
+            "SELECT 1 FROM choice_loop_state
+             WHERE singleton_id = 1 AND ?1 = 'choice-loop'"
+        }
+        CHOICE_IDLE_CLOCK_ACTION => {
+            "SELECT 1 FROM choice_idle_clock_anchor
+             WHERE singleton_id = 1 AND ?1 = 'choice-idle-clock'"
+        }
+        C2_SKILL_DEMO_ACTION => {
+            "SELECT 1 FROM c2_skill_demo_state
+             WHERE singleton_id = 1 AND ?1 = 'c2-demo-skill'"
+        }
+        B2_MEMORY_DEMO_ACTION => {
+            "SELECT 1 FROM b2_memory_demo_state
+             WHERE singleton_id = 1 AND ?1 = 'b2-demo-memory'"
+        }
+        B2_MEMORY_SOURCE_ACTION => {
+            "SELECT 1 WHERE ?1 = 'b2-demo-memory-source' AND
+             (EXISTS(SELECT 1 FROM b2_memory_prepared_source WHERE singleton_id = 1)
+              OR EXISTS(SELECT 1 FROM b2_memory_source_tombstone WHERE singleton_id = 1))"
+        }
+        B2_MEMORY_SOURCE_RETIRED_ACTION => {
+            "SELECT 1 FROM b2_memory_source_tombstone
+             WHERE singleton_id = 1 AND ?1 = 'b2-demo-memory-source'"
         }
         CHANNEL_ROUTE_SET_ACTION => "SELECT 1 FROM channel_route_set WHERE mission_id = ?1",
         CHANNEL_MISSION_EVENT_ACTION => "SELECT 1 FROM channel_mission_event WHERE entity_id = ?1",
@@ -5107,6 +12039,24 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
         }
     }
     Ok(())
+}
+
+fn audit_state_hash_for(
+    connection: &Connection,
+    action: &str,
+    entity_id: &str,
+) -> Result<String, StoreError> {
+    connection
+        .query_row(
+            "SELECT state_hash FROM audit_ledger
+             WHERE action = ?1 AND entity_id = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![action, entity_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .filter(|hash: &String| is_sha256_hex(hash))
+        .ok_or(StoreError::ChoiceLoopStateConflict)
 }
 
 fn verify_command_audit_reconciliation(
@@ -5293,6 +12243,2327 @@ fn verify_blob_binding(
         return Err(StoreError::StateBindingMismatch(entity_id.to_owned()));
     }
     Ok(())
+}
+
+fn load_choice_model_selection(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<ModelSelection>, StoreError> {
+    let row: Option<(Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT encrypted_blob, blob_hash FROM choice_model_selection WHERE singleton_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(blob, stored_hash)| {
+        if stored_hash != blob_hash(&blob) {
+            return Err(StoreError::ChoiceModelSelectionConflict);
+        }
+        verify_blob_binding(
+            connection,
+            CHOICE_MODEL_SELECTION_ACTION,
+            "choice-model-selection",
+            "choice:model_selection",
+            &blob,
+        )?;
+        let selection: ModelSelection =
+            authority.decrypt_json(&blob, choice_model_selection_aad().as_bytes())?;
+        if !selection.is_valid() {
+            return Err(StoreError::ChoiceModelSelectionConflict);
+        }
+        Ok(selection)
+    })
+    .transpose()
+}
+
+fn choice_begin_matches_snapshot(
+    record: &ChoiceBeginRecord,
+    snapshot: &ChoiceLoopSnapshot,
+) -> bool {
+    snapshot.session.id == record.accepted.choice_session_id
+        && snapshot.session.state == ChoiceSessionState::Interpreting
+        && snapshot.session.revision == record.accepted.accepted_session_revision
+        && snapshot.session.model_selection_state
+            == ModelSelectionState::Selected {
+                model_provenance_ref: record.model_selection.id.clone(),
+            }
+        && snapshot.session.primary_delivery_binding_id.as_deref()
+            == Some(&record.source_envelope.delivery_binding_id)
+        && snapshot.session.opened_at_ms == record.accepted_at_ms
+        && snapshot.session.last_input_at_ms == record.accepted_at_ms
+        && snapshot.active_batch.as_ref() == Some(&record.batch)
+        && snapshot.interpretation.is_none()
+        && snapshot.active_choice_set.is_none()
+        && snapshot.last_selection.is_none()
+        && snapshot.confirmation.is_none()
+        && snapshot.document_manifest == record.source_manifest
+}
+
+type ChoicePrivateRequestRow = (String, String, String, String, String, Vec<u8>, String, i64);
+type ChoiceRefinementContextRow = (String, String, String, String, Vec<u8>, String, i64);
+type ChoiceRefinementResultRow = (String, String, String, String, String, Vec<u8>, String, i64);
+
+fn load_choice_begin_record(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    request_id: &str,
+) -> Result<Option<ChoiceBeginRecord>, StoreError> {
+    let row: Option<ChoicePrivateRequestRow> = connection
+        .query_row(
+            "SELECT request_digest, choice_session_id, operation_id, source_envelope_id,
+                    conversation_turn_batch_id, encrypted_blob, blob_hash, accepted_at_ms
+             FROM choice_begin_request
+             WHERE request_id = ?1",
+            params![request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            request_digest,
+            choice_session_id,
+            operation_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            blob,
+            stored_hash,
+            accepted_at_ms,
+        )| {
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChoiceBeginConflict);
+            }
+            verify_blob_binding(
+                connection,
+                CHOICE_BEGIN_ACTION,
+                request_id,
+                "choice:begin",
+                &blob,
+            )?;
+            let record: ChoiceBeginRecord = authority.decrypt_json(
+                &blob,
+                choice_begin_request_aad(
+                    request_id,
+                    &choice_session_id,
+                    &operation_id,
+                    &source_envelope_id,
+                    &conversation_turn_batch_id,
+                    accepted_at_ms,
+                )
+                .as_bytes(),
+            )?;
+            if !record.is_valid()
+                || record.accepted.request_id != request_id
+                || record.accepted.choice_session_id != choice_session_id
+                || record.accepted.operation_id != operation_id
+                || record.accepted.source_envelope_id != source_envelope_id
+                || record.accepted.conversation_turn_batch_id != conversation_turn_batch_id
+                || record.source_envelope.id != source_envelope_id
+                || record.batch.id != conversation_turn_batch_id
+                || record.request_digest != request_digest
+                || record.accepted_at_ms != accepted_at_ms
+            {
+                return Err(StoreError::ChoiceBeginConflict);
+            }
+            Ok(record)
+        },
+    )
+    .transpose()
+}
+
+fn load_choice_begin_record_by_operation(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    operation_id: &str,
+) -> Result<Option<ChoiceBeginRecord>, StoreError> {
+    let request_id: Option<String> = connection
+        .query_row(
+            "SELECT request_id FROM choice_begin_request WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    request_id
+        .map(|request_id| load_choice_begin_record(connection, authority, &request_id))
+        .transpose()
+        .map(Option::flatten)
+}
+
+/// Returns the sole encrypted initial-intake record for a session. The
+/// session column is unique, so this is a lookup of an already authenticated
+/// Host record rather than a caller-controlled source selection.
+fn load_choice_begin_record_by_session(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+) -> Result<Option<ChoiceBeginRecord>, StoreError> {
+    let request_id: Option<String> = connection
+        .query_row(
+            "SELECT request_id FROM choice_begin_request WHERE choice_session_id = ?1",
+            [choice_session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    request_id
+        .map(|request_id| load_choice_begin_record(connection, authority, &request_id))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn choice_imessage_reply_aad(
+    reply_id: &str,
+    source_message_id: &str,
+    choice_session_id: &str,
+    choice_set_id: &str,
+    preview_revision: u64,
+    confirmation_digest: &str,
+) -> String {
+    let identity = serde_json::to_vec(&json!({
+        "replyId": reply_id,
+        "sourceMessageId": source_message_id,
+        "choiceSessionId": choice_session_id,
+        "choiceSetId": choice_set_id,
+        "previewRevision": preview_revision,
+        "confirmationDigest": confirmation_digest,
+    }))
+    .expect("bounded reply identity serializes");
+    format!("openopen-choice-imessage-reply-v2:{}", blob_hash(&identity))
+}
+
+fn load_choice_imessage_reply_by_id(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    reply_id: &str,
+) -> Result<Option<(ChoiceIMessageReplyIntent, String, Option<String>)>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT reply_id, source_message_id, choice_session_id, choice_set_id,
+                preview_revision, confirmation_digest, status_json,
+                encrypted_blob, blob_hash, provider_message_id
+         FROM choice_imessage_reply WHERE reply_id = ?1",
+    )?;
+    let row = statement
+        .query_map([reply_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?
+        .next()
+        .transpose()?;
+    row.map(
+        |(
+            indexed_reply_id,
+            source_message_id,
+            choice_session_id,
+            choice_set_id,
+            preview_revision,
+            confirmation_digest,
+            status,
+            blob,
+            stored_hash,
+            provider,
+        )| {
+            let preview_revision =
+                u64::try_from(preview_revision).map_err(|_| StoreError::ChannelOutboundConflict)?;
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChannelOutboundConflict);
+            }
+            if status != "prepared" && status != "authorized" && status != "delivered" {
+                return Err(StoreError::ChannelOutboundConflict);
+            }
+            let action = if status == "prepared" {
+                CHOICE_IMESSAGE_REPLY_PREPARED_ACTION
+            } else {
+                CHOICE_IMESSAGE_REPLY_AUTHORIZED_ACTION
+            };
+            verify_blob_binding(connection, action, reply_id, "choice:imessage_reply", &blob)?;
+            let intent: ChoiceIMessageReplyIntent = authority.decrypt_json(
+                &blob,
+                choice_imessage_reply_aad(
+                    &indexed_reply_id,
+                    &source_message_id,
+                    &choice_session_id,
+                    &choice_set_id,
+                    preview_revision,
+                    &confirmation_digest,
+                )
+                .as_bytes(),
+            )?;
+            if !intent.is_valid()
+                || indexed_reply_id != reply_id
+                || intent.preview.reply_id != reply_id
+                || intent.source_message_id != source_message_id
+                || intent.choice_session_id != choice_session_id
+                || intent.choice_set_id != choice_set_id
+                || intent.preview.preview_revision != preview_revision
+                || intent.preview.confirmation_digest != confirmation_digest
+                || (status == "prepared" && intent.approved_at_ms.is_some())
+                || ((status == "authorized" || status == "delivered")
+                    && intent.approved_at_ms.is_none())
+                || (status == "delivered") != provider.is_some()
+            {
+                return Err(StoreError::ChannelOutboundConflict);
+            }
+            if let Some(provider_message_id) = provider.as_deref() {
+                let audit_binding: Option<(String, String)> = connection
+                    .query_row(
+                        "SELECT state_kind, state_hash FROM audit_ledger
+                     WHERE action = ?1 AND entity_id = ?2
+                     ORDER BY sequence DESC LIMIT 1",
+                        params![CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION, reply_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if audit_binding
+                    != Some((
+                        "choice:imessage_reply".to_owned(),
+                        blob_hash(provider_message_id.as_bytes()),
+                    ))
+                {
+                    return Err(StoreError::ChannelOutboundConflict);
+                }
+            }
+            Ok((intent, status, provider))
+        },
+    )
+    .transpose()
+}
+
+fn load_choice_imessage_reply_by_source(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    source_message_id: &str,
+) -> Result<Option<(ChoiceIMessageReplyIntent, String, Option<String>)>, StoreError> {
+    let reply_id: Option<String> = connection
+        .query_row(
+            "SELECT reply_id FROM choice_imessage_reply WHERE source_message_id = ?1",
+            [source_message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    reply_id
+        .map(|reply_id| load_choice_imessage_reply_by_id(connection, authority, &reply_id))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn validate_choice_imessage_reply_current(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    intent: &ChoiceIMessageReplyIntent,
+) -> Result<(), StoreError> {
+    let snapshot = load_choice_loop_snapshot(connection, authority)?
+        .ok_or(StoreError::ChannelOutboundConflict)?;
+    let choice_set = snapshot
+        .active_choice_set
+        .as_ref()
+        .ok_or(StoreError::ChannelOutboundConflict)?;
+    let begin =
+        load_choice_begin_record_by_session(connection, authority, &intent.choice_session_id)?
+            .ok_or(StoreError::ChannelOutboundConflict)?;
+    let pairing = load_channel_pairing(connection, authority, ChannelKind::IMessage)?
+        .ok_or(StoreError::ChannelOutboundConflict)?;
+    if snapshot.session.state != ChoiceSessionState::Active
+        || snapshot.session.id != intent.choice_session_id
+        || snapshot.session.revision != intent.session_revision
+        || snapshot.session.active_choice_set_id.as_deref() != Some(intent.choice_set_id.as_str())
+        || choice_set.id != intent.choice_set_id
+        || canonical_choice_set_digest(choice_set).as_deref()
+            != Some(intent.choice_set_digest.as_str())
+        || choice_set.persona_revision != intent.persona_revision
+        || choice_set.source_manifest_digest != intent.source_manifest_digest
+        || choice_set.model_provenance != intent.model_provenance
+        || snapshot.document_manifest.aggregate_digest != intent.source_manifest_digest
+        || pairing != intent.pairing
+        || begin.source_envelope.surface != "imessage-self-chat"
+        || begin.source_envelope.provider_message_id.as_deref()
+            != Some(intent.source_message_id.as_str())
+        || begin.source_envelope.delivery_binding_id != intent.delivery_binding_id
+        || snapshot.session.primary_delivery_binding_id.as_deref()
+            != Some(intent.delivery_binding_id.as_str())
+    {
+        return Err(StoreError::ChannelOutboundConflict);
+    }
+    Ok(())
+}
+
+fn load_choice_d_record(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    request_id: &str,
+) -> Result<Option<ChoiceDIntakeRecord>, StoreError> {
+    let row: Option<ChoicePrivateRequestRow> = connection
+        .query_row(
+            "SELECT request_digest, operation_id, choice_session_id, source_envelope_id,
+                    conversation_turn_batch_id, encrypted_blob, blob_hash, accepted_at_ms
+             FROM choice_d_request WHERE request_id = ?1",
+            [request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            request_digest,
+            operation_id,
+            choice_session_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            blob,
+            stored_hash,
+            accepted_at_ms,
+        )| {
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            verify_blob_binding(
+                connection,
+                CHOICE_D_INTAKE_ACTION,
+                request_id,
+                "choice:d_intake",
+                &blob,
+            )?;
+            let record: ChoiceDIntakeRecord = authority.decrypt_json(
+                &blob,
+                choice_d_request_aad(
+                    request_id,
+                    &choice_session_id,
+                    &operation_id,
+                    &source_envelope_id,
+                    &conversation_turn_batch_id,
+                    accepted_at_ms,
+                )
+                .as_bytes(),
+            )?;
+            if !record.is_valid()
+                || record.input.request_id != request_id
+                || record.input.choice_session_id != choice_session_id
+                || record.source_envelope.id != source_envelope_id
+                || record.batch.id != conversation_turn_batch_id
+                || record.selection.id
+                    != operation_id.strip_prefix("refinement-").unwrap_or_default()
+                || record.request_digest != request_digest
+                || record.input.submitted_at_ms != accepted_at_ms
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            Ok(record)
+        },
+    )
+    .transpose()
+}
+
+fn load_choice_refinement_context(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    operation_id: &str,
+) -> Result<Option<ChoiceRefinementContext>, StoreError> {
+    let row: Option<ChoiceRefinementContextRow> = connection
+        .query_row(
+            "SELECT selection_id, choice_session_id, source_envelope_id, conversation_turn_batch_id,
+                    encrypted_blob, blob_hash, created_at_ms
+             FROM choice_refinement_context WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            selection_id,
+            choice_session_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            blob,
+            stored_hash,
+            created_at_ms,
+        )| {
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            verify_blob_binding(
+                connection,
+                CHOICE_REFINEMENT_CONTEXT_ACTION,
+                operation_id,
+                "choice:refinement_context",
+                &blob,
+            )?;
+            let context: ChoiceRefinementContext = authority.decrypt_json(
+                &blob,
+                choice_refinement_context_aad(
+                    operation_id,
+                    &selection_id,
+                    &choice_session_id,
+                    &source_envelope_id,
+                    &conversation_turn_batch_id,
+                    created_at_ms,
+                )
+                .as_bytes(),
+            )?;
+            if !context.is_valid()
+                || context.operation_id != operation_id
+                || context.selection_id != selection_id
+                || context.choice_session_id != choice_session_id
+                || context.source_envelope_id != source_envelope_id
+                || context.conversation_turn_batch_id != conversation_turn_batch_id
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            Ok(context)
+        },
+    )
+    .transpose()
+}
+
+fn choice_private_body_tombstone_exists(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    source_kind: &str,
+    request_id: &str,
+) -> Result<bool, StoreError> {
+    load_choice_private_body_retirement(connection, authority, source_kind, request_id)
+        .map(|record| record.is_some())
+}
+
+fn load_choice_private_body_retirement(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    source_kind: &str,
+    entity_id: &str,
+) -> Result<Option<ChoicePrivateBodyRetirement>, StoreError> {
+    let row: Option<(Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT encrypted_blob, blob_hash FROM choice_private_body_retirement
+             WHERE source_kind = ?1 AND entity_id = ?2",
+            params![source_kind, entity_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(blob, stored_hash)| {
+        if stored_hash != blob_hash(&blob) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verify_blob_binding(
+            connection,
+            CHOICE_BODY_RETIREMENT_ACTION,
+            &format!("{source_kind}:{entity_id}"),
+            "choice:private_body_retirement",
+            &blob,
+        )?;
+        let record: ChoicePrivateBodyRetirement = authority.decrypt_json(
+            &blob,
+            choice_private_body_retirement_aad(source_kind, entity_id).as_bytes(),
+        )?;
+        if !record.is_valid() || record.source_kind != source_kind || record.entity_id != entity_id
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if record.legacy_blocked {
+            let marker =
+                legacy_private_body_marker_digest_for_row(connection, source_kind, entity_id)?
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            if record.request_digest.is_some()
+                || record.choice_session_id != "legacy-retirement-blocked"
+                || record.body_digest != marker
+                || record.source_blob_hash != marker
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        } else {
+            let (action, source_entity_id) = match source_kind {
+                "begin" => (CHOICE_BEGIN_ACTION, entity_id),
+                "d" => (CHOICE_D_INTAKE_ACTION, entity_id),
+                "refinement" if entity_id.starts_with("context:") => (
+                    CHOICE_REFINEMENT_CONTEXT_ACTION,
+                    entity_id
+                        .strip_prefix("context:")
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?,
+                ),
+                "refinement" => (CHOICE_REFINEMENT_RESULT_ACTION, entity_id),
+                _ => return Err(StoreError::ChoiceLoopStateConflict),
+            };
+            if audit_state_hash_for(connection, action, source_entity_id)?
+                != record.source_blob_hash
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+        }
+        Ok(record)
+    })
+    .transpose()
+}
+
+fn legacy_private_body_marker_digest(value: &serde_json::Value) -> String {
+    // `serde_json::Map` is ordered, and every migration call supplies a
+    // fixed literal key sequence. This is a body-free compatibility marker,
+    // not a reconstruction or a new attestation of legacy metadata.
+    sha256_hex(value.to_string().as_bytes())
+}
+
+fn retirement_audit_exists(
+    transaction: &Transaction<'_>,
+    source_kind: &str,
+    entity_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit_ledger
+             WHERE action = ?1 AND entity_id = ?2)",
+            params![
+                CHOICE_BODY_RETIREMENT_ACTION,
+                format!("{source_kind}:{entity_id}")
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_private_body_marker_digest_for_row(
+    connection: &Connection,
+    source_kind: &str,
+    entity_id: &str,
+) -> Result<Option<String>, StoreError> {
+    match source_kind {
+        "begin" | "d" => connection
+            .query_row(
+                "SELECT source_kind, request_id, request_digest, body_digest,
+                        choice_session_id, retired_at_ms
+                 FROM choice_private_body_tombstone
+                 WHERE source_kind = ?1 AND request_id = ?2",
+                params![source_kind, entity_id],
+                |row| {
+                    Ok(legacy_private_body_marker_digest(&json!({
+                        "sourceKind": row.get::<_, String>(0)?,
+                        "entityId": row.get::<_, String>(1)?,
+                        "requestDigest": row.get::<_, String>(2)?,
+                        "bodyDigest": row.get::<_, String>(3)?,
+                        "choiceSessionId": row.get::<_, String>(4)?,
+                        "retiredAtMs": row.get::<_, i64>(5)?,
+                    })))
+                },
+            )
+            .optional()
+            .map_err(Into::into),
+        "refinement" => connection
+            .query_row(
+                "SELECT operation_id, result_digest, choice_session_id, retired_at_ms
+                 FROM choice_refinement_body_tombstone WHERE operation_id = ?1",
+                [entity_id],
+                |row| {
+                    Ok(legacy_private_body_marker_digest(&json!({
+                        "sourceKind": "refinement",
+                        "entityId": row.get::<_, String>(0)?,
+                        "bodyDigest": row.get::<_, String>(1)?,
+                        "choiceSessionId": row.get::<_, String>(2)?,
+                        "retiredAtMs": row.get::<_, i64>(3)?,
+                    })))
+                },
+            )
+            .optional()
+            .map_err(Into::into),
+        _ => Ok(None),
+    }
+}
+
+fn verify_choice_private_body_retirements(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<(), StoreError> {
+    let identifiers = connection
+        .prepare("SELECT source_kind, entity_id FROM choice_private_body_retirement")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (source_kind, entity_id) in identifiers {
+        let _ =
+            load_choice_private_body_retirement(connection, authority, &source_kind, &entity_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One transaction keeps both intake kinds verified before retirement.
+fn purge_choice_private_bodies(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let begins = transaction
+        .prepare(
+            "SELECT request_id, request_digest, operation_id, source_envelope_id,
+                    conversation_turn_batch_id, encrypted_blob, blob_hash, accepted_at_ms
+             FROM choice_begin_request WHERE choice_session_id = ?1",
+        )?
+        .query_map([choice_session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        request_id,
+        request_digest,
+        operation_id,
+        source_envelope_id,
+        conversation_turn_batch_id,
+        blob,
+        stored_hash,
+        accepted_at_ms,
+    ) in begins
+    {
+        if blob_hash(&blob) != stored_hash {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        let record: ChoiceBeginRecord = authority.decrypt_json(
+            &blob,
+            choice_begin_request_aad(
+                &request_id,
+                choice_session_id,
+                &operation_id,
+                &source_envelope_id,
+                &conversation_turn_batch_id,
+                accepted_at_ms,
+            )
+            .as_bytes(),
+        )?;
+        if !record.is_valid()
+            || record.accepted.choice_session_id != choice_session_id
+            || record.accepted.operation_id != operation_id
+            || record.source_envelope.id != source_envelope_id
+            || record.batch.id != conversation_turn_batch_id
+        {
+            return Err(StoreError::ChoiceBeginConflict);
+        }
+        insert_choice_private_body_tombstone(
+            transaction,
+            authority,
+            &ChoicePrivateBodyTombstoneArgs {
+                source_kind: "begin",
+                request_id: &request_id,
+                request_digest: &request_digest,
+                body_digest: &record.source_envelope.body_digest,
+                choice_session_id,
+                source_blob_hash: &stored_hash,
+                retired_at_ms,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM choice_begin_request WHERE request_id = ?1",
+            [&request_id],
+        )?;
+    }
+
+    let d_records = transaction
+        .prepare(
+            "SELECT request_id, request_digest, operation_id, choice_session_id,
+                    source_envelope_id, conversation_turn_batch_id, encrypted_blob, blob_hash,
+                    accepted_at_ms
+             FROM choice_d_request",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        request_id,
+        request_digest,
+        operation_id,
+        stored_choice_session_id,
+        source_envelope_id,
+        conversation_turn_batch_id,
+        blob,
+        stored_hash,
+        accepted_at_ms,
+    ) in d_records
+    {
+        if blob_hash(&blob) != stored_hash {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let record: ChoiceDIntakeRecord = authority.decrypt_json(
+            &blob,
+            choice_d_request_aad(
+                &request_id,
+                &stored_choice_session_id,
+                &operation_id,
+                &source_envelope_id,
+                &conversation_turn_batch_id,
+                accepted_at_ms,
+            )
+            .as_bytes(),
+        )?;
+        if !record.is_valid()
+            || record.input.choice_session_id != stored_choice_session_id
+            || record.source_envelope.id != source_envelope_id
+            || record.batch.id != conversation_turn_batch_id
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if record.input.choice_session_id != choice_session_id {
+            continue;
+        }
+        insert_choice_private_body_tombstone(
+            transaction,
+            authority,
+            &ChoicePrivateBodyTombstoneArgs {
+                source_kind: "d",
+                request_id: &request_id,
+                request_digest: &request_digest,
+                body_digest: &sha256_hex(record.input.bounded_text.as_bytes()),
+                choice_session_id,
+                source_blob_hash: &stored_hash,
+                retired_at_ms,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM choice_d_request WHERE request_id = ?1",
+            [&request_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn retire_choice_refinement_results(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let rows = transaction
+        .prepare(
+            "SELECT operation_id, selection_id, choice_session_id, source_envelope_id,
+                    conversation_turn_batch_id, result_digest, encrypted_blob, blob_hash, completed_at_ms
+             FROM choice_refinement_result",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        operation_id,
+        selection_id,
+        stored_choice_session_id,
+        source_envelope_id,
+        conversation_turn_batch_id,
+        result_digest,
+        blob,
+        stored_hash,
+        completed_at_ms,
+    ) in rows
+    {
+        if blob_hash(&blob) != stored_hash {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let result: ChoiceRefinementResult = authority.decrypt_json(
+            &blob,
+            choice_refinement_result_aad(
+                &operation_id,
+                &selection_id,
+                &stored_choice_session_id,
+                &source_envelope_id,
+                &conversation_turn_batch_id,
+                &result_digest,
+                completed_at_ms,
+            )
+            .as_bytes(),
+        )?;
+        if !result.is_valid()
+            || result.operation_id != operation_id
+            || result.selection_id != selection_id
+            || result.interpretation.choice_session_id != stored_choice_session_id
+            || result.source_envelope_id != source_envelope_id
+            || result.conversation_turn_batch_id != conversation_turn_batch_id
+            || result.result_digest != result_digest
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if result.interpretation.choice_session_id != choice_session_id {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO choice_refinement_body_tombstone
+             (operation_id, result_digest, choice_session_id, retired_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id,
+                result_digest,
+                choice_session_id,
+                retired_at_ms
+            ],
+        )?;
+        persist_choice_private_body_retirement(
+            transaction,
+            authority,
+            &ChoicePrivateBodyRetirement {
+                source_kind: "refinement".to_owned(),
+                entity_id: operation_id.clone(),
+                request_digest: None,
+                body_digest: result_digest.clone(),
+                choice_session_id: choice_session_id.to_owned(),
+                source_blob_hash: stored_hash,
+                retired_at_ms,
+                legacy_blocked: false,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM choice_refinement_result WHERE operation_id = ?1",
+            [&operation_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Retires the encrypted semantic worker input once it can no longer be
+/// consumed by a pending refinement. The body-free retirement reuses the
+/// refinement namespace with a disjoint `context:` identity so the original
+/// context audit remains verifiable without retaining the derived frame or
+/// selected option.
+fn retire_choice_refinement_contexts(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let rows = transaction
+        .prepare(
+            "SELECT operation_id, selection_id, choice_session_id, source_envelope_id,
+                    conversation_turn_batch_id, encrypted_blob, blob_hash, created_at_ms
+             FROM choice_refinement_context",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        operation_id,
+        selection_id,
+        stored_session_id,
+        source_envelope_id,
+        conversation_turn_batch_id,
+        blob,
+        stored_hash,
+        created_at_ms,
+    ) in rows
+    {
+        if blob_hash(&blob) != stored_hash {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        let context: ChoiceRefinementContext = authority.decrypt_json(
+            &blob,
+            choice_refinement_context_aad(
+                &operation_id,
+                &selection_id,
+                &stored_session_id,
+                &source_envelope_id,
+                &conversation_turn_batch_id,
+                created_at_ms,
+            )
+            .as_bytes(),
+        )?;
+        if !context.is_valid()
+            || context.operation_id != operation_id
+            || context.selection_id != selection_id
+            || context.choice_session_id != stored_session_id
+            || context.source_envelope_id != source_envelope_id
+            || context.conversation_turn_batch_id != conversation_turn_batch_id
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        if stored_session_id != choice_session_id {
+            continue;
+        }
+        let context_digest = sha256_hex(
+            &serde_json::to_vec(&context)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?,
+        );
+        persist_choice_private_body_retirement(
+            transaction,
+            authority,
+            &ChoicePrivateBodyRetirement {
+                source_kind: "refinement".to_owned(),
+                entity_id: format!("context:{operation_id}"),
+                request_digest: None,
+                body_digest: context_digest,
+                choice_session_id: choice_session_id.to_owned(),
+                source_blob_hash: stored_hash,
+                retired_at_ms,
+                legacy_blocked: false,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM choice_refinement_context WHERE operation_id = ?1",
+            [&operation_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Retires a cancelled session's Markdown body without claiming that a render
+/// receipt exists.  The intent metadata remains auditable so restart recovery
+/// can report the cancelled journal, but no body is retained after cancellation.
+fn retire_choice_markdown_intents_on_cancel(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let intent_ids = transaction
+        .prepare("SELECT intent_id FROM choice_markdown_render_intent")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for intent_id in intent_ids {
+        let stored = load_markdown_render_intent(transaction, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if stored.intent.choice_session_id != choice_session_id {
+            continue;
+        }
+        if stored.plaintext_body.is_some() {
+            // The retained encrypted intent metadata and its body-retired
+            // audit record are the body-free tombstone for a cancelled
+            // journal. Unlike begin/D, a render intent must remain present
+            // so restart can explain reconciliation without recreating text.
+            persist_retired_markdown_render_intent(
+                transaction,
+                authority,
+                &stored.intent,
+                retired_at_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_choice_private_body_tombstone(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    args: &ChoicePrivateBodyTombstoneArgs<'_>,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO choice_private_body_tombstone
+         (source_kind, request_id, request_digest, body_digest, choice_session_id, retired_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            args.source_kind,
+            args.request_id,
+            args.request_digest,
+            args.body_digest,
+            args.choice_session_id,
+            args.retired_at_ms
+        ],
+    )?;
+    persist_choice_private_body_retirement(
+        transaction,
+        authority,
+        &ChoicePrivateBodyRetirement {
+            source_kind: args.source_kind.to_owned(),
+            entity_id: args.request_id.to_owned(),
+            request_digest: Some(args.request_digest.to_owned()),
+            body_digest: args.body_digest.to_owned(),
+            choice_session_id: args.choice_session_id.to_owned(),
+            source_blob_hash: args.source_blob_hash.to_owned(),
+            retired_at_ms: args.retired_at_ms,
+            legacy_blocked: false,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_choice_private_body_retirement(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &ChoicePrivateBodyRetirement,
+) -> Result<(), StoreError> {
+    if !record.is_valid() {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let blob = authority.encrypt_json(
+        &record,
+        choice_private_body_retirement_aad(&record.source_kind, &record.entity_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_private_body_retirement
+         (source_kind, entity_id, encrypted_blob, blob_hash, retired_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &record.source_kind,
+            &record.entity_id,
+            blob,
+            &state_hash,
+            record.retired_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!(
+                "choice-body-retired-{}-{}",
+                record.source_kind, record.entity_id
+            ),
+            command_id: &record.entity_id,
+            command_hash: &record.body_digest,
+            actor: "openopen-host",
+            action: CHOICE_BODY_RETIREMENT_ACTION,
+            entity_id: &format!("{}:{}", record.source_kind, record.entity_id),
+            created_at_ms: record.retired_at_ms,
+            state_kind: "choice:private_body_retirement",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn model_provenance_matches_selection(
+    provenance: &openopen_protocol::ModelProvenance,
+    selection: &ModelSelection,
+) -> bool {
+    provenance.model_id == selection.model_id
+        && provenance.requested_effort == selection.requested_effort
+        && provenance.actual_effort == selection.actual_effort
+        && provenance.catalog_fingerprint == selection.catalog_fingerprint
+        && provenance.catalog_revision == selection.catalog_revision
+        && provenance.account_display_class == selection.account_display_class
+        && provenance.protocol_schema_revision == selection.protocol_schema_revision
+}
+
+fn choice_selection_id(selection: &Selection) -> &str {
+    match selection {
+        Selection::OptionSelection(value) => &value.id,
+        Selection::NaturalConversationSelection(value) => &value.id,
+    }
+}
+
+fn persist_choice_begin_record(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &ChoiceBeginRecord,
+) -> Result<(), StoreError> {
+    let request_id = &record.accepted.request_id;
+    let blob = authority.encrypt_json(
+        record,
+        choice_begin_request_aad(
+            request_id,
+            &record.accepted.choice_session_id,
+            &record.accepted.operation_id,
+            &record.accepted.source_envelope_id,
+            &record.accepted.conversation_turn_batch_id,
+            record.accepted_at_ms,
+        )
+        .as_bytes(),
+    )?;
+    let encrypted_blob_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_begin_request (
+            request_id, request_digest, choice_session_id, operation_id, source_envelope_id,
+            conversation_turn_batch_id, encrypted_blob, blob_hash, accepted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            request_id,
+            &record.request_digest,
+            &record.accepted.choice_session_id,
+            &record.accepted.operation_id,
+            &record.accepted.source_envelope_id,
+            &record.accepted.conversation_turn_batch_id,
+            blob,
+            encrypted_blob_hash,
+            record.accepted_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-begin-{}", record.accepted.operation_id),
+            command_id: request_id,
+            command_hash: &record.request_digest,
+            actor: "owner",
+            action: CHOICE_BEGIN_ACTION,
+            entity_id: request_id,
+            created_at_ms: record.accepted_at_ms,
+            state_kind: "choice:begin",
+            state_hash: &encrypted_blob_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_choice_d_record(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &ChoiceDIntakeRecord,
+    operation: &ChoiceRefinementOperation,
+) -> Result<(), StoreError> {
+    let blob = authority.encrypt_json(
+        record,
+        choice_d_request_aad(
+            &record.input.request_id,
+            &record.input.choice_session_id,
+            &operation.id,
+            &record.source_envelope.id,
+            &record.batch.id,
+            record.input.submitted_at_ms,
+        )
+        .as_bytes(),
+    )?;
+    let encrypted_blob_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_d_request (
+            request_id, request_digest, operation_id, choice_session_id, source_envelope_id,
+            conversation_turn_batch_id, encrypted_blob, blob_hash, accepted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &record.input.request_id,
+            &record.request_digest,
+            &operation.id,
+            &record.input.choice_session_id,
+            &record.source_envelope.id,
+            &record.batch.id,
+            blob,
+            encrypted_blob_hash,
+            record.input.submitted_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-d-intake-{}", record.input.request_id),
+            command_id: &record.input.request_id,
+            command_hash: &record.request_digest,
+            actor: "owner",
+            action: CHOICE_D_INTAKE_ACTION,
+            entity_id: &record.input.request_id,
+            created_at_ms: record.input.submitted_at_ms,
+            state_kind: "choice:d_intake",
+            state_hash: &encrypted_blob_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_choice_refinement_context(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    context: &ChoiceRefinementContext,
+    created_at_ms: i64,
+) -> Result<(), StoreError> {
+    if !context.is_valid() || created_at_ms < 0 {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let blob = authority.encrypt_json(
+        context,
+        choice_refinement_context_aad(
+            &context.operation_id,
+            &context.selection_id,
+            &context.choice_session_id,
+            &context.source_envelope_id,
+            &context.conversation_turn_batch_id,
+            created_at_ms,
+        )
+        .as_bytes(),
+    )?;
+    let hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_refinement_context
+         (operation_id, selection_id, choice_session_id, source_envelope_id,
+          conversation_turn_batch_id, encrypted_blob, blob_hash, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &context.operation_id,
+            &context.selection_id,
+            &context.choice_session_id,
+            &context.source_envelope_id,
+            &context.conversation_turn_batch_id,
+            blob,
+            hash,
+            created_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-refinement-context-{}", context.operation_id),
+            command_id: &context.operation_id,
+            command_hash: &format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(context)
+                        .map_err(|error| CryptoError::Serialization(error.to_string()))?
+                )
+            ),
+            actor: "host",
+            action: CHOICE_REFINEMENT_CONTEXT_ACTION,
+            entity_id: &context.operation_id,
+            created_at_ms,
+            state_kind: "choice:refinement_context",
+            state_hash: &hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn load_choice_refinement_result(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    operation_id: &str,
+) -> Result<Option<ChoiceRefinementResult>, StoreError> {
+    let row: Option<ChoiceRefinementResultRow> = connection
+        .query_row(
+            "SELECT selection_id, choice_session_id, source_envelope_id,
+                    conversation_turn_batch_id, result_digest, encrypted_blob, blob_hash,
+                    completed_at_ms
+             FROM choice_refinement_result WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            selection_id,
+            choice_session_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            result_digest,
+            blob,
+            stored_hash,
+            completed_at_ms,
+        )| {
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            verify_blob_binding(
+                connection,
+                CHOICE_REFINEMENT_RESULT_ACTION,
+                operation_id,
+                "choice:refinement_result",
+                &blob,
+            )?;
+            let result: ChoiceRefinementResult = authority.decrypt_json(
+                &blob,
+                choice_refinement_result_aad(
+                    operation_id,
+                    &selection_id,
+                    &choice_session_id,
+                    &source_envelope_id,
+                    &conversation_turn_batch_id,
+                    &result_digest,
+                    completed_at_ms,
+                )
+                .as_bytes(),
+            )?;
+            if !result.is_valid()
+                || result.operation_id != operation_id
+                || result.selection_id != selection_id
+                || result.interpretation.choice_session_id != choice_session_id
+                || result.source_envelope_id != source_envelope_id
+                || result.conversation_turn_batch_id != conversation_turn_batch_id
+                || result.result_digest != result_digest
+                || result.completed_at_ms != completed_at_ms
+            {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            Ok(result)
+        },
+    )
+    .transpose()
+}
+
+fn persist_choice_refinement_result(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    result: &ChoiceRefinementResult,
+) -> Result<(), StoreError> {
+    let blob = authority.encrypt_json(
+        result,
+        choice_refinement_result_aad(
+            &result.operation_id,
+            &result.selection_id,
+            &result.interpretation.choice_session_id,
+            &result.source_envelope_id,
+            &result.conversation_turn_batch_id,
+            &result.result_digest,
+            result.completed_at_ms,
+        )
+        .as_bytes(),
+    )?;
+    let encrypted_blob_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_refinement_result
+         (operation_id, selection_id, choice_session_id, source_envelope_id,
+          conversation_turn_batch_id, result_digest, encrypted_blob, blob_hash, completed_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &result.operation_id,
+            &result.selection_id,
+            &result.interpretation.choice_session_id,
+            &result.source_envelope_id,
+            &result.conversation_turn_batch_id,
+            &result.result_digest,
+            &blob,
+            &encrypted_blob_hash,
+            result.completed_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-refinement-result-{}", result.operation_id),
+            command_id: &result.operation_id,
+            command_hash: &result.result_digest,
+            actor: "host",
+            action: CHOICE_REFINEMENT_RESULT_ACTION,
+            entity_id: &result.operation_id,
+            created_at_ms: result.completed_at_ms,
+            state_kind: "choice:refinement_result",
+            state_hash: &encrypted_blob_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn load_markdown_render_intent(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    intent_id: &str,
+) -> Result<Option<StoredMarkdownRenderIntent>, StoreError> {
+    let row: Option<(String, Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT intent_digest, encrypted_blob, blob_hash
+             FROM choice_markdown_render_intent WHERE intent_id = ?1",
+            [intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(intent_digest, blob, stored_hash)| {
+        if stored_hash != blob_hash(&blob) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verify_blob_binding(
+            connection,
+            CHOICE_MARKDOWN_RENDER_INTENT_ACTION,
+            intent_id,
+            "choice:markdown_render_intent",
+            &blob,
+        )?;
+        let record: StoredMarkdownRenderIntent = authority.decrypt_json(
+            &blob,
+            markdown_render_intent_aad(intent_id, &intent_digest).as_bytes(),
+        )?;
+        let computed_digest = markdown_render_intent_digest(&record.intent)?;
+        let body_is_valid = record.plaintext_body.as_ref().is_none_or(|body| {
+            body.len() as u64 == record.intent.entry.byte_length
+                && sha256_hex(body.as_bytes()) == record.intent.content_digest
+        });
+        if !record.intent.is_valid()
+            || record.intent.id != intent_id
+            || !body_is_valid
+            || record
+                .reconciliation
+                .as_ref()
+                .is_some_and(|value| !value.is_valid())
+            || computed_digest != intent_digest
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        Ok(record)
+    })
+    .transpose()
+}
+
+fn persist_markdown_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredMarkdownRenderIntent,
+) -> Result<(), StoreError> {
+    let intent_digest = markdown_render_intent_digest(&record.intent)?;
+    let blob = authority.encrypt_json(
+        record,
+        markdown_render_intent_aad(&record.intent.id, &intent_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_markdown_render_intent
+         (intent_id, intent_digest, encrypted_blob, blob_hash, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &record.intent.id,
+            intent_digest,
+            blob,
+            state_hash,
+            record.intent.created_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{}:intent", record.intent.id),
+            command_id: &record.intent.id,
+            command_hash: &markdown_render_intent_digest(&record.intent)?,
+            actor: "openopen-host",
+            action: CHOICE_MARKDOWN_RENDER_INTENT_ACTION,
+            entity_id: &record.intent.id,
+            created_at_ms: record.intent.created_at_ms,
+            state_kind: "choice:markdown_render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn update_markdown_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredMarkdownRenderIntent,
+    audit_suffix: &str,
+    updated_at_ms: i64,
+) -> Result<(), StoreError> {
+    let intent_digest = markdown_render_intent_digest(&record.intent)?;
+    let blob = authority.encrypt_json(
+        record,
+        markdown_render_intent_aad(&record.intent.id, &intent_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    if transaction.execute(
+        "UPDATE choice_markdown_render_intent
+         SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE intent_id = ?1 AND intent_digest = ?4",
+        params![&record.intent.id, blob, state_hash, intent_digest],
+    )? != 1
+    {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{}:{audit_suffix}", record.intent.id),
+            command_id: &format!("{}:{audit_suffix}", record.intent.id),
+            command_hash: &markdown_render_intent_digest(&record.intent)?,
+            actor: "openopen-host",
+            action: CHOICE_MARKDOWN_RENDER_INTENT_ACTION,
+            entity_id: &record.intent.id,
+            created_at_ms: updated_at_ms,
+            state_kind: "choice:markdown_render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn persist_retired_markdown_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    intent: &MarkdownRenderIntent,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let intent_digest = markdown_render_intent_digest(intent)?;
+    let retired = StoredMarkdownRenderIntent {
+        intent: intent.clone(),
+        plaintext_body: None,
+        reconciliation: None,
+    };
+    let blob = authority.encrypt_json(
+        &retired,
+        markdown_render_intent_aad(&intent.id, &intent_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "UPDATE choice_markdown_render_intent
+         SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE intent_id = ?1 AND intent_digest = ?4",
+        params![&intent.id, blob, state_hash, intent_digest],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{}:body-retired", intent.id),
+            command_id: &format!("{}:body-retired", intent.id),
+            command_hash: &markdown_render_intent_digest(intent)?,
+            actor: "openopen-host",
+            action: CHOICE_MARKDOWN_RENDER_INTENT_ACTION,
+            entity_id: &intent.id,
+            created_at_ms: retired_at_ms,
+            state_kind: "choice:markdown_render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn retire_reconciled_markdown_intents_for_session(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    choice_session_id: &str,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let intent_ids = transaction
+        .prepare("SELECT intent_id FROM choice_markdown_render_intent")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for intent_id in intent_ids {
+        let stored = load_markdown_render_intent(transaction, authority, &intent_id)?
+            .ok_or(StoreError::ChoiceLoopStateConflict)?;
+        if stored.intent.choice_session_id != choice_session_id || stored.plaintext_body.is_none() {
+            continue;
+        }
+        if stored.reconciliation.is_none()
+            || load_markdown_render_receipt(transaction, authority, &intent_id)?.is_some()
+        {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        persist_retired_markdown_render_intent(
+            transaction,
+            authority,
+            &stored.intent,
+            retired_at_ms,
+        )?;
+    }
+    Ok(())
+}
+
+fn load_markdown_render_receipt(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    intent_id: &str,
+) -> Result<Option<MarkdownRenderReceipt>, StoreError> {
+    let row: Option<(String, Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT choice_markdown_render_intent.intent_digest,
+                    choice_markdown_render_receipt.encrypted_blob,
+                    choice_markdown_render_receipt.blob_hash
+             FROM choice_markdown_render_intent
+             JOIN choice_markdown_render_receipt USING(intent_id)
+             WHERE intent_id = ?1",
+            [intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(intent_digest, blob, stored_hash)| {
+        if stored_hash != blob_hash(&blob) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verify_blob_binding(
+            connection,
+            CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION,
+            intent_id,
+            "choice:markdown_render_receipt",
+            &blob,
+        )?;
+        let receipt: MarkdownRenderReceipt = authority.decrypt_json(
+            &blob,
+            markdown_render_receipt_aad(intent_id, &intent_digest).as_bytes(),
+        )?;
+        if !receipt.is_valid() || receipt.intent_id != intent_id {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        Ok(receipt)
+    })
+    .transpose()
+}
+
+fn persist_markdown_render_receipt(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    intent: &MarkdownRenderIntent,
+    receipt: &MarkdownRenderReceipt,
+) -> Result<(), StoreError> {
+    let intent_digest = markdown_render_intent_digest(intent)?;
+    let blob = authority.encrypt_json(
+        receipt,
+        markdown_render_receipt_aad(&receipt.intent_id, &intent_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_markdown_render_receipt
+         (intent_id, encrypted_blob, blob_hash, committed_at_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &receipt.intent_id,
+            blob,
+            state_hash,
+            receipt.committed_at_ms
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("{}:receipt", receipt.intent_id),
+            command_id: &format!("{}:receipt", receipt.intent_id),
+            command_hash: &markdown_render_receipt_digest(receipt)?,
+            actor: "openopen-host",
+            action: CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION,
+            entity_id: &receipt.intent_id,
+            created_at_ms: receipt.committed_at_ms,
+            state_kind: "choice:markdown_render_receipt",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChoiceIdleClockContinuity {
+    Calibrate { trusted_now_ms: i64 },
+    Continuous { trusted_now_ms: i64 },
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ChoiceIdleClockAnchor {
+    evidence: ChoiceIdleClockEvidence,
+    trusted_now_ms: i64,
+}
+
+impl ChoiceIdleClockAnchor {
+    fn is_valid(&self) -> bool {
+        self.evidence.is_valid() && self.trusted_now_ms >= 0
+    }
+}
+
+fn classify_choice_idle_clock(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    next: &ChoiceIdleClockEvidence,
+) -> Result<ChoiceIdleClockContinuity, StoreError> {
+    let previous = load_choice_idle_clock_anchor(connection, authority)?;
+    let Some(previous) = previous else {
+        return Ok(ChoiceIdleClockContinuity::Calibrate {
+            trusted_now_ms: next.wall_clock_ms,
+        });
+    };
+    if next.boot_id != previous.evidence.boot_id {
+        // A changed boot has no comparable monotonic clock. It must be
+        // calibrated by this valid Host-owned wake and cannot authorize an
+        // idle/stale transition until a later same-boot sample.
+        return Ok(if next.wall_clock_ms >= previous.evidence.wall_clock_ms {
+            ChoiceIdleClockContinuity::Calibrate {
+                trusted_now_ms: previous.trusted_now_ms,
+            }
+        } else {
+            ChoiceIdleClockContinuity::Uncertain
+        });
+    }
+    let Some(wall_delta) = next
+        .wall_clock_ms
+        .checked_sub(previous.evidence.wall_clock_ms)
+    else {
+        return Ok(ChoiceIdleClockContinuity::Uncertain);
+    };
+    let Some(monotonic_delta) = next
+        .monotonic_ms
+        .checked_sub(previous.evidence.monotonic_ms)
+    else {
+        return Ok(ChoiceIdleClockContinuity::Uncertain);
+    };
+    // An exact repeated sample is an idempotent no-progress observation.
+    // Rollback of either clock is uncertainty and leaves the last good anchor
+    // intact. A positive sleep-shaped skew is handled separately below as a
+    // non-authorizing recalibration point.
+    if wall_delta == 0 && monotonic_delta == 0 {
+        return Ok(ChoiceIdleClockContinuity::Continuous {
+            trusted_now_ms: previous.trusted_now_ms,
+        });
+    }
+    if wall_delta <= 0 || monotonic_delta <= 0 {
+        return Ok(ChoiceIdleClockContinuity::Uncertain);
+    }
+    if wall_delta.abs_diff(monotonic_delta) > 60_000 {
+        // A sleep-shaped or forward-adjusted wall sample is ambiguous and may
+        // not consume a deadline. Persist it only as a new calibration point;
+        // the caller returns typed clock uncertainty and requires a later
+        // same-boot sample before any Choice transition can occur. This makes
+        // uncertainty recoverable without treating unknown elapsed time as
+        // authority.
+        return Ok(ChoiceIdleClockContinuity::Calibrate {
+            trusted_now_ms: previous.trusted_now_ms,
+        });
+    }
+    let trusted_now_ms = previous
+        .trusted_now_ms
+        .checked_add(monotonic_delta)
+        .ok_or(StoreError::ChoiceClockUncertain)?;
+    Ok(ChoiceIdleClockContinuity::Continuous { trusted_now_ms })
+}
+
+/// Persists a non-authorizing clock calibration.  If an old active `ChoiceSet`
+/// exists, retire it in the same transaction: an ambiguous first/rebooted
+/// clock sample cannot leave model-derived authority consumable on a retry.
+fn calibrate_choice_idle_state(
+    transaction: Transaction<'_>,
+    authority: &LocalAuthority,
+    current: ChoiceLoopSnapshot,
+    clock: &ChoiceIdleClockEvidence,
+    trusted_now_ms: i64,
+) -> Result<ChoiceIdleAdvance, StoreError> {
+    persist_choice_idle_clock_anchor(&transaction, authority, clock, trusted_now_ms)?;
+    if current.session.state != ChoiceSessionState::Active {
+        transaction.commit()?;
+        return Ok(ChoiceIdleAdvance::Calibrated(current));
+    }
+
+    let mut next = current.clone();
+    next.session.revision = current
+        .session
+        .revision
+        .checked_add(1)
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    next.session.state = ChoiceSessionState::SoftIdle;
+    next.session.active_choice_set_id = None;
+    next.active_choice_set = None;
+    if !next.is_permitted_successor_of(&current) {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let retirement_at_ms = trusted_now_ms
+        .max(current.session.last_input_at_ms)
+        .max(current.document_manifest.generated_at_ms);
+    persist_choice_loop_snapshot(&transaction, authority, &next, retirement_at_ms)?;
+    transaction.commit()?;
+    Ok(ChoiceIdleAdvance::Transitioned(next))
+}
+
+fn load_choice_idle_clock_anchor(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<ChoiceIdleClockAnchor>, StoreError> {
+    connection
+        .query_row(
+            "SELECT encrypted_blob, blob_hash
+             FROM choice_idle_clock_anchor WHERE singleton_id = 1",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .map(|(blob, stored_hash)| {
+            if stored_hash != blob_hash(&blob) {
+                return Err(StoreError::ChoiceClockUncertain);
+            }
+            verify_blob_binding(
+                connection,
+                CHOICE_IDLE_CLOCK_ACTION,
+                "choice-idle-clock",
+                "choice:idle_clock_anchor",
+                &blob,
+            )?;
+            let anchor: ChoiceIdleClockAnchor = authority
+                .decrypt_json(&blob, choice_idle_clock_aad().as_bytes())
+                .map_err(StoreError::Crypto)?;
+            anchor
+                .is_valid()
+                .then_some(anchor)
+                .ok_or(StoreError::ChoiceClockUncertain)
+        })
+        .transpose()
+}
+
+fn persist_choice_idle_clock_anchor(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    clock: &ChoiceIdleClockEvidence,
+    trusted_now_ms: i64,
+) -> Result<(), StoreError> {
+    let anchor = ChoiceIdleClockAnchor {
+        evidence: clock.clone(),
+        trusted_now_ms,
+    };
+    if !anchor.is_valid() {
+        return Err(StoreError::ChoiceClockUncertain);
+    }
+    let command_hash = serde_json::to_vec(&anchor)
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| StoreError::Crypto(CryptoError::Serialization(error.to_string())))?;
+    let blob = authority.encrypt_json(&anchor, choice_idle_clock_aad().as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_idle_clock_anchor (singleton_id, encrypted_blob, blob_hash)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton_id) DO UPDATE SET encrypted_blob = excluded.encrypted_blob,
+             blob_hash = excluded.blob_hash",
+        params![blob, state_hash],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-idle-clock:{command_hash}"),
+            command_id: &format!("choice-idle-clock:{command_hash}"),
+            command_hash: &command_hash,
+            actor: "openopen-host",
+            action: CHOICE_IDLE_CLOCK_ACTION,
+            entity_id: "choice-idle-clock",
+            created_at_ms: clock.wall_clock_ms,
+            state_kind: "choice:idle_clock_anchor",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn markdown_render_intent_digest(intent: &MarkdownRenderIntent) -> Result<String, StoreError> {
+    serde_json::to_vec(intent)
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| StoreError::Crypto(CryptoError::Serialization(error.to_string())))
+}
+
+fn markdown_render_receipt_digest(receipt: &MarkdownRenderReceipt) -> Result<String, StoreError> {
+    serde_json::to_vec(receipt)
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| StoreError::Crypto(CryptoError::Serialization(error.to_string())))
+}
+
+fn persist_choice_loop_snapshot(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    snapshot: &ChoiceLoopSnapshot,
+    updated_at_ms: i64,
+) -> Result<(), StoreError> {
+    let blob = authority.encrypt_json(snapshot, choice_loop_state_aad().as_bytes())?;
+    let snapshot_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(snapshot)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?
+        )
+    );
+    let encrypted_blob_hash = blob_hash(&blob);
+    let audit_id = format!("choice-loop-state-{snapshot_hash}-{updated_at_ms}");
+    transaction.execute(
+        "INSERT INTO choice_loop_state (singleton_id, encrypted_blob, blob_hash, updated_at_ms)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(singleton_id) DO UPDATE SET encrypted_blob = excluded.encrypted_blob,
+             blob_hash = excluded.blob_hash, updated_at_ms = excluded.updated_at_ms",
+        params![blob, encrypted_blob_hash, updated_at_ms],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &audit_id,
+            command_id: &audit_id,
+            command_hash: &snapshot_hash,
+            actor: "owner",
+            action: CHOICE_LOOP_STATE_ACTION,
+            entity_id: "choice-loop",
+            created_at_ms: updated_at_ms,
+            state_kind: "choice:loop_state",
+            state_hash: &encrypted_blob_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn valid_choice_reminder_time_zone(value: &str) -> bool {
+    value.parse::<chrono_tz::Tz>().is_ok()
+}
+
+/// Binds every plaintext schedule index to the encrypted record.  These
+/// columns are used for replay and current-revision lookup, so accepting a
+/// record with only its ciphertext authenticated would let a direct row edit
+/// alter idempotency or ordering without changing the blob itself.
+fn choice_reminder_schedule_aad(
+    schedule_id: &str,
+    request_id: &str,
+    choice_session_id: &str,
+    revision: u64,
+    accepted_at_ms: i64,
+) -> Vec<u8> {
+    let mut aad = b"openopen:choice-reminder-schedule:v2".to_vec();
+    for value in [schedule_id, request_id, choice_session_id] {
+        aad.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        aad.extend_from_slice(value.as_bytes());
+    }
+    aad.extend_from_slice(&8_u64.to_be_bytes());
+    aad.extend_from_slice(&revision.to_be_bytes());
+    aad.extend_from_slice(&8_u64.to_be_bytes());
+    aad.extend_from_slice(&accepted_at_ms.to_be_bytes());
+    aad
+}
+
+fn persist_choice_reminder_schedule(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    schedule: &ChoiceReminderSchedule,
+) -> Result<(), StoreError> {
+    if !schedule.is_valid() || !valid_choice_reminder_time_zone(&schedule.input.time_zone) {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    let blob = authority.encrypt_json(
+        schedule,
+        &choice_reminder_schedule_aad(
+            &schedule.id,
+            &schedule.input.request_id,
+            &schedule.input.choice_session_id,
+            schedule.revision,
+            schedule.accepted_at_ms,
+        ),
+    )?;
+    let hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO choice_reminder_schedule
+         (schedule_id, request_id, choice_session_id, revision, encrypted_blob, blob_hash, accepted_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![schedule.id, schedule.input.request_id, schedule.input.choice_session_id,
+            i64::try_from(schedule.revision).map_err(|_| StoreError::ChoiceLoopStateConflict)?,
+            blob, hash, schedule.accepted_at_ms],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("choice-reminder-schedule-{}", schedule.id),
+            command_id: &schedule.input.request_id,
+            command_hash: &format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&schedule.input)
+                        .map_err(|error| CryptoError::Serialization(error.to_string()))?
+                )
+            ),
+            actor: "owner",
+            action: CHOICE_REMINDER_SCHEDULE_ACTION,
+            entity_id: &schedule.id,
+            created_at_ms: schedule.accepted_at_ms,
+            state_kind: "choice:reminder_schedule",
+            state_hash: &hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn load_choice_reminder_schedule_by_request(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    request_id: &str,
+) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT schedule_id FROM choice_reminder_schedule WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| load_choice_reminder_schedule(connection, authority, &id))
+        .transpose()
+}
+
+fn load_current_choice_reminder_schedule(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    session_id: &str,
+) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+    let id: Option<String> = connection.query_row(
+        "SELECT schedule_id FROM choice_reminder_schedule WHERE choice_session_id = ?1 ORDER BY revision DESC LIMIT 1",
+        [session_id], |row| row.get(0),
+    ).optional()?;
+    id.map(|id| load_choice_reminder_schedule(connection, authority, &id))
+        .transpose()
+}
+
+fn load_current_choice_reminder_schedule_for_revision(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    session_id: &str,
+    expected_session_revision: u64,
+) -> Result<Option<ChoiceReminderSchedule>, StoreError> {
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT schedule_id FROM choice_reminder_schedule
+             WHERE choice_session_id = ?1 ORDER BY revision DESC LIMIT 1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let schedule = load_choice_reminder_schedule(connection, authority, &id)?;
+    Ok((schedule.input.expected_session_revision == expected_session_revision).then_some(schedule))
+}
+
+fn load_choice_reminder_schedule(
+    connection: &Connection,
+    authority: &LocalAuthority,
+    schedule_id: &str,
+) -> Result<ChoiceReminderSchedule, StoreError> {
+    let (request_id, choice_session_id, revision, blob, hash, accepted_at_ms): (
+        String,
+        String,
+        i64,
+        Vec<u8>,
+        String,
+        i64,
+    ) = connection.query_row(
+        "SELECT request_id, choice_session_id, revision, encrypted_blob, blob_hash, accepted_at_ms
+         FROM choice_reminder_schedule WHERE schedule_id = ?1",
+        [schedule_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    let revision = u64::try_from(revision).map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+    if accepted_at_ms < 0 {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    if hash != blob_hash(&blob) {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    verify_blob_binding(
+        connection,
+        CHOICE_REMINDER_SCHEDULE_ACTION,
+        schedule_id,
+        "choice:reminder_schedule",
+        &blob,
+    )?;
+    let schedule: ChoiceReminderSchedule = authority.decrypt_json(
+        &blob,
+        &choice_reminder_schedule_aad(
+            schedule_id,
+            &request_id,
+            &choice_session_id,
+            revision,
+            accepted_at_ms,
+        ),
+    )?;
+    if !schedule.is_valid()
+        || !valid_choice_reminder_time_zone(&schedule.input.time_zone)
+        || schedule.id != schedule_id
+        || schedule.input.request_id != request_id
+        || schedule.input.choice_session_id != choice_session_id
+        || schedule.revision != revision
+        || schedule.accepted_at_ms != accepted_at_ms
+    {
+        return Err(StoreError::ChoiceLoopStateConflict);
+    }
+    Ok(schedule)
+}
+
+fn confirmation_delivery_is_bound(
+    confirmation: &ChoiceConsolidatedConfirmation,
+    session: &openopen_protocol::ChoiceSession,
+) -> bool {
+    match (
+        confirmation.delivery_binding_id.as_deref(),
+        confirmation.recipient.as_deref(),
+        confirmation.delivery_scope.as_deref(),
+        session.primary_delivery_binding_id.as_deref(),
+    ) {
+        (None, None, None, None) => true,
+        (Some(binding), Some(_), Some(_), Some(primary)) => binding == primary,
+        _ => false,
+    }
+}
+
+fn session_model_matches_choice_set(session: &ChoiceSession, choice_set: &ChoiceSet) -> bool {
+    matches!(
+        &session.model_selection_state,
+        ModelSelectionState::Selected {
+            model_provenance_ref,
+        } if model_provenance_ref == &choice_set.model_provenance.id
+    )
+}
+
+fn selected_model_matches_choice_set(selection: &ModelSelection, choice_set: &ChoiceSet) -> bool {
+    selection.model_id == choice_set.model_provenance.model_id
+        && selection.requested_effort == choice_set.model_provenance.requested_effort
+        && selection.actual_effort == choice_set.model_provenance.actual_effort
+        && selection.catalog_fingerprint == choice_set.model_provenance.catalog_fingerprint
+        && selection.catalog_revision == choice_set.model_provenance.catalog_revision
+        && selection.account_display_class == choice_set.model_provenance.account_display_class
+        && selection.protocol_schema_revision
+            == choice_set.model_provenance.protocol_schema_revision
+}
+
+fn raw_choice_loop_batch_lacks_delivery_binding(raw: &serde_json::Value) -> bool {
+    raw.get("activeBatch")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|batch| !batch.contains_key("deliveryBindingId"))
+}
+
+fn load_raw_choice_loop_snapshot(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let row: Option<(Vec<u8>, String)> = connection
+        .query_row(
+            "SELECT encrypted_blob, blob_hash FROM choice_loop_state WHERE singleton_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(blob, stored_hash)| {
+        if stored_hash != blob_hash(&blob) {
+            return Err(StoreError::ChoiceLoopStateConflict);
+        }
+        verify_blob_binding(
+            connection,
+            CHOICE_LOOP_STATE_ACTION,
+            "choice-loop",
+            "choice:loop_state",
+            &blob,
+        )?;
+        authority
+            .decrypt_json(&blob, choice_loop_state_aad().as_bytes())
+            .map_err(StoreError::Crypto)
+    })
+    .transpose()
+}
+
+fn load_choice_loop_snapshot(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<ChoiceLoopSnapshot>, StoreError> {
+    load_raw_choice_loop_snapshot(connection, authority)?
+        .map(|mut raw| {
+            let historical_batch_without_binding = raw
+                .get("activeBatch")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|batch| !batch.contains_key("deliveryBindingId"));
+            let object = raw
+                .as_object_mut()
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            // These fields were added after the first Choice-loop persistence
+            // shape. Their absence is a neutral empty value, unlike a missing
+            // authority binding below.
+            object
+                .entry("lastSelection")
+                .or_insert(serde_json::Value::Null);
+            object
+                .entry("confirmation")
+                .or_insert(serde_json::Value::Null);
+            if historical_batch_without_binding {
+                // Never infer authority from owner/provider/body/time. Expose the
+                // legacy batch as a typed blocked recovery state until a fresh,
+                // Host-derived batch is accepted through the normal command path.
+                if let Some(batch) = object
+                    .get_mut("activeBatch")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    batch.insert(
+                        "deliveryBindingId".to_owned(),
+                        serde_json::Value::String("blocked-missing-binding".to_owned()),
+                    );
+                }
+                if let Some(session) = object
+                    .get_mut("session")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    session.insert(
+                        "state".to_owned(),
+                        serde_json::Value::String("blocked".to_owned()),
+                    );
+                    session.insert("activeChoiceSetId".to_owned(), serde_json::Value::Null);
+                    session.insert("pendingConfirmationId".to_owned(), serde_json::Value::Null);
+                }
+                object.insert("activeChoiceSet".to_owned(), serde_json::Value::Null);
+                object.insert("confirmation".to_owned(), serde_json::Value::Null);
+            }
+            let snapshot: ChoiceLoopSnapshot = serde_json::from_value(raw).map_err(|error| {
+                StoreError::Crypto(CryptoError::Serialization(error.to_string()))
+            })?;
+            if !snapshot.is_valid() {
+                return Err(StoreError::ChoiceLoopStateConflict);
+            }
+            Ok(snapshot)
+        })
+        .transpose()
 }
 
 fn channel_json(channel: ChannelKind) -> Result<String, StoreError> {
@@ -7117,6 +16388,142 @@ fn channel_pairing_aad(channel_json: &str) -> String {
     format!("openopen:channel-pairing:v1:{channel_json}")
 }
 
+fn choice_model_selection_aad() -> &'static str {
+    "openopen:choice-model-selection:v1"
+}
+
+fn choice_loop_state_aad() -> &'static str {
+    "openopen:choice-loop-state:v1"
+}
+
+fn choice_idle_clock_aad() -> &'static str {
+    "openopen:choice-idle-clock-anchor:v1"
+}
+
+fn choice_begin_request_aad(
+    request_id: &str,
+    choice_session_id: &str,
+    operation_id: &str,
+    source_envelope_id: &str,
+    conversation_turn_batch_id: &str,
+    accepted_at_ms: i64,
+) -> String {
+    let accepted_at_ms = accepted_at_ms.to_string();
+    choice_identity_aad(
+        "openopen:choice-begin-request:v3",
+        &[
+            request_id,
+            choice_session_id,
+            operation_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            &accepted_at_ms,
+        ],
+    )
+}
+
+fn choice_d_request_aad(
+    request_id: &str,
+    choice_session_id: &str,
+    operation_id: &str,
+    source_envelope_id: &str,
+    conversation_turn_batch_id: &str,
+    accepted_at_ms: i64,
+) -> String {
+    let accepted_at_ms = accepted_at_ms.to_string();
+    choice_identity_aad(
+        "openopen:choice-d-request:v3",
+        &[
+            request_id,
+            choice_session_id,
+            operation_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            &accepted_at_ms,
+        ],
+    )
+}
+
+fn choice_refinement_context_aad(
+    operation_id: &str,
+    selection_id: &str,
+    choice_session_id: &str,
+    source_envelope_id: &str,
+    conversation_turn_batch_id: &str,
+    created_at_ms: i64,
+) -> String {
+    let created_at_ms = created_at_ms.to_string();
+    choice_identity_aad(
+        "openopen:choice-refinement-context:v3",
+        &[
+            operation_id,
+            selection_id,
+            choice_session_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            &created_at_ms,
+        ],
+    )
+}
+
+fn choice_refinement_result_aad(
+    operation_id: &str,
+    selection_id: &str,
+    choice_session_id: &str,
+    source_envelope_id: &str,
+    conversation_turn_batch_id: &str,
+    result_digest: &str,
+    completed_at_ms: i64,
+) -> String {
+    let completed_at_ms = completed_at_ms.to_string();
+    choice_identity_aad(
+        "openopen:choice-refinement-result:v4",
+        &[
+            operation_id,
+            selection_id,
+            choice_session_id,
+            source_envelope_id,
+            conversation_turn_batch_id,
+            result_digest,
+            &completed_at_ms,
+        ],
+    )
+}
+
+fn choice_identity_aad(domain: &str, fields: &[&str]) -> String {
+    let mut aad = String::from(domain);
+    for field in fields {
+        aad.push('|');
+        aad.push_str(&field.len().to_string());
+        aad.push(':');
+        aad.push_str(field);
+    }
+    aad
+}
+
+fn choice_private_body_retirement_aad(source_kind: &str, entity_id: &str) -> String {
+    format!("openopen:choice-private-body-retirement:v1:{source_kind}:{entity_id}")
+}
+
+fn markdown_render_intent_aad(intent_id: &str, intent_digest: &str) -> String {
+    format!("openopen:choice-markdown-render-intent:v2:{intent_id}:{intent_digest}")
+}
+
+fn markdown_render_receipt_aad(intent_id: &str, intent_digest: &str) -> String {
+    format!("openopen:choice-markdown-render-receipt:v2:{intent_id}:{intent_digest}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn channel_observation_aad(entity_id: &str) -> String {
     format!("openopen:channel-observation:v1:{entity_id}")
 }
@@ -7298,6 +16705,3788 @@ mod correction_directive_tests {
 }
 
 #[cfg(test)]
+mod choice_model_selection_tests {
+    use super::*;
+
+    fn selection(model_id: &str, catalog_fingerprint: &str) -> ModelSelection {
+        ModelSelection {
+            id: format!("selection-{model_id}"),
+            model_id: model_id.to_owned(),
+            requested_effort: "not_applicable".to_owned(),
+            actual_effort: "not_applicable".to_owned(),
+            catalog_fingerprint: catalog_fingerprint.to_owned(),
+            catalog_revision: 1,
+            account_display_class: "chatgpt:test".to_owned(),
+            protocol_schema_revision: 1,
+        }
+    }
+
+    #[test]
+    fn explicit_model_selection_is_audited_idempotent_and_tamper_evident() {
+        let authority = LocalAuthority::from_master("choice-model-selection", [91_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        let first = selection("gpt-test-a", &"a".repeat(64));
+
+        assert_eq!(
+            store
+                .select_model_selection(&first, 1)
+                .expect("persist first selection"),
+            first
+        );
+        assert_eq!(
+            store
+                .selected_model_selection()
+                .expect("load first selection"),
+            Some(first.clone())
+        );
+
+        assert_eq!(
+            store
+                .select_model_selection(&first, 2)
+                .expect("idempotent selection"),
+            first
+        );
+        let audit_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE action = ?1",
+                [CHOICE_MODEL_SELECTION_ACTION],
+                |row| row.get(0),
+            )
+            .expect("audit count");
+        assert_eq!(audit_count, 1);
+
+        let second = selection("gpt-test-b", &"b".repeat(64));
+        store
+            .select_model_selection(&second, 3)
+            .expect("persist changed selection");
+        assert_eq!(
+            store
+                .selected_model_selection()
+                .expect("load changed selection"),
+            Some(second)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE choice_model_selection SET blob_hash = ?1 WHERE singleton_id = 1",
+                ["00".repeat(32)],
+            )
+            .expect("tamper selection hash");
+        assert!(matches!(
+            store.selected_model_selection(),
+            Err(StoreError::ChoiceModelSelectionConflict)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod choice_begin_tests {
+    use super::*;
+    use crate::{BrokerEnrollmentRecord, broker_enrollment_signing_bytes};
+    use ed25519_dalek::{Signer, SigningKey};
+    use openopen_protocol::{
+        BatchSealReason, ChoiceBeginAccepted, ChoiceBeginRecord, ChoiceDInput, ChoiceDIntakeRecord,
+        ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption, ChoiceResumeResult, ChoiceSession,
+        ChoiceSessionState, ChoiceSet, ConversationTurnBatch, DocumentManifest,
+        DocumentManifestEntry, EFFECT_PROTOCOL_VERSION, InterpretationFrame, MarkdownRenderIntent,
+        MarkdownRenderReceipt, ModelProvenance, ModelSelection, ModelSelectionState,
+        NaturalConversationSelection, OptionSelection, PersonaRevisionRef, RuntimeControlReceipt,
+        SourceEnvelope, canonical_document_manifest_digest, runtime_control_authorization_hash,
+        runtime_control_receipt_signing_bytes,
+    };
+
+    pub(super) fn commit_runtime_revision(
+        store: &mut Store,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> (RuntimeControlAuthorization, RuntimeControlReceipt) {
+        let broker = SigningKey::from_bytes(&[94_u8; 32]);
+        let broker_key = broker.verifying_key().to_bytes();
+        let authorization = store
+            .prepare_runtime_control(enabled, updated_at_ms)
+            .unwrap();
+        let mut receipt = RuntimeControlReceipt {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            authorization_hash: runtime_control_authorization_hash(&authorization).unwrap(),
+            checkpoint_nonce: "90".repeat(32),
+            request_nonce: None,
+            broker_key_id: format!("{:x}", Sha256::digest(broker_key)),
+            broker_signature_hex: String::new(),
+        };
+        receipt.broker_signature_hex = hex::encode(
+            broker
+                .sign(&runtime_control_receipt_signing_bytes(&receipt).unwrap())
+                .to_bytes(),
+        );
+        store
+            .commit_runtime_control(&authorization, &receipt)
+            .unwrap();
+        (authorization, receipt)
+    }
+
+    pub(super) fn enable_runtime(
+        store: &mut Store,
+        authority: &LocalAuthority,
+    ) -> (RuntimeControlAuthorization, RuntimeControlReceipt) {
+        let broker = SigningKey::from_bytes(&[94_u8; 32]);
+        let broker_key = broker.verifying_key().to_bytes();
+        let mut enrollment = BrokerEnrollmentRecord {
+            version: 1,
+            broker_key_id: format!("{:x}", Sha256::digest(broker_key)),
+            broker_verifying_key_hex: hex::encode(broker_key),
+            helper_designated_requirement_digest: "cd".repeat(32),
+            installed_at_ms: 1,
+            core_key_id: authority.effect_key_id(),
+            core_authorization_signature_hex: String::new(),
+        };
+        let mut derivation = b"openopen-effect-authorizer-v1".to_vec();
+        derivation.extend([93_u8; 32]);
+        let core_signing_key = SigningKey::from_bytes(&Sha256::digest(derivation).into());
+        enrollment.core_authorization_signature_hex = hex::encode(
+            core_signing_key
+                .sign(&broker_enrollment_signing_bytes(&enrollment).unwrap())
+                .to_bytes(),
+        );
+        store.install_trusted_broker(&enrollment).unwrap();
+        commit_runtime_revision(store, true, 1)
+    }
+
+    pub(super) fn selection() -> ModelSelection {
+        ModelSelection {
+            id: "model-selection-1".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "not_applicable".to_owned(),
+            actual_effort: "not_applicable".to_owned(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 1,
+            account_display_class: "chatgpt:test".to_owned(),
+            protocol_schema_revision: 1,
+        }
+    }
+
+    pub(super) fn persona_revision() -> PersonaRevisionRef {
+        PersonaRevisionRef {
+            persona_id: "openopen.nondev.default".to_owned(),
+            revision: "draft-03-en".to_owned(),
+            aggregate_digest: "f".repeat(64),
+            instructions_digest: "e".repeat(64),
+        }
+    }
+
+    pub(super) fn begin_state(
+        question: &str,
+        request_id: &str,
+    ) -> (ChoiceBeginRecord, ChoiceLoopSnapshot) {
+        let digest = format!("{:x}", Sha256::digest(question.as_bytes()));
+        let manifest_entry = DocumentManifestEntry {
+            relative_path: "sessions/session-1/SESSION.md".to_owned(),
+            sha256: digest.clone(),
+            byte_length: u64::try_from(question.len()).unwrap(),
+            mode: 0o600,
+        };
+        let source_manifest = DocumentManifest {
+            root_version: 1,
+            entries: vec![manifest_entry],
+            aggregate_digest: canonical_document_manifest_digest(&[DocumentManifestEntry {
+                relative_path: "sessions/session-1/SESSION.md".to_owned(),
+                sha256: digest.clone(),
+                byte_length: u64::try_from(question.len()).unwrap(),
+                mode: 0o600,
+            }])
+            .unwrap(),
+            generated_at_ms: 10,
+        };
+        let source_envelope = SourceEnvelope {
+            id: "source-1".to_owned(),
+            surface: "mac".to_owned(),
+            delivery_binding_id: "mac-local-owner".to_owned(),
+            provider_message_id: None,
+            owner_id: "openopen-local-owner".to_owned(),
+            received_at_ms: 10,
+            monotonic_sequence: 1,
+            body_digest: digest,
+            attachment_manifest: None,
+            third_party_data: false,
+            session_hint: None,
+            schema_version: 1,
+        };
+        let batch = ConversationTurnBatch {
+            id: "batch-1".to_owned(),
+            choice_session_id: "session-1".to_owned(),
+            delivery_binding_id: "mac-local-owner".to_owned(),
+            source_envelope_ids: vec!["source-1".to_owned()],
+            opened_at_ms: 10,
+            quiet_deadline_ms: 2_510,
+            hard_deadline_ms: 8_010,
+            sealed_at_ms: Some(10),
+            seal_reason: Some(BatchSealReason::InitialIntake),
+            revision: 1,
+        };
+        let accepted = ChoiceBeginAccepted {
+            request_id: request_id.to_owned(),
+            operation_id: "operation-1".to_owned(),
+            choice_session_id: "session-1".to_owned(),
+            accepted_session_revision: 1,
+            source_envelope_id: "source-1".to_owned(),
+            conversation_turn_batch_id: "batch-1".to_owned(),
+            state: ChoiceSessionState::Interpreting,
+        };
+        let record = ChoiceBeginRecord {
+            accepted: accepted.clone(),
+            request_digest: "b".repeat(64),
+            bounded_local_question: question.to_owned(),
+            source_envelope,
+            batch: batch.clone(),
+            model_selection: selection(),
+            source_manifest: source_manifest.clone(),
+            persona_revision: persona_revision(),
+            runtime_revision: 1,
+            accepted_at_ms: 10,
+        };
+        let snapshot = ChoiceLoopSnapshot {
+            session: ChoiceSession {
+                id: "session-1".to_owned(),
+                state: ChoiceSessionState::Interpreting,
+                revision: 1,
+                model_selection_state: ModelSelectionState::Selected {
+                    model_provenance_ref: "model-selection-1".to_owned(),
+                },
+                communication_profile_revision: 0,
+                active_choice_set_id: None,
+                active_interpretation_revision: None,
+                opened_at_ms: 10,
+                last_input_at_ms: 10,
+                soft_idle_at_ms: 1_800_010,
+                stale_review_at_ms: 86_400_010,
+                primary_delivery_binding_id: Some("mac-local-owner".to_owned()),
+                pending_confirmation_id: None,
+                background_mission_ids: vec![],
+            },
+            active_batch: Some(batch),
+            interpretation: None,
+            active_choice_set: None,
+            last_selection: None,
+            pending_refinement_operation: None,
+            confirmation: None,
+            document_manifest: source_manifest,
+        };
+        (record, snapshot)
+    }
+
+    pub(super) fn initial_result(record: &ChoiceBeginRecord) -> ChoiceInitialResult {
+        let provenance = ModelProvenance {
+            id: "turn-provenance-1".to_owned(),
+            model_id: record.model_selection.model_id.clone(),
+            requested_effort: record.model_selection.requested_effort.clone(),
+            actual_effort: record.model_selection.actual_effort.clone(),
+            catalog_fingerprint: record.model_selection.catalog_fingerprint.clone(),
+            catalog_revision: record.model_selection.catalog_revision,
+            account_display_class: record.model_selection.account_display_class.clone(),
+            protocol_schema_revision: record.model_selection.protocol_schema_revision,
+            turn_id: "turn-1".to_owned(),
+        };
+        let interpretation = InterpretationFrame {
+            choice_session_id: record.accepted.choice_session_id.clone(),
+            revision: 1,
+            understood_goal: "Plan one bounded task".to_owned(),
+            current_context: "A local first question was accepted".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+        };
+        ChoiceInitialResult {
+            operation_id: record.accepted.operation_id.clone(),
+            expected_session_revision: record.accepted.accepted_session_revision,
+            expected_generation: record.runtime_revision,
+            model_provenance: provenance.clone(),
+            source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+            persona_revision: record.persona_revision.clone(),
+            interpretation: interpretation.clone(),
+            choice_set: ChoiceSet {
+                id: "choice-set-1".to_owned(),
+                choice_session_id: record.accepted.choice_session_id.clone(),
+                session_revision: record.accepted.accepted_session_revision + 1,
+                interpretation_revision: interpretation.revision,
+                generated_at_ms: 11,
+                expires_on_revision: record.accepted.accepted_session_revision + 1,
+                options: vec![
+                    ChoiceOption {
+                        id: "option-1".to_owned(),
+                        position: 1,
+                        direction: "Review the first step".to_owned(),
+                        rationale: "Keeps the work bounded".to_owned(),
+                        expected_result: "A clear next step".to_owned(),
+                        information_needed: vec![],
+                        external_effects_preview: vec![],
+                        source_categories: vec!["ownerInput".to_owned()],
+                    },
+                    ChoiceOption {
+                        id: "option-2".to_owned(),
+                        position: 2,
+                        direction: "Narrow the task".to_owned(),
+                        rationale: "Reduces uncertainty".to_owned(),
+                        expected_result: "A smaller plan".to_owned(),
+                        information_needed: vec![],
+                        external_effects_preview: vec![],
+                        source_categories: vec!["ownerInput".to_owned()],
+                    },
+                    ChoiceOption {
+                        id: "option-3".to_owned(),
+                        position: 3,
+                        direction: "Prepare an alternative".to_owned(),
+                        rationale: "Keeps one safe backup".to_owned(),
+                        expected_result: "A bounded alternative".to_owned(),
+                        information_needed: vec![],
+                        external_effects_preview: vec![],
+                        source_categories: vec!["ownerInput".to_owned()],
+                    },
+                ],
+                d_available: true,
+                source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+                model_provenance: provenance,
+                persona_revision: record.persona_revision.clone(),
+            },
+            completed_at_ms: 11,
+        }
+    }
+
+    fn d_intake_record(active: &ChoiceLoopSnapshot) -> ChoiceDIntakeRecord {
+        let choice_set = active
+            .active_choice_set
+            .as_ref()
+            .expect("active choice set");
+        let input = ChoiceDInput {
+            request_id: "choice-d-request-1".to_owned(),
+            bounded_text: "Refine the bounded local task".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            expected_session_revision: active.session.revision,
+            submitted_at_ms: 20,
+        };
+        let request_digest = input.request_digest().expect("valid D request digest");
+        let source_envelope = SourceEnvelope {
+            id: "choice-d-source-1".to_owned(),
+            surface: "mac".to_owned(),
+            delivery_binding_id: active
+                .session
+                .primary_delivery_binding_id
+                .clone()
+                .expect("bound local delivery"),
+            provider_message_id: None,
+            owner_id: "openopen-local-owner".to_owned(),
+            received_at_ms: input.submitted_at_ms,
+            monotonic_sequence: active.session.revision,
+            body_digest: format!("{:x}", Sha256::digest(input.bounded_text.as_bytes())),
+            attachment_manifest: None,
+            third_party_data: false,
+            session_hint: Some(active.session.id.clone()),
+            schema_version: choice_set.model_provenance.protocol_schema_revision,
+        };
+        let batch = ConversationTurnBatch {
+            id: "choice-d-batch-1".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            delivery_binding_id: source_envelope.delivery_binding_id.clone(),
+            source_envelope_ids: vec![source_envelope.id.clone()],
+            opened_at_ms: input.submitted_at_ms,
+            quiet_deadline_ms: input.submitted_at_ms + 2_500,
+            hard_deadline_ms: input.submitted_at_ms + 8_000,
+            sealed_at_ms: Some(input.submitted_at_ms),
+            seal_reason: Some(BatchSealReason::ImmediateRefinement),
+            revision: active.session.revision,
+        };
+        ChoiceDIntakeRecord {
+            input: input.clone(),
+            request_digest,
+            source_envelope,
+            batch: batch.clone(),
+            selection: NaturalConversationSelection {
+                id: "choice-d-selection-1".to_owned(),
+                choice_session_id: input.choice_session_id.clone(),
+                choice_set_id: input.choice_set_id.clone(),
+                d_input_batch_id: batch.id,
+                expected_session_revision: input.expected_session_revision,
+                selected_at_ms: input.submitted_at_ms,
+            },
+        }
+    }
+
+    pub(super) fn refining_d_store(
+        label: &str,
+    ) -> (
+        Store,
+        ChoiceDIntakeRecord,
+        ChoiceRefinementOperation,
+        ChoiceLoopSnapshot,
+        ChoiceSet,
+    ) {
+        let authority = LocalAuthority::from_master(label, [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open Store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 1)
+            .expect("persist model selection");
+        let (begin, snapshot) = begin_state("Plan one bounded task", "request-private-row");
+        store
+            .begin_choice_session(&begin, &snapshot)
+            .expect("begin Choice");
+        let active = store
+            .commit_initial_choice_result(&initial_result(&begin))
+            .expect("activate Choice");
+        let choices = active.active_choice_set.clone().expect("active choices");
+        let d_record = d_intake_record(&active);
+        let refining = store
+            .commit_choice_d_selection(&d_record, 1)
+            .expect("commit D intake");
+        let operation = refining
+            .pending_refinement_operation
+            .clone()
+            .expect("pending refinement");
+        (store, d_record, operation, refining, choices)
+    }
+
+    pub(super) fn refinement_result_for(
+        refining: &ChoiceLoopSnapshot,
+        operation: &ChoiceRefinementOperation,
+        choices: &ChoiceSet,
+    ) -> ChoiceRefinementResult {
+        let interpretation = InterpretationFrame {
+            choice_session_id: refining.session.id.clone(),
+            revision: refining.session.revision + 1,
+            understood_goal: "Refined private task".to_owned(),
+            current_context: "The owner supplied a bound direction".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+        };
+        let mut result = ChoiceRefinementResult {
+            operation_id: operation.id.clone(),
+            selection_id: operation.selection_id.clone(),
+            source_envelope_id: operation.source_envelope_id.clone(),
+            conversation_turn_batch_id: operation.conversation_turn_batch_id.clone(),
+            expected_session_revision: operation.expected_session_revision,
+            expected_generation: operation.expected_generation,
+            model_provenance: operation.model_provenance.clone(),
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+            persona_revision: operation.persona_revision.clone(),
+            interpretation: interpretation.clone(),
+            choice_set: ChoiceSet {
+                id: "choices-private-refined".to_owned(),
+                choice_session_id: refining.session.id.clone(),
+                session_revision: refining.session.revision + 1,
+                interpretation_revision: interpretation.revision,
+                generated_at_ms: 21,
+                expires_on_revision: refining.session.revision + 1,
+                options: choices.options.clone(),
+                d_available: true,
+                source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+                model_provenance: operation.model_provenance.clone(),
+                persona_revision: operation.persona_revision.clone(),
+            },
+            result_digest: String::new(),
+            completed_at_ms: 21,
+        };
+        result.result_digest = result
+            .canonical_result_digest()
+            .expect("canonical refinement result");
+        result
+    }
+
+    #[test]
+    fn choice_begin_is_atomic_idempotent_and_rejects_changed_or_active_replays() {
+        let authority = LocalAuthority::from_master("choice-begin", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-1");
+
+        assert_eq!(
+            store.begin_choice_session(&record, &snapshot).unwrap(),
+            record.accepted
+        );
+        assert_eq!(
+            store.begin_choice_session(&record, &snapshot).unwrap(),
+            record.accepted
+        );
+        let begin_rows: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_begin_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let state_rows: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_loop_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((begin_rows, state_rows), (1, 1));
+
+        let (mut changed, changed_snapshot) = begin_state("Changed question", "request-1");
+        changed.request_digest = "c".repeat(64);
+        assert!(matches!(
+            store.begin_choice_session(&changed, &changed_snapshot),
+            Err(StoreError::ChoiceBeginConflict)
+        ));
+        let (other, other_snapshot) = begin_state("Another question", "request-2");
+        assert!(matches!(
+            store.begin_choice_session(&other, &other_snapshot),
+            Err(StoreError::ChoiceBeginConflict)
+        ));
+        assert_eq!(
+            store.choice_loop_snapshot().unwrap().unwrap().session.state,
+            ChoiceSessionState::Interpreting
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One tamper corpus keeps every active private-row identity together.
+    fn active_private_choice_rows_bind_every_clear_identity_and_fail_closed_on_tamper() {
+        let root = tempfile::tempdir().expect("temporary Store root");
+        let path = root.path().join("choice.sqlite3");
+        let authority = LocalAuthority::from_master("choice-private-index-restart", [93_u8; 32]);
+        let (begin, snapshot) = begin_state("Plan one bounded task", "request-index-restart");
+        {
+            let mut store = Store::open(&path, authority.clone()).expect("open persistent Store");
+            enable_runtime(&mut store, &authority);
+            store
+                .select_model_selection(&selection(), 1)
+                .expect("persist model selection");
+            store
+                .begin_choice_session(&begin, &snapshot)
+                .expect("persist begin");
+            store
+                .connection
+                .execute(
+                    "UPDATE choice_begin_request SET source_envelope_id = 'tampered-envelope'
+                     WHERE request_id = ?1",
+                    [&begin.accepted.request_id],
+                )
+                .expect("tamper begin clear identity");
+        }
+        let reopened = Store::open(&path, authority).expect("reopen persistent Store");
+        assert!(matches!(
+            reopened.choice_begin_replay(&begin.accepted.request_id, &begin.request_digest),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceBeginConflict)
+        ));
+        assert!(
+            reopened.choice_loop_snapshot().is_err(),
+            "restart continuity must not present a healthy session over a tampered begin row"
+        );
+
+        let delete_authority =
+            LocalAuthority::from_master("choice-private-row-delete", [93_u8; 32]);
+        let mut deleted_store = Store::open_in_memory(delete_authority.clone())
+            .expect("open private-row deletion Store");
+        enable_runtime(&mut deleted_store, &delete_authority);
+        deleted_store
+            .select_model_selection(&selection(), 1)
+            .expect("persist model selection");
+        let (deleted_begin, deleted_snapshot) =
+            begin_state("Plan one bounded task", "request-row-delete");
+        deleted_store
+            .begin_choice_session(&deleted_begin, &deleted_snapshot)
+            .expect("persist audited begin row");
+        deleted_store
+            .connection
+            .execute(
+                "DELETE FROM choice_begin_request WHERE request_id = ?1",
+                [&deleted_begin.accepted.request_id],
+            )
+            .expect("delete audited private row");
+        assert!(
+            deleted_store.choice_loop_snapshot().is_err(),
+            "an audit-linked private row deletion must fail continuity closed"
+        );
+
+        let (mut d_store, _d_record, d_operation, _refining, _choices) =
+            refining_d_store("choice-d-index-tamper");
+        d_store
+            .connection
+            .execute(
+                "UPDATE choice_d_request SET conversation_turn_batch_id = 'tampered-batch'
+                 WHERE operation_id = ?1",
+                [&d_operation.id],
+            )
+            .expect("tamper D clear identity");
+        assert!(matches!(
+            d_store.choice_d_intake_for_refinement(&d_operation),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(d_store.choice_loop_snapshot().is_err());
+        assert!(matches!(
+            d_store.cancel_choice_session(1, 22),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        let retained_d_rows: i64 = d_store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_d_request", [], |row| {
+                row.get(0)
+            })
+            .expect("D body remains until a valid retirement");
+        let false_d_tombstones: i64 = d_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_private_body_tombstone WHERE source_kind = 'd'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("no false D retirement");
+        assert_eq!((retained_d_rows, false_d_tombstones), (1, 0));
+
+        let (context_store, _d_record, context_operation, _refining, _choices) =
+            refining_d_store("choice-context-index-tamper");
+        context_store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_context SET selection_id = 'tampered-selection'
+                 WHERE operation_id = ?1",
+                [&context_operation.id],
+            )
+            .expect("tamper context clear identity");
+        assert!(matches!(
+            context_store.choice_refinement_context(&context_operation),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(context_store.choice_loop_snapshot().is_err());
+
+        let (source_context_store, _d_record, source_context_operation, _refining, _choices) =
+            refining_d_store("choice-context-source-index-tamper");
+        source_context_store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_context SET source_envelope_id = 'tampered-envelope'
+                 WHERE operation_id = ?1",
+                [&source_context_operation.id],
+            )
+            .expect("tamper context source identity");
+        assert!(matches!(
+            source_context_store.choice_refinement_context(&source_context_operation),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(source_context_store.choice_loop_snapshot().is_err());
+
+        let (timing_store, _d_record, timing_operation, _refining, _choices) =
+            refining_d_store("choice-context-time-tamper");
+        timing_store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_context SET created_at_ms = created_at_ms + 1
+                 WHERE operation_id = ?1",
+                [&timing_operation.id],
+            )
+            .expect("tamper context timing index");
+        assert!(matches!(
+            timing_store.choice_refinement_context(&timing_operation),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(timing_store.choice_loop_snapshot().is_err());
+
+        let (mut result_store, _d_record, result_operation, refining, choices) =
+            refining_d_store("choice-result-index-tamper");
+        let result = refinement_result_for(&refining, &result_operation, &choices);
+        result_store
+            .commit_choice_refinement_result(&result)
+            .expect("persist exact result");
+        result_store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_result SET choice_session_id = 'tampered-session'
+                 WHERE operation_id = ?1",
+                [&result_operation.id],
+            )
+            .expect("tamper result clear identity");
+        assert!(matches!(
+            result_store.commit_choice_refinement_result(&result),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(result_store.choice_loop_snapshot().is_err());
+
+        let (mut source_result_store, _d_record, source_result_operation, refining, choices) =
+            refining_d_store("choice-result-source-index-tamper");
+        let result = refinement_result_for(&refining, &source_result_operation, &choices);
+        source_result_store
+            .commit_choice_refinement_result(&result)
+            .expect("persist source-bound result");
+        source_result_store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_result
+                 SET conversation_turn_batch_id = 'tampered-batch' WHERE operation_id = ?1",
+                [&source_result_operation.id],
+            )
+            .expect("tamper result batch identity");
+        assert!(matches!(
+            source_result_store.commit_choice_refinement_result(&result),
+            Err(StoreError::Crypto(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(source_result_store.choice_loop_snapshot().is_err());
+    }
+
+    #[test]
+    fn a_new_explicit_question_supersedes_only_a_local_executing_journal() {
+        let authority = LocalAuthority::from_master("choice-begin-after-markdown", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 1)
+            .expect("persist selection");
+
+        // This is the post-receipt shape: the local journal is durable, but
+        // no Mission, Reminder, delivery, or other effect exists.
+        let (_, mut executing) = begin_state("Earlier local question", "request-earlier");
+        executing.session.state = ChoiceSessionState::Executing;
+        executing.active_batch = None;
+        store
+            .save_choice_loop_snapshot(&executing, 10)
+            .expect("seed an effect-free completed local journal");
+
+        let (mut record, mut next) = begin_state("A different local question", "request-next");
+        let next_revision = executing.session.revision + 1;
+        record.accepted.operation_id = "operation-next".to_owned();
+        record.accepted.choice_session_id = "session-next".to_owned();
+        record.accepted.accepted_session_revision = next_revision;
+        record.accepted.source_envelope_id = "source-next".to_owned();
+        record.accepted.conversation_turn_batch_id = "batch-next".to_owned();
+        record.source_envelope.id = record.accepted.source_envelope_id.clone();
+        record.batch.id = record.accepted.conversation_turn_batch_id.clone();
+        record.batch.choice_session_id = record.accepted.choice_session_id.clone();
+        record.batch.source_envelope_ids = vec![record.source_envelope.id.clone()];
+        record.batch.revision = next_revision;
+        next.session.id = record.accepted.choice_session_id.clone();
+        next.session.revision = next_revision;
+        let batch = next.active_batch.as_mut().expect("initial sealed batch");
+        batch.id = record.batch.id.clone();
+        batch.choice_session_id = record.batch.choice_session_id.clone();
+        batch.source_envelope_ids = record.batch.source_envelope_ids.clone();
+        batch.revision = next_revision;
+
+        assert_eq!(
+            store
+                .begin_choice_session(&record, &next)
+                .expect("new explicit question supersedes only the safe local state"),
+            record.accepted
+        );
+        assert_eq!(
+            store
+                .choice_loop_snapshot()
+                .expect("read durable successor")
+                .expect("current snapshot")
+                .session
+                .state,
+            ChoiceSessionState::Interpreting
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM mission_state", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no Mission exists"),
+            0
+        );
+    }
+
+    #[test]
+    fn initial_choice_result_is_operation_generation_and_provenance_bound() {
+        let authority = LocalAuthority::from_master("choice-initial-result", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-result-1");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let result = initial_result(&record);
+
+        let mut wrong_persona = result.clone();
+        let forged_persona = PersonaRevisionRef {
+            persona_id: record.persona_revision.persona_id.clone(),
+            revision: "draft-04-en".to_owned(),
+            aggregate_digest: "a".repeat(64),
+            instructions_digest: "b".repeat(64),
+        };
+        wrong_persona.persona_revision = forged_persona.clone();
+        wrong_persona.choice_set.persona_revision = forged_persona;
+        assert!(matches!(
+            store.commit_initial_choice_result(&wrong_persona),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+
+        let committed = store.commit_initial_choice_result(&result).unwrap();
+        assert_eq!(committed.session.state, ChoiceSessionState::Active);
+        assert_eq!(committed.session.revision, 2);
+        assert_eq!(committed.active_choice_set, Some(result.choice_set.clone()));
+        assert_eq!(
+            store.commit_initial_choice_result(&result).unwrap(),
+            committed
+        );
+
+        let mut changed = result.clone();
+        changed.choice_set.options[0].direction = "Changed replay".to_owned();
+        assert!(matches!(
+            store.commit_initial_choice_result(&changed),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mut stale = result;
+        stale.expected_generation = 2;
+        assert!(matches!(
+            store.commit_initial_choice_result(&stale),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mission_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM mission_state", [], |row| row.get(0))
+            .unwrap();
+        let receipt_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM receipt_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((mission_count, receipt_count), (0, 0));
+    }
+
+    #[test]
+    fn initial_choice_failure_is_durable_idempotent_and_never_reopens_the_batch() {
+        let authority = LocalAuthority::from_master("choice-initial-block", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-blocked-1");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+
+        let blocked = store
+            .block_initial_choice_operation(
+                &record.accepted.operation_id,
+                record.runtime_revision,
+                record.accepted_at_ms + 1,
+            )
+            .unwrap();
+        assert_eq!(blocked.session.state, ChoiceSessionState::Blocked);
+        assert_eq!(blocked.session.revision, snapshot.session.revision + 1);
+        assert!(blocked.active_batch.is_none());
+        assert_eq!(
+            store
+                .block_initial_choice_operation(
+                    &record.accepted.operation_id,
+                    record.runtime_revision,
+                    record.accepted_at_ms + 2,
+                )
+                .unwrap(),
+            blocked
+        );
+        assert!(matches!(
+            store.commit_initial_choice_result(&initial_result(&record)),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn host_restart_recovery_blocks_only_the_interrupted_choice_worker_without_retrying() {
+        let authority = LocalAuthority::from_master("choice-restart-recovery", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-restart-1");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+
+        let recovered = store
+            .recover_interrupted_choice_operation(
+                record.runtime_revision,
+                record.accepted_at_ms + 1,
+            )
+            .unwrap()
+            .expect("interpreting state is recovered");
+        assert_eq!(recovered.session.state, ChoiceSessionState::Blocked);
+        assert!(recovered.active_batch.is_none());
+        assert_eq!(
+            store
+                .recover_interrupted_choice_operation(
+                    record.runtime_revision,
+                    record.accepted_at_ms + 2,
+                )
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.commit_initial_choice_result(&initial_result(&record)),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+
+        let (mut refining_store, _, operation, _, _) = refining_d_store("choice-restart-refining");
+        let recovered = refining_store
+            .recover_interrupted_choice_operation(
+                operation.expected_generation,
+                operation.created_at_ms + 1,
+            )
+            .unwrap()
+            .expect("refining state is recovered");
+        assert_eq!(recovered.session.state, ChoiceSessionState::Blocked);
+        assert!(recovered.pending_refinement_operation.is_none());
+        assert_eq!(
+            refining_store
+                .recover_interrupted_choice_operation(
+                    operation.expected_generation,
+                    operation.created_at_ms + 2,
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn choice_cancellation_is_terminal_and_rejects_late_initial_results() {
+        let authority = LocalAuthority::from_master("choice-cancel", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-cancel-1");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+
+        let cancelled = store
+            .cancel_choice_session(record.runtime_revision, record.accepted_at_ms + 1)
+            .unwrap();
+        assert_eq!(cancelled.session.state, ChoiceSessionState::Cancelled);
+        assert_eq!(cancelled.session.revision, snapshot.session.revision + 1);
+        assert!(cancelled.active_batch.is_none());
+        assert!(cancelled.active_choice_set.is_none());
+        let retained_bodies: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_begin_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let tombstones: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_private_body_tombstone WHERE source_kind = 'begin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((retained_bodies, tombstones), (0, 1));
+        assert!(matches!(
+            store.choice_begin_replay(&record.accepted.request_id, &record.request_digest),
+            Err(StoreError::ChoiceBeginConflict)
+        ));
+        assert!(matches!(
+            store.commit_initial_choice_result(&initial_result(&record)),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn private_body_retirement_is_authenticated_and_direct_row_tampering_fails_closed() {
+        let authority = LocalAuthority::from_master("choice-retirement-tamper", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan one bounded task", "request-retirement-tamper");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        store
+            .cancel_choice_session(record.runtime_revision, record.accepted_at_ms + 1)
+            .unwrap();
+
+        assert!(matches!(
+            store.choice_begin_replay(&record.accepted.request_id, &record.request_digest),
+            Err(StoreError::ChoiceBeginConflict)
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE choice_private_body_retirement SET blob_hash = '0' WHERE source_kind = 'begin' AND entity_id = ?1",
+                [&record.accepted.request_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.choice_begin_replay(&record.accepted.request_id, &record.request_digest),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn cancelling_a_d_refinement_tombstones_and_removes_its_encrypted_body() {
+        let authority = LocalAuthority::from_master("choice-d-private-body", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (begin, snapshot) = begin_state("Plan one bounded task", "request-d-private");
+        store.begin_choice_session(&begin, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&begin))
+            .unwrap();
+        let choice_set = active.active_choice_set.clone().unwrap();
+        let d_record = d_intake_record(&active);
+        let refining = store.commit_choice_d_selection(&d_record, 1).unwrap();
+        assert_eq!(refining.session.state, ChoiceSessionState::Refining);
+        let operation = refining.pending_refinement_operation.clone().unwrap();
+        let interpretation = InterpretationFrame {
+            choice_session_id: refining.session.id.clone(),
+            revision: 2,
+            understood_goal: "Refined private task".to_owned(),
+            current_context: "The owner supplied D input".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+        };
+        let mut result = ChoiceRefinementResult {
+            operation_id: operation.id.clone(),
+            selection_id: operation.selection_id.clone(),
+            source_envelope_id: operation.source_envelope_id.clone(),
+            conversation_turn_batch_id: operation.conversation_turn_batch_id.clone(),
+            expected_session_revision: operation.expected_session_revision,
+            expected_generation: operation.expected_generation,
+            model_provenance: operation.model_provenance.clone(),
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+            persona_revision: operation.persona_revision.clone(),
+            interpretation: interpretation.clone(),
+            choice_set: ChoiceSet {
+                id: "choices-d-private-refined".to_owned(),
+                choice_session_id: refining.session.id.clone(),
+                session_revision: refining.session.revision + 1,
+                interpretation_revision: interpretation.revision,
+                generated_at_ms: 20,
+                expires_on_revision: refining.session.revision + 1,
+                options: choice_set.options,
+                d_available: true,
+                source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+                model_provenance: operation.model_provenance,
+                persona_revision: operation.persona_revision.clone(),
+            },
+            result_digest: String::new(),
+            completed_at_ms: 20,
+        };
+        result.result_digest = result.canonical_result_digest().unwrap();
+        store.commit_choice_refinement_result(&result).unwrap();
+
+        store.cancel_choice_session(1, 21).unwrap();
+        let retained_bodies: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_d_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let tombstones: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_private_body_tombstone
+                 WHERE source_kind = 'd' AND request_id = 'choice-d-request-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((retained_bodies, tombstones), (0, 1));
+        let retained_results: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_refinement_result", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let result_tombstones: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_refinement_body_tombstone WHERE operation_id = ?1",
+                [&operation.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((retained_results, result_tombstones), (0, 1));
+        assert!(matches!(
+            store.commit_choice_d_selection(&d_record, 1),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        store
+            .current_verified_audit_anchor()
+            .expect("body-free tombstone keeps audit valid");
+        store
+            .choice_loop_snapshot()
+            .expect("cancelled snapshot stays readable after raw-body removal");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retains the ordered receipt/retirement assertions in one transaction test.
+    fn markdown_render_intent_and_receipt_are_atomic_replay_safe_and_effect_free() {
+        let authority = LocalAuthority::from_master("markdown-render", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 1)
+            .expect("persist selection");
+        let (record, snapshot) = begin_state("Plan a local task", "request-markdown");
+        store
+            .begin_choice_session(&record, &snapshot)
+            .expect("persist begin state");
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .expect("commit active choice state");
+        let body = "# Local continuity\n";
+        let entry = DocumentManifestEntry {
+            relative_path: "tasks/session-1/STATE.md".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            byte_length: body.len() as u64,
+            mode: 0o600,
+        };
+        let intent = MarkdownRenderIntent {
+            id: "markdown-intent-1".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            expected_session_revision: active.session.revision,
+            expected_generation: 1,
+            entry: entry.clone(),
+            expected_base: None,
+            content_digest: entry.sha256.clone(),
+            created_at_ms: 22,
+        };
+        assert_eq!(
+            store
+                .begin_markdown_render_for_test(&intent, body)
+                .expect("persist intent"),
+            intent
+        );
+        assert_eq!(
+            store
+                .begin_markdown_render_for_test(&intent, body)
+                .expect("exact replay"),
+            intent
+        );
+        store
+            .record_markdown_reconciliation(&intent.id, 22)
+            .expect("persist body-free reconciliation marker");
+        assert!(matches!(
+            store.private_markdown_body_available_for_test(&intent.id, false),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(
+            store
+                .private_markdown_body_available_for_test(&intent.id, true)
+                .unwrap()
+        );
+        let original_intent_blob: (Vec<u8>, String) = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob, blob_hash FROM choice_markdown_render_intent WHERE intent_id = ?1",
+                [&intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.begin_markdown_render_for_test(&intent, "# changed\n"),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(
+            store
+                .retire_choice_private_bodies_after_render(&intent.id, 23)
+                .is_err()
+        );
+        let retained_before_receipt: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_begin_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_before_receipt, 1);
+        let receipt = MarkdownRenderReceipt {
+            intent_id: intent.id.clone(),
+            final_entry: entry,
+            final_device: 1,
+            final_inode: 2,
+            displaced_base: None,
+            committed_at_ms: 23,
+        };
+        assert_eq!(
+            store
+                .commit_markdown_render_receipt_for_test(&receipt)
+                .expect("commit receipt"),
+            receipt
+        );
+        let retained_before_retirement: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_begin_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_before_retirement, 1);
+        store
+            .retire_choice_private_bodies_after_render(&intent.id, 24)
+            .expect("durable receipt permits body retirement");
+        let retained_bodies: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM choice_begin_request", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let tombstones: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_private_body_tombstone WHERE source_kind = 'begin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((retained_bodies, tombstones), (0, 1));
+        let retired_intent_blob: (Vec<u8>, String) = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob, blob_hash FROM choice_markdown_render_intent WHERE intent_id = ?1",
+                [&intent.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE choice_markdown_render_intent SET encrypted_blob = ?2, blob_hash = ?3 WHERE intent_id = ?1",
+                params![&intent.id, original_intent_blob.0, original_intent_blob.1],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.markdown_render_intent(&intent.id),
+            Err(StoreError::StateBindingMismatch(_))
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE choice_markdown_render_intent SET encrypted_blob = ?2, blob_hash = ?3 WHERE intent_id = ?1",
+                params![&intent.id, retired_intent_blob.0, retired_intent_blob.1],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_markdown_render_receipt_for_test(&receipt)
+                .expect("exact receipt replay"),
+            receipt
+        );
+        let mut changed_receipt = receipt;
+        changed_receipt.final_inode = 3;
+        assert!(matches!(
+            store.commit_markdown_render_receipt_for_test(&changed_receipt),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn cancellation_retires_pending_markdown_body_without_fabricating_a_receipt() {
+        let authority = LocalAuthority::from_master("markdown-cancel", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan a local task", "request-markdown-cancel");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .unwrap();
+        let body = "# Local continuity\n";
+        let entry = DocumentManifestEntry {
+            relative_path: "tasks/session-1/STATE.md".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            byte_length: body.len() as u64,
+            mode: 0o600,
+        };
+        let intent = MarkdownRenderIntent {
+            id: "markdown-intent-1".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            expected_session_revision: active.session.revision,
+            expected_generation: 1,
+            entry: entry.clone(),
+            expected_base: None,
+            content_digest: entry.sha256,
+            created_at_ms: 22,
+        };
+        store.begin_markdown_render_for_test(&intent, body).unwrap();
+        store.cancel_choice_session(1, 23).unwrap();
+        assert!(matches!(
+            store.private_markdown_body_available_for_test(&intent.id, false),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(store.markdown_render_receipt(&intent.id).unwrap().is_none());
+        store.current_verified_audit_anchor().unwrap();
+    }
+
+    #[test]
+    fn cancelled_receipted_journal_keeps_only_the_verified_off_cleanup_path() {
+        let authority = LocalAuthority::from_master("markdown-receipt-off", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan a local task", "request-markdown-receipt-off");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .unwrap();
+        let body = "# Local continuity\n";
+        let entry = DocumentManifestEntry {
+            relative_path: "tasks/session-1/STATE.md".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            byte_length: body.len() as u64,
+            mode: 0o600,
+        };
+        let intent = MarkdownRenderIntent {
+            id: "markdown-receipt-off-intent".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            expected_session_revision: active.session.revision,
+            expected_generation: 1,
+            entry: entry.clone(),
+            expected_base: None,
+            content_digest: entry.sha256.clone(),
+            created_at_ms: 22,
+        };
+        store.begin_markdown_render_for_test(&intent, body).unwrap();
+        store
+            .commit_markdown_render_receipt_for_test(&MarkdownRenderReceipt {
+                intent_id: intent.id.clone(),
+                final_entry: entry,
+                final_device: 1,
+                final_inode: 2,
+                displaced_base: None,
+                committed_at_ms: 23,
+            })
+            .unwrap();
+        store.cancel_choice_session(1, 24).unwrap();
+
+        let broker = SigningKey::from_bytes(&[94_u8; 32]);
+        let authorization = store.prepare_runtime_control(false, 25).unwrap();
+        let mut off_receipt = RuntimeControlReceipt {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            authorization_hash: runtime_control_authorization_hash(&authorization).unwrap(),
+            checkpoint_nonce: "91".repeat(32),
+            request_nonce: None,
+            broker_key_id: format!("{:x}", Sha256::digest(broker.verifying_key().to_bytes())),
+            broker_signature_hex: String::new(),
+        };
+        off_receipt.broker_signature_hex = hex::encode(
+            broker
+                .sign(&runtime_control_receipt_signing_bytes(&off_receipt).unwrap())
+                .to_bytes(),
+        );
+        store
+            .commit_runtime_control(&authorization, &off_receipt)
+            .unwrap();
+
+        let stored = load_markdown_render_intent(&store.connection, &authority, &intent.id)
+            .unwrap()
+            .unwrap();
+        let receipt = load_markdown_render_receipt(&store.connection, &authority, &intent.id)
+            .unwrap()
+            .unwrap();
+        require_current_markdown_cleanup_authority(
+            &store.connection,
+            &authority,
+            store.trusted_broker.as_ref(),
+            &stored.intent,
+            &receipt,
+        )
+        .expect("Off permits only verified retained-base cleanup");
+        assert!(matches!(
+            store.private_markdown_body_available_for_test(&intent.id, false),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn direct_markdown_publication_rejects_a_durable_global_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let authority = LocalAuthority::from_master("markdown-off-fence", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        let home = tempfile::tempdir().unwrap();
+        let documents = home.path().join("Documents");
+        let root = documents.join("OpenOpen");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&documents, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store.bind_choice_markdown_root(home.path()).unwrap();
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan a local task", "request-markdown-off");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .unwrap();
+        let body = "# Local continuity\n";
+        let entry = DocumentManifestEntry {
+            relative_path: "tasks/session-1/STATE.md".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            byte_length: body.len() as u64,
+            mode: 0o600,
+        };
+        let intent = MarkdownRenderIntent {
+            id: "markdown-off-intent".to_owned(),
+            choice_session_id: active.session.id,
+            expected_session_revision: active.session.revision,
+            expected_generation: 1,
+            entry: entry.clone(),
+            expected_base: None,
+            content_digest: entry.sha256,
+            created_at_ms: 22,
+        };
+        store.begin_markdown_render_for_test(&intent, body).unwrap();
+
+        let broker = SigningKey::from_bytes(&[94_u8; 32]);
+        let authorization = store.prepare_runtime_control(false, 2).unwrap();
+        let mut receipt = RuntimeControlReceipt {
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            authorization_hash: runtime_control_authorization_hash(&authorization).unwrap(),
+            checkpoint_nonce: "91".repeat(32),
+            request_nonce: None,
+            broker_key_id: format!("{:x}", Sha256::digest(broker.verifying_key().to_bytes())),
+            broker_signature_hex: String::new(),
+        };
+        receipt.broker_signature_hex = hex::encode(
+            broker
+                .sign(&runtime_control_receipt_signing_bytes(&receipt).unwrap())
+                .to_bytes(),
+        );
+        store
+            .commit_runtime_control(&authorization, &receipt)
+            .unwrap();
+
+        assert!(matches!(
+            store.publish_markdown_render_intent(&intent.id, false, 23),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(!root.join(&intent.entry.relative_path).try_exists().unwrap());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One ordered clock corpus proves calibration through stale transition.
+    fn host_owned_idle_transition_requires_continuous_clock_and_retires_stale_choices() {
+        let authority = LocalAuthority::from_master("choice-idle", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 1)
+            .expect("persist selection");
+        let (record, snapshot) = begin_state("Plan a local task", "request-idle");
+        store
+            .begin_choice_session(&record, &snapshot)
+            .expect("begin session");
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .expect("active session");
+        let active_choices = active.active_choice_set.clone().expect("initial ChoiceSet");
+        let calibration = ChoiceIdleClockEvidence {
+            boot_id: "test-boot".to_owned(),
+            wall_clock_ms: active.session.opened_at_ms,
+            monotonic_ms: active.session.opened_at_ms,
+        };
+        let calibrated = store
+            .advance_choice_idle_state(&active.session.id, active.session.revision, 1, &calibration)
+            .expect("seed clock anchor");
+        assert_eq!(calibrated, active);
+        assert!(matches!(
+            store.advance_choice_idle_state_classified(
+                &active.session.id,
+                active.session.revision,
+                1,
+                &calibration,
+            ),
+            Ok(ChoiceIdleAdvance::Unchanged(snapshot)) if snapshot == active
+        ));
+        assert!(matches!(
+            store.advance_choice_idle_state(
+                &active.session.id,
+                active.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "test-boot".to_owned(),
+                    wall_clock_ms: calibration.wall_clock_ms + 1,
+                    monotonic_ms: calibration.monotonic_ms - 1,
+                },
+            ),
+            Err(StoreError::ChoiceClockUncertain)
+        ));
+        assert!(matches!(
+            store.advance_choice_idle_state(
+                &active.session.id,
+                active.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "test-boot".to_owned(),
+                    wall_clock_ms: calibration.wall_clock_ms - 1,
+                    monotonic_ms: calibration.monotonic_ms + 1,
+                },
+            ),
+            Err(StoreError::ChoiceClockUncertain)
+        ));
+        let soft_clock = ChoiceIdleClockEvidence {
+            boot_id: "test-boot".to_owned(),
+            wall_clock_ms: active.session.soft_idle_at_ms,
+            monotonic_ms: active.session.soft_idle_at_ms,
+        };
+        let soft = store
+            .advance_choice_idle_state(&active.session.id, active.session.revision, 1, &soft_clock)
+            .expect("soft idle after continuous clock evidence");
+        assert_eq!(soft.session.state, ChoiceSessionState::SoftIdle);
+        assert!(soft.active_choice_set.is_none());
+        assert!(soft.session.active_choice_set_id.is_none());
+        let soft_selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-during-soft-idle".to_owned(),
+            choice_session_id: soft.session.id.clone(),
+            choice_set_id: active_choices.id.clone(),
+            selected_option_id: active_choices.options[0].id.clone(),
+            expected_session_revision: soft.session.revision,
+            selected_at_ms: soft.session.soft_idle_at_ms + 1,
+        });
+        assert!(matches!(
+            store.commit_choice_selection(&soft_selection, 1, soft.session.soft_idle_at_ms + 1,),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let sleep_shaped_clock = ChoiceIdleClockEvidence {
+            boot_id: "test-boot".to_owned(),
+            wall_clock_ms: soft.session.stale_review_at_ms - 1,
+            monotonic_ms: soft_clock.monotonic_ms + 1,
+        };
+        assert!(matches!(
+            store.advance_choice_idle_state_classified(
+                &soft.session.id,
+                soft.session.revision,
+                1,
+                &sleep_shaped_clock,
+            ),
+            Ok(ChoiceIdleAdvance::Calibrated(snapshot)) if snapshot == soft
+        ));
+        // The ambiguous sample updates only the authenticated clock anchor. It
+        // consumes no deadline, revision, ChoiceSet, model, or effect authority.
+        assert_eq!(store.choice_loop_snapshot().unwrap(), Some(soft.clone()));
+        let audit_count_after_recalibration: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row.get(0))
+            .unwrap();
+        assert!(matches!(
+            store.advance_choice_idle_state_classified(
+                &soft.session.id,
+                soft.session.revision,
+                1,
+                &sleep_shaped_clock,
+            ),
+            Ok(ChoiceIdleAdvance::Unchanged(snapshot)) if snapshot == soft
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            audit_count_after_recalibration,
+            "the later continuity proof creates neither a revision nor an audit"
+        );
+        let reboot_clock = ChoiceIdleClockEvidence {
+            boot_id: "boot-2".to_owned(),
+            wall_clock_ms: sleep_shaped_clock.wall_clock_ms + 1_000,
+            monotonic_ms: 1,
+        };
+        let recalibrated = store
+            .advance_choice_idle_state(&soft.session.id, soft.session.revision, 1, &reboot_clock)
+            .expect("reboot clock recalibration");
+        assert_eq!(recalibrated, soft);
+        assert!(matches!(
+            store.advance_choice_idle_state_classified(
+                &soft.session.id,
+                soft.session.revision,
+                1,
+                &reboot_clock,
+            ),
+            Ok(ChoiceIdleAdvance::Unchanged(snapshot)) if snapshot == soft
+        ));
+        let stale_delta = soft
+            .session
+            .stale_review_at_ms
+            .checked_sub(soft_clock.wall_clock_ms)
+            .expect("stale deadline follows soft-idle deadline");
+        let stale = store
+            .advance_choice_idle_state(
+                &soft.session.id,
+                soft.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "boot-2".to_owned(),
+                    wall_clock_ms: reboot_clock.wall_clock_ms + stale_delta,
+                    monotonic_ms: reboot_clock.monotonic_ms + stale_delta,
+                },
+            )
+            .expect("reboot-anchor stale review after later continuous sample");
+        assert_eq!(stale.session.state, ChoiceSessionState::StaleReview);
+        // Stale review retires the old menu. A timer can never manufacture a
+        // fresh authenticated ChoiceSet, and the prior choices must no longer
+        // remain selectable after the 24-hour boundary.
+        assert!(stale.active_choice_set.is_none());
+        assert!(stale.session.active_choice_set_id.is_none());
+        let stale_selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-after-stale".to_owned(),
+            choice_session_id: stale.session.id.clone(),
+            choice_set_id: active_choices.id.clone(),
+            selected_option_id: active_choices.options[0].id.clone(),
+            expected_session_revision: stale.session.revision,
+            selected_at_ms: stale.session.stale_review_at_ms + 1,
+        });
+        assert!(matches!(
+            store.commit_choice_selection(
+                &stale_selection,
+                1,
+                stale.session.stale_review_at_ms + 1,
+            ),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert!(matches!(
+            store.advance_choice_idle_state(
+                &stale.session.id,
+                stale.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "boot-2".to_owned(),
+                    wall_clock_ms: stale.session.stale_review_at_ms,
+                    monotonic_ms: 2,
+                },
+            ),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn active_choice_clock_discontinuity_retires_authority_before_every_retry() {
+        for (label, discontinuity) in [
+            (
+                "sleep",
+                ChoiceIdleClockEvidence {
+                    boot_id: "test-boot".to_owned(),
+                    wall_clock_ms: 1_800_011,
+                    monotonic_ms: 11,
+                },
+            ),
+            (
+                "reboot",
+                ChoiceIdleClockEvidence {
+                    boot_id: "boot-2".to_owned(),
+                    wall_clock_ms: 86_400_011,
+                    monotonic_ms: 1,
+                },
+            ),
+        ] {
+            let authority = LocalAuthority::from_master(
+                format!("choice-clock-discontinuity-{label}"),
+                [93_u8; 32],
+            );
+            let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+            enable_runtime(&mut store, &authority);
+            store
+                .select_model_selection(&selection(), 1)
+                .expect("persist selection");
+            let (record, snapshot) = begin_state("Plan a local task", "request-discontinuity");
+            store
+                .begin_choice_session(&record, &snapshot)
+                .expect("begin session");
+            let active = store
+                .commit_initial_choice_result(&initial_result(&record))
+                .expect("active session");
+            let old_choice_set = active.active_choice_set.clone().expect("active ChoiceSet");
+
+            let retired = match store
+                .advance_choice_idle_state_classified(
+                    &active.session.id,
+                    active.session.revision,
+                    1,
+                    &discontinuity,
+                )
+                .expect("discontinuity fails closed by retiring old authority")
+            {
+                ChoiceIdleAdvance::Transitioned(snapshot) => snapshot,
+                other => panic!("expected a durable retirement transition, got {other:?}"),
+            };
+            assert_eq!(retired.session.state, ChoiceSessionState::SoftIdle);
+            assert!(retired.session.active_choice_set_id.is_none());
+            assert!(retired.active_choice_set.is_none());
+
+            let audit_count_after_retirement: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row.get(0))
+                .unwrap();
+            assert!(matches!(
+                store.advance_choice_idle_state_classified(
+                    &retired.session.id,
+                    retired.session.revision,
+                    1,
+                    &discontinuity,
+                ),
+                Ok(ChoiceIdleAdvance::Unchanged(snapshot)) if snapshot == retired
+            ));
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                audit_count_after_retirement,
+                "a retry cannot mint another revision or audit"
+            );
+
+            let stale_selection = Selection::OptionSelection(OptionSelection {
+                id: format!("selection-after-{label}"),
+                choice_session_id: retired.session.id.clone(),
+                choice_set_id: old_choice_set.id.clone(),
+                selected_option_id: old_choice_set.options[0].id.clone(),
+                expected_session_revision: retired.session.revision,
+                selected_at_ms: discontinuity.wall_clock_ms,
+            });
+            for _ in 0..2 {
+                assert!(matches!(
+                    store
+                        .commit_choice_selection(&stale_selection, 1, discontinuity.wall_clock_ms,),
+                    Err(StoreError::ChoiceLoopStateConflict)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_clock_anchor_survives_core_restart_without_using_wall_time_alone() {
+        let root = tempfile::tempdir().expect("temporary Store root");
+        let path = root.path().join("idle-restart.sqlite3");
+        let authority = LocalAuthority::from_master("choice-idle-restart", [93_u8; 32]);
+        let (session_id, session_revision, soft_idle_at_ms, trusted_broker) = {
+            let mut store = Store::open(&path, authority.clone()).expect("open persistent Store");
+            enable_runtime(&mut store, &authority);
+            store
+                .select_model_selection(&selection(), 1)
+                .expect("persist selection");
+            let (record, snapshot) = begin_state("Plan a local task", "request-idle-restart");
+            store
+                .begin_choice_session(&record, &snapshot)
+                .expect("begin session");
+            let active = store
+                .commit_initial_choice_result(&initial_result(&record))
+                .expect("active session");
+            let calibration = ChoiceIdleClockEvidence {
+                boot_id: "stable-boot".to_owned(),
+                wall_clock_ms: active.session.soft_idle_at_ms - 1_000,
+                monotonic_ms: 5_000,
+            };
+            let calibrated = store
+                .advance_choice_idle_state(
+                    &active.session.id,
+                    active.session.revision,
+                    1,
+                    &calibration,
+                )
+                .expect("persist calibration");
+            // A first clock sample is not elapsed-time authority.  The
+            // fail-closed calibration therefore retires the old active menu;
+            // it must not leave it usable until a later authenticated return
+            // creates a new ChoiceSet.
+            assert_eq!(calibrated.session.state, ChoiceSessionState::SoftIdle);
+            assert!(calibrated.active_choice_set.is_none());
+            (
+                calibrated.session.id,
+                calibrated.session.revision,
+                calibrated.session.soft_idle_at_ms,
+                store.trusted_broker.clone().expect("trusted broker"),
+            )
+        };
+        let mut reopened = Store::open_with_trusted_broker(&path, authority, trusted_broker)
+            .expect("reopen with exact broker");
+        let first_continuous = reopened
+            .advance_choice_idle_state(
+                &session_id,
+                session_revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "stable-boot".to_owned(),
+                    wall_clock_ms: soft_idle_at_ms,
+                    monotonic_ms: 6_000,
+                },
+            )
+            .expect("same-boot monotonic evidence survives Core restart");
+        // The persisted calibration survives the Core restart. This first
+        // continuous same-boot sample has no new timer authority to mint a
+        // second revision or recap from the retired ChoiceSet.
+        assert_eq!(first_continuous.session.state, ChoiceSessionState::SoftIdle);
+        assert!(first_continuous.active_choice_set.is_none());
+        assert_eq!(
+            first_continuous.session.revision, session_revision,
+            "a continuous retry cannot mint a second retirement revision"
+        );
+        let wall_jump_only = reopened
+            .advance_choice_idle_state(
+                &session_id,
+                first_continuous.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "stable-boot".to_owned(),
+                    wall_clock_ms: soft_idle_at_ms + 86_400_000,
+                    monotonic_ms: 6_001,
+                },
+            )
+            .expect("a wall-only jump is a non-authorizing recalibration");
+        assert_eq!(wall_jump_only, first_continuous);
+    }
+
+    #[test]
+    fn authenticated_idle_resume_is_atomic_replay_safe_and_failure_returns_to_idle() {
+        let authority = LocalAuthority::from_master("choice-resume", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan a local task", "request-resume");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .unwrap();
+        let calibration = ChoiceIdleClockEvidence {
+            boot_id: "resume-boot".to_owned(),
+            wall_clock_ms: active.session.soft_idle_at_ms - 1_000,
+            monotonic_ms: 5_000,
+        };
+        let soft = store
+            .advance_choice_idle_state(&active.session.id, active.session.revision, 1, &calibration)
+            .unwrap();
+        assert_eq!(soft.session.state, ChoiceSessionState::SoftIdle);
+        let resumed = store
+            .begin_choice_resume(1, soft.session.soft_idle_at_ms + 1)
+            .unwrap();
+        let operation = resumed.pending_refinement_operation.clone().unwrap();
+        assert_eq!(resumed.session.state, ChoiceSessionState::Refining);
+        assert!(operation.is_owner_resume());
+        assert_eq!(
+            store
+                .begin_choice_resume(1, soft.session.soft_idle_at_ms + 2)
+                .unwrap(),
+            resumed
+        );
+        let returned = store
+            .block_choice_refinement_operation(
+                &operation.id,
+                operation.expected_generation,
+                soft.session.soft_idle_at_ms + 3,
+            )
+            .unwrap();
+        assert_eq!(returned.session.state, ChoiceSessionState::SoftIdle);
+        assert!(returned.active_choice_set.is_none());
+        assert!(returned.pending_refinement_operation.is_none());
+        assert!(returned.interpretation.is_some());
+        let retried = store
+            .begin_choice_resume(1, soft.session.soft_idle_at_ms + 4)
+            .expect("a new authenticated return can retry after the blocked resume");
+        assert!(
+            retried
+                .pending_refinement_operation
+                .as_ref()
+                .is_some_and(ChoiceRefinementOperation::is_owner_resume)
+        );
+    }
+
+    #[test]
+    fn off_then_on_generation_retires_an_interrupted_owner_resume_without_retrying() {
+        let authority = LocalAuthority::from_master("choice-resume-off-on", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).unwrap();
+        enable_runtime(&mut store, &authority);
+        store.select_model_selection(&selection(), 1).unwrap();
+        let (record, snapshot) = begin_state("Plan a local task", "request-resume-off-on");
+        store.begin_choice_session(&record, &snapshot).unwrap();
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .unwrap();
+        let soft = store
+            .advance_choice_idle_state(
+                &active.session.id,
+                active.session.revision,
+                1,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "resume-off-on-boot".to_owned(),
+                    wall_clock_ms: active.session.soft_idle_at_ms - 1_000,
+                    monotonic_ms: 5_000,
+                },
+            )
+            .unwrap();
+        let pending = store
+            .begin_choice_resume(1, soft.session.soft_idle_at_ms + 1)
+            .unwrap();
+        let operation = pending.pending_refinement_operation.clone().unwrap();
+        commit_runtime_revision(&mut store, false, 2);
+        commit_runtime_revision(&mut store, true, 3);
+
+        let recovered = store
+            .recover_interrupted_choice_operation(3, soft.session.soft_idle_at_ms + 2)
+            .unwrap()
+            .expect("replacement generation retires the old resume worker");
+        assert_eq!(recovered.session.state, ChoiceSessionState::SoftIdle);
+        assert!(recovered.pending_refinement_operation.is_none());
+        assert!(recovered.active_choice_set.is_none());
+        assert!(recovered.session.revision > pending.session.revision);
+        assert!(matches!(
+            store.begin_choice_resume(3, soft.session.soft_idle_at_ms + 3),
+            Ok(next) if next.pending_refinement_operation.as_ref().is_some_and(ChoiceRefinementOperation::is_owner_resume)
+        ));
+        assert_ne!(operation.expected_generation, 3);
+    }
+
+    fn pending_choice_resume(
+        label: &str,
+    ) -> (
+        Store,
+        ChoiceLoopSnapshot,
+        ChoiceRefinementOperation,
+        ChoiceSet,
+    ) {
+        let authority = LocalAuthority::from_master(label, [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open Store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 1)
+            .expect("persist selection");
+        let (record, snapshot) = begin_state("Plan a local task", label);
+        store
+            .begin_choice_session(&record, &snapshot)
+            .expect("begin Choice");
+        let active = store
+            .commit_initial_choice_result(&initial_result(&record))
+            .expect("activate Choice");
+        let calibration = ChoiceIdleClockEvidence {
+            boot_id: "resume-result-boot".to_owned(),
+            wall_clock_ms: active.session.soft_idle_at_ms - 1_000,
+            monotonic_ms: 5_000,
+        };
+        let soft = store
+            .advance_choice_idle_state(&active.session.id, active.session.revision, 1, &calibration)
+            .expect("retire ChoiceSet for idle");
+        let resumed = store
+            .begin_choice_resume(1, soft.session.soft_idle_at_ms + 1)
+            .expect("begin exact owner resume");
+        let operation = resumed
+            .pending_refinement_operation
+            .clone()
+            .expect("pending owner resume");
+        (
+            store,
+            resumed,
+            operation,
+            active.active_choice_set.expect("prior choices"),
+        )
+    }
+
+    #[test]
+    fn choice_resume_result_is_typed_and_exactly_replay_safe() {
+        let (mut store, resumed, operation, choices) = pending_choice_resume("resume-result-valid");
+        let result = ChoiceResumeResult {
+            result: refinement_result_for(&resumed, &operation, &choices),
+        };
+        let active = store
+            .commit_choice_resume_result(&result)
+            .expect("commit exact typed owner-resume result");
+        assert_eq!(active.session.state, ChoiceSessionState::Active);
+        assert!(active.pending_refinement_operation.is_none());
+        assert_eq!(
+            store
+                .commit_choice_resume_result(&result)
+                .expect("exact typed replay"),
+            active
+        );
+    }
+
+    #[test]
+    fn choice_resume_result_rejects_a_stale_generation() {
+        let (mut stale_store, stale, stale_operation, stale_choices) =
+            pending_choice_resume("resume-result-stale");
+        let mut stale_result = ChoiceResumeResult {
+            result: refinement_result_for(&stale, &stale_operation, &stale_choices),
+        };
+        stale_result.result.expected_generation += 1;
+        stale_result.result.result_digest = stale_result
+            .result
+            .canonical_result_digest()
+            .expect("re-sign stale test result");
+        assert!(matches!(
+            stale_store.commit_choice_resume_result(&stale_result),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn choice_resume_result_rejects_cancelled_work() {
+        let (mut cancelled_store, cancelled, cancelled_operation, cancelled_choices) =
+            pending_choice_resume("resume-result-cancelled");
+        let cancelled_result = ChoiceResumeResult {
+            result: refinement_result_for(&cancelled, &cancelled_operation, &cancelled_choices),
+        };
+        cancelled_store
+            .cancel_choice_session(1, cancelled.session.last_input_at_ms + 1)
+            .expect("cancel pending owner resume");
+        assert!(matches!(
+            cancelled_store.commit_choice_resume_result(&cancelled_result),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn choice_resume_result_rejects_a_wrong_operation_marker() {
+        let (mut wrong_marker_store, wrong_marker, wrong_operation, wrong_choices) =
+            pending_choice_resume("resume-result-marker");
+        let mut wrong_marker_result = ChoiceResumeResult {
+            result: refinement_result_for(&wrong_marker, &wrong_operation, &wrong_choices),
+        };
+        wrong_marker_result.result.operation_id = "resume-operation-other".to_owned();
+        wrong_marker_result.result.result_digest = wrong_marker_result
+            .result
+            .canonical_result_digest()
+            .expect("re-sign wrong-marker result");
+        assert!(matches!(
+            wrong_marker_store.commit_choice_resume_result(&wrong_marker_result),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn idle_clock_anchor_is_authenticated_and_deletion_never_recalibrates() {
+        fn seeded_store(label: &str) -> (Store, ChoiceLoopSnapshot, ChoiceIdleClockEvidence) {
+            let authority = LocalAuthority::from_master(label, [93_u8; 32]);
+            let mut store = Store::open_in_memory(authority.clone()).unwrap();
+            enable_runtime(&mut store, &authority);
+            store.select_model_selection(&selection(), 1).unwrap();
+            let (record, snapshot) = begin_state("Plan a local task", label);
+            store.begin_choice_session(&record, &snapshot).unwrap();
+            let active = store
+                .commit_initial_choice_result(&initial_result(&record))
+                .unwrap();
+            let calibration = ChoiceIdleClockEvidence {
+                boot_id: "stable-boot".to_owned(),
+                wall_clock_ms: active.session.soft_idle_at_ms - 1_000,
+                monotonic_ms: 5_000,
+            };
+            store
+                .advance_choice_idle_state(
+                    &active.session.id,
+                    active.session.revision,
+                    1,
+                    &calibration,
+                )
+                .unwrap();
+            (store, active, calibration)
+        }
+
+        let (mut tampered, active, calibration) = seeded_store("clock-anchor-tamper");
+        tampered
+            .connection
+            .execute(
+                "UPDATE choice_idle_clock_anchor SET blob_hash = ?1 WHERE singleton_id = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        assert!(
+            tampered
+                .advance_choice_idle_state(
+                    &active.session.id,
+                    active.session.revision,
+                    1,
+                    &ChoiceIdleClockEvidence {
+                        wall_clock_ms: calibration.wall_clock_ms + 1,
+                        monotonic_ms: calibration.monotonic_ms + 1,
+                        ..calibration.clone()
+                    },
+                )
+                .is_err()
+        );
+
+        let (mut deleted, active, calibration) = seeded_store("clock-anchor-delete");
+        deleted
+            .connection
+            .execute("DELETE FROM choice_idle_clock_anchor", [])
+            .unwrap();
+        assert!(
+            deleted
+                .advance_choice_idle_state(
+                    &active.session.id,
+                    active.session.revision,
+                    1,
+                    &ChoiceIdleClockEvidence {
+                        wall_clock_ms: calibration.wall_clock_ms + 1,
+                        monotonic_ms: calibration.monotonic_ms + 1,
+                        ..calibration
+                    },
+                )
+                .is_err(),
+            "a missing audited anchor is corruption, not a fresh calibration"
+        );
+    }
+}
+
+#[cfg(test)]
+mod choice_loop_state_tests {
+    use super::choice_begin_tests::{
+        begin_state, enable_runtime, initial_result, persona_revision, refinement_result_for,
+        refining_d_store, selection,
+    };
+    use super::*;
+    use openopen_protocol::{
+        CHOICE_SESSION_SOFT_IDLE_MS, CHOICE_SESSION_STALE_REVIEW_MS, ChoiceBeginRecord,
+        ChoiceConsolidatedConfirmation, ChoiceLoopSnapshot, ChoiceOption,
+        ChoiceReminderScheduleInput, ChoiceSession, ChoiceSessionState, ChoiceSet,
+        ConversationTurnBatch, DocumentManifest, DocumentManifestEntry, InterpretationFrame,
+        ModelProvenance, ModelSelection, ModelSelectionState, OptionSelection, PersonaRevisionRef,
+        Selection, canonical_document_manifest_digest,
+    };
+    use tempfile::tempdir;
+
+    fn manifest(entries: Vec<DocumentManifestEntry>, generated_at_ms: i64) -> DocumentManifest {
+        let aggregate_digest = canonical_document_manifest_digest(&entries)
+            .expect("test entries satisfy canonical manifest policy");
+        DocumentManifest {
+            root_version: 1,
+            entries,
+            aggregate_digest,
+            generated_at_ms,
+        }
+    }
+
+    fn snapshot() -> ChoiceLoopSnapshot {
+        ChoiceLoopSnapshot {
+            session: ChoiceSession {
+                id: "session-1".to_owned(),
+                state: ChoiceSessionState::Active,
+                revision: 1,
+                model_selection_state: ModelSelectionState::Unselected,
+                communication_profile_revision: 0,
+                active_choice_set_id: None,
+                active_interpretation_revision: None,
+                opened_at_ms: 10,
+                last_input_at_ms: 20,
+                soft_idle_at_ms: 20 + CHOICE_SESSION_SOFT_IDLE_MS,
+                stale_review_at_ms: 20 + CHOICE_SESSION_STALE_REVIEW_MS,
+                primary_delivery_binding_id: None,
+                pending_confirmation_id: None,
+                background_mission_ids: vec![],
+            },
+            active_batch: None,
+            interpretation: None,
+            active_choice_set: None,
+            last_selection: None,
+            pending_refinement_operation: None,
+            confirmation: None,
+            document_manifest: manifest(
+                vec![DocumentManifestEntry {
+                    relative_path: "sessions/session-1/SESSION.md".to_owned(),
+                    sha256: "a".repeat(64),
+                    byte_length: 64,
+                    mode: 0o600,
+                }],
+                20,
+            ),
+        }
+    }
+
+    fn advance_snapshot(
+        previous: &ChoiceLoopSnapshot,
+        last_input_at_ms: i64,
+    ) -> ChoiceLoopSnapshot {
+        let mut next = previous.clone();
+        next.session.revision += 1;
+        next.session.last_input_at_ms = last_input_at_ms;
+        next.session.soft_idle_at_ms = last_input_at_ms + CHOICE_SESSION_SOFT_IDLE_MS;
+        next.session.stale_review_at_ms = last_input_at_ms + CHOICE_SESSION_STALE_REVIEW_MS;
+        next.document_manifest.generated_at_ms = last_input_at_ms;
+        next
+    }
+
+    fn choice_set_snapshot(
+        previous: &ChoiceLoopSnapshot,
+        last_input_at_ms: i64,
+    ) -> ChoiceLoopSnapshot {
+        let mut next = advance_snapshot(previous, last_input_at_ms);
+        let source_manifest_digest = next.document_manifest.aggregate_digest.clone();
+        next.interpretation = Some(InterpretationFrame {
+            choice_session_id: next.session.id.clone(),
+            revision: 1,
+            understood_goal: "Prepare the next bounded step".to_owned(),
+            current_context: "The user has one active local session".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            source_manifest_digest: source_manifest_digest.clone(),
+        });
+        next.session.active_interpretation_revision = Some(1);
+        next.active_choice_set = Some(ChoiceSet {
+            id: "choices-1".to_owned(),
+            choice_session_id: next.session.id.clone(),
+            session_revision: next.session.revision,
+            interpretation_revision: 1,
+            generated_at_ms: last_input_at_ms,
+            expires_on_revision: next.session.revision,
+            options: vec![
+                ChoiceOption {
+                    id: "option-1".to_owned(),
+                    position: 1,
+                    direction: "Review the current plan".to_owned(),
+                    rationale: "Keeps the next step bounded".to_owned(),
+                    expected_result: "A clear local next step".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                },
+                ChoiceOption {
+                    id: "option-2".to_owned(),
+                    position: 2,
+                    direction: "Narrow the next action".to_owned(),
+                    rationale: "Reduces uncertainty before confirmation".to_owned(),
+                    expected_result: "A smaller decision".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                },
+                ChoiceOption {
+                    id: "option-3".to_owned(),
+                    position: 3,
+                    direction: "Prepare a safe alternative".to_owned(),
+                    rationale: "Keeps an alternate path visible".to_owned(),
+                    expected_result: "One bounded alternative".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                },
+            ],
+            d_available: true,
+            source_manifest_digest,
+            model_provenance: ModelProvenance {
+                id: "provenance-1".to_owned(),
+                model_id: "gpt-test-model".to_owned(),
+                requested_effort: "not_applicable".to_owned(),
+                actual_effort: "not_applicable".to_owned(),
+                catalog_fingerprint: "c".repeat(64),
+                catalog_revision: 1,
+                account_display_class: "ChatGPT account".to_owned(),
+                protocol_schema_revision: 1,
+                turn_id: "turn-1".to_owned(),
+            },
+            persona_revision: persona_revision(),
+        });
+        next.session.model_selection_state = ModelSelectionState::Selected {
+            model_provenance_ref: "provenance-1".to_owned(),
+        };
+        next.session.active_choice_set_id = Some("choices-1".to_owned());
+        next
+    }
+
+    fn batch_snapshot(previous: &ChoiceLoopSnapshot, last_input_at_ms: i64) -> ChoiceLoopSnapshot {
+        let mut next = advance_snapshot(previous, last_input_at_ms);
+        next.session.primary_delivery_binding_id = Some("binding-1".to_owned());
+        next.active_batch = Some(ConversationTurnBatch {
+            id: "batch-1".to_owned(),
+            choice_session_id: next.session.id.clone(),
+            delivery_binding_id: "binding-1".to_owned(),
+            source_envelope_ids: vec!["envelope-1".to_owned()],
+            opened_at_ms: last_input_at_ms,
+            quiet_deadline_ms: last_input_at_ms + 2_500,
+            hard_deadline_ms: last_input_at_ms + 8_000,
+            sealed_at_ms: None,
+            seal_reason: None,
+            revision: next.session.revision,
+        });
+        next
+    }
+
+    fn active_choice_from_authenticated_begin(
+        store: &mut Store,
+        request_id: &str,
+    ) -> (ChoiceBeginRecord, ChoiceLoopSnapshot, ChoiceSet) {
+        store
+            .select_model_selection(&selection(), 20)
+            .expect("persist selected model for authenticated begin");
+        let (begin, snapshot) = begin_state("Plan one bounded task", request_id);
+        store
+            .begin_choice_session(&begin, &snapshot)
+            .expect("persist authenticated begin");
+        let active = store
+            .commit_initial_choice_result(&initial_result(&begin))
+            .expect("commit authenticated initial result");
+        let choice_set = active.active_choice_set.clone().expect("active ChoiceSet");
+        (begin, active, choice_set)
+    }
+
+    fn choice_set_with_bound_batch_snapshot(
+        previous: &ChoiceLoopSnapshot,
+        last_input_at_ms: i64,
+    ) -> ChoiceLoopSnapshot {
+        let mut next = choice_set_snapshot(previous, last_input_at_ms);
+        next.session.primary_delivery_binding_id = Some("binding-1".to_owned());
+        next.active_batch = Some(ConversationTurnBatch {
+            id: "batch-1".to_owned(),
+            choice_session_id: next.session.id.clone(),
+            delivery_binding_id: "binding-1".to_owned(),
+            source_envelope_ids: vec!["envelope-1".to_owned()],
+            opened_at_ms: last_input_at_ms,
+            quiet_deadline_ms: last_input_at_ms + 2_500,
+            hard_deadline_ms: last_input_at_ms + 8_000,
+            sealed_at_ms: None,
+            seal_reason: None,
+            revision: next.session.revision,
+        });
+        next
+    }
+
+    fn matching_model_selection(choice_set: &ChoiceSet) -> ModelSelection {
+        ModelSelection {
+            id: "model-selection-1".to_owned(),
+            model_id: choice_set.model_provenance.model_id.clone(),
+            requested_effort: choice_set.model_provenance.requested_effort.clone(),
+            actual_effort: choice_set.model_provenance.actual_effort.clone(),
+            catalog_fingerprint: choice_set.model_provenance.catalog_fingerprint.clone(),
+            catalog_revision: choice_set.model_provenance.catalog_revision,
+            account_display_class: choice_set.model_provenance.account_display_class.clone(),
+            protocol_schema_revision: choice_set.model_provenance.protocol_schema_revision,
+        }
+    }
+
+    fn confirmation_for(
+        choices: &ChoiceLoopSnapshot,
+        choice_set: &ChoiceSet,
+        confirmed_at_ms: i64,
+    ) -> ChoiceConsolidatedConfirmation {
+        let mut confirmation = ChoiceConsolidatedConfirmation {
+            id: "confirmation-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selection_id: choices.last_selection.as_ref().map_or_else(
+                || "selection-1".to_owned(),
+                |selection| selection.id().to_owned(),
+            ),
+            expected_session_revision: choices.session.revision,
+            interpretation_revision: choice_set.interpretation_revision,
+            payload_revision: 0,
+            payload_digest: String::new(),
+            goal: "Prepare one bounded local plan".to_owned(),
+            steps: vec!["Review the prepared plan".to_owned()],
+            markdown_entry: DocumentManifestEntry {
+                relative_path: format!("sessions/{}/CHOICE.md", choices.session.id),
+                sha256: "b".repeat(64),
+                byte_length: 1,
+                mode: 0o600,
+            },
+            markdown_expected_base: None,
+            markdown_manifest_digests: vec![choices.document_manifest.aggregate_digest.clone()],
+            document_diff_digest: "d".repeat(64),
+            model_provenance: choice_set.model_provenance.clone(),
+            persona_revision: choice_set.persona_revision.clone(),
+            reminder_list_id: "reminder-list-1".to_owned(),
+            reminder_items: vec![openopen_protocol::ChoiceReminderItem {
+                id: "reminder-1".to_owned(),
+                text: "Review the prepared plan".to_owned(),
+                due_at_ms: confirmed_at_ms,
+                time_zone: "Etc/UTC".to_owned(),
+                evidence_intent: "reminder-readback".to_owned(),
+            }],
+            reminder_count: 1,
+            reminder_payload_digest: String::new(),
+            evidence_requirements: vec!["Reminder readback is required before Done".to_owned()],
+            delivery_binding_id: None,
+            recipient: None,
+            delivery_scope: None,
+            data_categories: vec!["local task state".to_owned()],
+            retention: "Local until the user deletes it".to_owned(),
+            permissions: vec![],
+            effect_classes: vec!["reminder".to_owned()],
+            confirmed_at_ms,
+        };
+        let markdown_body = confirmed_choice_markdown_body(&confirmation);
+        confirmation.markdown_entry.sha256 = sha256_hex(markdown_body.as_bytes());
+        confirmation.markdown_entry.byte_length =
+            u64::try_from(markdown_body.len()).expect("bounded fixture Markdown length");
+        confirmation.markdown_manifest_digests.push(
+            canonical_document_manifest_digest(std::slice::from_ref(&confirmation.markdown_entry))
+                .expect("canonical desired Markdown manifest"),
+        );
+        confirmation.reminder_payload_digest = confirmation
+            .canonical_reminder_payload_digest()
+            .expect("canonical reminder digest");
+        confirmation.payload_revision = confirmation
+            .canonical_payload_revision(1)
+            .expect("canonical confirmation revision");
+        confirmation.payload_digest = confirmation
+            .canonical_payload_digest()
+            .expect("canonical confirmation digest");
+        confirmation
+    }
+
+    fn record_schedule_for(
+        store: &mut Store,
+        choices: &ChoiceLoopSnapshot,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        request_id: &str,
+        accepted_at_ms: i64,
+    ) -> ChoiceReminderSchedule {
+        store
+            .record_choice_reminder_schedule(
+                &ChoiceReminderScheduleInput {
+                    request_id: request_id.to_owned(),
+                    choice_session_id: choices.session.id.clone(),
+                    expected_session_revision: choices.session.revision,
+                    reminder_list_id: confirmation.reminder_list_id.clone(),
+                    reminder_count: confirmation.reminder_count,
+                    due_at_ms: confirmation.reminder_items[0].due_at_ms,
+                    time_zone: confirmation.reminder_items[0].time_zone.clone(),
+                },
+                1,
+                accepted_at_ms,
+            )
+            .expect("record effect-free schedule")
+    }
+
+    fn store_with_executing_markdown_receipt(
+        authority_id: &str,
+    ) -> (
+        Store,
+        ChoiceConsolidatedConfirmation,
+        MarkdownRenderIntent,
+        ChoiceLoopSnapshot,
+    ) {
+        let authority = LocalAuthority::from_master(authority_id, [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store.save_choice_loop_snapshot(&first, 20).unwrap();
+        let mut choices = choice_set_snapshot(&first, 21);
+        let choice_set = choices.active_choice_set.clone().unwrap();
+        choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+            id: "selection-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision - 1,
+            selected_at_ms: 21,
+        }));
+        store.save_choice_loop_snapshot(&choices, 21).unwrap();
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .unwrap();
+        let confirmation = confirmation_for(&choices, &choice_set, 22);
+        record_schedule_for(
+            &mut store,
+            &choices,
+            &confirmation,
+            "schedule-request-render",
+            21,
+        );
+        let (committed, intent) = store
+            .commit_choice_confirmation_and_render_intent(&confirmation, 1, 22)
+            .unwrap();
+        store
+            .commit_markdown_render_receipt_for_test(&MarkdownRenderReceipt {
+                intent_id: intent.id.clone(),
+                final_entry: intent.entry.clone(),
+                final_device: 1,
+                final_inode: 2,
+                displaced_base: None,
+                committed_at_ms: 24,
+            })
+            .unwrap();
+        let next = store
+            .retire_choice_private_bodies_after_render(&intent.id, 25)
+            .unwrap();
+        assert_eq!(next.session.revision, committed.session.revision + 1);
+        (store, confirmation, intent, next)
+    }
+
+    fn store_with_reminder_schedule_for_tamper() -> (Store, ChoiceReminderSchedule) {
+        let authority = LocalAuthority::from_master("choice-reminder-index-tamper", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store.save_choice_loop_snapshot(&first, 20).expect("base");
+        let mut choices = choice_set_snapshot(&first, 21);
+        let choice_set = choices.active_choice_set.clone().expect("choice set");
+        choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+            id: "selection-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision - 1,
+            selected_at_ms: 21,
+        }));
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("choices");
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .expect("model");
+        let confirmation = confirmation_for(&choices, &choice_set, 22);
+        let schedule = record_schedule_for(
+            &mut store,
+            &choices,
+            &confirmation,
+            "schedule-index-tamper-request",
+            21,
+        );
+        (store, schedule)
+    }
+
+    #[test]
+    fn choice_select_is_command_owned_atomic_and_replay_safe() {
+        let authority = LocalAuthority::from_master("choice-select", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        enable_runtime(
+            &mut store,
+            &LocalAuthority::from_master("choice-select", [93_u8; 32]),
+        );
+        let (_begin, choices, choice_set) =
+            active_choice_from_authenticated_begin(&mut store, "request-choice-select");
+        let selection = Selection::OptionSelection(OptionSelection {
+            id: "resume-soft-idle-forged".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision,
+            selected_at_ms: 22,
+        });
+        let committed = store
+            .commit_choice_selection(&selection, 1, 22)
+            .expect("commit selection");
+        assert_eq!(committed.session.revision, 3);
+        assert_eq!(committed.session.state, ChoiceSessionState::Refining);
+        assert!(committed.active_choice_set.is_none());
+        assert_eq!(committed.last_selection, Some(selection.clone()));
+        let operation = committed
+            .pending_refinement_operation
+            .as_ref()
+            .expect("selection owns a pending refinement operation");
+        assert_eq!(operation.selection_id, "resume-soft-idle-forged");
+        assert_eq!(operation.expected_generation, 1);
+        assert!(
+            !operation.is_owner_resume(),
+            "a caller-supplied OptionSelection id cannot mint owner-return authority"
+        );
+        assert_eq!(
+            store
+                .commit_choice_selection(&selection, 1, 22)
+                .expect("exact replay"),
+            committed
+        );
+        assert!(matches!(
+            store.commit_choice_selection(&selection, 1, 23),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mut stale = selection.clone();
+        if let Selection::OptionSelection(value) = &mut stale {
+            value.id = "selection-2".to_owned();
+        }
+        assert!(matches!(
+            store.commit_choice_selection(&stale, 1, 24),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+
+        let Selection::OptionSelection(mut caller_retry) = selection else {
+            unreachable!("test constructs an option selection");
+        };
+        caller_retry.selected_at_ms = i64::MAX;
+        assert_eq!(
+            store
+                .choice_option_selection_replay(&caller_retry)
+                .expect("untrusted caller time is not replay authority"),
+            Some(committed)
+        );
+    }
+
+    #[test]
+    fn choice_select_accepts_each_current_option_and_only_the_current_d_binding() {
+        for (index, option_id) in ["option-1", "option-2", "option-3"].iter().enumerate() {
+            let authority =
+                LocalAuthority::from_master(format!("choice-select-option-{index}"), [93_u8; 32]);
+            let mut store = Store::open_in_memory(authority.clone()).expect("open option store");
+            enable_runtime(&mut store, &authority);
+            let (_begin, choices, choice_set) = active_choice_from_authenticated_begin(
+                &mut store,
+                &format!("request-choice-select-option-{index}"),
+            );
+            let selection = Selection::OptionSelection(OptionSelection {
+                id: format!("selection-option-{index}"),
+                choice_session_id: choices.session.id.clone(),
+                choice_set_id: choice_set.id.clone(),
+                selected_option_id: (*option_id).to_owned(),
+                expected_session_revision: choices.session.revision,
+                selected_at_ms: 22,
+            });
+            assert_eq!(
+                store
+                    .commit_choice_selection(&selection, 1, 22)
+                    .expect("commit current option")
+                    .last_selection,
+                Some(selection)
+            );
+        }
+
+        let authority = LocalAuthority::from_master("choice-select-d", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open D store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store
+            .save_choice_loop_snapshot(&first, 20)
+            .expect("persist D base");
+        let choices = choice_set_with_bound_batch_snapshot(&first, 21);
+        assert!(choices.is_valid());
+        let choice_set = choices.active_choice_set.clone().expect("D choice set");
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("persist D choices");
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .expect("persist D model provenance");
+        let selection = Selection::NaturalConversationSelection(
+            openopen_protocol::NaturalConversationSelection {
+                id: "selection-d".to_owned(),
+                choice_session_id: "session-1".to_owned(),
+                choice_set_id: "choices-1".to_owned(),
+                d_input_batch_id: "batch-1".to_owned(),
+                expected_session_revision: 2,
+                selected_at_ms: 22,
+            },
+        );
+        let mut wrong_binding = selection.clone();
+        if let Selection::NaturalConversationSelection(value) = &mut wrong_binding {
+            value.d_input_batch_id = "batch-not-current".to_owned();
+        }
+        assert!(matches!(
+            store.commit_choice_selection(&wrong_binding, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        // The historical natural-selection shape carries a persisted batch
+        // identity, so it is never a public write route.  D must arrive as a
+        // Host-derived encrypted intake record instead.
+        assert!(matches!(
+            store.commit_choice_selection(&selection, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Covers result replay, tamper, and visibility in one ordered transaction trace.
+    fn refinement_result_is_selection_bound_replay_safe_and_never_partially_visible() {
+        let authority = LocalAuthority::from_master("choice-refinement", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        store
+            .select_model_selection(&selection(), 20)
+            .expect("model");
+        let (begin, snapshot) = begin_state("Plan one bounded task", "request-refinement");
+        store
+            .begin_choice_session(&begin, &snapshot)
+            .expect("begin source-bound Choice");
+        let choices = store
+            .commit_initial_choice_result(&initial_result(&begin))
+            .expect("activate source-bound Choice");
+        let choice_set = choices.active_choice_set.clone().expect("choice set");
+        let selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-refinement-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision,
+            selected_at_ms: 22,
+        });
+        let refining = store
+            .commit_choice_selection(&selection, 1, 22)
+            .expect("pending refinement");
+        let operation = refining
+            .pending_refinement_operation
+            .clone()
+            .expect("operation");
+        assert_eq!(
+            operation.source_envelope_id,
+            begin.accepted.source_envelope_id
+        );
+        assert_eq!(
+            operation.conversation_turn_batch_id,
+            begin.accepted.conversation_turn_batch_id
+        );
+        let interpretation = InterpretationFrame {
+            choice_session_id: refining.session.id.clone(),
+            revision: 2,
+            understood_goal: "Refined bounded local plan".to_owned(),
+            current_context: "The owner selected one direction".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+        };
+        let mut result = ChoiceRefinementResult {
+            operation_id: operation.id.clone(),
+            selection_id: operation.selection_id.clone(),
+            source_envelope_id: operation.source_envelope_id.clone(),
+            conversation_turn_batch_id: operation.conversation_turn_batch_id.clone(),
+            expected_session_revision: operation.expected_session_revision,
+            expected_generation: operation.expected_generation,
+            model_provenance: operation.model_provenance.clone(),
+            source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+            persona_revision: operation.persona_revision.clone(),
+            interpretation: interpretation.clone(),
+            choice_set: ChoiceSet {
+                id: "choices-refined-1".to_owned(),
+                choice_session_id: refining.session.id.clone(),
+                session_revision: refining.session.revision + 1,
+                interpretation_revision: interpretation.revision,
+                generated_at_ms: 23,
+                expires_on_revision: refining.session.revision + 1,
+                options: choice_set.options.clone(),
+                d_available: true,
+                source_manifest_digest: refining.document_manifest.aggregate_digest.clone(),
+                model_provenance: operation.model_provenance.clone(),
+                persona_revision: operation.persona_revision.clone(),
+            },
+            result_digest: String::new(),
+            completed_at_ms: 23,
+        };
+        result.result_digest = result
+            .canonical_result_digest()
+            .expect("canonical refinement digest");
+        let mut wrong_persona = result.clone();
+        let forged_persona = PersonaRevisionRef {
+            persona_id: operation.persona_revision.persona_id.clone(),
+            revision: "draft-04-en".to_owned(),
+            aggregate_digest: "a".repeat(64),
+            instructions_digest: "b".repeat(64),
+        };
+        wrong_persona.persona_revision = forged_persona.clone();
+        wrong_persona.choice_set.persona_revision = forged_persona;
+        wrong_persona.result_digest = wrong_persona
+            .canonical_result_digest()
+            .expect("forged but self-consistent digest");
+        assert!(matches!(
+            store.commit_choice_refinement_result(&wrong_persona),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let active = store
+            .commit_choice_refinement_result(&result)
+            .expect("commit exact result");
+        assert_eq!(active.session.state, ChoiceSessionState::Active);
+        assert!(active.pending_refinement_operation.is_none());
+        assert_eq!(
+            store
+                .commit_choice_refinement_result(&result)
+                .expect("exact result replay"),
+            active
+        );
+        let mut changed = result.clone();
+        changed.selection_id = "selection-other".to_owned();
+        changed.result_digest = changed.canonical_result_digest().expect("changed digest");
+        assert!(matches!(
+            store.commit_choice_refinement_result(&changed),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_result SET blob_hash = ?1 WHERE operation_id = ?2",
+                ["00".repeat(32), operation.id.clone()],
+            )
+            .expect("tamper retained result");
+        // Retained private results are audited inputs until their typed body
+        // retirement. A later unrelated transition must fail closed too.
+        assert!(matches!(
+            store.cancel_choice_session(1, 24),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn pending_refinement_keeps_the_selected_semantic_context_private_and_bound() {
+        let authority = LocalAuthority::from_master("choice-refinement-context", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let (_begin, choices, choice_set) =
+            active_choice_from_authenticated_begin(&mut store, "request-refinement-context");
+        let selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-context-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-2".to_owned(),
+            expected_session_revision: choices.session.revision,
+            selected_at_ms: 22,
+        });
+        let refining = store
+            .commit_choice_selection(&selection, 1, 22)
+            .expect("selection and context commit atomically");
+        let operation = refining.pending_refinement_operation.expect("operation");
+        let context = store
+            .choice_refinement_context(&operation)
+            .expect("private context");
+        assert_eq!(
+            context.interpretation,
+            choices.interpretation.expect("interpretation")
+        );
+        assert_eq!(
+            context.selected_option.expect("selected option").direction,
+            "Narrow the task"
+        );
+        assert!(
+            store
+                .choice_d_intake_for_refinement(&operation)
+                .expect("A/B/C has no D input")
+                .is_none()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE choice_refinement_context SET blob_hash = ?1 WHERE operation_id = ?2",
+                ["00".repeat(32), operation.id.clone()],
+            )
+            .expect("tamper context");
+        assert!(matches!(
+            store.choice_refinement_context(&operation),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        // A private worker row must also fence unrelated command-owned
+        // transitions. Otherwise a later command could advance durable state
+        // while a tampered semantic context remained live in the Store.
+        assert!(matches!(
+            store.cancel_choice_session(1, 23),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn stale_reminder_schedule_is_history_not_current_choice_continuity() {
+        let authority = LocalAuthority::from_master("choice-stale-schedule", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let (_begin, initial, initial_choice_set) =
+            active_choice_from_authenticated_begin(&mut store, "request-stale-schedule");
+        let first_selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-before-schedule".to_owned(),
+            choice_session_id: initial.session.id.clone(),
+            choice_set_id: initial_choice_set.id.clone(),
+            selected_option_id: "option-3".to_owned(),
+            expected_session_revision: initial.session.revision,
+            selected_at_ms: initial.session.last_input_at_ms,
+        });
+        let refining = store
+            .commit_choice_selection(&first_selection, 1, initial.session.last_input_at_ms)
+            .expect("commit first selected direction");
+        let operation = refining
+            .pending_refinement_operation
+            .clone()
+            .expect("pending refinement");
+        let refinement = refinement_result_for(&refining, &operation, &initial_choice_set);
+        let choices = store
+            .commit_choice_refinement_result(&refinement)
+            .expect("activate refined selected direction");
+        let choice_set = choices
+            .active_choice_set
+            .clone()
+            .expect("refined choice set");
+        let confirmation = confirmation_for(&choices, &choice_set, 100_000);
+        let schedule = record_schedule_for(
+            &mut store,
+            &choices,
+            &confirmation,
+            "stale-schedule-request",
+            22,
+        );
+        assert_eq!(
+            store
+                .current_choice_reminder_schedule_for_revision(
+                    &choices.session.id,
+                    choices.session.revision,
+                )
+                .expect("current schedule"),
+            Some(schedule)
+        );
+        let selection = Selection::OptionSelection(OptionSelection {
+            id: "selection-after-schedule".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision,
+            selected_at_ms: 23,
+        });
+        let refining = store
+            .commit_choice_selection(&selection, 1, 23)
+            .expect("new Choice revision");
+        assert!(
+            store
+                .current_choice_reminder_schedule_for_revision(
+                    &refining.session.id,
+                    refining.session.revision,
+                )
+                .expect("stale schedule lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .current_choice_reminder_schedule(&refining.session.id)
+                .expect("history remains auditable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One ordered regression proves atomic bind, exact replay, drift rejection, and zero effects.
+    fn choice_confirm_binds_the_exact_payload_without_effects() {
+        let authority = LocalAuthority::from_master("choice-confirm", [93_u8; 32]);
+        let directory = tempdir().expect("temporary Store root");
+        let database = directory.path().join("choice-confirm.sqlite");
+        let mut store = Store::open(&database, authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store
+            .save_choice_loop_snapshot(&first, 20)
+            .expect("persist base");
+        let mut choices = choice_set_snapshot(&first, 21);
+        choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+            id: "selection-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choices
+                .active_choice_set
+                .as_ref()
+                .expect("choice set")
+                .id
+                .clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision - 1,
+            selected_at_ms: 21,
+        }));
+        let choice_set = choices.active_choice_set.clone().expect("choice set");
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("persist choices");
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .expect("persist exact model provenance");
+        let confirmation = confirmation_for(&choices, &choice_set, 22);
+        let schedule = record_schedule_for(
+            &mut store,
+            &choices,
+            &confirmation,
+            "schedule-request-1",
+            21,
+        );
+        assert_eq!(schedule.revision, 1);
+        let mut unbound_delivery = confirmation.clone();
+        unbound_delivery.delivery_binding_id = Some("binding-not-current".to_owned());
+        unbound_delivery.recipient = Some("recipient-1".to_owned());
+        unbound_delivery.delivery_scope = Some("same-surface only".to_owned());
+        unbound_delivery.payload_digest = unbound_delivery
+            .canonical_payload_digest()
+            .expect("canonical unbound delivery digest");
+        assert!(matches!(
+            store.commit_choice_confirmation(&unbound_delivery, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let committed = store
+            .commit_choice_confirmation(&confirmation, 1, 22)
+            .expect("commit confirmation");
+        assert_eq!(
+            committed.session.state,
+            ChoiceSessionState::AwaitingConfirmation
+        );
+        assert_eq!(
+            committed.session.pending_confirmation_id.as_deref(),
+            Some("confirmation-1")
+        );
+        assert_eq!(committed.confirmation, Some(confirmation.clone()));
+        assert_eq!(
+            store
+                .commit_choice_confirmation(&confirmation, 1, 22)
+                .expect("exact confirmation replay"),
+            committed
+        );
+        let pending_intent = store
+            .pending_markdown_render_intent_for_session(&committed.session.id)
+            .expect("read atomic confirmation journal")
+            .expect("confirmation and render intent commit together");
+        assert!(markdown_intent_matches_confirmation(
+            &pending_intent,
+            &confirmation
+        ));
+        let intent_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_markdown_render_intent",
+                [],
+                |row| row.get(0),
+            )
+            .expect("render intent count");
+        let intent_audits: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE action = ?1",
+                [CHOICE_MARKDOWN_RENDER_INTENT_ACTION],
+                |row| row.get(0),
+            )
+            .expect("render intent audit count");
+        assert_eq!((intent_rows, intent_audits), (1, 1));
+        let mission_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM mission_state", [], |row| row.get(0))
+            .expect("mission count");
+        assert_eq!(mission_count, 0);
+        let mut drifted = confirmation.clone();
+        drifted.goal = "A changed goal".to_owned();
+        assert!(matches!(
+            store.commit_choice_confirmation(&drifted, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mut reminder_drifted = confirmation.clone();
+        reminder_drifted.reminder_items[0].due_at_ms += 1;
+        reminder_drifted.reminder_payload_digest = reminder_drifted
+            .canonical_reminder_payload_digest()
+            .expect("canonical changed reminder digest");
+        reminder_drifted.payload_digest = reminder_drifted
+            .canonical_payload_digest()
+            .expect("canonical changed confirmation digest");
+        assert!(matches!(
+            store.commit_choice_confirmation(&reminder_drifted, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mut persona_drifted = confirmation.clone();
+        persona_drifted.persona_revision.aggregate_digest = "a".repeat(64);
+        persona_drifted.payload_digest = persona_drifted
+            .canonical_payload_digest()
+            .expect("canonical changed Persona digest");
+        assert!(matches!(
+            store.commit_choice_confirmation(&persona_drifted, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        drop(store);
+        let mut restarted = Store::open(&database, authority).expect("restart Store");
+        assert_eq!(
+            restarted
+                .commit_choice_confirmation(&confirmation, 1, 23)
+                .expect("exact immutable confirmation replay after restart"),
+            committed
+        );
+    }
+
+    #[test]
+    fn choice_reminder_schedule_is_future_bound_revisioned_and_reconfirmation_gated() {
+        let authority = LocalAuthority::from_master("choice-reminder-schedule", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store.save_choice_loop_snapshot(&first, 20).expect("base");
+        let mut choices = choice_set_snapshot(&first, 21);
+        let choice_set = choices.active_choice_set.clone().expect("choice set");
+        choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+            id: "selection-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision - 1,
+            selected_at_ms: 21,
+        }));
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("choices");
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .expect("model");
+        let confirmation = confirmation_for(&choices, &choice_set, 22);
+        let first_schedule = record_schedule_for(
+            &mut store,
+            &choices,
+            &confirmation,
+            "schedule-request-1",
+            21,
+        );
+        assert_eq!(
+            record_schedule_for(
+                &mut store,
+                &choices,
+                &confirmation,
+                "schedule-request-1",
+                21,
+            ),
+            first_schedule,
+            "exact schedule request is replay-safe"
+        );
+        assert_eq!(
+            store
+                .record_choice_reminder_schedule(&first_schedule.input, 1, 100)
+                .expect("a lost response may replay its exact durable proposal"),
+            first_schedule,
+            "an expired proposal still cannot be recreated or mutated by retry"
+        );
+        let mut changed_input = first_schedule.input.clone();
+        changed_input.due_at_ms = 23;
+        changed_input.reminder_count = 2;
+        assert!(matches!(
+            store.record_choice_reminder_schedule(&changed_input, 1, 21),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        changed_input.request_id = "schedule-request-2".to_owned();
+        let second_schedule = store
+            .record_choice_reminder_schedule(&changed_input, 1, 21)
+            .expect("edited schedule creates a new revision");
+        assert_eq!(second_schedule.revision, 2);
+        assert_eq!(second_schedule.input.reminder_count, 2);
+        assert!(matches!(
+            store.commit_choice_confirmation(&confirmation, 1, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        let mut reconfirmed = confirmation.clone();
+        reconfirmed.reminder_items[0].due_at_ms = second_schedule.input.due_at_ms;
+        let mut second_item = reconfirmed.reminder_items[0].clone();
+        second_item.id = "reminder-item-2".to_owned();
+        reconfirmed.reminder_items.push(second_item);
+        reconfirmed.reminder_count = second_schedule.input.reminder_count;
+        reconfirmed.reminder_payload_digest = reconfirmed
+            .canonical_reminder_payload_digest()
+            .expect("updated reminder digest");
+        reconfirmed.payload_revision = reconfirmed
+            .canonical_payload_revision(second_schedule.revision)
+            .expect("updated confirmation revision");
+        reconfirmed.payload_digest = reconfirmed
+            .canonical_payload_digest()
+            .expect("updated confirmation digest");
+        assert_eq!(
+            store
+                .commit_choice_confirmation(&reconfirmed, 1, 22)
+                .expect("new exact confirmation")
+                .confirmation,
+            Some(reconfirmed)
+        );
+        let mission_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM mission_state", [], |row| row.get(0))
+            .expect("mission count");
+        assert_eq!(
+            mission_count, 0,
+            "schedule and confirmation have no effect authority"
+        );
+    }
+
+    #[test]
+    fn choice_reminder_schedule_survives_restart_without_recreating_authority() {
+        let directory = tempdir().expect("temporary store directory");
+        let path = directory.path().join("choice-reminder-schedule.sqlite3");
+        let authority = LocalAuthority::from_master("choice-reminder-restart", [93_u8; 32]);
+        let expected = {
+            let mut store = Store::open(&path, authority.clone()).expect("open persistent store");
+            enable_runtime(&mut store, &authority);
+            let first = snapshot();
+            store.save_choice_loop_snapshot(&first, 20).expect("base");
+            let mut choices = choice_set_snapshot(&first, 21);
+            let choice_set = choices.active_choice_set.clone().expect("choice set");
+            choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+                id: "selection-1".to_owned(),
+                choice_session_id: choices.session.id.clone(),
+                choice_set_id: choice_set.id.clone(),
+                selected_option_id: "option-1".to_owned(),
+                expected_session_revision: choices.session.revision - 1,
+                selected_at_ms: 21,
+            }));
+            store
+                .save_choice_loop_snapshot(&choices, 21)
+                .expect("choices");
+            store
+                .select_model_selection(&matching_model_selection(&choice_set), 21)
+                .expect("model");
+            let confirmation = confirmation_for(&choices, &choice_set, 22);
+            record_schedule_for(
+                &mut store,
+                &choices,
+                &confirmation,
+                "schedule-request-restart",
+                21,
+            )
+        };
+        let reopened = Store::open(&path, authority).expect("reopen schedule store");
+        assert_eq!(
+            reopened
+                .current_choice_reminder_schedule("session-1")
+                .expect("read persisted schedule"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn choice_reminder_schedule_indexes_are_authenticated_and_store_rejects_invalid_time_zone() {
+        for (column, value) in [
+            ("request_id", "tampered-request"),
+            ("choice_session_id", "tampered-session"),
+            ("revision", "99"),
+            ("accepted_at_ms", "99"),
+        ] {
+            let (mut store, schedule) = store_with_reminder_schedule_for_tamper();
+            let statement =
+                format!("UPDATE choice_reminder_schedule SET {column} = ?1 WHERE schedule_id = ?2");
+            store
+                .connection
+                .execute(&statement, params![value, schedule.id])
+                .expect("tamper plaintext schedule index");
+            assert!(
+                load_choice_reminder_schedule(&store.connection, &store.authority, &schedule.id)
+                    .is_err(),
+                "{column} must be authenticated before index lookup can trust it"
+            );
+            assert!(
+                store
+                    .record_choice_reminder_schedule(&schedule.input, 1, 100)
+                    .is_err(),
+                "tampering must not permit a duplicate idempotent schedule write"
+            );
+            let count: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM choice_reminder_schedule", [], |row| {
+                    row.get(0)
+                })
+                .expect("schedule count");
+            assert_eq!(count, 1, "tampering never creates a second schedule");
+        }
+
+        let (mut store, schedule) = store_with_reminder_schedule_for_tamper();
+        let mut invalid = schedule.input.clone();
+        invalid.request_id = "schedule-invalid-zone".to_owned();
+        invalid.time_zone = "Invalid/Zone".to_owned();
+        assert!(
+            invalid.is_valid(),
+            "protocol shape alone permits a bounded string"
+        );
+        assert!(matches!(
+            store.record_choice_reminder_schedule(&invalid, 1, 21),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn confirmed_markdown_receipt_reaches_a_durable_effect_free_next_state() {
+        let (store, confirmation, _intent, next) =
+            store_with_executing_markdown_receipt("choice-confirm-render");
+        assert_eq!(next.session.state, ChoiceSessionState::SoftIdle);
+        assert_eq!(next.confirmation.as_ref(), Some(&confirmation));
+        assert_eq!(
+            next.document_manifest.aggregate_digest,
+            confirmation.markdown_manifest_digests[1]
+        );
+        assert_eq!(
+            next.document_manifest.entries,
+            vec![confirmation.markdown_entry.clone()]
+        );
+        assert_eq!(
+            next.session.pending_confirmation_id.as_deref(),
+            Some(confirmation.id.as_str())
+        );
+        assert_eq!(
+            store.choice_loop_snapshot().unwrap(),
+            Some(next),
+            "restart observes the reachable post-render state without repeating work"
+        );
+    }
+
+    #[test]
+    fn executing_choice_continuity_rejects_missing_markdown_proof_rows() {
+        let (store, _, intent, _) =
+            store_with_executing_markdown_receipt("choice-confirm-missing-receipt");
+        store
+            .connection
+            .execute(
+                "DELETE FROM choice_markdown_render_receipt WHERE intent_id = ?1",
+                [&intent.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.choice_loop_snapshot(),
+            Err(StoreError::StateBindingMismatch(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+
+        let (store, _, intent, _) =
+            store_with_executing_markdown_receipt("choice-confirm-missing-journal");
+        store
+            .connection
+            .execute(
+                "DELETE FROM choice_markdown_render_receipt WHERE intent_id = ?1",
+                [&intent.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM choice_markdown_render_intent WHERE intent_id = ?1",
+                [&intent.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.choice_loop_snapshot(),
+            Err(StoreError::StateBindingMismatch(_) | StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn markdown_reconciliation_returns_to_reconfirm_and_retires_the_old_journal() {
+        let authority = LocalAuthority::from_master("choice-confirm-reconcile", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store.save_choice_loop_snapshot(&first, 20).unwrap();
+        let mut choices = choice_set_snapshot(&first, 21);
+        let choice_set = choices.active_choice_set.clone().unwrap();
+        choices.last_selection = Some(Selection::OptionSelection(OptionSelection {
+            id: "selection-1".to_owned(),
+            choice_session_id: choices.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: "option-1".to_owned(),
+            expected_session_revision: choices.session.revision - 1,
+            selected_at_ms: 21,
+        }));
+        store.save_choice_loop_snapshot(&choices, 21).unwrap();
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .unwrap();
+        let first_confirmation = confirmation_for(&choices, &choice_set, 10_000);
+        record_schedule_for(
+            &mut store,
+            &choices,
+            &first_confirmation,
+            "schedule-request-reconcile-1",
+            21,
+        );
+        let (awaiting, first_intent) = store
+            .commit_choice_confirmation_and_render_intent(&first_confirmation, 1, 22)
+            .unwrap();
+        assert_eq!(
+            awaiting.session.state,
+            ChoiceSessionState::AwaitingConfirmation
+        );
+
+        store
+            .record_markdown_reconciliation(&first_intent.id, 23)
+            .expect("descriptor conflict becomes durable re-review state");
+        let recovered = store
+            .choice_loop_snapshot()
+            .unwrap()
+            .expect("recovered Choice snapshot");
+        assert_eq!(recovered.session.state, ChoiceSessionState::Active);
+        assert_eq!(recovered.session.pending_confirmation_id, None);
+        assert_eq!(recovered.confirmation, None);
+        let recovery_set = recovered
+            .active_choice_set
+            .clone()
+            .expect("exact alternatives remain reachable for re-review");
+        assert_eq!(recovery_set.session_revision, recovered.session.revision);
+
+        let mut replacement = first_confirmation.clone();
+        replacement.id = "confirmation-2".to_owned();
+        replacement.choice_set_id = recovery_set.id.clone();
+        replacement.expected_session_revision = recovered.session.revision;
+        replacement.confirmed_at_ms = 20_000;
+        replacement.reminder_items[0].due_at_ms = 20_000;
+        replacement.reminder_payload_digest = replacement
+            .canonical_reminder_payload_digest()
+            .expect("replacement reminder digest");
+        let schedule = record_schedule_for(
+            &mut store,
+            &recovered,
+            &replacement,
+            "schedule-request-reconcile-2",
+            24,
+        );
+        replacement.payload_revision = replacement
+            .canonical_payload_revision(schedule.revision)
+            .expect("replacement confirmation revision");
+        replacement.payload_digest = replacement
+            .canonical_payload_digest()
+            .expect("replacement confirmation digest");
+
+        let (_, replacement_intent) = store
+            .commit_choice_confirmation_and_render_intent(&replacement, 1, 25)
+            .expect("explicit re-confirmation creates one replacement journal");
+        assert_ne!(replacement_intent.id, first_intent.id);
+        assert_eq!(
+            store
+                .pending_markdown_render_intent_for_session(&recovered.session.id)
+                .unwrap(),
+            Some(replacement_intent)
+        );
+        assert!(
+            load_markdown_render_intent(&store.connection, &store.authority, &first_intent.id)
+                .unwrap()
+                .is_some_and(|record| record.plaintext_body.is_none()),
+            "the reconciled journal keeps only authenticated body-free metadata"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM mission_state", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn markdown_reconciliation_reverifies_live_private_rows_before_state_advance() {
+        let (mut store, d_record, operation, refining, choices) =
+            refining_d_store("choice-reconcile-private-row");
+        let result = refinement_result_for(&refining, &operation, &choices);
+        let active = store
+            .commit_choice_refinement_result(&result)
+            .expect("commit bound refinement result");
+        let choice_set = active.active_choice_set.clone().unwrap();
+        let mut confirmation = confirmation_for(&active, &choice_set, 10_000);
+        // The D batch is bound to the interactive owner surface, so its
+        // confirmation fixture must carry that exact complete delivery tuple.
+        confirmation.delivery_binding_id = active.session.primary_delivery_binding_id.clone();
+        confirmation.recipient = Some("owner-self".to_owned());
+        confirmation.delivery_scope = Some("same-surface only".to_owned());
+        confirmation.payload_revision = confirmation
+            .canonical_payload_revision(1)
+            .expect("canonical bound confirmation revision");
+        confirmation.payload_digest = confirmation
+            .canonical_payload_digest()
+            .expect("canonical bound confirmation digest");
+        record_schedule_for(
+            &mut store,
+            &active,
+            &confirmation,
+            "schedule-request-private-row",
+            22,
+        );
+        let (awaiting, intent) = store
+            .commit_choice_confirmation_and_render_intent(&confirmation, 1, 23)
+            .expect("commit confirmation and journal");
+        let audit_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row.get(0))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM choice_d_request WHERE request_id = ?1",
+                [&d_record.input.request_id],
+            )
+            .expect("delete one audited live private row");
+
+        assert!(
+            store
+                .record_markdown_reconciliation(&intent.id, 24)
+                .is_err()
+        );
+        assert_eq!(
+            load_choice_loop_snapshot(&store.connection, &store.authority).unwrap(),
+            Some(awaiting),
+            "failed reconciliation cannot advance the raw durable snapshot"
+        );
+        assert!(
+            load_markdown_render_intent(&store.connection, &store.authority, &intent.id)
+                .unwrap()
+                .is_some_and(|record| record.reconciliation.is_none()),
+            "failed reconciliation cannot persist a false marker"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM audit_ledger", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            audit_count,
+            "failed reconciliation appends no audit entry"
+        );
+        assert!(store.choice_loop_snapshot().is_err());
+    }
+
+    #[test]
+    fn choice_confirmation_rejects_current_catalog_drift_without_partial_commit() {
+        let authority = LocalAuthority::from_master("choice-confirm-catalog", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority.clone()).expect("open store");
+        enable_runtime(&mut store, &authority);
+        let first = snapshot();
+        store
+            .save_choice_loop_snapshot(&first, 20)
+            .expect("persist base");
+        let choices = choice_set_snapshot(&first, 21);
+        let choice_set = choices.active_choice_set.clone().expect("choice set");
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("persist choices");
+        store
+            .select_model_selection(&matching_model_selection(&choice_set), 21)
+            .expect("persist exact model provenance");
+
+        let mut drifted_selection = matching_model_selection(&choice_set);
+        drifted_selection.catalog_fingerprint = "f".repeat(64);
+        drifted_selection.catalog_revision = 2;
+        store
+            .select_model_selection(&drifted_selection, 22)
+            .expect("persist catalog drift for test");
+        let confirmation = confirmation_for(&choices, &choice_set, 23);
+        assert!(matches!(
+            store.commit_choice_confirmation(&confirmation, 1, 23),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            store
+                .choice_loop_snapshot()
+                .expect("read unchanged choice state"),
+            Some(choices)
+        );
+    }
+
+    #[test]
+    fn historical_batch_without_binding_migrates_once_to_durable_blocked_recovery() {
+        let directory = tempdir().expect("temporary store directory");
+        let path = directory.path().join("choice-loop-legacy.sqlite3");
+        let authority = LocalAuthority::from_master("choice-loop-legacy", [111_u8; 32]);
+        let legacy_snapshot = batch_snapshot(&snapshot(), 21);
+        assert!(legacy_snapshot.is_valid());
+        {
+            let mut store = Store::open(&path, authority.clone()).expect("open persistent store");
+            store
+                .save_choice_loop_snapshot(&legacy_snapshot, 21)
+                .expect("persist bound batch before historical projection");
+            let mut historical = serde_json::to_value(&legacy_snapshot)
+                .expect("serialize historical choice snapshot");
+            historical
+                .get_mut("activeBatch")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("historical active batch")
+                .remove("deliveryBindingId");
+            let blob = store
+                .authority
+                .encrypt_json(&historical, choice_loop_state_aad().as_bytes())
+                .expect("encrypt historical snapshot");
+            let encrypted_blob_hash = blob_hash(&blob);
+            let command_hash = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&historical).expect("serialize historical command hash")
+                )
+            );
+            let transaction = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin historical projection transaction");
+            transaction
+                .execute(
+                    "UPDATE choice_loop_state SET encrypted_blob = ?1, blob_hash = ?2, updated_at_ms = 22 WHERE singleton_id = 1",
+                    params![blob, encrypted_blob_hash],
+                )
+                .expect("replace with historical shape");
+            append_audit(
+                &transaction,
+                &store.authority,
+                &AuditRecord {
+                    id: "choice-loop-state-legacy-missing-binding-22",
+                    command_id: "choice-loop-state-legacy-missing-binding-22",
+                    command_hash: &command_hash,
+                    actor: "owner",
+                    action: CHOICE_LOOP_STATE_ACTION,
+                    entity_id: "choice-loop",
+                    created_at_ms: 22,
+                    state_kind: "choice:loop_state",
+                    state_hash: &encrypted_blob_hash,
+                },
+            )
+            .expect("audit historical shape");
+            transaction.commit().expect("commit historical shape");
+        }
+
+        let reopened = Store::open(&path, authority).expect("migrate legacy batch at open");
+        let migrated = reopened
+            .choice_loop_snapshot()
+            .expect("load migrated snapshot")
+            .expect("migrated snapshot exists");
+        assert_eq!(migrated.session.state, ChoiceSessionState::Blocked);
+        assert_eq!(
+            migrated
+                .active_batch
+                .as_ref()
+                .map(|batch| batch.delivery_binding_id.as_str()),
+            Some("blocked-missing-binding")
+        );
+        let raw = load_raw_choice_loop_snapshot(&reopened.connection, &reopened.authority)
+            .expect("load durable migration projection")
+            .expect("durable migrated raw snapshot");
+        assert!(!raw_choice_loop_batch_lacks_delivery_binding(&raw));
+    }
+
+    #[test]
+    fn choice_loop_snapshot_is_atomic_audited_idempotent_and_tamper_evident() {
+        let authority = LocalAuthority::from_master("choice-loop", [92_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        let first = snapshot();
+        assert_eq!(
+            store
+                .save_choice_loop_snapshot(&first, 20)
+                .expect("persist choice loop"),
+            first
+        );
+        assert_eq!(
+            store.choice_loop_snapshot().expect("load snapshot"),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store
+                .save_choice_loop_snapshot(&first, 21)
+                .expect("idempotent retry"),
+            first
+        );
+        let audit_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE action = ?1",
+                [CHOICE_LOOP_STATE_ACTION],
+                |row| row.get(0),
+            )
+            .expect("audit count");
+        assert_eq!(audit_count, 1);
+
+        let mut changed = first.clone();
+        changed.session.revision = 2;
+        changed.session.last_input_at_ms = 21;
+        changed.session.soft_idle_at_ms = 21 + CHOICE_SESSION_SOFT_IDLE_MS;
+        changed.session.stale_review_at_ms = 21 + CHOICE_SESSION_STALE_REVIEW_MS;
+        store
+            .save_choice_loop_snapshot(&changed, 21)
+            .expect("persist revision advance");
+        assert_eq!(
+            store.choice_loop_snapshot().expect("load changed"),
+            Some(changed)
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE choice_loop_state SET blob_hash = ?1 WHERE singleton_id = 1",
+                ["00".repeat(32)],
+            )
+            .expect("tamper snapshot hash");
+        assert!(matches!(
+            store.choice_loop_snapshot(),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn choice_loop_rejects_stale_choice_set_and_never_persists_partial_state() {
+        let authority = LocalAuthority::from_master("choice-loop-stale", [93_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        let mut invalid = snapshot();
+        invalid.session.active_choice_set_id = Some("choices-1".to_owned());
+        assert!(matches!(
+            store.save_choice_loop_snapshot(&invalid, 20),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            store.choice_loop_snapshot().expect("no partial state"),
+            None
+        );
+    }
+
+    #[test]
+    fn choice_loop_rejects_rollback_equal_revision_and_timestamp_rewrites_atomically() {
+        let authority = LocalAuthority::from_master("choice-loop-monotonic", [94_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        let first = snapshot();
+        store
+            .save_choice_loop_snapshot(&first, 20)
+            .expect("persist first snapshot");
+        let second = advance_snapshot(&first, 21);
+        store
+            .save_choice_loop_snapshot(&second, 21)
+            .expect("persist exact successor");
+
+        assert!(matches!(
+            store.save_choice_loop_snapshot(&first, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            store
+                .choice_loop_snapshot()
+                .expect("rollback left state intact"),
+            Some(second.clone())
+        );
+
+        let mut same_revision_mutation = second.clone();
+        same_revision_mutation.session.last_input_at_ms = 22;
+        same_revision_mutation.session.soft_idle_at_ms = 22 + CHOICE_SESSION_SOFT_IDLE_MS;
+        same_revision_mutation.session.stale_review_at_ms = 22 + CHOICE_SESSION_STALE_REVIEW_MS;
+        assert!(same_revision_mutation.is_valid());
+        assert!(matches!(
+            store.save_choice_loop_snapshot(&same_revision_mutation, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+
+        let mut timestamp_regression = advance_snapshot(&second, 22);
+        timestamp_regression.document_manifest.generated_at_ms = 20;
+        assert!(timestamp_regression.is_valid());
+        assert!(matches!(
+            store.save_choice_loop_snapshot(&timestamp_regression, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            store
+                .choice_loop_snapshot()
+                .expect("all rejected writes are atomic"),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn choice_loop_retires_old_choice_sets_instead_of_rebinding_them_to_a_new_revision() {
+        let authority = LocalAuthority::from_master("choice-loop-choices", [95_u8; 32]);
+        let mut store = Store::open_in_memory(authority).expect("open store");
+        let first = snapshot();
+        store
+            .save_choice_loop_snapshot(&first, 20)
+            .expect("persist first snapshot");
+        let choices = choice_set_snapshot(&first, 21);
+        store
+            .save_choice_loop_snapshot(&choices, 21)
+            .expect("persist choice set");
+
+        let mut resurrected = choice_set_snapshot(&choices, 22);
+        let choice_set = resurrected
+            .active_choice_set
+            .as_mut()
+            .expect("active choice set");
+        choice_set.session_revision = resurrected.session.revision;
+        choice_set.generated_at_ms = 22;
+        choice_set.expires_on_revision = resurrected.session.revision;
+        assert!(resurrected.is_valid());
+        assert!(matches!(
+            store.save_choice_loop_snapshot(&resurrected, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            store
+                .choice_loop_snapshot()
+                .expect("stale choice set not rebound"),
+            Some(choices)
+        );
+    }
+
+    #[test]
+    fn choice_loop_rejects_replayed_snapshot_after_restart() {
+        let directory = tempdir().expect("temporary store directory");
+        let path = directory.path().join("choice-loop.sqlite3");
+        let authority = LocalAuthority::from_master("choice-loop-restart", [96_u8; 32]);
+        let first = snapshot();
+        let second = advance_snapshot(&first, 21);
+        {
+            let mut store = Store::open(&path, authority.clone()).expect("open persistent store");
+            store
+                .save_choice_loop_snapshot(&first, 20)
+                .expect("persist first snapshot");
+            store
+                .save_choice_loop_snapshot(&second, 21)
+                .expect("persist successor");
+        }
+        let mut reopened = Store::open(&path, authority).expect("reopen persistent store");
+        assert_eq!(
+            reopened
+                .choice_loop_snapshot()
+                .expect("load latest snapshot"),
+            Some(second.clone())
+        );
+        assert!(matches!(
+            reopened.save_choice_loop_snapshot(&first, 22),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+        assert_eq!(
+            reopened
+                .choice_loop_snapshot()
+                .expect("replay leaves latest intact"),
+            Some(second)
+        );
+    }
+}
+
+#[cfg(test)]
 mod channel_model_mission_recovery_tests {
     use super::*;
     use crate::{
@@ -7462,6 +20651,7 @@ mod channel_model_mission_recovery_tests {
                 owner_sender_id: "owner-imessage".into(),
                 conversation_id: "chat-imessage".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 6,
             })
@@ -7573,6 +20763,7 @@ mod migration_tests {
                 owner_sender_id: "owner-legacy".into(),
                 conversation_id: "chat-legacy".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 2,
             })
@@ -7725,5 +20916,179 @@ mod migration_tests {
             .expect("route count");
         assert!(legacy_exists);
         assert_eq!(route_count, 0);
+    }
+
+    #[test]
+    fn legacy_plaintext_body_retirement_migrates_to_a_typed_blocked_marker() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("legacy-private-retirement.sqlite3");
+        let store = Store::open(&path, test_authority()).expect("create current schema");
+        store
+            .connection
+            .execute(
+                "INSERT INTO choice_private_body_tombstone
+                 (source_kind, request_id, request_digest, body_digest, choice_session_id, retired_at_ms)
+                 VALUES ('begin', 'legacy-request', ?1, ?2, 'legacy-session', 1)",
+                params!["a".repeat(64), "b".repeat(64)],
+            )
+            .expect("seed untrusted legacy marker");
+        drop(store);
+
+        let reopened = Store::open(&path, test_authority())
+            .expect("legacy tombstone must not make the whole Store unavailable");
+        assert!(
+            choice_private_body_tombstone_exists(
+                &reopened.connection,
+                &reopened.authority,
+                "begin",
+                "legacy-request",
+            )
+            .expect("load authenticated blocked marker"),
+            "the old request remains fail-closed rather than becoming replay authority"
+        );
+        let connection = Connection::open(&path).expect("inspect failed migration");
+        let authoritative_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM choice_private_body_retirement",
+                [],
+                |row| row.get(0),
+            )
+            .expect("authoritative retirement count");
+        assert_eq!(authoritative_rows, 1, "migration seals one blocked marker");
+        // Deleting the authenticated record must not make the mutable legacy
+        // row a fresh migration source. The durable retirement audit means a
+        // missing record is tampering, not an invitation to seal whatever
+        // happens to be in the old table now.
+        connection
+            .execute(
+                "DELETE FROM choice_private_body_retirement WHERE source_kind = 'begin' AND entity_id = 'legacy-request'",
+                [],
+            )
+            .expect("remove authoritative marker to simulate row tampering");
+        connection
+            .execute(
+                "UPDATE choice_private_body_tombstone SET body_digest = ?1 WHERE request_id = 'legacy-request'",
+                ["c".repeat(64)],
+            )
+            .expect("tamper legacy row");
+        drop(connection);
+        assert!(
+            Store::open(&path, test_authority()).is_err(),
+            "a changed legacy row cannot be silently accepted after migration"
+        );
+    }
+
+    #[test]
+    fn pre_identity_private_tables_upgrade_only_when_no_unbound_rows_exist() {
+        const OLD_PRIVATE_SCHEMA: &str = "
+CREATE TABLE choice_begin_request (
+ request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, choice_session_id TEXT NOT NULL UNIQUE,
+ operation_id TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL,
+ accepted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE choice_d_request (
+ request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
+ operation_id TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, accepted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE choice_refinement_result (
+ operation_id TEXT PRIMARY KEY, selection_id TEXT NOT NULL, result_digest TEXT NOT NULL,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, completed_at_ms INTEGER NOT NULL
+);";
+        let empty_directory = tempdir().expect("empty migration directory");
+        let empty_path = empty_directory.path().join("empty-private.sqlite3");
+        let connection = Connection::open(&empty_path).expect("open empty legacy database");
+        connection
+            .execute_batch(OLD_PRIVATE_SCHEMA)
+            .expect("seed empty pre-identity tables");
+        drop(connection);
+        let upgraded = Store::open(&empty_path, test_authority())
+            .expect("empty tables may acquire stronger identity columns");
+        for (table, column) in [
+            ("choice_begin_request", "source_envelope_id"),
+            ("choice_begin_request", "conversation_turn_batch_id"),
+            ("choice_d_request", "choice_session_id"),
+            ("choice_d_request", "source_envelope_id"),
+            ("choice_d_request", "conversation_turn_batch_id"),
+            ("choice_refinement_result", "choice_session_id"),
+        ] {
+            let columns = upgraded
+                .connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("inspect upgraded table")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("read upgraded columns")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect upgraded columns");
+            assert!(columns.iter().any(|value| value == column));
+        }
+
+        let occupied_directory = tempdir().expect("occupied migration directory");
+        let occupied_path = occupied_directory.path().join("occupied-private.sqlite3");
+        let connection = Connection::open(&occupied_path).expect("open occupied database");
+        connection
+            .execute_batch(OLD_PRIVATE_SCHEMA)
+            .expect("seed occupied pre-identity tables");
+        connection
+            .execute(
+                "INSERT INTO choice_begin_request
+                 (request_id, request_digest, choice_session_id, operation_id, encrypted_blob,
+                  blob_hash, accepted_at_ms)
+                 VALUES ('request-1', ?1, 'session-1', 'operation-1', X'00', ?2, 1)",
+                params!["a".repeat(64), "b".repeat(64)],
+            )
+            .expect("seed an unauthenticated pre-identity row");
+        drop(connection);
+        assert!(matches!(
+            Store::open(&occupied_path, test_authority()),
+            Err(StoreError::ChoiceLoopStateConflict)
+        ));
+    }
+
+    #[test]
+    fn legacy_plaintext_idle_clock_is_never_promoted_into_time_authority() {
+        const OLD_CLOCK_SCHEMA: &str = "CREATE TABLE choice_idle_clock_anchor (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            boot_id TEXT NOT NULL, wall_clock_ms INTEGER NOT NULL,
+            monotonic_ms INTEGER NOT NULL
+        );";
+
+        let empty_directory = tempdir().expect("empty clock migration directory");
+        let empty_path = empty_directory.path().join("empty-clock.sqlite3");
+        Connection::open(&empty_path)
+            .unwrap()
+            .execute_batch(OLD_CLOCK_SCHEMA)
+            .unwrap();
+        let upgraded = Store::open(&empty_path, test_authority())
+            .expect("empty unshipped clock table upgrades mechanically");
+        let columns = upgraded
+            .connection
+            .prepare("PRAGMA table_info(choice_idle_clock_anchor)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "encrypted_blob"));
+        assert!(columns.iter().any(|name| name == "blob_hash"));
+        assert!(!columns.iter().any(|name| name == "boot_id"));
+
+        let occupied_directory = tempdir().expect("occupied clock migration directory");
+        let occupied_path = occupied_directory.path().join("occupied-clock.sqlite3");
+        let connection = Connection::open(&occupied_path).unwrap();
+        connection.execute_batch(OLD_CLOCK_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO choice_idle_clock_anchor
+                 (singleton_id, boot_id, wall_clock_ms, monotonic_ms)
+                 VALUES (1, 'legacy-boot', 100, 100)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            Store::open(&occupied_path, test_authority()),
+            Err(StoreError::ChoiceClockUncertain)
+        ));
     }
 }

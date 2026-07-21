@@ -8,13 +8,15 @@ use openopen_core::{
     channel_receipt_content,
 };
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
-    ChannelMissionEvent, ChannelModelDisposition, ChannelObservation, ChannelOutboundDisposition,
-    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision,
-    ChannelRouteRole, EFFECT_PROTOCOL_VERSION, EffectBrokerSession, EffectNonCommit, EffectPermit,
-    EffectPermitPurpose, EffectReceipt, EvidenceKind, MissionFileEffect, MissionStatus,
-    OutcomeSuggestion, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
+    ApprovalKind, ApprovalStatus, C2_INSTRUCTION_ONLY_PERMISSION_DIGEST, C2SkillDemoCommand,
+    C2SkillDemoCommandKind, C2SkillDemoSeal, C2SkillDemoStage, ChannelCursor,
+    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundMessageClass,
+    ChannelKind, ChannelMessageKind, ChannelMissionEvent, ChannelModelDisposition,
+    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
+    ChannelRouteApproval, ChannelRouteApprovalDecision, ChannelRouteRole, EFFECT_PROTOCOL_VERSION,
+    EffectBrokerSession, EffectNonCommit, EffectPermit, EffectPermitPurpose, EffectReceipt,
+    EvidenceKind, IMessagePairingMetadata, MissionFileEffect, MissionStatus, OutcomeSuggestion,
+    RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
     effect_noncommit_signing_bytes, effect_permit_hash, effect_receipt_signing_bytes,
     runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
 };
@@ -24,6 +26,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn authority() -> LocalAuthority {
     LocalAuthority::from_master("openopen-core", [9_u8; 32])
+}
+
+fn c2_command(
+    request_id: &str,
+    expected_revision: u64,
+    kind: C2SkillDemoCommandKind,
+    nonce_byte: char,
+) -> C2SkillDemoCommand {
+    C2SkillDemoCommand {
+        request_id: request_id.to_owned(),
+        expected_revision,
+        kind,
+        seal: C2SkillDemoSeal {
+            package_id: "demo-skill".to_owned(),
+            source_url: "https://github.com/example/demo/tree/0123456789abcdef0123456789abcdef01234567/skill".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            package_digest: "a".repeat(64),
+            audit_anchor: "b".repeat(64),
+            permission_digest: C2_INSTRUCTION_ONLY_PERMISSION_DIGEST.to_owned(),
+            license: "MIT".to_owned(),
+        },
+        actor_id: "owner".to_owned(),
+        decision_id: format!("decision-{request_id}"),
+        approval_nonce: nonce_byte.to_string().repeat(64),
+        result_digest: (kind == C2SkillDemoCommandKind::RecordFirstNoEffectUse)
+            .then(|| "e".repeat(64)),
+        explicitly_confirmed: true,
+        decided_at_ms: 10 + i64::try_from(expected_revision).unwrap(),
+    }
 }
 
 fn create_command(mission_id: &str, now_ms: i64) -> MissionCommand {
@@ -483,6 +514,7 @@ fn channel_pairing() -> ChannelPairing {
         owner_sender_id: "owner-1".into(),
         conversation_id: "channel-1".into(),
         require_explicit_address: true,
+        imessage: None,
         discord: Some(openopen_protocol::DiscordPairingMetadata {
             guild_id: "101".into(),
             bot_user_id: "102".into(),
@@ -527,6 +559,7 @@ fn imessage_pairing() -> ChannelPairing {
         owner_sender_id: "owner-imessage".into(),
         conversation_id: "chat-imessage".into(),
         require_explicit_address: true,
+        imessage: None,
         discord: None,
         paired_at_ms: 6,
     }
@@ -553,6 +586,50 @@ fn imessage_observation(id: u64) -> ChannelObservation {
         is_bot: false,
         explicitly_addressed: true,
     }
+}
+
+#[test]
+fn legacy_imessage_pairing_has_one_typed_self_chat_upgrade_and_then_freezes() {
+    let mut store = effect_store_in_memory(authority());
+    store.pair_channel(&imessage_pairing()).unwrap();
+    let upgraded = ChannelPairing {
+        channel: ChannelKind::IMessage,
+        owner_sender_id: "owner-imessage".into(),
+        conversation_id: "chat-imessage".into(),
+        require_explicit_address: false,
+        imessage: Some(IMessagePairingMetadata {
+            chat_guid: "iMessage;+;self-chat".into(),
+            chat_identifier: "self-chat".into(),
+            service: "iMessage".into(),
+            participant_ids: vec!["owner-imessage".into()],
+        }),
+        discord: None,
+        paired_at_ms: 7,
+    };
+    let mut rebound = upgraded.clone();
+    rebound.owner_sender_id = "other@example.invalid".into();
+    rebound.conversation_id = "43".into();
+    rebound.imessage.as_mut().unwrap().participant_ids = vec![rebound.owner_sender_id.clone()];
+    assert!(matches!(
+        store.pair_channel(&rebound),
+        Err(StoreError::ChannelPairingConflict)
+    ));
+    assert_eq!(
+        store.channel_pairing(ChannelKind::IMessage).unwrap(),
+        Some(imessage_pairing())
+    );
+    store.pair_channel(&upgraded).unwrap();
+    assert_eq!(
+        store.channel_pairing(ChannelKind::IMessage).unwrap(),
+        Some(upgraded.clone())
+    );
+    store.pair_channel(&upgraded).unwrap();
+    let mut changed = upgraded;
+    changed.conversation_id = "43".into();
+    assert!(matches!(
+        store.pair_channel(&changed),
+        Err(StoreError::ChannelPairingConflict)
+    ));
 }
 
 fn imessage_body(id: u64) -> String {
@@ -4264,4 +4341,121 @@ fn tampered_effect_receipt_state_or_audit_fails_closed() {
         let reopened = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
         assert!(reopened.verify_audit_chain(&receipt_anchor).is_err());
     }
+}
+
+#[test]
+fn c2_skill_demo_lifecycle_is_atomic_idempotent_and_tamper_evident() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    let authorization = store.prepare_runtime_control(true, 1).unwrap();
+    let runtime_receipt = signed_runtime_control_receipt(&authorization);
+    store
+        .commit_runtime_control(&authorization, &runtime_receipt)
+        .unwrap();
+    let commands = [
+        c2_command(
+            "candidate",
+            0,
+            C2SkillDemoCommandKind::RegisterCandidate,
+            '1',
+        ),
+        c2_command("staged", 1, C2SkillDemoCommandKind::StageReviewed, '2'),
+        c2_command("runnable", 2, C2SkillDemoCommandKind::EnableRunnable, '3'),
+        c2_command(
+            "first-use",
+            3,
+            C2SkillDemoCommandKind::RecordFirstNoEffectUse,
+            '4',
+        ),
+    ];
+    for (index, command) in commands.iter().enumerate() {
+        let (state, receipt) = store
+            .apply_c2_skill_demo_command(command, &authorization, &runtime_receipt)
+            .unwrap();
+        assert_eq!(state.revision, (index + 1) as u64);
+        assert_eq!(receipt.revision, state.revision);
+        let (replayed, replay_receipt) = store
+            .apply_c2_skill_demo_command(command, &authorization, &runtime_receipt)
+            .unwrap();
+        assert_eq!(replayed, state);
+        assert_eq!(replay_receipt, receipt);
+    }
+    assert_eq!(
+        store.c2_skill_demo_state().unwrap().unwrap().stage,
+        C2SkillDemoStage::Used
+    );
+    let mut changed_replay = commands[3].clone();
+    changed_replay.result_digest = Some("f".repeat(64));
+    assert!(matches!(
+        store.apply_c2_skill_demo_command(&changed_replay, &authorization, &runtime_receipt),
+        Err(StoreError::C2SkillDemoConflict)
+    ));
+    drop(store);
+    let reopened =
+        Store::open_with_trusted_broker(&path, security.clone(), enrollment.clone()).unwrap();
+    assert_eq!(
+        reopened.c2_skill_demo_state().unwrap().unwrap().stage,
+        C2SkillDemoStage::Used
+    );
+    drop(reopened);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE c2_skill_demo_state SET revision = 2 WHERE singleton_id = 1",
+            [],
+        )
+        .unwrap();
+    let tampered = Store::open_with_trusted_broker(&path, security, enrollment).unwrap();
+    assert!(tampered.c2_skill_demo_state().is_err());
+}
+
+#[test]
+fn c2_skill_demo_rejects_stale_runtime_proof_inside_atomic_transition() {
+    let security = authority();
+    let enrollment = broker_enrollment(&security);
+    let mut store = Store::open_in_memory_with_trusted_broker(security, enrollment).unwrap();
+    let initial_authorization = store.prepare_runtime_control(true, 1).unwrap();
+    let initial_receipt = signed_runtime_control_receipt(&initial_authorization);
+    store
+        .commit_runtime_control(&initial_authorization, &initial_receipt)
+        .unwrap();
+    store
+        .apply_c2_skill_demo_command(
+            &c2_command(
+                "candidate",
+                0,
+                C2SkillDemoCommandKind::RegisterCandidate,
+                '1',
+            ),
+            &initial_authorization,
+            &initial_receipt,
+        )
+        .unwrap();
+
+    let off = store.prepare_runtime_control(false, 2).unwrap();
+    let off_receipt = signed_runtime_control_receipt(&off);
+    store.commit_runtime_control(&off, &off_receipt).unwrap();
+    let current = store.prepare_runtime_control(true, 3).unwrap();
+    let current_receipt = signed_runtime_control_receipt(&current);
+    store
+        .commit_runtime_control(&current, &current_receipt)
+        .unwrap();
+    let stage = c2_command("staged", 1, C2SkillDemoCommandKind::StageReviewed, '2');
+    assert!(matches!(
+        store.apply_c2_skill_demo_command(&stage, &initial_authorization, &initial_receipt),
+        Err(StoreError::RuntimeControlMismatch)
+    ));
+    assert_eq!(store.c2_skill_demo_state().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        store
+            .apply_c2_skill_demo_command(&stage, &current, &current_receipt)
+            .unwrap()
+            .0
+            .revision,
+        2
+    );
 }

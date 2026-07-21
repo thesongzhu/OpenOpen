@@ -1,10 +1,10 @@
 use crate::CodexError;
+use openopen_protocol::PersonaRevisionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const REQUIRED_MODEL: &str = "gpt-5.6-sol";
-pub const REQUIRED_REASONING_EFFORT: &str = "high";
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
 pub const MAX_SOURCE_REFS: usize = 64;
 pub const MAX_SOURCE_REF_BYTES: usize = 128;
@@ -16,6 +16,13 @@ pub const MAX_REASONING_EFFORTS: usize = 16;
 pub const MAX_REASONING_EFFORT_BYTES: usize = 32;
 pub const MAX_MODEL_CURSOR_BYTES: usize = 512;
 pub const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
+pub const MAX_DEVELOPER_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+pub const MAX_MEMORY_CANDIDATES: usize = 3;
+pub const MAX_MEMORY_CANDIDATE_ID_BYTES: usize = 64;
+pub const MAX_MEMORY_CANDIDATE_TITLE_CHARS: usize = 120;
+pub const MAX_MEMORY_CANDIDATE_RATIONALE_CHARS: usize = 600;
+pub const MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS: usize = 1024;
+pub const MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS: &str = "Return only the requested Memory-candidate JSON. Use only the supplied source references. Propose one to three local Markdown lines for review. Do not request or perform tools, actions, writes, network access, delivery, permissions, or any external effect.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -43,11 +50,63 @@ pub struct GptModel {
     pub supported_reasoning_efforts: Vec<String>,
 }
 
+/// An explicit user selection bound by Host to one verified model catalog.
+/// `None` means the selected model has no user-configurable effort and is
+/// persisted by the caller as `not_applicable`; it never asks the runtime to
+/// choose an effort implicitly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelectedModel {
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub catalog_fingerprint: String,
+    pub catalog_revision: u64,
+}
+
+impl SelectedModel {
+    /// Validates only the bounded wire representation. Catalog membership is
+    /// checked immediately before the model thread starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected model, effort, or catalog binding
+    /// is not a bounded protocol value.
+    pub fn validate(&self) -> Result<(), CodexError> {
+        if self.model_id.is_empty()
+            || self.model_id.len() > MAX_MODEL_ID_BYTES
+            || !self
+                .model_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CodexError::InvalidContract("invalid selected model"));
+        }
+        if let Some(effort) = &self.reasoning_effort
+            && (effort.is_empty()
+                || effort.len() > MAX_REASONING_EFFORT_BYTES
+                || !effort
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-'))
+        {
+            return Err(CodexError::InvalidContract("invalid selected effort"));
+        }
+        if !is_sha256_hex(&self.catalog_fingerprint) || self.catalog_revision == 0 {
+            return Err(CodexError::InvalidContract(
+                "invalid selected model catalog",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutcomeRequest {
     pub prompt: String,
     pub allowed_source_refs: Vec<String>,
+    pub selected_model: Option<SelectedModel>,
+    pub persona_revision: PersonaRevisionRef,
+    pub developer_instructions: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +116,72 @@ pub struct StructuredOutcome {
     pub why_now: String,
     pub proposed_steps: Vec<String>,
     pub source_refs: Vec<String>,
+}
+
+/// Host-owned request for the first dynamic Choice Loop result. The model may
+/// describe bounded understanding and three directions, but it cannot supply
+/// session, delivery, audit, provenance, or effect authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChoiceGenerationRequest {
+    pub prompt: String,
+    pub allowed_source_refs: Vec<String>,
+    pub selected_model: Option<SelectedModel>,
+    pub persona_revision: PersonaRevisionRef,
+    pub developer_instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredChoiceOption {
+    pub direction: String,
+    pub rationale: String,
+    pub expected_result: String,
+    pub information_needed: Vec<String>,
+    pub external_effects_preview: Vec<String>,
+    pub source_categories: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredChoiceGeneration {
+    pub understood_goal: String,
+    pub current_context: String,
+    pub assumptions: Vec<String>,
+    pub constraints: Vec<String>,
+    pub uncertainties: Vec<String>,
+    pub what_to_avoid: Vec<String>,
+    pub options: Vec<StructuredChoiceOption>,
+    pub source_refs: Vec<String>,
+}
+
+/// Host-owned, tool-free request for at most three Memory candidates. Source
+/// excerpts remain opaque prompt data; the model can cite only the exact
+/// source references supplied by Host and cannot grant write or effect
+/// authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryCandidateGenerationRequest {
+    pub prompt: String,
+    pub allowed_source_refs: Vec<String>,
+    pub selected_model: SelectedModel,
+    pub developer_instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredMemoryCandidate {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+    pub proposed_markdown_line: String,
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredMemoryCandidateGeneration {
+    pub candidates: Vec<StructuredMemoryCandidate>,
 }
 
 impl OutcomeRequest {
@@ -69,6 +194,28 @@ impl OutcomeRequest {
     pub fn validate(&self) -> Result<(), CodexError> {
         if self.prompt.trim().is_empty() || self.prompt.len() > MAX_PROMPT_BYTES {
             return Err(CodexError::InvalidContract("invalid prompt length"));
+        }
+        if !self.persona_revision.is_valid()
+            || self.developer_instructions.trim().is_empty()
+            || self.developer_instructions.len() > MAX_DEVELOPER_INSTRUCTIONS_BYTES
+            || !self
+                .developer_instructions
+                .contains(&self.persona_revision.persona_id)
+            || !self
+                .developer_instructions
+                .contains(&self.persona_revision.revision)
+            || !self
+                .developer_instructions
+                .contains(&self.persona_revision.aggregate_digest)
+            || format!(
+                "{:x}",
+                Sha256::digest(self.developer_instructions.as_bytes())
+            ) != self.persona_revision.instructions_digest
+        {
+            return Err(CodexError::InvalidContract("invalid persona binding"));
+        }
+        if let Some(selected_model) = &self.selected_model {
+            selected_model.validate()?;
         }
         if self.allowed_source_refs.len() > MAX_SOURCE_REFS {
             return Err(CodexError::InvalidContract("too many source refs"));
@@ -119,6 +266,128 @@ impl OutcomeRequest {
     }
 }
 
+impl ChoiceGenerationRequest {
+    /// # Errors
+    ///
+    /// Returns an error when the host-owned prompt, source-reference list, or
+    /// exact selected-model binding exceeds the sealed contract.
+    pub fn validate(&self) -> Result<(), CodexError> {
+        OutcomeRequest {
+            prompt: self.prompt.clone(),
+            allowed_source_refs: self.allowed_source_refs.clone(),
+            selected_model: self.selected_model.clone(),
+            persona_revision: self.persona_revision.clone(),
+            developer_instructions: self.developer_instructions.clone(),
+        }
+        .validate()
+    }
+
+    pub(crate) fn output_schema(&self) -> Value {
+        let source_items = if self.allowed_source_refs.is_empty() {
+            Value::Bool(false)
+        } else {
+            json!({"enum": self.allowed_source_refs, "type": "string"})
+        };
+        let text = |maximum| json!({"maxLength": maximum, "minLength": 1, "type": "string"});
+        let string_list = |maximum_items, maximum_length| json!({"items": {"maxLength": maximum_length, "minLength": 1, "type": "string"}, "maxItems": maximum_items, "type": "array"});
+        json!({
+            "additionalProperties": false,
+            "properties": {
+                "understoodGoal": text(1024), "currentContext": text(2048),
+                "assumptions": string_list(64, 1024), "constraints": string_list(64, 1024),
+                "uncertainties": string_list(64, 1024), "whatToAvoid": string_list(64, 1024),
+                "options": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "object", "additionalProperties": false, "required": ["direction", "rationale", "expectedResult", "informationNeeded", "externalEffectsPreview", "sourceCategories"], "properties": {"direction": text(512), "rationale": text(1024), "expectedResult": text(1024), "informationNeeded": string_list(16, 512), "externalEffectsPreview": string_list(16, 512), "sourceCategories": string_list(16, 128)}}},
+                "sourceRefs": {"items": source_items, "maxItems": self.allowed_source_refs.len(), "type": "array"}
+            },
+            "required": ["understoodGoal", "currentContext", "assumptions", "constraints", "uncertainties", "whatToAvoid", "options", "sourceRefs"], "type": "object"
+        })
+    }
+}
+
+impl MemoryCandidateGenerationRequest {
+    /// Validates the bounded Host-owned prompt, exact selected-model binding,
+    /// source-reference allowlist, and tool-free developer contract before a
+    /// model process can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any field is empty, malformed, duplicated, or
+    /// outside the sealed Memory-candidate bounds.
+    pub fn validate(&self) -> Result<(), CodexError> {
+        if self.prompt.trim().is_empty() || self.prompt.len() > MAX_PROMPT_BYTES {
+            return Err(CodexError::InvalidContract("invalid prompt length"));
+        }
+        self.selected_model.validate()?;
+        if self.developer_instructions != MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS {
+            return Err(CodexError::InvalidContract(
+                "invalid Memory candidate instructions",
+            ));
+        }
+        validate_source_refs(&self.allowed_source_refs, true)
+    }
+
+    pub(crate) fn output_schema(&self) -> Value {
+        let text = |maximum| json!({"maxLength": maximum, "minLength": 1, "type": "string"});
+        json!({
+            "additionalProperties": false,
+            "properties": {
+                "candidates": {
+                    "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": text(MAX_MEMORY_CANDIDATE_ID_BYTES),
+                            "proposedMarkdownLine": text(MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS),
+                            "rationale": text(MAX_MEMORY_CANDIDATE_RATIONALE_CHARS),
+                            "sourceRefs": {
+                                "items": {"enum": self.allowed_source_refs, "type": "string"},
+                                "maxItems": self.allowed_source_refs.len(),
+                                "minItems": 1,
+                                "type": "array"
+                            },
+                            "title": text(MAX_MEMORY_CANDIDATE_TITLE_CHARS)
+                        },
+                        "required": ["id", "title", "rationale", "proposedMarkdownLine", "sourceRefs"],
+                        "type": "object"
+                    },
+                    "maxItems": MAX_MEMORY_CANDIDATES,
+                    "minItems": 1,
+                    "type": "array"
+                }
+            },
+            "required": ["candidates"],
+            "type": "object"
+        })
+    }
+}
+
+fn validate_source_refs(source_refs: &[String], require_nonempty: bool) -> Result<(), CodexError> {
+    if (require_nonempty && source_refs.is_empty()) || source_refs.len() > MAX_SOURCE_REFS {
+        return Err(CodexError::InvalidContract("invalid source ref count"));
+    }
+    let mut unique = HashSet::new();
+    for source_ref in source_refs {
+        if source_ref.is_empty()
+            || source_ref.len() > MAX_SOURCE_REF_BYTES
+            || !source_ref.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+            || !unique.insert(source_ref)
+        {
+            return Err(CodexError::InvalidContract("invalid source ref"));
+        }
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl StructuredOutcome {
     pub(crate) fn parse_and_validate(
         text: &str,
@@ -150,6 +419,119 @@ impl StructuredOutcome {
         }
         Ok(value)
     }
+}
+
+impl StructuredChoiceGeneration {
+    pub(crate) fn parse_and_validate(
+        text: &str,
+        allowed_source_refs: &[String],
+    ) -> Result<Self, CodexError> {
+        let value: Self = serde_json::from_str(text)
+            .map_err(|_| CodexError::InvalidContract("model output did not match choice schema"))?;
+        let valid_text = |text: &str, maximum: usize| {
+            !text.trim().is_empty() && text.is_ascii() && text.chars().count() <= maximum
+        };
+        let valid_list = |values: &[String], maximum_items: usize, maximum: usize| {
+            values.len() <= maximum_items && values.iter().all(|value| valid_text(value, maximum))
+        };
+        if !valid_text(&value.understood_goal, 1024)
+            || !valid_text(&value.current_context, 2048)
+            || !valid_list(&value.assumptions, 64, 1024)
+            || !valid_list(&value.constraints, 64, 1024)
+            || !valid_list(&value.uncertainties, 64, 1024)
+            || !valid_list(&value.what_to_avoid, 64, 1024)
+            || value.options.len() != 3
+            || value.options.iter().any(|option| {
+                !valid_text(&option.direction, 512)
+                    || !valid_text(&option.rationale, 1024)
+                    || !valid_text(&option.expected_result, 1024)
+                    || !valid_list(&option.information_needed, 16, 512)
+                    || !valid_list(&option.external_effects_preview, 16, 512)
+                    || !valid_list(&option.source_categories, 16, 128)
+            })
+        {
+            return Err(CodexError::InvalidContract("invalid choice output bounds"));
+        }
+        let directions = value
+            .options
+            .iter()
+            .map(|option| option.direction.as_str())
+            .collect::<HashSet<_>>();
+        if directions.len() != 3 {
+            return Err(CodexError::InvalidContract(
+                "choice directions were not distinct",
+            ));
+        }
+        let allowed = allowed_source_refs.iter().collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        if value
+            .source_refs
+            .iter()
+            .any(|source_ref| !allowed.contains(source_ref) || !seen.insert(source_ref))
+        {
+            return Err(CodexError::InvalidContract("model forged a source ref"));
+        }
+        Ok(value)
+    }
+}
+
+impl StructuredMemoryCandidateGeneration {
+    pub(crate) fn parse_and_validate(
+        text: &str,
+        allowed_source_refs: &[String],
+    ) -> Result<Self, CodexError> {
+        let value: Self = serde_json::from_str(text).map_err(|_| {
+            CodexError::InvalidContract("model output did not match Memory candidate schema")
+        })?;
+        if value.candidates.is_empty() || value.candidates.len() > MAX_MEMORY_CANDIDATES {
+            return Err(CodexError::InvalidContract(
+                "invalid Memory candidate count",
+            ));
+        }
+        let allowed = allowed_source_refs.iter().collect::<HashSet<_>>();
+        let mut candidate_ids = HashSet::new();
+        for candidate in &value.candidates {
+            if candidate.id.is_empty()
+                || candidate.id.len() > MAX_MEMORY_CANDIDATE_ID_BYTES
+                || !candidate.id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+                || !candidate_ids.insert(candidate.id.as_str())
+                || !valid_single_line(&candidate.title, MAX_MEMORY_CANDIDATE_TITLE_CHARS)
+                || !valid_single_line(&candidate.rationale, MAX_MEMORY_CANDIDATE_RATIONALE_CHARS)
+                || !valid_single_line(
+                    &candidate.proposed_markdown_line,
+                    MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS,
+                )
+                || candidate.source_refs.is_empty()
+            {
+                return Err(CodexError::InvalidContract(
+                    "invalid Memory candidate bounds",
+                ));
+            }
+            let mut seen_refs = HashSet::new();
+            if candidate
+                .source_refs
+                .iter()
+                .any(|source_ref| !allowed.contains(source_ref) || !seen_refs.insert(source_ref))
+            {
+                return Err(CodexError::InvalidContract(
+                    "Memory candidate forged a source ref",
+                ));
+            }
+        }
+        Ok(value)
+    }
+}
+
+fn valid_single_line(value: &str, maximum_chars: usize) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= maximum_chars
+        && !value.chars().any(|character| {
+            character == '\n' || character == '\r' || character == '\0' || character.is_control()
+        })
 }
 
 pub(crate) fn model_from_value(value: &Value) -> Result<Option<GptModel>, CodexError> {
@@ -219,10 +601,30 @@ pub(crate) fn model_from_value(value: &Value) -> Result<Option<GptModel>, CodexE
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountState, MAX_MODEL_DISPLAY_NAME_BYTES, OutcomeRequest, StructuredOutcome,
-        model_from_value,
+        AccountState, ChoiceGenerationRequest, MAX_MEMORY_CANDIDATES, MAX_MODEL_DISPLAY_NAME_BYTES,
+        MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS, MemoryCandidateGenerationRequest, OutcomeRequest,
+        SelectedModel, StructuredChoiceGeneration, StructuredMemoryCandidateGeneration,
+        StructuredOutcome, is_sha256_hex, model_from_value,
     };
+    use openopen_protocol::PersonaRevisionRef;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    fn persona_revision() -> PersonaRevisionRef {
+        PersonaRevisionRef {
+            persona_id: "openopen.nondev.default".into(),
+            revision: "draft-03-en".into(),
+            aggregate_digest: "b".repeat(64),
+            instructions_digest: format!("{:x}", Sha256::digest(persona_instructions())),
+        }
+    }
+
+    fn persona_instructions() -> String {
+        format!(
+            "OpenOpen persona openopen.nondev.default / draft-03-en; aggregate={}. Return only the requested JSON.",
+            "b".repeat(64)
+        )
+    }
 
     #[test]
     fn connected_account_uses_the_swift_camel_case_contract() {
@@ -255,10 +657,95 @@ mod tests {
     }
 
     #[test]
+    fn choice_generation_requires_three_distinct_bounded_options_and_host_refs() {
+        let request = ChoiceGenerationRequest {
+            prompt: "Plan one bounded local task".into(),
+            allowed_source_refs: vec!["local:intake".into()],
+            selected_model: Some(SelectedModel {
+                model_id: "gpt-example".into(),
+                reasoning_effort: Some("high".into()),
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            }),
+            persona_revision: persona_revision(),
+            developer_instructions: persona_instructions(),
+        };
+        request.validate().unwrap();
+        assert_eq!(
+            request.output_schema()["properties"]["options"]["minItems"],
+            3
+        );
+        let output = r#"{"understoodGoal":"Plan safely","currentContext":"One local question","assumptions":[],"constraints":[],"uncertainties":[],"whatToAvoid":[],"options":[{"direction":"Review","rationale":"Bound scope","expectedResult":"A plan","informationNeeded":[],"externalEffectsPreview":[],"sourceCategories":["ownerInput"]},{"direction":"Narrow","rationale":"Reduce uncertainty","expectedResult":"A smaller plan","informationNeeded":[],"externalEffectsPreview":[],"sourceCategories":["ownerInput"]},{"direction":"Prepare backup","rationale":"Keep an alternative","expectedResult":"A safe alternative","informationNeeded":[],"externalEffectsPreview":[],"sourceCategories":["ownerInput"]}],"sourceRefs":["local:intake"]}"#;
+        assert!(
+            StructuredChoiceGeneration::parse_and_validate(output, &request.allowed_source_refs)
+                .is_ok()
+        );
+        assert!(
+            StructuredChoiceGeneration::parse_and_validate(
+                &output.replace("\"Narrow\"", "\"Review\""),
+                &request.allowed_source_refs
+            )
+            .is_err()
+        );
+        assert!(
+            StructuredChoiceGeneration::parse_and_validate(
+                &output.replace("local:intake", "forged:source"),
+                &request.allowed_source_refs
+            )
+            .is_err()
+        );
+        assert!(
+            StructuredChoiceGeneration::parse_and_validate(
+                &output.replace("Plan safely", "计划"),
+                &request.allowed_source_refs
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn model_request_rejects_a_persona_digest_not_bound_into_instructions() {
+        let mut request = ChoiceGenerationRequest {
+            prompt: "Plan one bounded local task".into(),
+            allowed_source_refs: vec!["local:intake".into()],
+            selected_model: None,
+            persona_revision: persona_revision(),
+            developer_instructions: persona_instructions(),
+        };
+        request.validate().unwrap();
+        request.persona_revision.aggregate_digest = "c".repeat(64);
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn model_request_rejects_compiler_output_that_differs_from_the_bound_digest() {
+        let mut request = ChoiceGenerationRequest {
+            prompt: "Plan one bounded local task".into(),
+            allowed_source_refs: vec!["local:intake".into()],
+            selected_model: None,
+            persona_revision: persona_revision(),
+            developer_instructions: persona_instructions(),
+        };
+        request.validate().unwrap();
+        request
+            .developer_instructions
+            .push_str(" Changed compiler output.");
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
     fn request_schema_enumerates_only_host_refs() {
         let request = OutcomeRequest {
             prompt: "Help me plan today".into(),
             allowed_source_refs: vec!["typed:1".into()],
+            selected_model: Some(SelectedModel {
+                model_id: "gpt-example".into(),
+                reasoning_effort: None,
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            }),
+            persona_revision: persona_revision(),
+            developer_instructions: persona_instructions(),
         };
         request.validate().unwrap();
         assert_eq!(
@@ -278,6 +765,14 @@ mod tests {
         let request = OutcomeRequest {
             prompt: "Help me plan today".into(),
             allowed_source_refs: Vec::new(),
+            selected_model: Some(SelectedModel {
+                model_id: "gpt-example".into(),
+                reasoning_effort: None,
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            }),
+            persona_revision: persona_revision(),
+            developer_instructions: persona_instructions(),
         };
         request.validate().unwrap();
         assert_eq!(
@@ -290,12 +785,92 @@ mod tests {
         );
     }
 
+    fn memory_candidate_request() -> MemoryCandidateGenerationRequest {
+        MemoryCandidateGenerationRequest {
+            prompt: "Source typed:conversation-1 says the owner prefers a weekly review.".into(),
+            allowed_source_refs: vec!["typed:conversation-1".into()],
+            selected_model: SelectedModel {
+                model_id: "gpt-example".into(),
+                reasoning_effort: Some("high".into()),
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            },
+            developer_instructions: MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS.into(),
+        }
+    }
+
+    #[test]
+    fn memory_candidate_request_binds_model_refs_and_exact_tool_free_instructions() {
+        let mut request = memory_candidate_request();
+        request.validate().unwrap();
+        assert_eq!(
+            request.output_schema()["properties"]["candidates"]["maxItems"],
+            MAX_MEMORY_CANDIDATES
+        );
+        assert_eq!(
+            request.output_schema()["properties"]["candidates"]["items"]["properties"]["sourceRefs"]
+                ["items"]["enum"][0],
+            "typed:conversation-1"
+        );
+
+        request.allowed_source_refs.clear();
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request
+            .allowed_source_refs
+            .push("typed:conversation-1".into());
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request.selected_model.catalog_fingerprint = "f".repeat(63);
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request.developer_instructions.push_str(" Use a tool.");
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn memory_candidate_output_accepts_one_to_three_exact_source_bound_records() {
+        let allowed = vec!["typed:conversation-1".to_owned()];
+        let output = r#"{"candidates":[{"id":"weekly-review","title":"Weekly review","rationale":"The source states a recurring preference.","proposedMarkdownLine":"- Prefers a weekly review.","sourceRefs":["typed:conversation-1"]}]}"#;
+        let parsed =
+            StructuredMemoryCandidateGeneration::parse_and_validate(output, &allowed).unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+
+        let three = r#"{"candidates":[{"id":"first","title":"First","rationale":"A first bounded candidate.","proposedMarkdownLine":"- First candidate.","sourceRefs":["typed:conversation-1"]},{"id":"second","title":"Second","rationale":"A second bounded candidate.","proposedMarkdownLine":"- Second candidate.","sourceRefs":["typed:conversation-1"]},{"id":"third","title":"Third","rationale":"A third bounded candidate.","proposedMarkdownLine":"- Third candidate.","sourceRefs":["typed:conversation-1"]}]}"#;
+        assert!(StructuredMemoryCandidateGeneration::parse_and_validate(three, &allowed).is_ok());
+    }
+
+    #[test]
+    fn memory_candidate_output_rejects_forgery_duplicates_actions_and_extra_fields() {
+        let allowed = vec!["typed:conversation-1".to_owned()];
+        for output in [
+            r#"{"candidates":[]}"#,
+            r#"{"candidates":[{"id":"one","title":"One","rationale":"Reason","proposedMarkdownLine":"- One","sourceRefs":["typed:conversation-1"]},{"id":"two","title":"Two","rationale":"Reason","proposedMarkdownLine":"- Two","sourceRefs":["typed:conversation-1"]},{"id":"three","title":"Three","rationale":"Reason","proposedMarkdownLine":"- Three","sourceRefs":["typed:conversation-1"]},{"id":"four","title":"Four","rationale":"Reason","proposedMarkdownLine":"- Four","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"same","title":"One","rationale":"Reason","proposedMarkdownLine":"- One","sourceRefs":["typed:conversation-1"]},{"id":"same","title":"Two","rationale":"Reason","proposedMarkdownLine":"- Two","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"forged","title":"Forged","rationale":"Reason","proposedMarkdownLine":"- Forged","sourceRefs":["typed:other"]}]}"#,
+            r#"{"candidates":[{"id":"duplicate-ref","title":"Duplicate","rationale":"Reason","proposedMarkdownLine":"- Duplicate","sourceRefs":["typed:conversation-1","typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"multiline","title":"Multiline","rationale":"Reason","proposedMarkdownLine":"- One\n- Two","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"action","title":"Action","rationale":"Reason","proposedMarkdownLine":"- Action","sourceRefs":["typed:conversation-1"],"tool":"send"}]}"#,
+        ] {
+            assert!(
+                StructuredMemoryCandidateGeneration::parse_and_validate(output, &allowed).is_err(),
+                "unexpectedly accepted {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_catalog_digest_rejects_non_hex_lowercase_letters() {
+        assert!(is_sha256_hex(&"abcdef0123456789".repeat(4)));
+        assert!(!is_sha256_hex(&format!("g{}", "a".repeat(63))));
+    }
+
     #[test]
     fn model_fields_and_effort_catalog_are_strictly_bounded() {
         let oversized = json!({
             "displayName": "x".repeat(MAX_MODEL_DISPLAY_NAME_BYTES + 1),
             "hidden": false,
-            "model": "gpt-5.6-sol",
+            "model": "gpt-test-model",
             "supportedReasoningEfforts": [{"reasoningEffort": "high"}]
         });
         assert!(model_from_value(&oversized).is_err());
@@ -303,7 +878,7 @@ mod tests {
         let duplicate_effort = json!({
             "displayName": "GPT",
             "hidden": false,
-            "model": "gpt-5.6-sol",
+            "model": "gpt-test-model",
             "supportedReasoningEfforts": [
                 {"reasoningEffort": "high"},
                 {"reasoningEffort": "high"}

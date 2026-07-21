@@ -5,6 +5,7 @@ umask 077
 usage() {
   echo "usage: $0 --app ABSOLUTE_PATH --output ABSOLUTE_DMG [--developer-id-identity CERTIFICATE_NAME --identity-receipt ABSOLUTE_RECEIPT]" >&2
   echo "       $0 --app ABSOLUTE_PATH --identity-receipt ABSOLUTE_RECEIPT --developer-id-identity CERTIFICATE_NAME (--verify-identity-receipt-only|--test-identity-receipt)" >&2
+  echo "       $0 --app /Applications/OpenOpen.app --identity-receipt ABSOLUTE_RECEIPT --developer-id-identity CERTIFICATE_NAME --verify-installed-copy-only" >&2
   exit 64
 }
 
@@ -16,6 +17,11 @@ execution_mode="package"
 readonly expected_developer_id_identity="Developer ID Application: Wenxin Dou (UHDY2275L5)"
 readonly expected_developer_id_team="UHDY2275L5"
 readonly expected_developer_id_leaf_sha="a7e43925d8ee4ad927f6ac27078eff554b7487a58f73b8f3acd7fabadc4057c8"
+readonly expected_app_unsigned_sha="0c8d8013405d75c06ac4d18211d5a6d994b0733383ef10dc1eda4cf5f4e38c10"
+readonly expected_core_unsigned_sha="19518aeba40579f85dd358351837a3a8f4792e4acbf812194c0c28259c98987f"
+readonly expected_broker_unsigned_sha="3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78"
+readonly expected_worker_unsigned_sha="4788bb2cd6e3f4615c3b042d78b4f25dfd8ff29da94a997a53208bedb3eceec2"
+readonly expected_deep_zip_unsigned_sha="b0099bc496205e4e69174de1a30a2c3716493f5bb39e02acd10e084cf0055017"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app)
@@ -46,6 +52,11 @@ while [[ $# -gt 0 ]]; do
     --test-identity-receipt)
       [[ "$execution_mode" == "package" ]] || usage
       execution_mode="test"
+      shift
+      ;;
+    --verify-installed-copy-only)
+      [[ "$execution_mode" == "package" ]] || usage
+      execution_mode="installed-verify"
       shift
       ;;
     *) usage ;;
@@ -163,6 +174,7 @@ verify_owner_certificate() {
 
 verify_entry_operational_metadata() {
   local path="$1"
+  local policy="${2:-strict}"
   local flags acl_lines attribute
   flags="$(/usr/bin/stat -f '%f' "$path")"
   [[ "$flags" == "0" ]] || {
@@ -175,11 +187,22 @@ verify_entry_operational_metadata() {
     exit 66
   }
   while IFS= read -r attribute; do
-    [[ -z "$attribute" || "$attribute" == "com.apple.provenance" ]] || {
+    [[ -z "$attribute" || "$attribute" == "com.apple.provenance" \
+      || ("$policy" == "installed-root" \
+        && "$attribute" == "com.apple.macl") ]] || {
       echo "exact alpha entry has a forbidden extended attribute: $path" >&2
       exit 66
     }
   done < <(/usr/bin/xattr "$path" 2>/dev/null || true)
+  if [[ "$policy" == "installed-root" ]]; then
+    local macl_hex
+    macl_hex="$(/usr/bin/xattr -px com.apple.macl "$path" 2>/dev/null \
+      | /usr/bin/tr -d ' \r\n')"
+    [[ "$macl_hex" =~ ^0{144}$ ]] || {
+      echo "installed App root has an unexpected Finder macOS ACL marker" >&2
+      exit 66
+    }
+  fi
 }
 
 verify_developer_id_code() {
@@ -271,6 +294,38 @@ write_tree_manifest() {
         "$kind" "$mode" "$flags" "$attributes" "$size" "$sha" "$relative"
     done < <(/usr/bin/find -P "$root" -print0 | LC_ALL=C /usr/bin/sort -z)
   ) >"$destination"
+}
+
+write_installed_copy_manifest() {
+  local root="$1"
+  local destination="$2"
+  local raw path
+  raw="$(/usr/bin/mktemp /private/tmp/OpenOpen-installed-manifest.XXXXXX)"
+  while IFS= read -r -d '' path; do
+    if [[ "$path" != "$root" ]] \
+      && /usr/bin/xattr "$path" 2>/dev/null \
+        | /usr/bin/grep -Fx com.apple.macl >/dev/null; then
+      rm -f "$raw"
+      echo "installed App has a Finder ACL marker below its bundle root: $path" >&2
+      return 66
+    fi
+  done < <(/usr/bin/find -P "$root" -print0)
+  verify_entry_operational_metadata "$root" installed-root
+  write_tree_manifest "$root" "$raw"
+  /usr/bin/awk -F '\t' -v OFS='\t' '
+    NR == 1 { print; next }
+    $7 == "." {
+      if ($4 !~ /com\.apple\.macl=0{144};/) exit 66
+      sub(/com\.apple\.macl=0{144};/, "", $4)
+    }
+    /com\.apple\.macl=/ { exit 66 }
+    { print }
+  ' "$raw" >"$destination" || {
+    rm -f "$raw" "$destination"
+    echo "installed App Finder metadata normalization failed closed" >&2
+    return 66
+  }
+  rm -f "$raw"
 }
 
 snapshot_external_pair() {
@@ -562,6 +617,7 @@ verify_post_stage_identity_receipt() {
   local receipt="$1"
   local candidate="$2"
   local app_team="$3"
+  local verification_scope="${4:-strict}"
   local identity_json manifest_file scratch_manifest
   local source_snapshot_file scratch_source_snapshot source_snapshot_sha
   local actual_dirs expected_dirs actual_files expected_files
@@ -653,6 +709,14 @@ verify_post_stage_identity_receipt() {
       and .source.indexState == "empty"
       and .source.sourceSnapshotFile == "Contents/Resources/source-snapshot.tsv"
       and .source.sourceSnapshotFormat == "OPENOPEN-SOURCE-SNAPSHOT-V2"
+      and (.source.head | test("^[0-9a-f]{40}$"))
+      and (.source.statusSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.binaryDiffSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.sourceSnapshotSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.stageScriptSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.dmgScriptSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.provenanceSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.thirdPartyNoticesSha256 | test("^[0-9a-f]{64}$"))
       and .signer == {identity: $identity, teamIdentifier: $team,
         leafCertificateSha256: $leaf}
       and (.app | keys) == ["bundleIdentifier", "components", "directoryCount",
@@ -661,15 +725,16 @@ verify_post_stage_identity_receipt() {
       and .app.bundleIdentifier == "com.thesongzhu.OpenOpen"
       and .app.manifestFile == "Contents/Resources/app-manifest.tsv"
       and .app.manifestFormat == "OPENOPEN-TREE-MANIFEST-V1"
-      and .app.directoryCount == 18 and .app.fileCount == 617
+      and .app.directoryCount == 19 and .app.fileCount == 618
       and .app.metadataPolicy == {types: ["directory", "regular-file"],
         directoryMode: "755", regularFileMode: "644", machOMode: "755",
         bsdFlags: "0", aclEntries: 0,
         allowedExtendedAttributes: ["com.apple.provenance"]}
-      and (.app.components | length) == 4
+      and (.app.components | length) == 5
       and [.app.components[].path] == ["Contents/MacOS/OpenOpen",
         "Contents/MacOS/OpenOpenCore", "Contents/MacOS/OpenOpenEffectBroker",
-        "Contents/MacOS/OpenOpenEffectBrokerWorker"]
+        "Contents/MacOS/OpenOpenEffectBrokerWorker",
+        "Contents/Resources/DeepZip/openopen-deep-zip-worker"]
       and all(.app.components[];
         (keys == ["cdhash", "entitlements", "hardenedRuntime", "identifier", "path",
           "secureTimestamp", "signedSha256", "teamIdentifier", "unsignedSha256"])
@@ -709,31 +774,33 @@ verify_post_stage_identity_receipt() {
     echo "external identity receipt source snapshot digest mismatch" >&2
     exit 66
   }
-  scratch_source_snapshot="$(/usr/bin/mktemp \
-    /private/tmp/OpenOpen-source-snapshot.XXXXXX)"
-  write_source_snapshot_manifest "$repo_root" "$scratch_source_snapshot"
-  /usr/bin/cmp -s "$source_snapshot_file" "$scratch_source_snapshot" || {
+  if [[ "$verification_scope" == "strict" ]]; then
+    scratch_source_snapshot="$(/usr/bin/mktemp \
+      /private/tmp/OpenOpen-source-snapshot.XXXXXX)"
+    write_source_snapshot_manifest "$repo_root" "$scratch_source_snapshot"
+    /usr/bin/cmp -s "$source_snapshot_file" "$scratch_source_snapshot" || {
+      rm -f "$scratch_source_snapshot"
+      echo "external identity receipt source snapshot mismatch" >&2
+      exit 66
+    }
     rm -f "$scratch_source_snapshot"
-    echo "external identity receipt source snapshot mismatch" >&2
-    exit 66
-  }
-  rm -f "$scratch_source_snapshot"
-  /usr/bin/jq -e \
-    --arg head "$head" --arg status "$status_sha" --arg diff "$diff_sha" \
-    --arg stage "$stage_script_sha" --arg dmg "$dmg_script_sha" \
-    --arg snapshot "$source_snapshot_sha" \
-    --arg provenance "$provenance_sha" --arg notices "$third_party_notices_sha" \
-    '.source == {head: $head, statusSha256: $status,
-      binaryDiffSha256: $diff, indexState: "empty",
-      sourceSnapshotFile: "Contents/Resources/source-snapshot.tsv",
-      sourceSnapshotFormat: "OPENOPEN-SOURCE-SNAPSHOT-V2",
-      sourceSnapshotSha256: $snapshot,
-      stageScriptSha256: $stage,
-      dmgScriptSha256: $dmg, provenanceSha256: $provenance,
-      thirdPartyNoticesSha256: $notices}' "$identity_json" >/dev/null || {
-    echo "external identity receipt source fingerprint mismatch" >&2
-    exit 66
-  }
+    /usr/bin/jq -e \
+      --arg head "$head" --arg status "$status_sha" --arg diff "$diff_sha" \
+      --arg stage "$stage_script_sha" --arg dmg "$dmg_script_sha" \
+      --arg snapshot "$source_snapshot_sha" \
+      --arg provenance "$provenance_sha" --arg notices "$third_party_notices_sha" \
+      '.source == {head: $head, statusSha256: $status,
+        binaryDiffSha256: $diff, indexState: "empty",
+        sourceSnapshotFile: "Contents/Resources/source-snapshot.tsv",
+        sourceSnapshotFormat: "OPENOPEN-SOURCE-SNAPSHOT-V2",
+        sourceSnapshotSha256: $snapshot,
+        stageScriptSha256: $stage,
+        dmgScriptSha256: $dmg, provenanceSha256: $provenance,
+        thirdPartyNoticesSha256: $notices}' "$identity_json" >/dev/null || {
+      echo "external identity receipt source fingerprint mismatch" >&2
+      exit 66
+    }
+  fi
 
   manifest_sha="$(/usr/bin/shasum -a 256 "$manifest_file" \
     | /usr/bin/awk '{print $1}')"
@@ -742,7 +809,11 @@ verify_post_stage_identity_receipt() {
     exit 66
   }
   scratch_manifest="$(/usr/bin/mktemp /private/tmp/OpenOpen-app-manifest.XXXXXX)"
-  write_tree_manifest "$candidate" "$scratch_manifest"
+  if [[ "$verification_scope" == "installed-copy" ]]; then
+    write_installed_copy_manifest "$candidate" "$scratch_manifest"
+  else
+    write_tree_manifest "$candidate" "$scratch_manifest"
+  fi
   /usr/bin/cmp -s "$manifest_file" "$scratch_manifest" || {
     rm -f "$scratch_manifest"
     echo "App does not match its external post-stage identity receipt" >&2
@@ -753,7 +824,7 @@ verify_post_stage_identity_receipt() {
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
   file_count="$(/usr/bin/find -P "$candidate" -type f -print \
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "$directory_count" == "18" && "$file_count" == "617" ]] || {
+  [[ "$directory_count" == "19" && "$file_count" == "618" ]] || {
     echo "App shape does not match its external identity receipt" >&2
     exit 66
   }
@@ -777,10 +848,11 @@ verify_post_stage_identity_receipt() {
       exit 66
     }
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$expected_app_unsigned_sha
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$expected_core_unsigned_sha
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$expected_broker_unsigned_sha
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$expected_worker_unsigned_sha
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$expected_deep_zip_unsigned_sha
 EOF
 }
 
@@ -788,13 +860,16 @@ verify_exact_developer_app() {
   local candidate="$1"
   local app_team="$2"
   local receipt="$3"
+  local verification_scope="${4:-strict}"
   local openai_team="2DC432GLL2"
   local rel path actual_macho expected_macho entitlement_json mode expected_mode
   local actual_app_files expected_app_files actual_app_dirs expected_app_dirs
   local notice_hashes runtime_sha app_cdhash core_cdhash broker_cdhash worker_cdhash
+  local deep_zip_cdhash
   local provenance_sha third_party_notices_sha
 
-  verify_post_stage_identity_receipt "$receipt" "$candidate" "$app_team"
+  verify_post_stage_identity_receipt "$receipt" "$candidate" "$app_team" \
+    "$verification_scope"
   app_cdhash="$(receipt_component_value "$receipt" \
     Contents/MacOS/OpenOpen cdhash)"
   core_cdhash="$(receipt_component_value "$receipt" \
@@ -803,6 +878,8 @@ verify_exact_developer_app() {
     Contents/MacOS/OpenOpenEffectBroker cdhash)"
   worker_cdhash="$(receipt_component_value "$receipt" \
     Contents/MacOS/OpenOpenEffectBrokerWorker cdhash)"
+  deep_zip_cdhash="$(receipt_component_value "$receipt" \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker cdhash)"
   provenance_sha="$(/usr/bin/jq -er '.source.provenanceSha256' \
     "$receipt/Contents/Resources/identity.json")"
   third_party_notices_sha="$(/usr/bin/jq -er '.source.thirdPartyNoticesSha256' \
@@ -830,6 +907,7 @@ verify_exact_developer_app() {
     Contents/Resources/Codex/0.144.0/bin/codex \
     Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host \
     Contents/Resources/Codex/0.144.0/codex-path/rg \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker \
     Contents/Resources/iMessage/0.13.0/bin/imsg | LC_ALL=C sort)"
   actual_macho="$(
     /usr/bin/find -P "$candidate" -type f -print0 \
@@ -864,14 +942,15 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|d6ea4e29d47570442d8bc3518ce0a7310b63abe80d5dc94f727e8107aafebe3c
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|160bf60550d9e7b89924d872f5b605557502d6004d775a4949146fb588359fed
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|c01e0c2707ed47c86bb3f73622f7add5e2e35c5a92f981347b2c525e3f58c8ee
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|4b5b973d3d5ba1f14bb789e96f69d54766fa58e15e6784d9a9eff509f972c208
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|$expected_app_unsigned_sha
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|$expected_core_unsigned_sha
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|$expected_broker_unsigned_sha
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|$expected_worker_unsigned_sha
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$app_team|$deep_zip_cdhash|$expected_deep_zip_unsigned_sha
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-
 Contents/Resources/Codex/0.144.0/codex-path/rg|rg|$app_team|b117313f07e30d05462b942c318b1ae0b73b4e5c|ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6
-Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|19de2b3e834adf95fed67c0cfd1a6f6a7759d5de|cdea42cf30e731d52c00524c16db5865fe2d01ef6a3f377cb6e3a3eb65f5f313
+Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|a26439305914f6bc47e6c6c0a1228c89b2bdefc3|35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a
 EOF
 
   for rel in \
@@ -879,6 +958,7 @@ EOF
     Contents/MacOS/OpenOpenCore \
     Contents/MacOS/OpenOpenEffectBroker \
     Contents/MacOS/OpenOpenEffectBrokerWorker \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker \
     Contents/Resources/Codex/0.144.0/codex-path/rg; do
     [[ "$(entitlements_json "$candidate/$rel")" == "{}" ]] || {
       echo "unexpected entitlement on exact alpha component: $rel" >&2
@@ -908,7 +988,7 @@ EOF
     exit 66
   }
 
-  verify_sha c1769b4093faa6e8bde56cdb16ad2c950ee39ea5501630e0ba022901b56a7b3d \
+  verify_sha dc38dd78a8c3bfef736333257335667b8b87e28e205256637b751ac064f65ff7 \
     "$candidate/Contents/Resources/iMessage/0.13.0/BUILD-RECEIPT.json"
   verify_sha 818495226dda3332f711fc6d6408eacf1776e08fcddfa06342ab3f5196417839 \
     "$candidate/Contents/Resources/Notices/third_party/manifest.json"
@@ -968,6 +1048,7 @@ EOF
         Contents/MacOS/OpenOpenCore \
         Contents/MacOS/OpenOpenEffectBroker \
         Contents/MacOS/OpenOpenEffectBrokerWorker \
+        Contents/Resources/DeepZip/openopen-deep-zip-worker \
         Contents/Resources/Codex/0.144.0/bin/codex \
         Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host \
         Contents/Resources/Codex/0.144.0/codex-package.json \
@@ -1012,6 +1093,7 @@ EOF
     Contents/Resources/Codex/0.144.0 \
     Contents/Resources/Codex/0.144.0/bin \
     Contents/Resources/Codex/0.144.0/codex-path \
+    Contents/Resources/DeepZip \
     Contents/Resources/Notices \
     Contents/Resources/Notices/third_party \
     Contents/Resources/Notices/third_party/texts \
@@ -1034,7 +1116,11 @@ EOF
       echo "exact alpha directory mode mismatch: $rel" >&2
       exit 66
     }
-    verify_entry_operational_metadata "$candidate/$rel"
+    if [[ "$verification_scope" == "installed-copy" && "$rel" == "." ]]; then
+      verify_entry_operational_metadata "$candidate/$rel" installed-root
+    else
+      verify_entry_operational_metadata "$candidate/$rel"
+    fi
   done <<<"$expected_app_dirs"
   while IFS= read -r rel; do
     expected_mode="644"
@@ -1055,12 +1141,12 @@ EOF
   /usr/bin/jq -e --arg team "$app_team" \
     --arg runtime_sha "$runtime_sha" \
     '.schemaVersion == 1
-     and .buildReceiptSha256 == "c1769b4093faa6e8bde56cdb16ad2c950ee39ea5501630e0ba022901b56a7b3d"
+     and .buildReceiptSha256 == "dc38dd78a8c3bfef736333257335667b8b87e28e205256637b751ac064f65ff7"
      and .binarySha256 == $runtime_sha
      and .resourceTreeSha256 == "7a5cb869823a893a7181bcacfef6dfc8be335a5ce2bf14caac579096f78909cc"
      and .signingIdentifier == "com.thesongzhu.OpenOpen.imsg"
      and .teamIdentifier == $team
-     and .cdhash == "19de2b3e834adf95fed67c0cfd1a6f6a7759d5de"' \
+     and .cdhash == "a26439305914f6bc47e6c6c0a1228c89b2bdefc3"' \
     "$candidate/Contents/Resources/iMessage/0.13.0/RUNTIME-RECEIPT.json" >/dev/null || {
     echo "exact imsg runtime receipt mismatch" >&2
     exit 66
@@ -1402,7 +1488,7 @@ cleanup_input_snapshot() {
   fi
 }
 trap cleanup_input_snapshot EXIT
-if [[ -n "$signing_identity" ]]; then
+if [[ -n "$signing_identity" && "$execution_mode" != "installed-verify" ]]; then
   input_snapshot="$(/usr/bin/mktemp -d \
     /private/tmp/OpenOpen-verified-input.XXXXXX)"
   snapshot_external_pair "$app" "$identity_receipt" "$input_snapshot"
@@ -1433,11 +1519,20 @@ if [[ -n "$signing_identity" ]]; then
       echo "requested Developer ID Application identity is unavailable" >&2
       exit 65
     }
-  verify_exact_developer_app "$app" "$app_team" "$identity_receipt"
+  if [[ "$execution_mode" == "installed-verify" ]]; then
+    verify_exact_developer_app "$app" "$app_team" "$identity_receipt" \
+      installed-copy
+  else
+    verify_exact_developer_app "$app" "$app_team" "$identity_receipt"
+  fi
 fi
 
 if [[ "$execution_mode" == "verify" ]]; then
   echo "POST_STAGE_IDENTITY_RECEIPT_VERIFY=PASS $app_team $original_app $original_identity_receipt"
+  exit 0
+fi
+if [[ "$execution_mode" == "installed-verify" ]]; then
+  echo "INSTALLED_COPY_IDENTITY_RECEIPT_VERIFY=PASS $app_team $original_app $original_identity_receipt"
   exit 0
 fi
 if [[ "$execution_mode" == "test" ]]; then

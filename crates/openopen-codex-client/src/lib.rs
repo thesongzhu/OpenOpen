@@ -5,8 +5,10 @@ mod process;
 mod wire;
 
 pub use contracts::{
-    AccountState, ChatGptLogin, GptModel, OutcomeRequest, REQUIRED_MODEL,
-    REQUIRED_REASONING_EFFORT, StructuredOutcome,
+    AccountState, ChatGptLogin, ChoiceGenerationRequest, GptModel,
+    MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS, MemoryCandidateGenerationRequest, OutcomeRequest,
+    SelectedModel, StructuredChoiceGeneration, StructuredChoiceOption, StructuredMemoryCandidate,
+    StructuredMemoryCandidateGeneration, StructuredOutcome,
 };
 pub use process::{
     CODEX_BINARY_SHA256, CODEX_CODE_MODE_HOST_SHA256, CODEX_PACKAGE_SHA256, CODEX_RG_SHA256,
@@ -17,6 +19,7 @@ use contracts::{
     MAX_MODEL_CATALOG_BYTES, MAX_MODEL_CURSOR_BYTES, MAX_MODEL_PAGES, MAX_MODELS, model_from_value,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -26,6 +29,100 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use wire::{Incoming, Transport};
+
+trait StructuredRequest {
+    fn validate_request(&self) -> Result<(), CodexError>;
+    fn prompt(&self) -> &str;
+    fn schema(&self) -> Value;
+    fn selected_model(&self) -> Option<&SelectedModel>;
+    fn allowed_source_refs(&self) -> &[String];
+    fn developer_instructions(&self) -> &str;
+}
+
+trait StructuredResponse: Sized {
+    fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError>;
+}
+
+impl StructuredRequest for OutcomeRequest {
+    fn validate_request(&self) -> Result<(), CodexError> {
+        self.validate()
+    }
+    fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    fn schema(&self) -> Value {
+        self.output_schema()
+    }
+    fn selected_model(&self) -> Option<&SelectedModel> {
+        self.selected_model.as_ref()
+    }
+    fn allowed_source_refs(&self) -> &[String] {
+        &self.allowed_source_refs
+    }
+    fn developer_instructions(&self) -> &str {
+        &self.developer_instructions
+    }
+}
+
+impl StructuredRequest for ChoiceGenerationRequest {
+    fn validate_request(&self) -> Result<(), CodexError> {
+        self.validate()
+    }
+    fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    fn schema(&self) -> Value {
+        self.output_schema()
+    }
+    fn selected_model(&self) -> Option<&SelectedModel> {
+        self.selected_model.as_ref()
+    }
+    fn allowed_source_refs(&self) -> &[String] {
+        &self.allowed_source_refs
+    }
+    fn developer_instructions(&self) -> &str {
+        &self.developer_instructions
+    }
+}
+
+impl StructuredRequest for MemoryCandidateGenerationRequest {
+    fn validate_request(&self) -> Result<(), CodexError> {
+        self.validate()
+    }
+    fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    fn schema(&self) -> Value {
+        self.output_schema()
+    }
+    fn selected_model(&self) -> Option<&SelectedModel> {
+        Some(&self.selected_model)
+    }
+    fn allowed_source_refs(&self) -> &[String] {
+        &self.allowed_source_refs
+    }
+    fn developer_instructions(&self) -> &str {
+        &self.developer_instructions
+    }
+}
+
+impl StructuredResponse for StructuredOutcome {
+    fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
+        Self::parse_and_validate(text, allowed_source_refs)
+    }
+}
+
+impl StructuredResponse for StructuredChoiceGeneration {
+    fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
+        Self::parse_and_validate(text, allowed_source_refs)
+    }
+}
+
+impl StructuredResponse for StructuredMemoryCandidateGeneration {
+    fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
+        Self::parse_and_validate(text, allowed_source_refs)
+    }
+}
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -434,9 +531,41 @@ impl CodexClient {
         Err(CodexError::Protocol("model pagination exceeded limit"))
     }
 
-    /// Runs the sealed outcome contract with the required model and high
-    /// reasoning. Any tool/action item, reroute, scope mismatch, or malformed
-    /// output terminates the child and returns no result.
+    /// Returns the stable content binding for the complete, sorted compatible
+    /// catalog returned by [`Self::list_gpt_models`]. Host persists this value
+    /// with the explicit owner selection and rejects catalog drift before a
+    /// turn can begin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the complete catalog cannot be serialized into
+    /// the pinned canonical binding.
+    pub fn model_catalog_fingerprint(models: &[GptModel]) -> Result<String, CodexError> {
+        let encoded = serde_json::to_vec(models)
+            .map_err(|_| CodexError::Protocol("invalid model catalog"))?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
+    /// A deterministic numeric projection of the full catalog fingerprint.
+    /// The fingerprint remains the authoritative binding; the revision is a
+    /// stable display/storage version for the exact same catalog bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied catalog fingerprint has no valid
+    /// hexadecimal revision prefix.
+    pub fn model_catalog_revision(fingerprint: &str) -> Result<u64, CodexError> {
+        let prefix = fingerprint
+            .get(..16)
+            .ok_or(CodexError::Protocol("invalid model catalog fingerprint"))?;
+        let revision = u64::from_str_radix(prefix, 16)
+            .map_err(|_| CodexError::Protocol("invalid model catalog fingerprint"))?;
+        Ok(revision.max(1))
+    }
+
+    /// Runs the sealed outcome contract with Host's explicit catalog-bound
+    /// model selection. Any tool/action item, reroute, scope mismatch, or
+    /// malformed output terminates the child and returns no result.
     ///
     /// # Errors
     ///
@@ -447,7 +576,78 @@ impl CodexClient {
         request: &OutcomeRequest,
     ) -> Result<StructuredOutcome, CodexError> {
         let workspace = self.model_workspace.clone();
-        self.run_structured_outcome_in_workspace(request, &workspace)
+        self.run_structured_in_workspace(request, &workspace)
+    }
+
+    /// Runs the sealed Choice-generation contract with the exact same
+    /// read-only/tool-free containment as an Outcome, but returns only
+    /// bounded understanding and three directions rather than effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable model access, containment mismatch,
+    /// tool/action requests, failed turns, or schema-invalid output.
+    pub fn run_structured_choice_generation(
+        &mut self,
+        request: &ChoiceGenerationRequest,
+    ) -> Result<StructuredChoiceGeneration, CodexError> {
+        let workspace = self.model_workspace.clone();
+        self.run_structured_in_workspace(request, &workspace)
+    }
+
+    /// Runs the sealed Memory-candidate contract with the selected catalog-
+    /// bound model. The turn remains read-only, network-disabled, tool-free,
+    /// and can return only one to three source-bound candidate records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable selected-model access, containment
+    /// mismatch, action/tool requests, failed turns, or invalid output.
+    pub fn run_structured_memory_candidate_generation(
+        &mut self,
+        request: &MemoryCandidateGenerationRequest,
+    ) -> Result<StructuredMemoryCandidateGeneration, CodexError> {
+        let workspace = self.model_workspace.clone();
+        self.run_structured_in_workspace(request, &workspace)
+    }
+
+    /// Runs the sealed Memory-candidate contract in an already-contained
+    /// read-only workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace escapes containment or the request,
+    /// selected model, or structured result violates the sealed contract.
+    pub fn run_structured_memory_candidate_generation_in_workspace(
+        &mut self,
+        request: &MemoryCandidateGenerationRequest,
+        workspace: &Path,
+    ) -> Result<StructuredMemoryCandidateGeneration, CodexError> {
+        self.run_structured_in_workspace(request, workspace)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the supplied workspace or the sealed Outcome
+    /// request violates the same bounded model contract as the default root.
+    pub fn run_structured_outcome_in_workspace(
+        &mut self,
+        request: &OutcomeRequest,
+        workspace: &Path,
+    ) -> Result<StructuredOutcome, CodexError> {
+        self.run_structured_in_workspace(request, workspace)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the supplied workspace or the sealed Choice
+    /// generation request violates the bounded model contract.
+    pub fn run_structured_choice_generation_in_workspace(
+        &mut self,
+        request: &ChoiceGenerationRequest,
+        workspace: &Path,
+    ) -> Result<StructuredChoiceGeneration, CodexError> {
+        self.run_structured_in_workspace(request, workspace)
     }
 
     /// Runs one structured outcome in an exact subdirectory already contained
@@ -458,26 +658,34 @@ impl CodexClient {
     /// Returns an error when the workspace escapes the immutable sandbox root,
     /// required model access is unavailable, the runtime violates containment,
     /// or the structured result fails the sealed outcome contract.
-    pub fn run_structured_outcome_in_workspace(
+    fn run_structured_in_workspace<R, T>(
         &mut self,
-        request: &OutcomeRequest,
+        request: &R,
         workspace: &Path,
-    ) -> Result<StructuredOutcome, CodexError> {
+    ) -> Result<T, CodexError>
+    where
+        R: StructuredRequest,
+        T: StructuredResponse,
+    {
         self.require_purpose(RuntimePurpose::Model)?;
-        request.validate()?;
+        request.validate_request()?;
         let workspace = std::fs::canonicalize(workspace).map_err(CodexError::Io)?;
         if !workspace.starts_with(&self.model_workspace) {
             return Err(CodexError::InvalidPath);
         }
         let models = self.list_gpt_models()?;
-        let required = models
-            .iter()
-            .find(|model| model.id == REQUIRED_MODEL)
+        let selected_model = request
+            .selected_model()
             .ok_or(CodexError::RequiredModelUnavailable)?;
-        if !required
-            .supported_reasoning_efforts
+        let selected = models
             .iter()
-            .any(|effort| effort == REQUIRED_REASONING_EFFORT)
+            .find(|model| model.id == selected_model.model_id)
+            .ok_or(CodexError::RequiredModelUnavailable)?;
+        let catalog_fingerprint = Self::model_catalog_fingerprint(&models)?;
+        if catalog_fingerprint != selected_model.catalog_fingerprint
+            || Self::model_catalog_revision(&catalog_fingerprint)?
+                != selected_model.catalog_revision
+            || !selected_model_matches_catalog(selected, selected_model)
         {
             return Err(CodexError::RequiredModelUnavailable);
         }
@@ -491,21 +699,21 @@ impl CodexClient {
                 "approvalPolicy": "never",
                 "config": {"web_search": "disabled"},
                 "cwd": cwd,
-                "developerInstructions": "Return only the requested JSON. Do not invoke tools.",
+                "developerInstructions": request.developer_instructions(),
                 "ephemeral": true,
-                "model": REQUIRED_MODEL,
+                "model": selected_model.model_id,
                 "sandbox": "read-only"
             }),
             REQUEST_TIMEOUT,
         )?;
-        validate_thread(&thread, &cwd)?;
+        validate_thread(&thread, &cwd, &selected_model.model_id)?;
         let thread_id = thread
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .ok_or(CodexError::Protocol("thread id missing"))?
             .to_owned();
 
-        self.start_turn_and_collect_outcome(&thread_id, &cwd, request, &request.allowed_source_refs)
+        self.start_turn_and_collect(&thread_id, &cwd, request)
     }
 
     fn require_purpose(&self, purpose: RuntimePurpose) -> Result<(), CodexError> {
@@ -516,42 +724,49 @@ impl CodexClient {
         }
     }
 
-    fn start_turn_and_collect_outcome(
+    fn start_turn_and_collect<R, T>(
         &mut self,
         thread_id: &str,
         cwd: &str,
-        request: &OutcomeRequest,
-        allowed_source_refs: &[String],
-    ) -> Result<StructuredOutcome, CodexError> {
-        let result =
-            self.start_turn_and_collect_outcome_inner(thread_id, cwd, request, allowed_source_refs);
+        request: &R,
+    ) -> Result<T, CodexError>
+    where
+        R: StructuredRequest,
+        T: StructuredResponse,
+    {
+        let result = self.start_turn_and_collect_inner(thread_id, cwd, request);
         match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => self.fail(error),
         }
     }
 
-    fn start_turn_and_collect_outcome_inner(
+    fn start_turn_and_collect_inner<R, T>(
         &mut self,
         thread_id: &str,
         cwd: &str,
-        request: &OutcomeRequest,
-        allowed_source_refs: &[String],
-    ) -> Result<StructuredOutcome, CodexError> {
-        let response = self.request(
-            "turn/start",
-            &json!({
-                "approvalPolicy": "never",
-                "cwd": cwd,
-                "effort": REQUIRED_REASONING_EFFORT,
-                "input": [{"text": request.prompt, "type": "text"}],
-                "model": REQUIRED_MODEL,
-                "outputSchema": request.output_schema(),
-                "sandboxPolicy": {"networkAccess": false, "type": "readOnly"},
-                "threadId": thread_id
-            }),
-            REQUEST_TIMEOUT,
-        )?;
+        request: &R,
+    ) -> Result<T, CodexError>
+    where
+        R: StructuredRequest,
+        T: StructuredResponse,
+    {
+        let selected_model = request
+            .selected_model()
+            .ok_or(CodexError::RequiredModelUnavailable)?;
+        let mut turn_params = json!({
+            "approvalPolicy": "never",
+            "cwd": cwd,
+            "input": [{"text": request.prompt(), "type": "text"}],
+            "model": selected_model.model_id,
+            "outputSchema": request.schema(),
+            "sandboxPolicy": {"networkAccess": false, "type": "readOnly"},
+            "threadId": thread_id
+        });
+        if let Some(effort) = &selected_model.reasoning_effort {
+            turn_params["effort"] = Value::String(effort.clone());
+        }
+        let response = self.request("turn/start", &turn_params, REQUEST_TIMEOUT)?;
         validate_exact_object_keys(&response, &["turn"], "invalid turn start response")?;
         let validated = validate_turn(
             response
@@ -560,7 +775,7 @@ impl CodexClient {
             None,
             TurnValidationPhase::StartResponse,
         )?;
-        self.collect_outcome_inner(thread_id, &validated.id, allowed_source_refs)
+        self.collect_structured_inner(thread_id, &validated.id, request.allowed_source_refs())
     }
 
     #[cfg(test)]
@@ -570,19 +785,19 @@ impl CodexClient {
         turn_id: &str,
         allowed_source_refs: &[String],
     ) -> Result<StructuredOutcome, CodexError> {
-        let result = self.collect_outcome_inner(thread_id, turn_id, allowed_source_refs);
+        let result = self.collect_structured_inner(thread_id, turn_id, allowed_source_refs);
         match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => self.fail(error),
         }
     }
 
-    fn collect_outcome_inner(
+    fn collect_structured_inner<T: StructuredResponse>(
         &mut self,
         thread_id: &str,
         turn_id: &str,
         allowed_source_refs: &[String],
-    ) -> Result<StructuredOutcome, CodexError> {
+    ) -> Result<T, CodexError> {
         let deadline = Instant::now() + TURN_TIMEOUT;
         let mut turn = TurnAccumulator::default();
         loop {
@@ -645,7 +860,7 @@ impl CodexClient {
                                 return self.fail(CodexError::Protocol("multiple final answers"));
                             }
                         };
-                        return StructuredOutcome::parse_and_validate(text, allowed_source_refs);
+                        return T::parse_response(text, allowed_source_refs);
                     }
                     "error" => {
                         validate_turn_identity(&params, thread_id, turn_id)?;
@@ -804,8 +1019,12 @@ fn request_allowed(
     security_config_verified || method == "config/read"
 }
 
-fn validate_thread(result: &Value, expected_cwd: &str) -> Result<(), CodexError> {
-    if result.get("model").and_then(Value::as_str) != Some(REQUIRED_MODEL)
+fn validate_thread(
+    result: &Value,
+    expected_cwd: &str,
+    expected_model: &str,
+) -> Result<(), CodexError> {
+    if result.get("model").and_then(Value::as_str) != Some(expected_model)
         || result.get("modelProvider").and_then(Value::as_str) != Some("openai")
         || result.get("cwd").and_then(Value::as_str) != Some(expected_cwd)
         || result.get("approvalPolicy").and_then(Value::as_str) != Some("never")
@@ -1161,7 +1380,10 @@ fn validate_passive_turn_payload(method: &str, params: &Value) -> Result<(), Cod
 }
 
 fn validate_safety_buffering(params: &Value) -> Result<(), CodexError> {
-    if params.get("model").and_then(Value::as_str) != Some(REQUIRED_MODEL)
+    if !params
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(valid_model_identifier)
         || params
             .get("showBufferingUi")
             .and_then(Value::as_bool)
@@ -1180,6 +1402,27 @@ fn validate_safety_buffering(params: &Value) -> Result<(), CodexError> {
         ));
     }
     Ok(())
+}
+
+fn selected_model_matches_catalog(model: &GptModel, selected: &SelectedModel) -> bool {
+    match &selected.reasoning_effort {
+        Some(effort) => {
+            !model.supported_reasoning_efforts.is_empty()
+                && model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|candidate| candidate == effort)
+        }
+        None => model.supported_reasoning_efforts.is_empty(),
+    }
+}
+
+fn valid_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_stream_item_id(params: &Value) -> Result<(), CodexError> {
@@ -1787,10 +2030,11 @@ mod tests {
         AccountState, CODEX_BINARY_SHA256, CODEX_CODE_MODE_HOST_SHA256, CODEX_PACKAGE_SHA256,
         CODEX_RG_SHA256, CODEX_VERSION, CodexClient, CodexError, CodexRuntimeConfig,
         MAX_PASSIVE_DELTA_BYTES, MAX_PASSIVE_TURN_NOTIFICATIONS, MAX_TURN_ACCUMULATED_TEXT_BYTES,
-        MAX_TURN_ITEM_ID_BYTES, MAX_TURN_ITEMS, OutcomeRequest, RuntimePurpose, TurnAccumulator,
-        TurnValidationPhase, inspect_item, request_allowed, sanitized_turn_error_class,
-        validate_effective_security_config, validate_item_lifecycle_notification,
-        validate_passive_turn_notification, validate_thread, validate_turn,
+        MAX_TURN_ITEM_ID_BYTES, MAX_TURN_ITEMS, OutcomeRequest, RuntimePurpose, SelectedModel,
+        TurnAccumulator, TurnValidationPhase, inspect_item, request_allowed,
+        sanitized_turn_error_class, validate_effective_security_config,
+        validate_item_lifecycle_notification, validate_passive_turn_notification, validate_thread,
+        validate_turn,
     };
     use crate::wire::Transport;
     use serde_json::{Value, json};
@@ -1806,15 +2050,15 @@ mod tests {
             "approvalPolicy": "never",
             "cwd": "/tmp/model-input",
             "instructionSources": [],
-            "model": "gpt-5.6-sol",
+            "model": "gpt-test-model",
             "modelProvider": "openai",
             "sandbox": {"networkAccess": false, "type": "readOnly"},
             "thread": {"id": "thread-1"}
         });
-        validate_thread(&good, "/tmp/model-input").unwrap();
+        validate_thread(&good, "/tmp/model-input", "gpt-test-model").unwrap();
         let mut changed = good;
         changed["sandbox"]["networkAccess"] = json!(true);
-        assert!(validate_thread(&changed, "/tmp/model-input").is_err());
+        assert!(validate_thread(&changed, "/tmp/model-input", "gpt-test-model").is_err());
     }
 
     #[test]
@@ -2002,7 +2246,7 @@ mod tests {
                 "model/safetyBuffering/updated",
                 json!({
                     "fasterModel": null,
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-test-model",
                     "reasons": [],
                     "showBufferingUi": false,
                     "threadId": thread_id,
@@ -2602,16 +2846,32 @@ mod tests {
             initialized: true,
             purpose: RuntimePurpose::Model,
         };
+        let developer_instructions = format!(
+            "OpenOpen persona openopen.nondev.default / draft-03-en; aggregate={}. Return only the requested JSON.",
+            "b".repeat(64)
+        );
         let request = OutcomeRequest {
             prompt: "synthetic bounded prompt".to_owned(),
             allowed_source_refs: vec![],
+            selected_model: Some(SelectedModel {
+                model_id: "gpt-example".to_owned(),
+                reasoning_effort: None,
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            }),
+            persona_revision: openopen_protocol::PersonaRevisionRef {
+                persona_id: "openopen.nondev.default".to_owned(),
+                revision: "draft-03-en".to_owned(),
+                aggregate_digest: "b".repeat(64),
+                instructions_digest: format!(
+                    "{:x}",
+                    Sha256::digest(developer_instructions.as_bytes())
+                ),
+            },
+            developer_instructions,
         };
-        let result = client.start_turn_and_collect_outcome(
-            "thread-1",
-            &model_workspace_string,
-            &request,
-            &[],
-        );
+        let result: Result<super::StructuredOutcome, CodexError> =
+            client.start_turn_and_collect("thread-1", &model_workspace_string, &request);
         assert!(matches!(
             result,
             Err(CodexError::Protocol("incomplete turn items"))

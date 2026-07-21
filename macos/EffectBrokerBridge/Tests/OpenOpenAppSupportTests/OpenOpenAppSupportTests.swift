@@ -33,11 +33,50 @@ private func descendants(of root: NSView) -> [NSView] {
   [root] + root.subviews.flatMap { descendants(of: $0) }
 }
 
+@Test
+func choiceIMessageReplyPreviewIsExactAndRejectsHiddenOrMalformedAuthorityFields() throws {
+  let preview = ChoiceIMessageReplyPreview(
+    replyId: "choice-imessage-reply-1",
+    previewRevision: 2,
+    destination: "Your selected iMessage self-chat",
+    visibleBody: "OpenOpen · AI\nA — Review\nD — Something else",
+    confirmationDigest: String(repeating: "a", count: 64)
+  )
+  #expect(try preview.validated() == preview)
+  let encoded = try JSONEncoder().encode(
+    AuthorizeChoiceIMessageReplyParameters(
+      preview: preview,
+      proof: BrokerRuntimeState(
+        authorization: RuntimeControlAuthorization(
+          protocolVersion: 1,
+          enabled: true,
+          revision: 1,
+          updatedAtMs: 1,
+          coreKeyId: String(repeating: "c", count: 64),
+          authorizationSignatureHex: String(repeating: "a", count: 128)),
+        receipt: RuntimeControlReceipt(
+          protocolVersion: 1,
+          authorizationHash: String(repeating: "b", count: 64),
+          checkpointNonce: String(repeating: "e", count: 64),
+          requestNonce: nil,
+          brokerKeyId: String(repeating: "c", count: 64),
+          brokerSignatureHex: String(repeating: "d", count: 128))
+      )
+    ))
+  let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+  #expect(object["replyId"] as? String == preview.replyId)
+  #expect(object["explicitlyApproved"] as? Bool == true)
+  #expect(object["body"] == nil)
+  #expect(object["recipient"] == nil)
+  #expect(object["channel"] == nil)
+  #expect(object["sessionId"] == nil)
+}
+
 @MainActor
 private func dashboardOutcomeField(in root: NSView) -> NSTextField? {
   descendants(of: root)
     .compactMap { $0 as? NSTextField }
-    .first { $0.placeholderString == "What outcome would help right now?" }
+    .first { $0.placeholderString == "Tell OpenOpen what you want to sort out…" }
 }
 
 @MainActor
@@ -114,6 +153,72 @@ private func testConfirmedMission(
     reminderDispatch: reminderDispatch,
     reminderLinks: reminderLinks
   )
+}
+
+private func testChoiceConfirmedMission(
+  confirmation: ChoiceConsolidatedConfirmation,
+  dispatch: [ConfirmedReminderDispatch]
+) -> ConfirmedMission {
+  let missionId = "choice-mission-1"
+  let target = ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1")
+  let workItems = confirmation.reminderItems.map {
+    MissionWorkItem(id: $0.id, title: $0.text)
+  }
+  var payload = Data("OPENOPEN_REMINDER_WRITE_V2\0".utf8)
+  func append(_ value: String) {
+    let bytes = Data(value.utf8)
+    var count = UInt64(bytes.count).bigEndian
+    withUnsafeBytes(of: &count) { payload.append(contentsOf: $0) }
+    payload.append(bytes)
+  }
+  append(missionId)
+  append(confirmation.id)
+  append(confirmation.payloadDigest)
+  append(confirmation.reminderPayloadDigest)
+  append(ReminderWriteAuthorization.logicalListId)
+  append(target.sourceIdentifier)
+  append(target.calendarIdentifier)
+  for item in confirmation.reminderItems {
+    append(item.id)
+    append(item.text)
+    var dueAtMs = UInt64(bitPattern: item.dueAtMs).bigEndian
+    withUnsafeBytes(of: &dueAtMs) { payload.append(contentsOf: $0) }
+    append(item.timeZone)
+    append(item.evidenceIntent)
+  }
+  let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+  return ConfirmedMission(
+    missionId: missionId, title: confirmation.goal, workItems: workItems,
+    reminderAuthorization: ReminderWriteAuthorization(
+      missionId: missionId, listId: ReminderWriteAuthorization.logicalListId,
+      payloadSha256: digest, approvalId: "choice-approval-1",
+      approvalDigest: String(repeating: "a", count: 64), target: target,
+      writeDisposition: .recoverOnly),
+    reminderDispatch: dispatch, reminderLinks: [], choiceConfirmationId: confirmation.id,
+    choicePayloadDigest: confirmation.payloadDigest,
+    choiceReminderPayloadDigest: confirmation.reminderPayloadDigest,
+    choiceReminderItems: confirmation.reminderItems)
+}
+
+/// Historical dashboard state may contain an already-durable suggestion from
+/// before the Choice loop. Keep recovery coverage explicit: this fixture never
+/// drives the retired prompt-to-Outcome UI path.
+@MainActor
+private func restoreLegacySuggestionForRecovery(
+  _ core: MockCore,
+  model: AppModel,
+  identifier: String = testSuggestionOneId
+) async {
+  let first = identifier == testSuggestionOneId
+  let suggestion = OutcomeSuggestion(
+    id: identifier,
+    title: first ? "Plan the day" : "Plan tomorrow",
+    whyNow: "Recovered durable state.",
+    proposedSteps: [first ? "Pick one priority" : "Choose tomorrow's priority"],
+    sourceRefs: []
+  )
+  await core.restoreFromDashboard(mission: nil, receipt: nil, suggestion: suggestion)
+  await model.refreshDashboard()
 }
 
 private func testChannelRouteSet(
@@ -301,6 +406,8 @@ private struct TestChannelSend: Equatable, Sendable {
 }
 
 private actor MockCore: CoreServing {
+  nonisolated var permitsDeferredChannelTestRoutes: Bool { true }
+  nonisolated var permitsIMessageSelfChatRoutes: Bool { true }
   var control = RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0)
   let dashboardDelay: Duration
   let dashboardFails: Bool
@@ -359,6 +466,43 @@ private actor MockCore: CoreServing {
   var dashboardChannelRouteSetAfterNextConfirmation: ChannelRouteSet?
   var dashboardOverride: DashboardState?
   var rejectNextDashboardRead = false
+  var choiceLoopResponse: ChoiceLoopSnapshot?
+  var personaStatusResponse: PersonaStatusView?
+  var choiceReminderScheduleResponse: ChoiceReminderSchedule?
+  var nextChoiceReminderScheduleReadError: CoreClientError?
+  var choiceReminderScheduleInputs: [ChoiceReminderScheduleInput] = []
+  var choiceConfirmationResponse: ChoiceConsolidatedConfirmation?
+  var choiceIMessageReplyPreviewResponse: ChoiceIMessageReplyPreview?
+  var choiceIMessageReplyPrepareStatus = "prepared"
+  var choiceIMessageReplyAuthorizations: [ChoiceIMessageReplyPreview] = []
+  var choiceMarkdownReceiptCleanupAvailable = false
+  var choiceMarkdownReceiptCleanupCount = 0
+  var choiceCancellationResponse: ChoiceLoopSnapshot?
+  var nextChoiceCancellationErrorAfterAcceptance: CoreClientError?
+  var choiceBeginAccepted: ChoiceBeginAccepted?
+  var choiceBeginParameters: [ChoiceBeginParameters] = []
+  var choiceSelections: [ChoiceSelection] = []
+  var choiceDInputs: [ChoiceDInput] = []
+  var nextChoiceDInputError: CoreClientError?
+  var nextChoiceDInputErrorAfterAcceptance: CoreClientError?
+  var beforeNextChoiceDInputErrorAfterAcceptance: (@Sendable () -> Void)?
+  var nextChoiceDUnexpectedResponseAfterAcceptance: ChoiceLoopSnapshot?
+  var choiceResumeCount = 0
+  var choiceResumeResponse: ChoiceLoopSnapshot?
+  var nextChoiceResumeErrorAfterAcceptance: CoreClientError?
+  var choiceCallTrace: [String] = []
+  var choiceConfirmationPrepareCount = 0
+  var choiceConfirmations: [ChoiceConsolidatedConfirmation] = []
+  var choiceReminderMissionResponse: ConfirmedMission?
+  var choiceReminderDispatchStartResponse: ReminderDispatchStart?
+  var choiceReminderAbortCount = 0
+  var loseNextChoiceReminderAbortResponseAfterCommit = false
+  var choiceReminderAbortFailuresRemaining = 0
+  var rejectNextChoiceLoopRead = false
+  var choiceLoopReadFailuresRemaining = 0
+  var nextChoiceLoopReadError: CoreClientError?
+  var rejectNextChoiceMarkdownReconcile = false
+  var nextChoiceLoopGate: NonCooperativeRpcGate?
   var channelFailureAcknowledgementCount = 0
   var rejectNextChannelFailureAcknowledgement = false
   var rejectedChannelFailureIncidentIds = Set<String>()
@@ -423,6 +567,8 @@ private actor MockCore: CoreServing {
   var loginAwaitCount = 0
   var loginCompleted: Bool
   var modelCatalog: [GptModel]
+  var persistedModelSelection: ModelSelection?
+  var modelSelectionWriteCount = 0
   var loginAuthURL = "https://example.invalid"
   var rejectNextLoginAwait = false
   var rejectNextCodexPrepare = false
@@ -433,7 +579,7 @@ private actor MockCore: CoreServing {
     loginCompleted: Bool = true,
     modelCatalog: [GptModel] = [
       GptModel(
-        id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol",
+        id: "gpt-test-model", displayName: "Test model",
         supportedReasoningEfforts: ["high"])
     ]
   ) {
@@ -441,6 +587,42 @@ private actor MockCore: CoreServing {
     self.dashboardFails = dashboardFails
     self.loginCompleted = loginCompleted
     self.modelCatalog = modelCatalog
+    persistedModelSelection = loginCompleted ? Self.selection(for: modelCatalog) : nil
+  }
+
+  private static func catalogBinding(for models: [GptModel]) -> (
+    fingerprint: String, revision: UInt64
+  ) {
+    let value = models.map { model in
+      "\(model.id)\u{0}\(model.displayName)\u{0}\(model.supportedReasoningEfforts.joined(separator: "\u{0}"))"
+    }.joined(separator: "\u{1}")
+    let fingerprint = SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }
+      .joined()
+    let revision = UInt64(fingerprint.prefix(16), radix: 16) ?? 1
+    return (fingerprint, revision)
+  }
+
+  private static func catalogSnapshotId(
+    for binding: (fingerprint: String, revision: UInt64)
+  ) -> String {
+    let value = "mock-catalog-snapshot\u{0}\(binding.fingerprint)\u{0}\(binding.revision)"
+    return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  private static func selection(for models: [GptModel]) -> ModelSelection? {
+    guard let model = models.first else { return nil }
+    let binding = catalogBinding(for: models)
+    let effort = model.supportedReasoningEfforts.first ?? "not_applicable"
+    return ModelSelection(
+      id: "mock-selection-\(model.id)",
+      modelId: model.id,
+      requestedEffort: effort,
+      actualEffort: effort,
+      catalogFingerprint: binding.fingerprint,
+      catalogRevision: binding.revision,
+      accountDisplayClass: "chatgpt:plus",
+      protocolSchemaRevision: 1
+    )
   }
 
   func beginCoreGenerationFence() throws -> CoreGenerationFence {
@@ -626,6 +808,87 @@ private actor MockCore: CoreServing {
     rejectNextDashboardRead = true
   }
 
+  func setChoiceLoopSnapshot(_ snapshot: ChoiceLoopSnapshot?) {
+    choiceLoopResponse = snapshot
+  }
+
+  func setChoiceResumeResponse(_ snapshot: ChoiceLoopSnapshot?) {
+    choiceResumeResponse = snapshot
+  }
+
+  func failNextChoiceDInput(with error: CoreClientError) {
+    nextChoiceDInputError = error
+  }
+
+  func failNextChoiceDInputAfterAcceptance(
+    with error: CoreClientError, beforeThrow: (@Sendable () -> Void)? = nil
+  ) {
+    nextChoiceDInputErrorAfterAcceptance = error
+    beforeNextChoiceDInputErrorAfterAcceptance = beforeThrow
+  }
+
+  func returnUnexpectedChoiceDResponseAfterAcceptance(_ snapshot: ChoiceLoopSnapshot) {
+    nextChoiceDUnexpectedResponseAfterAcceptance = snapshot
+  }
+
+  func clearChoiceCallTrace() { choiceCallTrace = [] }
+
+  func setChoiceReminderSchedule(_ schedule: ChoiceReminderSchedule?) {
+    choiceReminderScheduleResponse = schedule
+  }
+
+  func failNextChoiceReminderScheduleRead(with error: CoreClientError) {
+    nextChoiceReminderScheduleReadError = error
+  }
+
+  func setChoiceConfirmationResponse(_ confirmation: ChoiceConsolidatedConfirmation?) {
+    choiceConfirmationResponse = confirmation
+  }
+
+  func recordedChoiceReminderScheduleInputs() -> [ChoiceReminderScheduleInput] {
+    choiceReminderScheduleInputs
+  }
+
+  func setChoiceMarkdownReceiptCleanupAvailable(_ available: Bool) {
+    choiceMarkdownReceiptCleanupAvailable = available
+  }
+
+  func setChoiceBeginAccepted(_ accepted: ChoiceBeginAccepted?) {
+    choiceBeginAccepted = accepted
+  }
+
+  func setChoiceCancellationResponse(_ snapshot: ChoiceLoopSnapshot?) {
+    choiceCancellationResponse = snapshot
+  }
+
+  func failNextChoiceCancellationAfterAcceptance(with error: CoreClientError) {
+    nextChoiceCancellationErrorAfterAcceptance = error
+  }
+
+  func failNextChoiceResumeAfterAcceptance(with error: CoreClientError) {
+    nextChoiceResumeErrorAfterAcceptance = error
+  }
+
+  func failNextChoiceLoopRead() {
+    rejectNextChoiceLoopRead = true
+  }
+
+  func failNextChoiceLoopReadAttempts(_ count: Int) {
+    choiceLoopReadFailuresRemaining = max(0, count)
+  }
+
+  func failNextChoiceLoopRead(with error: CoreClientError) {
+    nextChoiceLoopReadError = error
+  }
+
+  func failNextChoiceMarkdownReconcile() {
+    rejectNextChoiceMarkdownReconcile = true
+  }
+
+  func blockNextChoiceLoopRead(on gate: NonCooperativeRpcGate) {
+    nextChoiceLoopGate = gate
+  }
+
   func setLoginCompleted(_ completed: Bool) {
     loginCompleted = completed
   }
@@ -778,6 +1041,350 @@ private actor MockCore: CoreServing {
       needsYou: dashboardNeedsYou,
       receipt: dashboardReceipt
     )
+  }
+
+  func choiceLoop() async throws -> ChoiceLoopSnapshot? {
+    // Freeze the response at request admission. A noncooperative blocked RPC
+    // represents an already-issued Core response; later-generation reads may
+    // observe newer Store state without rewriting that older response.
+    let response = choiceLoopResponse
+    let gate = nextChoiceLoopGate
+    nextChoiceLoopGate = nil
+    try await gate?.wait()
+    if let error = nextChoiceLoopReadError {
+      nextChoiceLoopReadError = nil
+      throw error
+    }
+    if choiceLoopReadFailuresRemaining > 0 {
+      choiceLoopReadFailuresRemaining -= 1
+      throw CoreClientError.contractViolation("Choice continuity refresh failed closed.")
+    }
+    if rejectNextChoiceLoopRead {
+      rejectNextChoiceLoopRead = false
+      throw CoreClientError.contractViolation("Choice continuity refresh failed closed.")
+    }
+    return response
+  }
+
+  func prepareChoiceIMessageReply(proof _: BrokerRuntimeState) throws
+    -> ChoiceIMessageReplyPrepareResponse
+  {
+    guard let choiceIMessageReplyPreviewResponse else {
+      throw CoreClientError.contractViolation("No Choice iMessage reply is prepared.")
+    }
+    return ChoiceIMessageReplyPrepareResponse(
+      preview: choiceIMessageReplyPreviewResponse,
+      status: choiceIMessageReplyPrepareStatus)
+  }
+
+  func authorizeChoiceIMessageReply(
+    _ preview: ChoiceIMessageReplyPreview, proof _: BrokerRuntimeState
+  ) -> ChoiceIMessageReplyResponse {
+    choiceIMessageReplyAuthorizations.append(preview)
+    return ChoiceIMessageReplyResponse(status: "sent", recoveryOnly: nil)
+  }
+
+  func personaStatus() -> PersonaStatusView? { personaStatusResponse }
+
+  func setPersonaStatus(_ status: PersonaStatusView?) { personaStatusResponse = status }
+
+  func choiceReminderSchedule() async throws -> ChoiceReminderSchedule? {
+    if let error = nextChoiceReminderScheduleReadError {
+      nextChoiceReminderScheduleReadError = nil
+      throw error
+    }
+    return choiceReminderScheduleResponse
+  }
+
+  func recordChoiceReminderSchedule(
+    _ input: ChoiceReminderScheduleInput, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceReminderSchedule {
+    choiceReminderScheduleInputs.append(input)
+    if let current = choiceReminderScheduleResponse, current.input == input { return current }
+    let revision = (choiceReminderScheduleResponse?.revision ?? 0) + 1
+    let schedule = ChoiceReminderSchedule(
+      id: "schedule-\(revision)", input: input, revision: revision,
+      acceptedAtMs: Int64(Date().timeIntervalSince1970 * 1_000))
+    choiceReminderScheduleResponse = schedule
+    return schedule
+  }
+
+  func prepareChoiceConfirmation(proof _: BrokerRuntimeState) async throws
+    -> ChoiceConsolidatedConfirmation
+  {
+    choiceConfirmationPrepareCount += 1
+    guard let choiceConfirmationResponse else {
+      throw CoreClientError.contractViolation("Choice confirmation was not configured.")
+    }
+    return choiceConfirmationResponse
+  }
+
+  func authorizeChoiceReminders(
+    confirmationId _: String, reminderTarget _: ReminderTarget, proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    guard let choiceReminderMissionResponse else {
+      throw CoreClientError.contractViolation("Choice Reminder Mission was not configured.")
+    }
+    dashboardConfirmedMission = choiceReminderMissionResponse
+    return choiceReminderMissionResponse
+  }
+
+  func setChoiceReminderMission(_ mission: ConfirmedMission, executeNow: Bool) {
+    choiceReminderMissionResponse = mission
+    choiceReminderDispatchStartResponse = ReminderDispatchStart(
+      mission: mission, executeNow: executeNow)
+  }
+
+  func loseNextChoiceReminderAbortResponse() {
+    loseNextChoiceReminderAbortResponseAfterCommit = true
+  }
+
+  func failNextChoiceReminderAbortResponses(_ count: Int) {
+    choiceReminderAbortFailuresRemaining = count
+  }
+
+  func beginChoiceReminderDispatch(
+    confirmationId _: String, proof _: BrokerRuntimeState
+  ) async throws -> ReminderDispatchStart {
+    guard let response = choiceReminderDispatchStartResponse else {
+      throw CoreClientError.contractViolation("Choice Reminder dispatch was not configured.")
+    }
+    if response.executeNow {
+      choiceReminderDispatchStartResponse = ReminderDispatchStart(
+        mission: response.mission, executeNow: false)
+    }
+    return response
+  }
+
+  func abortChoiceReminderDispatchBeforeCommit(
+    confirmationId _: String, proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    choiceReminderAbortCount += 1
+    guard let choiceReminderMissionResponse else {
+      throw CoreClientError.contractViolation("Choice Reminder Mission was not configured.")
+    }
+    if choiceReminderAbortFailuresRemaining > 0 {
+      choiceReminderAbortFailuresRemaining -= 1
+      throw CoreClientError.contractViolation(
+        "Choice Reminder abort was temporarily unavailable.")
+    }
+    choiceReminderDispatchStartResponse = ReminderDispatchStart(
+      mission: choiceReminderMissionResponse, executeNow: true)
+    if loseNextChoiceReminderAbortResponseAfterCommit {
+      loseNextChoiceReminderAbortResponseAfterCommit = false
+      throw CoreClientError.contractViolation(
+        "Choice Reminder abort response was lost after commit.")
+    }
+    return choiceReminderMissionResponse
+  }
+
+  func recordChoiceReminderMirror(
+    confirmationId _: String, links: [ReminderLink], proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    guard let dispatched = choiceReminderMissionResponse else {
+      throw CoreClientError.contractViolation("Choice Reminder dispatch was not configured.")
+    }
+    let mission = ConfirmedMission(
+      missionId: dispatched.missionId, title: dispatched.title,
+      workItems: dispatched.workItems,
+      reminderAuthorization: dispatched.reminderAuthorization,
+      reminderDispatch: dispatched.reminderDispatch, reminderLinks: links,
+      choiceConfirmationId: dispatched.choiceConfirmationId,
+      choicePayloadDigest: dispatched.choicePayloadDigest,
+      choiceReminderPayloadDigest: dispatched.choiceReminderPayloadDigest,
+      choiceReminderItems: dispatched.choiceReminderItems)
+    choiceReminderMissionResponse = mission
+    choiceReminderDispatchStartResponse = ReminderDispatchStart(
+      mission: mission, executeNow: false)
+    dashboardConfirmedMission = mission
+    return mission
+  }
+
+  func choiceMarkdownReceiptCleanupAvailability() async throws
+    -> ChoiceMarkdownReceiptCleanupAvailability
+  {
+    ChoiceMarkdownReceiptCleanupAvailability(available: choiceMarkdownReceiptCleanupAvailable)
+  }
+
+  func cleanupChoiceMarkdownReceipt() async throws -> ChoiceLoopSnapshot {
+    choiceMarkdownReceiptCleanupCount += 1
+    guard let choiceLoopResponse else {
+      throw CoreClientError.contractViolation("Choice Markdown cleanup was not configured.")
+    }
+    return choiceLoopResponse
+  }
+
+  func choiceMarkdownReceiptCleanupInvocations() -> Int {
+    choiceMarkdownReceiptCleanupCount
+  }
+
+  func reconcileChoiceMarkdown(proof _: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    if rejectNextChoiceMarkdownReconcile {
+      rejectNextChoiceMarkdownReconcile = false
+      throw CoreClientError.contractViolation("Choice Markdown journal is unavailable.")
+    }
+    guard let choiceLoopResponse else {
+      throw CoreClientError.contractViolation("Choice Markdown journal was not configured.")
+    }
+    return choiceLoopResponse
+  }
+
+  func beginChoice(_ parameters: ChoiceBeginParameters) async throws -> ChoiceBeginAccepted {
+    choiceBeginParameters.append(parameters)
+    guard let choiceBeginAccepted else {
+      throw CoreClientError.contractViolation("Choice begin was not configured.")
+    }
+    return choiceBeginAccepted
+  }
+
+  func selectChoice(_ selection: ChoiceSelection, proof _: BrokerRuntimeState) async throws
+    -> ChoiceLoopSnapshot
+  {
+    choiceSelections.append(selection)
+    guard let choiceLoopResponse else {
+      throw CoreClientError.contractViolation("Choice selection was not configured.")
+    }
+    if choiceLoopResponse.session.state == "refining" {
+      let session = choiceLoopResponse.session
+      return ChoiceLoopSnapshot(
+        session: ChoiceSession(
+          id: session.id, state: session.state, revision: session.revision,
+          modelSelectionState: session.modelSelectionState,
+          communicationProfileRevision: session.communicationProfileRevision,
+          activeChoiceSetId: session.activeChoiceSetId,
+          activeInterpretationRevision: session.activeInterpretationRevision,
+          openedAtMs: session.openedAtMs, lastInputAtMs: selection.selectedAtMs,
+          softIdleAtMs: selection.selectedAtMs + 1_800_000,
+          staleReviewAtMs: selection.selectedAtMs + 86_400_000,
+          primaryDeliveryBindingId: session.primaryDeliveryBindingId,
+          pendingConfirmationId: session.pendingConfirmationId,
+          backgroundMissionIds: session.backgroundMissionIds),
+        activeBatch: choiceLoopResponse.activeBatch,
+        interpretation: choiceLoopResponse.interpretation,
+        activeChoiceSet: choiceLoopResponse.activeChoiceSet, lastSelection: selection,
+        pendingRefinementOperation: choiceLoopResponse.pendingRefinementOperation.map {
+          ChoiceRefinementOperation(
+            id: $0.id, selectionId: selection.id, choiceSessionId: $0.choiceSessionId,
+            sourceEnvelopeId: $0.sourceEnvelopeId,
+            conversationTurnBatchId: $0.conversationTurnBatchId,
+            expectedSessionRevision: $0.expectedSessionRevision,
+            expectedGeneration: $0.expectedGeneration, modelProvenance: $0.modelProvenance,
+            sourceManifestDigest: $0.sourceManifestDigest, personaRevision: $0.personaRevision,
+            dRequestId: $0.dRequestId,
+            dInputDigest: $0.dInputDigest, createdAtMs: $0.createdAtMs)
+        },
+        confirmation: choiceLoopResponse.confirmation,
+        documentManifest: choiceLoopResponse.documentManifest)
+    }
+    return choiceLoopResponse
+  }
+
+  func selectChoiceD(
+    _ input: ChoiceDInput, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    choiceDInputs.append(input)
+    if let nextChoiceDInputError {
+      self.nextChoiceDInputError = nil
+      throw nextChoiceDInputError
+    }
+    if let error = nextChoiceDInputErrorAfterAcceptance {
+      nextChoiceDInputErrorAfterAcceptance = nil
+      let beforeThrow = beforeNextChoiceDInputErrorAfterAcceptance
+      beforeNextChoiceDInputErrorAfterAcceptance = nil
+      guard let snapshot = choiceLoopResponse,
+        let operation = snapshot.pendingRefinementOperation
+      else {
+        throw CoreClientError.contractViolation("Choice D response loss was not configured.")
+      }
+      let acceptedOperation = ChoiceRefinementOperation(
+        id: operation.id, selectionId: operation.selectionId,
+        choiceSessionId: operation.choiceSessionId,
+        sourceEnvelopeId: operation.sourceEnvelopeId,
+        conversationTurnBatchId: operation.conversationTurnBatchId,
+        expectedSessionRevision: operation.expectedSessionRevision,
+        expectedGeneration: operation.expectedGeneration,
+        modelProvenance: operation.modelProvenance,
+        sourceManifestDigest: operation.sourceManifestDigest,
+        personaRevision: operation.personaRevision,
+        dRequestId: input.requestId,
+        dInputDigest: String(repeating: "a", count: 64), createdAtMs: operation.createdAtMs)
+      choiceLoopResponse = ChoiceLoopSnapshot(
+        session: snapshot.session, activeBatch: snapshot.activeBatch,
+        interpretation: snapshot.interpretation, activeChoiceSet: snapshot.activeChoiceSet,
+        lastSelection: snapshot.lastSelection, pendingRefinementOperation: acceptedOperation,
+        confirmation: snapshot.confirmation, documentManifest: snapshot.documentManifest)
+      beforeThrow?()
+      // Let an injected Core-termination event advance AppModel's generation
+      // before the old RPC returns its ambiguous transport error.
+      await Task.yield()
+      throw error
+    }
+    if let unexpected = nextChoiceDUnexpectedResponseAfterAcceptance {
+      nextChoiceDUnexpectedResponseAfterAcceptance = nil
+      guard let snapshot = choiceLoopResponse,
+        let operation = snapshot.pendingRefinementOperation
+      else {
+        throw CoreClientError.contractViolation("Choice D unexpected response was not configured.")
+      }
+      let acceptedOperation = ChoiceRefinementOperation(
+        id: operation.id, selectionId: operation.selectionId,
+        choiceSessionId: operation.choiceSessionId,
+        sourceEnvelopeId: operation.sourceEnvelopeId,
+        conversationTurnBatchId: operation.conversationTurnBatchId,
+        expectedSessionRevision: operation.expectedSessionRevision,
+        expectedGeneration: operation.expectedGeneration,
+        modelProvenance: operation.modelProvenance,
+        sourceManifestDigest: operation.sourceManifestDigest,
+        personaRevision: operation.personaRevision,
+        dRequestId: input.requestId,
+        dInputDigest: String(repeating: "a", count: 64), createdAtMs: operation.createdAtMs)
+      choiceLoopResponse = ChoiceLoopSnapshot(
+        session: snapshot.session, activeBatch: snapshot.activeBatch,
+        interpretation: snapshot.interpretation, activeChoiceSet: snapshot.activeChoiceSet,
+        lastSelection: snapshot.lastSelection, pendingRefinementOperation: acceptedOperation,
+        confirmation: snapshot.confirmation, documentManifest: snapshot.documentManifest)
+      return unexpected
+    }
+    guard let choiceLoopResponse else {
+      throw CoreClientError.contractViolation("Choice D selection was not configured.")
+    }
+    return choiceLoopResponse
+  }
+
+  func resumeChoice(proof _: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    choiceResumeCount += 1
+    choiceCallTrace.append("resume")
+    guard let choiceResumeResponse else {
+      throw CoreClientError.contractViolation("Choice resume was not configured.")
+    }
+    if let error = nextChoiceResumeErrorAfterAcceptance {
+      nextChoiceResumeErrorAfterAcceptance = nil
+      choiceLoopResponse = choiceResumeResponse
+      throw error
+    }
+    return choiceResumeResponse
+  }
+
+  func confirmChoice(
+    _ confirmation: ChoiceConsolidatedConfirmation, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    choiceConfirmations.append(confirmation)
+    guard let choiceLoopResponse else {
+      throw CoreClientError.contractViolation("Choice confirmation was not configured.")
+    }
+    return choiceLoopResponse
+  }
+
+  func cancelChoice(proof _: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    guard let choiceCancellationResponse else {
+      throw CoreClientError.contractViolation("Choice cancellation was not configured.")
+    }
+    if let error = nextChoiceCancellationErrorAfterAcceptance {
+      nextChoiceCancellationErrorAfterAcceptance = nil
+      choiceLoopResponse = choiceCancellationResponse
+      throw error
+    }
+    return choiceCancellationResponse
   }
 
   func pairChannel(_ pairing: ChannelPairing, proof _: BrokerRuntimeState) {
@@ -1173,16 +1780,87 @@ private actor MockCore: CoreServing {
     return loginCompleted ? modelCatalog : []
   }
 
-  func propose(prompt _: String, proof _: BrokerRuntimeState) -> OutcomeSuggestion {
-    proposalCount += 1
-    let isFirst = proposalCount == 1
-    return OutcomeSuggestion(
-      id: isFirst ? testSuggestionOneId : testSuggestionTwoId,
-      title: isFirst ? "Plan the day" : "Plan tomorrow",
-      whyNow: "It is morning",
-      proposedSteps: [isFirst ? "Pick one priority" : "Choose tomorrow's priority"],
-      sourceRefs: []
+  func modelSetup(proof: BrokerRuntimeState) -> ModelSetup {
+    proofNonces.append(proof.receipt.requestNonce ?? "")
+    choiceCallTrace.append("modelSetup")
+    guard loginCompleted else {
+      return ModelSetup(
+        account: .notConnected,
+        models: [],
+        selection: nil,
+        selectionStatus: .unselected,
+        catalogSnapshotId: String(repeating: "0", count: 64),
+        catalogFingerprint: String(repeating: "0", count: 64),
+        catalogRevision: 1
+      )
+    }
+    let binding = Self.catalogBinding(for: modelCatalog)
+    let current =
+      persistedModelSelection.flatMap { selection in
+        guard selection.catalogFingerprint == binding.fingerprint,
+          selection.catalogRevision == binding.revision,
+          selection.accountDisplayClass == "chatgpt:plus",
+          let model = modelCatalog.first(where: { $0.id == selection.modelId })
+        else { return false }
+        if selection.requestedEffort == "not_applicable" {
+          return selection.actualEffort == "not_applicable"
+            && model.supportedReasoningEfforts.isEmpty
+        }
+        return selection.actualEffort == selection.requestedEffort
+          && model.supportedReasoningEfforts.contains(selection.requestedEffort)
+      } ?? false
+    return ModelSetup(
+      account: .chatGpt(email: "owner@example.com", planType: "plus"),
+      models: modelCatalog,
+      selection: persistedModelSelection,
+      selectionStatus: persistedModelSelection == nil
+        ? .unselected : (current ? .current : .unavailable),
+      catalogSnapshotId: Self.catalogSnapshotId(for: binding),
+      catalogFingerprint: binding.fingerprint,
+      catalogRevision: binding.revision
     )
+  }
+
+  func selectModel(
+    modelId: String,
+    requestedEffort: String,
+    catalogSnapshotId: String,
+    catalogFingerprint: String,
+    catalogRevision: UInt64,
+    proof _: BrokerRuntimeState
+  ) throws -> ModelSelection {
+    guard loginCompleted,
+      let model = modelCatalog.first(where: { $0.id == modelId })
+    else {
+      throw CoreClientError.contractViolation("Mock model is unavailable.")
+    }
+    let validEffort =
+      model.supportedReasoningEfforts.isEmpty
+      ? requestedEffort == "not_applicable"
+      : model.supportedReasoningEfforts.contains(requestedEffort)
+    guard validEffort else {
+      throw CoreClientError.contractViolation("Mock effort is unavailable.")
+    }
+    let binding = Self.catalogBinding(for: modelCatalog)
+    guard catalogSnapshotId == Self.catalogSnapshotId(for: binding),
+      catalogFingerprint == binding.fingerprint,
+      catalogRevision == binding.revision
+    else {
+      throw CoreClientError.contractViolation("Mock catalog snapshot is stale.")
+    }
+    let selection = ModelSelection(
+      id: "mock-selection-\(modelId)",
+      modelId: modelId,
+      requestedEffort: requestedEffort,
+      actualEffort: requestedEffort,
+      catalogFingerprint: binding.fingerprint,
+      catalogRevision: binding.revision,
+      accountDisplayClass: "chatgpt:plus",
+      protocolSchemaRevision: 1
+    )
+    persistedModelSelection = selection
+    modelSelectionWriteCount += 1
+    return selection
   }
 
   func confirmSuggestion(
@@ -1213,6 +1891,10 @@ private actor MockCore: CoreServing {
     dashboardConfirmedMission = mission
     dashboardReceipt = nil
     dashboardNeedsYou = nil
+    // Consuming a recovered historical suggestion transitions durable
+    // dashboard state to the Mission. Leaving it behind would make a later
+    // Receipt contradictory rather than exercising the receipt route.
+    dashboardSuggestion = nil
     if let routeSet = dashboardChannelRouteSetAfterNextConfirmation {
       dashboardChannelRouteSetAfterNextConfirmation = nil
       dashboardChannelRouteSet = routeSet
@@ -1238,7 +1920,7 @@ private actor MockCore: CoreServing {
         id: "receipt-race",
         missionId: identifier,
         summary: "Completed before cancellation",
-        actualModel: "gpt-5.6-sol",
+        actualModel: "gpt-test-model",
         evidenceIds: ["evidence-race"],
         outputHashes: [],
         completedAtMs: 20
@@ -1292,7 +1974,7 @@ private actor MockCore: CoreServing {
       id: identifier == "mission-1" ? "receipt-1" : "receipt-2",
       missionId: identifier,
       summary: "Completed Plan the day",
-      actualModel: "gpt-5.6-sol",
+      actualModel: "gpt-test-model",
       evidenceIds: invalidCompletionReceipt
         ? [] : completions.map { "evidence-\($0.workItemId)" },
       outputHashes: [],
@@ -1455,15 +2137,6 @@ private actor FailClosedOffCore: CoreServing {
   }
   func awaitLogin(identifier _: String, proof _: BrokerRuntimeState) {}
   func models(proof _: BrokerRuntimeState) -> [GptModel] { [] }
-  func propose(prompt _: String, proof _: BrokerRuntimeState) -> OutcomeSuggestion {
-    OutcomeSuggestion(
-      id: testSuggestionOneId,
-      title: "Plan",
-      whyNow: "Now",
-      proposedSteps: ["One"],
-      sourceRefs: []
-    )
-  }
   func confirmSuggestion(
     identifier _: String, reminderTarget _: ReminderTarget
   ) throws -> ConfirmedMission {
@@ -1552,15 +2225,6 @@ private actor DelayedSwitchCore: CoreServing {
   }
   func awaitLogin(identifier _: String, proof _: BrokerRuntimeState) {}
   func models(proof _: BrokerRuntimeState) -> [GptModel] { [] }
-  func propose(prompt _: String, proof _: BrokerRuntimeState) -> OutcomeSuggestion {
-    OutcomeSuggestion(
-      id: testSuggestionOneId,
-      title: "Plan",
-      whyNow: "Now",
-      proposedSteps: ["One"],
-      sourceRefs: []
-    )
-  }
 }
 
 private actor MockBroker: BrokerRuntimeServing {
@@ -1778,6 +2442,7 @@ extension MockCore {
   }
   func setLoginAuthURL(_ value: String) { loginAuthURL = value }
   func setModelCatalog(_ value: [GptModel]) { modelCatalog = value }
+  func clearPersistedModelSelection() { persistedModelSelection = nil }
   func rejectNextLoginAwaitOperation() { rejectNextLoginAwait = true }
   func rejectNextModelRuntimePreparation() { rejectNextCodexPrepare = true }
   func loseNextCoreLeaseInstallResponse() { loseNextLeaseInstallResponse = true }
@@ -1825,14 +2490,19 @@ private final class MockReminders: RemindersServing {
   enum Mode {
     case complete
     case partial
+    case delayBeforeTarget
+    case waitPrecommitUntilCancelled
+    case tamperedMirror
     case failBeforeCommit
     case commitThenFailReadback
     case commitThenDelay
+    case cancelBeforeCommit
   }
 
   var mode: Mode
   private(set) var executeCount = 0
   private(set) var recoverCount = 0
+  private(set) var precommitCancelCount = 0
   private var storedLinks: [String: [ReminderLink]] = [:]
 
   init(mode: Mode = .complete) {
@@ -1840,12 +2510,27 @@ private final class MockReminders: RemindersServing {
   }
 
   func prepareTarget() async throws -> ReminderTarget {
-    ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1")
+    if mode == .delayBeforeTarget {
+      try await Task.sleep(for: .seconds(1))
+    }
+    return ReminderTarget(sourceIdentifier: "source-1", calendarIdentifier: "calendar-1")
   }
 
   func executeInitialMirror(_ start: ReminderDispatchStart) async throws -> [ReminderLink] {
     let mission = start.mission
     executeCount += 1
+    if mode == .waitPrecommitUntilCancelled {
+      do {
+        try await Task.sleep(for: .seconds(60))
+      } catch is CancellationError {
+        precommitCancelCount += 1
+        throw RemindersClientError.cancelledBeforeCommit
+      }
+    }
+    if mode == .cancelBeforeCommit {
+      precommitCancelCount += 1
+      throw RemindersClientError.cancelledBeforeCommit
+    }
     if mode == .failBeforeCommit {
       throw CoreClientError.contractViolation("Reminders access was denied.")
     }
@@ -1875,8 +2560,11 @@ private final class MockReminders: RemindersServing {
 
   func recoverMirror(for mission: ConfirmedMission) async throws -> [ReminderLink] {
     recoverCount += 1
+    if mode == .tamperedMirror {
+      throw RemindersClientError.reminderChanged(mission.title)
+    }
     guard let links = storedLinks[mission.missionId] else {
-      throw RemindersClientError.incompleteMirror(mission.title)
+      throw RemindersClientError.mirrorAbsent(mission.title)
     }
     return links
   }
@@ -2405,7 +3093,10 @@ func persistedOffWithTwoPairingsRestoresEverythingBeforePublishingOn() async thr
   #expect(model.discordStatus == "connected")
   #expect(await core.iMessageStartCount == 1)
   #expect(await core.discordSessionStartCount == 1)
-  #expect(await core.proofNonces.count == 2)
+  // Account, catalog, and durable-selection provenance arrive in one atomic
+  // Host snapshot. One fresh proof avoids a TOCTOU composition of separate
+  // account and catalog reads during protected On restoration.
+  #expect(await core.proofNonces.count == 1)
   #expect(await broker.appliedValues == [true])
   #expect(await core.channelPairings.count == 2)
   #expect(await core.proposalCount == 0)
@@ -2452,7 +3143,6 @@ func cursorBearingDiscordStartupDrainsTypedRecoveryBeforePublishingConnected() a
   #expect(await core.proposalCount == 0)
   #expect(await core.channelSends.isEmpty)
 
-  await model.updateEnabled(false)
 }
 
 @MainActor
@@ -2858,7 +3548,7 @@ func recoveredMissionParticipationOutsidePersistedRouteFailsClosed() async throw
 
 @MainActor
 @Test
-func protectedOnWaitsForManagedLoginAndRequiredModelBeforePublishingReady() async {
+func protectedOnRequiresAnExplicitModelAndEffortSelectionAfterManagedLogin() async {
   let core = MockCore(loginCompleted: false)
   let broker = MockBroker()
   let events = CoreTerminationEmitter()
@@ -2889,10 +3579,21 @@ func protectedOnWaitsForManagedLoginAndRequiredModelBeforePublishingReady() asyn
   await model.connectChatGpt()
 
   #expect(model.errorMessage == nil)
+  #expect(model.runtimeRecoveryState == .awaitingAccount)
+  #expect(model.runtimeDisplayState == .turningOn)
+  #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
+  #expect(model.availableModels.map(\.id) == ["gpt-test-model"])
+  #expect(model.selectedModelId.isEmpty)
+  #expect(!model.modelEntryEnabled)
+
+  model.chooseModel("gpt-test-model")
+  model.chooseModelEffort("high")
+  await model.persistSelectedModel()
+
+  #expect(model.errorMessage == nil)
   #expect(model.runtimeRecoveryState == .ready)
   #expect(model.runtimeDisplayState == .on)
-  #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
-  #expect(model.availableModels.map(\.id) == ["gpt-5.6-sol"])
+  #expect(model.modelSelectionStatus == .current)
   #expect(model.modelEntryEnabled)
   #expect(openedURLs.value.map(\.absoluteString) == ["https://example.invalid"])
   #expect(await broker.appliedValues == [true])
@@ -2932,11 +3633,11 @@ func protectedOffConvergesWithoutAccountOrModelReadiness() async {
 
 @MainActor
 @Test
-func protectedOnWaitsWhenTheRequiredSolModelIsMissingThenAcceptsFreshExactCatalog() async {
+func protectedOnWaitsForAnExplicitSelectionWhenTheCurrentCatalogChanges() async {
   let core = MockCore(
     modelCatalog: [
       GptModel(
-        id: "gpt-5.6-terra", displayName: "GPT-5.6 Terra",
+        id: "gpt-alternate-model", displayName: "Alternate test model",
         supportedReasoningEfforts: ["high"])
     ])
   let events = CoreTerminationEmitter()
@@ -2949,33 +3650,2279 @@ func protectedOnWaitsWhenTheRequiredSolModelIsMissingThenAcceptsFreshExactCatalo
 
   await model.updateEnabled(true)
 
-  #expect(model.runtimeRecoveryState == .awaitingAccount)
-  #expect(model.runtimeDisplayState == .turningOn)
-  #expect(model.accountSetupEnabled)
-  #expect(!model.modelEntryEnabled)
+  #expect(model.runtimeRecoveryState == .ready)
+  #expect(model.runtimeDisplayState == .on)
+  #expect(model.modelSelectionStatus == .current)
+  #expect(model.modelEntryEnabled)
 
   await core.setModelCatalog([
     GptModel(
-      id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol",
+      id: "gpt-test-model", displayName: "Test model",
       supportedReasoningEfforts: ["high"])
   ])
   await model.refreshAccountAndModels()
 
   #expect(model.errorMessage == nil)
+  #expect(model.runtimeRecoveryState == .awaitingAccount)
+  #expect(model.runtimeDisplayState == .turningOn)
+  #expect(model.modelSelectionStatus == .unavailable)
+  #expect(model.selectedModelId.isEmpty)
+  #expect(model.selectedModelEffort.isEmpty)
+  #expect(!model.modelEntryEnabled)
+
+  model.chooseModel("gpt-test-model")
+  model.chooseModelEffort("high")
+  await model.persistSelectedModel()
+
+  #expect(model.errorMessage == nil)
   #expect(model.runtimeRecoveryState == .ready)
   #expect(model.runtimeDisplayState == .on)
+  #expect(model.modelSelectionStatus == .current)
   #expect(model.modelEntryEnabled)
 }
 
 @MainActor
 @Test
-func protectedOnRejectsSolCatalogWithoutHighReasoning() async {
+func sameModelIdWithNewCatalogFingerprintRequiresASecondExplicitSelection() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.modelSelectionStatus == .current)
+  #expect(model.selectedModelId == "gpt-test-model")
+  let firstFingerprint = model.catalogFingerprint
+
+  await core.setModelCatalog([
+    GptModel(
+      id: "gpt-test-model", displayName: "Renamed test model",
+      supportedReasoningEfforts: ["high"])
+  ])
+  await model.refreshAccountAndModels()
+
+  #expect(model.catalogFingerprint != firstFingerprint)
+  #expect(model.modelSelectionStatus == .unavailable)
+  #expect(model.selectedModelId.isEmpty)
+  #expect(model.selectedModelEffort.isEmpty)
+  #expect(!model.modelEntryEnabled)
+
+  model.chooseModel("gpt-test-model")
+  model.chooseModelEffort("high")
+  await model.persistSelectedModel()
+
+  #expect(model.modelSelectionStatus == .current)
+  #expect(model.modelEntryEnabled)
+}
+
+@MainActor
+@Test
+func staleHostCatalogSnapshotCannotPersistASelection() async {
+  let core = MockCore()
+  await core.clearPersistedModelSelection()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.modelSelectionCanBeSaved == false)
+  model.chooseModel("gpt-test-model")
+  model.chooseModelEffort("high")
+  #expect(model.modelSelectionCanBeSaved)
+
+  // The visible draft still names the old catalog, but a changed Host-owned
+  // snapshot rejects it rather than trusting UI model metadata.
+  await core.setModelCatalog([
+    GptModel(
+      id: "gpt-test-model", displayName: "Changed after display",
+      supportedReasoningEfforts: ["high"])
+  ])
+  await model.persistSelectedModel()
+
+  #expect(model.errorMessage != nil)
+  #expect(await core.modelSelectionWriteCount == 0)
+  #expect(!model.modelEntryEnabled)
+
+  await model.refreshAccountAndModels()
+  #expect(model.modelSelectionStatus == .unselected)
+  #expect(model.selectedModelId.isEmpty)
+  #expect(model.selectedModelEffort.isEmpty)
+}
+
+@MainActor
+@Test
+func accountLossClearsDraftSelectionWithoutErasingDurableAuditState() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.modelSelectionStatus == .current)
+  #expect(model.selectedModelId == "gpt-test-model")
+
+  await core.setLoginCompleted(false)
+  await model.refreshAccountAndModels()
+
+  #expect(model.accountState == .notConnected)
+  #expect(model.modelSelectionStatus == .unselected)
+  #expect(model.selectedModelId.isEmpty)
+  #expect(model.selectedModelEffort.isEmpty)
+  #expect(!model.modelEntryEnabled)
+}
+
+@MainActor
+@Test
+func effortLabelsRemainDistinctForEverySupportedProtocolValue() async {
+  let model = AppModel(core: MockCore(), broker: MockBroker()) {}
+  let labels = ["low", "medium", "high", "xhigh", "max", "custom"]
+    .map { model.modelEffortLabel($0) }
+  #expect(Set(labels).count == labels.count)
+  #expect(model.modelEffortLabel("custom").contains("custom"))
+}
+
+@Test
+func choiceLoopReadContractRejectsReplayableTerminalState() throws {
+  let manifest = testChoiceLoopManifest()
+  let active = ChoiceSession(
+    id: "session-1", state: "active", revision: 1,
+    modelSelectionState: ChoiceModelSelectionState(
+      state: "unselected", modelProvenanceRef: nil, catalogRevision: nil, reason: nil),
+    communicationProfileRevision: 0, activeChoiceSetId: nil, activeInterpretationRevision: nil,
+    openedAtMs: 0, lastInputAtMs: 1, softIdleAtMs: 1_800_001,
+    staleReviewAtMs: 86_400_001, primaryDeliveryBindingId: nil,
+    pendingConfirmationId: nil, backgroundMissionIds: []
+  )
+  let valid = ChoiceLoopSnapshot(
+    session: active, activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: nil, confirmation: nil,
+    documentManifest: manifest)
+  _ = try valid.validated()
+
+  let terminal = ChoiceSession(
+    id: "session-1", state: "completed", revision: 1,
+    modelSelectionState: active.modelSelectionState, communicationProfileRevision: 0,
+    activeChoiceSetId: "choices-1", activeInterpretationRevision: nil,
+    openedAtMs: 0, lastInputAtMs: 1, softIdleAtMs: 1_800_001,
+    staleReviewAtMs: 86_400_001, primaryDeliveryBindingId: nil,
+    pendingConfirmationId: nil, backgroundMissionIds: []
+  )
+  let replayable = ChoiceLoopSnapshot(
+    session: terminal, activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: nil, confirmation: nil,
+    documentManifest: manifest)
+  #expect(throws: CoreClientError.self) { try replayable.validated() }
+
+  let terminalWithoutChoiceSet = ChoiceSession(
+    id: "session-1", state: "completed", revision: 2,
+    modelSelectionState: active.modelSelectionState, communicationProfileRevision: 0,
+    activeChoiceSetId: nil, activeInterpretationRevision: nil,
+    openedAtMs: 0, lastInputAtMs: 2, softIdleAtMs: 1_800_002,
+    staleReviewAtMs: 86_400_002, primaryDeliveryBindingId: nil,
+    pendingConfirmationId: nil, backgroundMissionIds: []
+  )
+  let replayableSelection = ChoiceLoopSnapshot(
+    session: terminalWithoutChoiceSet, activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: ChoiceSelection(
+      type: "optionSelection", id: "selection-1", choiceSessionId: "session-1",
+      choiceSetId: "choices-1", selectedOptionId: "option-1", dInputBatchId: nil,
+      expectedSessionRevision: 1, selectedAtMs: 2),
+    confirmation: nil, documentManifest: manifest)
+  #expect(throws: CoreClientError.self) { try replayableSelection.validated() }
+}
+
+@Test
+func choiceConfirmationDeliveryFieldsRequireOneCompleteBoundTuple() throws {
+  let session = ChoiceSession(
+    id: "session-1", state: "awaitingConfirmation", revision: 2,
+    modelSelectionState: ChoiceModelSelectionState(
+      state: "unselected", modelProvenanceRef: nil, catalogRevision: nil, reason: nil),
+    communicationProfileRevision: 0, activeChoiceSetId: nil, activeInterpretationRevision: nil,
+    openedAtMs: 0, lastInputAtMs: 1, softIdleAtMs: 1_800_001,
+    staleReviewAtMs: 86_400_001, primaryDeliveryBindingId: "binding-1",
+    pendingConfirmationId: "confirmation-1", backgroundMissionIds: []
+  )
+  let incomplete = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: nil, deliveryScope: nil)
+  let incompleteSnapshot = ChoiceLoopSnapshot(
+    session: session, activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: nil, confirmation: incomplete, documentManifest: testChoiceLoopManifest())
+  #expect(throws: CoreClientError.self) { try incompleteSnapshot.validated() }
+
+  let complete = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let completeSnapshot = ChoiceLoopSnapshot(
+    session: session, activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: nil, confirmation: complete, documentManifest: testChoiceLoopManifest())
+  _ = try completeSnapshot.validated()
+}
+
+@Test
+func choiceConfirmationSealBindsEachExactReminderField() {
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: nil, recipient: nil, deliveryScope: nil)
+  #expect(confirmation.canonicalPayloadDigest() == confirmation.payloadDigest)
+  #expect(confirmation.canonicalReminderPayloadDigest() == confirmation.reminderPayloadDigest)
+  #expect(confirmation.validated())
+  let changedItem = ChoiceReminderItem(
+    id: confirmation.reminderItems[0].id, text: confirmation.reminderItems[0].text,
+    dueAtMs: confirmation.reminderItems[0].dueAtMs + 1,
+    timeZone: confirmation.reminderItems[0].timeZone,
+    evidenceIntent: confirmation.reminderItems[0].evidenceIntent)
+  let changed = ChoiceConsolidatedConfirmation(
+    id: confirmation.id, choiceSessionId: confirmation.choiceSessionId,
+    choiceSetId: confirmation.choiceSetId, selectionId: confirmation.selectionId,
+    expectedSessionRevision: confirmation.expectedSessionRevision,
+    interpretationRevision: confirmation.interpretationRevision,
+    payloadRevision: confirmation.payloadRevision, payloadDigest: confirmation.payloadDigest,
+    goal: confirmation.goal, steps: confirmation.steps,
+    markdownEntry: confirmation.markdownEntry,
+    markdownExpectedBase: confirmation.markdownExpectedBase,
+    markdownManifestDigests: confirmation.markdownManifestDigests,
+    documentDiffDigest: confirmation.documentDiffDigest,
+    modelProvenance: confirmation.modelProvenance,
+    personaRevision: confirmation.personaRevision,
+    reminderListId: confirmation.reminderListId, reminderItems: [changedItem],
+    reminderCount: confirmation.reminderCount,
+    reminderPayloadDigest: confirmation.reminderPayloadDigest,
+    evidenceRequirements: confirmation.evidenceRequirements,
+    deliveryBindingId: confirmation.deliveryBindingId, recipient: confirmation.recipient,
+    deliveryScope: confirmation.deliveryScope, dataCategories: confirmation.dataCategories,
+    retention: confirmation.retention, permissions: confirmation.permissions,
+    effectClasses: confirmation.effectClasses, confirmedAtMs: confirmation.confirmedAtMs)
+  #expect(!changed.validated())
+  let personaDrifted = ChoiceConsolidatedConfirmation(
+    id: confirmation.id, choiceSessionId: confirmation.choiceSessionId,
+    choiceSetId: confirmation.choiceSetId, selectionId: confirmation.selectionId,
+    expectedSessionRevision: confirmation.expectedSessionRevision,
+    interpretationRevision: confirmation.interpretationRevision,
+    payloadRevision: confirmation.payloadRevision, payloadDigest: confirmation.payloadDigest,
+    goal: confirmation.goal, steps: confirmation.steps,
+    markdownEntry: confirmation.markdownEntry,
+    markdownExpectedBase: confirmation.markdownExpectedBase,
+    markdownManifestDigests: confirmation.markdownManifestDigests,
+    documentDiffDigest: confirmation.documentDiffDigest,
+    modelProvenance: confirmation.modelProvenance,
+    personaRevision: PersonaRevisionRef(
+      personaId: confirmation.personaRevision.personaId,
+      revision: confirmation.personaRevision.revision,
+      aggregateDigest: String(repeating: "0", count: 64),
+      instructionsDigest: confirmation.personaRevision.instructionsDigest),
+    reminderListId: confirmation.reminderListId, reminderItems: confirmation.reminderItems,
+    reminderCount: confirmation.reminderCount,
+    reminderPayloadDigest: confirmation.reminderPayloadDigest,
+    evidenceRequirements: confirmation.evidenceRequirements,
+    deliveryBindingId: confirmation.deliveryBindingId, recipient: confirmation.recipient,
+    deliveryScope: confirmation.deliveryScope, dataCategories: confirmation.dataCategories,
+    retention: confirmation.retention, permissions: confirmation.permissions,
+    effectClasses: confirmation.effectClasses, confirmedAtMs: confirmation.confirmedAtMs)
+  #expect(personaDrifted.canonicalPayloadDigest() != confirmation.payloadDigest)
+  #expect(!personaDrifted.validated())
+}
+
+@Test
+func choiceConfirmationTypedPreimageMatchesTheRustGoldenVector() {
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: nil, recipient: nil, deliveryScope: nil)
+  #expect(confirmation.canonicalPayloadPreimage()?.count == 2_439)
+  #expect(
+    confirmation.canonicalPayloadDigest()
+      == "5a7b8b6468fc9b773e9605d59c7bb4710c945baea9cb2f2ee155fb8f4626f7f9")
+}
+
+@Test
+func choiceReminderScheduleContractRequiresAnExplicitBoundedIanaProposal() {
+  let valid = ChoiceReminderScheduleInput(
+    requestId: "schedule-request-1", choiceSessionId: "session-1",
+    expectedSessionRevision: 1, reminderListId: "local-reminders",
+    reminderCount: 1,
+    dueAtMs: 1, timeZone: "America/Los_Angeles")
+  #expect(valid.validated())
+  #expect(
+    !ChoiceReminderScheduleInput(
+      requestId: valid.requestId, choiceSessionId: valid.choiceSessionId,
+      expectedSessionRevision: valid.expectedSessionRevision, reminderListId: valid.reminderListId,
+      reminderCount: valid.reminderCount,
+      dueAtMs: valid.dueAtMs, timeZone: "not/a-time-zone"
+    ).validated())
+  #expect(
+    !ChoiceReminderScheduleInput(
+      requestId: valid.requestId, choiceSessionId: valid.choiceSessionId,
+      expectedSessionRevision: valid.expectedSessionRevision, reminderListId: "list with spaces",
+      reminderCount: valid.reminderCount,
+      dueAtMs: valid.dueAtMs, timeZone: valid.timeZone
+    ).validated())
+  #expect(
+    !ChoiceReminderScheduleInput(
+      requestId: valid.requestId, choiceSessionId: valid.choiceSessionId,
+      expectedSessionRevision: valid.expectedSessionRevision, reminderListId: valid.reminderListId,
+      reminderCount: 0, dueAtMs: valid.dueAtMs, timeZone: valid.timeZone
+    ).validated())
+}
+
+@Test
+func typedReminderScheduleRecoveryKeepsTheKnownNextActionVisible() {
+  let error = CoreClientError.remote(
+    code: -32_024, message: "Choose a complete future Reminder schedule before review.")
+  #expect(error.errorDescription == "Choose a complete future Reminder schedule before review.")
+}
+
+private func testChoiceLoopManifest(aggregateDigest: String? = nil) -> DocumentManifest {
+  let entries = [
+    DocumentManifestEntry(
+      relativePath: "sessions/session-1/SESSION.md",
+      sha256: String(repeating: "a", count: 64), byteLength: 64, mode: 0o600)
+  ]
+  return DocumentManifest(
+    rootVersion: 1,
+    entries: entries,
+    aggregateDigest: aggregateDigest ?? DocumentManifest.canonicalAggregateDigest(
+      entries: entries)!,
+    generatedAtMs: 1
+  )
+}
+
+private func testChoiceConfirmation(
+  deliveryBindingId: String?, recipient: String?, deliveryScope: String?,
+  choiceSessionId: String = "session-1", choiceSetId: String = "choices-1",
+  selectionId: String = "selection-1", expectedSessionRevision: UInt64 = 1
+) -> ChoiceConsolidatedConfirmation {
+  let markdownEntry = DocumentManifestEntry(
+    relativePath: "sessions/session-1/CHOICE.md", sha256: String(repeating: "f", count: 64),
+    byteLength: 64, mode: 0o600)
+  return ChoiceConsolidatedConfirmation(
+    id: "confirmation-1", choiceSessionId: choiceSessionId, choiceSetId: choiceSetId,
+    selectionId: selectionId,
+    expectedSessionRevision: expectedSessionRevision, interpretationRevision: 1,
+    payloadRevision: 1,
+    payloadDigest: String(repeating: "a", count: 64), goal: "Prepare a bounded next step",
+    steps: ["Review the prepared plan"],
+    markdownEntry: markdownEntry,
+    markdownExpectedBase: nil,
+    markdownManifestDigests: [
+      String(repeating: "b", count: 64),
+      DocumentManifest.canonicalAggregateDigest(entries: [markdownEntry])!,
+    ],
+    documentDiffDigest: String(repeating: "c", count: 64),
+    modelProvenance: ChoiceModelProvenance(
+      id: "provenance-1", modelId: "gpt-test-model", requestedEffort: "not_applicable",
+      actualEffort: "not_applicable", catalogFingerprint: String(repeating: "d", count: 64),
+      catalogRevision: 1, accountDisplayClass: "ChatGPT account", protocolSchemaRevision: 1,
+      turnId: "turn-1"),
+    personaRevision: PersonaRevisionRef(
+      personaId: "openopen.nondev.default", revision: "draft-03-en",
+      aggregateDigest: String(repeating: "e", count: 64),
+      instructionsDigest: String(repeating: "f", count: 64)),
+    reminderListId: "openopen-default-reminders",
+    reminderItems: [
+      ChoiceReminderItem(
+        id: "reminder-1", text: "Review the prepared plan", dueAtMs: 1,
+        timeZone: "Etc/UTC", evidenceIntent: "reminder-readback")
+    ],
+    reminderCount: 1,
+    reminderPayloadDigest: String(repeating: "e", count: 64),
+    evidenceRequirements: ["Reminder readback before Done"], deliveryBindingId: deliveryBindingId,
+    recipient: recipient, deliveryScope: deliveryScope, dataCategories: ["local task state"],
+    retention: "Local until user deletion", permissions: [], effectClasses: ["reminder"],
+    confirmedAtMs: 1
+  ).withCanonicalPayloadDigest()
+}
+
+extension ChoiceConsolidatedConfirmation {
+  fileprivate func withCanonicalPayloadDigest() -> ChoiceConsolidatedConfirmation {
+    let reminderPayloadDigest = canonicalReminderPayloadDigest()!
+    let reminderBound = ChoiceConsolidatedConfirmation(
+      id: id, choiceSessionId: choiceSessionId, choiceSetId: choiceSetId,
+      selectionId: selectionId,
+      expectedSessionRevision: expectedSessionRevision,
+      interpretationRevision: interpretationRevision, payloadRevision: payloadRevision,
+      payloadDigest: "", goal: goal, steps: steps,
+      markdownEntry: markdownEntry, markdownExpectedBase: markdownExpectedBase,
+      markdownManifestDigests: markdownManifestDigests, documentDiffDigest: documentDiffDigest,
+      modelProvenance: modelProvenance, personaRevision: personaRevision,
+      reminderListId: reminderListId,
+      reminderItems: reminderItems, reminderCount: reminderCount,
+      reminderPayloadDigest: reminderPayloadDigest,
+      evidenceRequirements: evidenceRequirements, deliveryBindingId: deliveryBindingId,
+      recipient: recipient, deliveryScope: deliveryScope, dataCategories: dataCategories,
+      retention: retention, permissions: permissions, effectClasses: effectClasses,
+      confirmedAtMs: confirmedAtMs)
+    return ChoiceConsolidatedConfirmation(
+      id: reminderBound.id, choiceSessionId: reminderBound.choiceSessionId,
+      choiceSetId: reminderBound.choiceSetId, selectionId: reminderBound.selectionId,
+      expectedSessionRevision: reminderBound.expectedSessionRevision,
+      interpretationRevision: reminderBound.interpretationRevision,
+      payloadRevision: reminderBound.payloadRevision,
+      payloadDigest: reminderBound.canonicalPayloadDigest()!, goal: reminderBound.goal,
+      steps: reminderBound.steps, markdownEntry: reminderBound.markdownEntry,
+      markdownExpectedBase: reminderBound.markdownExpectedBase,
+      markdownManifestDigests: reminderBound.markdownManifestDigests,
+      documentDiffDigest: reminderBound.documentDiffDigest,
+      modelProvenance: reminderBound.modelProvenance,
+      personaRevision: reminderBound.personaRevision,
+      reminderListId: reminderBound.reminderListId,
+      reminderItems: reminderBound.reminderItems, reminderCount: reminderBound.reminderCount,
+      reminderPayloadDigest: reminderBound.reminderPayloadDigest,
+      evidenceRequirements: reminderBound.evidenceRequirements,
+      deliveryBindingId: reminderBound.deliveryBindingId, recipient: reminderBound.recipient,
+      deliveryScope: reminderBound.deliveryScope, dataCategories: reminderBound.dataCategories,
+      retention: reminderBound.retention, permissions: reminderBound.permissions,
+      effectClasses: reminderBound.effectClasses, confirmedAtMs: reminderBound.confirmedAtMs)
+  }
+}
+
+private func testChoiceLoopSnapshot(
+  sessionID: String = "session-1",
+  aggregateDigest: String? = nil
+) -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: sessionID, state: "active", revision: 1,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "unselected", modelProvenanceRef: nil, catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil, activeInterpretationRevision: nil,
+      openedAtMs: 0, lastInputAtMs: 1, softIdleAtMs: 1_800_001,
+      staleReviewAtMs: 86_400_001, primaryDeliveryBindingId: nil,
+      pendingConfirmationId: nil, backgroundMissionIds: []
+    ),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil,
+    lastSelection: nil, confirmation: nil,
+    documentManifest: testChoiceLoopManifest(aggregateDigest: aggregateDigest)
+  )
+}
+
+private func testInterpretingChoiceLoopSnapshot() -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-choice-1", state: "interpreting", revision: 1,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil, activeInterpretationRevision: nil,
+      openedAtMs: 1, lastInputAtMs: 1, softIdleAtMs: 1_800_001,
+      staleReviewAtMs: 86_400_001, primaryDeliveryBindingId: "mac-local-owner",
+      pendingConfirmationId: nil, backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: nil, documentManifest: testChoiceLoopManifest())
+}
+
+private func testPersonaRevision() -> PersonaRevisionRef {
+  PersonaRevisionRef(
+    personaId: "openopen.nondev.default", revision: "draft-03-en",
+    aggregateDigest: String(repeating: "f", count: 64),
+    instructionsDigest: String(repeating: "e", count: 64))
+}
+
+private func testActiveChoiceLoopSnapshot() -> ChoiceLoopSnapshot {
+  let manifest = testChoiceLoopManifest()
+  let provenance = ChoiceModelProvenance(
+    id: "choice-provenance-1", modelId: "gpt-test-model", requestedEffort: "high",
+    actualEffort: "high", catalogFingerprint: String(repeating: "a", count: 64),
+    catalogRevision: 1, accountDisplayClass: "managed", protocolSchemaRevision: 1,
+    turnId: "turn-choice-1")
+  let interpretation = InterpretationFrame(
+    choiceSessionId: "session-choice-active", revision: 1,
+    understoodGoal: "Prepare one bounded plan.", currentContext: "Local Mac session.",
+    assumptions: [], constraints: [], uncertainties: [], whatToAvoid: [],
+    sourceManifestDigest: manifest.aggregateDigest)
+  let options = (1...3).map { position in
+    ChoiceOption(
+      id: "choice-option-\(position)", position: UInt8(position),
+      direction: "Direction \(position)", rationale: "Bounded next direction.",
+      expectedResult: "A clearer next step.", informationNeeded: [],
+      externalEffectsPreview: [], sourceCategories: ["local"])
+  }
+  let choiceSet = ChoiceSet(
+    id: "choice-set-active", choiceSessionId: "session-choice-active", sessionRevision: 2,
+    interpretationRevision: 1, generatedAtMs: 10, expiresOnRevision: 3, options: options,
+    dAvailable: true, sourceManifestDigest: manifest.aggregateDigest, modelProvenance: provenance,
+    personaRevision: testPersonaRevision())
+  return ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-choice-active", state: "active", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: choiceSet.id,
+      activeInterpretationRevision: 1, openedAtMs: 1, lastInputAtMs: 10,
+      softIdleAtMs: 1_800_010, staleReviewAtMs: 86_400_010,
+      primaryDeliveryBindingId: "mac-local-owner", pendingConfirmationId: nil,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: interpretation, activeChoiceSet: choiceSet,
+    lastSelection: nil, confirmation: nil, documentManifest: manifest)
+}
+
+private func testRefiningChoiceLoopSnapshot(from active: ChoiceLoopSnapshot) -> ChoiceLoopSnapshot {
+  let selection = ChoiceSelection(
+    type: "optionSelection", id: "choice-selection-1", choiceSessionId: active.session.id,
+    choiceSetId: "choice-set-active", selectedOptionId: "choice-option-1", dInputBatchId: nil,
+    expectedSessionRevision: active.session.revision, selectedAtMs: 11)
+  return ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: active.session.id, state: "refining", revision: 3,
+      modelSelectionState: active.session.modelSelectionState, communicationProfileRevision: 0,
+      activeChoiceSetId: nil, activeInterpretationRevision: 1, openedAtMs: 1,
+      lastInputAtMs: 11, softIdleAtMs: 1_800_011, staleReviewAtMs: 86_400_011,
+      primaryDeliveryBindingId: "mac-local-owner", pendingConfirmationId: nil,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: active.interpretation, activeChoiceSet: nil,
+    lastSelection: selection,
+    pendingRefinementOperation: ChoiceRefinementOperation(
+      id: "choice-refinement-operation-1", selectionId: selection.id,
+      choiceSessionId: active.session.id, sourceEnvelopeId: "source-envelope-choice-1",
+      conversationTurnBatchId: "batch-choice-1", expectedSessionRevision: 3, expectedGeneration: 1,
+      modelProvenance: active.activeChoiceSet!.modelProvenance,
+      sourceManifestDigest: active.documentManifest.aggregateDigest,
+      personaRevision: active.activeChoiceSet!.personaRevision,
+      dRequestId: nil, dInputDigest: nil, createdAtMs: 11),
+    confirmation: nil, documentManifest: active.documentManifest)
+}
+
+private func testChoiceLoopSnapshot(
+  from active: ChoiceLoopSnapshot, state: String, revision: UInt64? = nil
+) -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: active.session.id, state: state, revision: revision ?? active.session.revision,
+      modelSelectionState: active.session.modelSelectionState,
+      communicationProfileRevision: active.session.communicationProfileRevision,
+      activeChoiceSetId: active.session.activeChoiceSetId,
+      activeInterpretationRevision: active.session.activeInterpretationRevision,
+      openedAtMs: active.session.openedAtMs, lastInputAtMs: active.session.lastInputAtMs,
+      softIdleAtMs: active.session.softIdleAtMs,
+      staleReviewAtMs: active.session.staleReviewAtMs,
+      primaryDeliveryBindingId: active.session.primaryDeliveryBindingId,
+      pendingConfirmationId: active.session.pendingConfirmationId,
+      backgroundMissionIds: active.session.backgroundMissionIds),
+    activeBatch: active.activeBatch, interpretation: active.interpretation,
+    activeChoiceSet: active.activeChoiceSet, lastSelection: active.lastSelection,
+    pendingRefinementOperation: active.pendingRefinementOperation,
+    confirmation: active.confirmation, documentManifest: active.documentManifest)
+}
+
+/// Matches the Store's post-resume-failure state: the old ChoiceSet has been
+/// retired, but the persisted interpretation remains a bounded local recap
+/// source for one later authenticated owner return.
+private func testResumeIdleChoiceLoopSnapshot(
+  from active: ChoiceLoopSnapshot, revision: UInt64
+) -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: active.session.id, state: "softIdle", revision: revision,
+      modelSelectionState: active.session.modelSelectionState,
+      communicationProfileRevision: active.session.communicationProfileRevision,
+      activeChoiceSetId: nil,
+      activeInterpretationRevision: active.interpretation?.revision,
+      openedAtMs: active.session.openedAtMs, lastInputAtMs: active.session.lastInputAtMs,
+      softIdleAtMs: active.session.softIdleAtMs,
+      staleReviewAtMs: active.session.staleReviewAtMs,
+      primaryDeliveryBindingId: active.session.primaryDeliveryBindingId,
+      pendingConfirmationId: nil, backgroundMissionIds: active.session.backgroundMissionIds),
+    activeBatch: nil, interpretation: active.interpretation, activeChoiceSet: nil,
+    lastSelection: nil, pendingRefinementOperation: nil, confirmation: nil,
+    documentManifest: active.documentManifest)
+}
+
+private func testCancelledChoiceLoopSnapshot(
+  from active: ChoiceLoopSnapshot
+) -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: active.session.id, state: "cancelled", revision: active.session.revision + 1,
+      modelSelectionState: active.session.modelSelectionState, communicationProfileRevision: 0,
+      activeChoiceSetId: nil, activeInterpretationRevision: nil, openedAtMs: 1,
+      lastInputAtMs: 11, softIdleAtMs: 1_800_011, staleReviewAtMs: 86_400_011,
+      primaryDeliveryBindingId: "mac-local-owner", pendingConfirmationId: nil,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: nil, documentManifest: active.documentManifest)
+}
+
+private func testExecutingChoiceLoopSnapshot(
+  from active: ChoiceLoopSnapshot
+) -> ChoiceLoopSnapshot {
+  ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: active.session.id, state: "executing", revision: active.session.revision + 1,
+      modelSelectionState: active.session.modelSelectionState, communicationProfileRevision: 0,
+      activeChoiceSetId: nil, activeInterpretationRevision: nil, openedAtMs: 1,
+      lastInputAtMs: 11, softIdleAtMs: 1_800_011, staleReviewAtMs: 86_400_011,
+      primaryDeliveryBindingId: "mac-local-owner", pendingConfirmationId: nil,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: nil, documentManifest: active.documentManifest)
+}
+
+@MainActor
+@Test
+func dashboardProjectsReadOnlyPersonaProvenanceWithoutLifecycleAuthority() async {
+  let core = MockCore()
+  let persona = PersonaRevisionRef(
+    personaId: "openopen.nondev.default", revision: "draft-03-en",
+    aggregateDigest: String(repeating: "a", count: 64),
+    instructionsDigest: String(repeating: "b", count: 64))
+  await core.setPersonaStatus(
+    PersonaStatusView(
+      status: PersonaStatus(active: persona, staged: nil, warning: nil, changeNotePending: false),
+      changeNote: nil))
+  let model = AppModel(core: core, broker: MockBroker()) {}
+
+  await model.refreshDashboard()
+
+  #expect(model.personaStatus?.status.active == persona)
+  #expect(model.personaStatus?.status.staged == nil)
+}
+
+@Test
+func editorialPersonaProvenanceIsReadOnlyAndHasNoLifecycleControls() throws {
+  let sourceURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/OpenOpenAppSupport/OpenOpenViews.swift")
+  let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+  #expect(source.contains("openopen-persona-provenance-revision"))
+  #expect(source.contains("openopen-persona-provenance-digest"))
+  #expect(!source.contains("persona.stage"))
+  #expect(!source.contains("persona.activate"))
+  #expect(!source.contains("persona.rollback"))
+}
+
+@Test
+func frozenReminderScheduleUsesNativeBoundedControlsWithoutRawContractFields() throws {
+  let sourceURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/OpenOpenAppSupport/OpenOpenViews.swift")
+  let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+  #expect(source.contains("GroupBox(\"A time is still needed\")"))
+  #expect(source.contains("DatePicker("))
+  #expect(source.contains("Button(\"Back\")"))
+  #expect(source.contains("Button(\"Review reminder\")"))
+  #expect(source.contains("!model.choiceReminderScheduleReadyForReview"))
+  #expect(source.contains("Nothing will be guessed."))
+  #expect(source.contains("model.requestChoiceReminderWrite()"))
+  #expect(source.contains("openopen-choice-reminder-recover"))
+  #expect(source.contains("model.confirmedMission?.choiceConfirmationId != nil"))
+  #expect(source.contains("model.confirmedMission?.choiceConfirmationId == nil"))
+  #expect(source.contains("Text(\"Reminders\")"))
+  #expect(!source.contains("Text(confirmation.reminderListId)"))
+  #expect(!source.contains("Text(item.evidenceIntent)"))
+  #expect(source.contains("GroupBox(\"Reminder added and verified\")"))
+  #expect(
+    source.contains(
+      "The saved Reminder matches the confirmed date, time, time zone, list, and count."))
+  #expect(source.contains("Readable proof is available without exposing private content."))
+  #expect(source.contains("model.receiptIsForCurrentChoice"))
+  #expect(source.contains("Button(\"View evidence\")"))
+  #expect(source.contains("Button(\"Continue\")"))
+  #expect(!source.contains("Date and time (YYYY-MM-DDTHH:MM)"))
+  #expect(!source.contains("TextField(\"Reminder list\""))
+  #expect(!source.contains("TextField(\"Reminder count\""))
+}
+
+@Test
+func postReceiptOwnerReturnReleasesBusyFenceBeforeAuthenticatedResume() throws {
+  let sourceURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/OpenOpenAppSupport/AppModel.swift")
+  let source = try String(contentsOf: sourceURL, encoding: .utf8)
+  let function = try #require(source.range(of: "public func checkChoiceReminderProgress() async"))
+  let tail = source[function.lowerBound...]
+  let release = try #require(tail.range(of: "isBusy = false"))
+  let resume = try #require(
+    tail.range(of: "await refreshDashboard(authenticatedHomeForeground: true)"))
+  #expect(release.lowerBound < resume.lowerBound)
+}
+
+@MainActor
+@Test
+func reminderScheduleStartsVisiblyUnselectedAndBackIsLocalOnly() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let snapshot = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(snapshot)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+
+  #expect(!model.choiceReminderPickerIsPresented)
+  #expect(!model.choiceReminderScheduleReadyForReview)
+  model.presentChoiceReminderDatePicker()
+  #expect(model.choiceReminderPickerIsPresented)
+  #expect(!model.choiceReminderScheduleReadyForReview)
+  model.selectChoiceReminderTimeZone("Etc/UTC")
+  model.selectChoiceReminderList("openopen.default-reminders")
+  model.selectChoiceReminderDate(Date().addingTimeInterval(3_600))
+  #expect(model.choiceReminderScheduleReadyForReview)
+
+  model.backFromChoiceReminderSchedule()
+  #expect(!model.choiceReminderScheduleIsVisible)
+  #expect(model.choiceReminderDateTime.isEmpty)
+  #expect(model.choiceLoopSnapshot == snapshot)
+  #expect(await core.recordedChoiceReminderScheduleInputs().isEmpty)
+}
+
+@MainActor
+@Test
+func globalOffCancelsTheOwnedChoiceReminderTaskBeforeAnySave() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .delayBeforeTarget)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "awaitingConfirmation", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  _ = try? snapshot.validated()
+  await core.setChoiceLoopSnapshot(snapshot)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot != nil)
+  #expect(model.choiceLoopSnapshot?.session.state == "awaitingConfirmation")
+  #expect(model.choiceLoopSnapshot?.confirmation?.id == confirmation.id)
+  #expect(model.errorMessage == nil)
+  #expect(model.storeControlEnabled)
+  #expect(!model.isBusy)
+
+  model.requestChoiceReminderWrite()
+  try? await Task.sleep(for: .milliseconds(20))
+  model.requestEnabled(false)
+  try? await Task.sleep(for: .milliseconds(80))
+
+  #expect(reminders.executeCount == 0)
+  #expect(!model.isBusy)
+}
+
+@MainActor
+@Test
+func choiceReminderPrecommitCancellationRecordsAbortBeforeRetryAuthority() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .cancelBeforeCommit)
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let mission = testChoiceConfirmedMission(
+    confirmation: confirmation,
+    dispatch: [
+      ConfirmedReminderDispatch(
+        workItemId: confirmation.reminderItems[0].id,
+        token: "dispatch-choice-work-1")
+    ])
+  #expect((try? mission.validated()) != nil)
+  await core.setChoiceReminderMission(mission, executeNow: true)
+  await core.loseNextChoiceReminderAbortResponse()
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "awaitingConfirmation", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  #expect((try? snapshot.validated()) != nil)
+  await core.setChoiceLoopSnapshot(snapshot)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot?.session.state == "awaitingConfirmation")
+  #expect(model.choiceLoopSnapshot?.confirmation?.id == confirmation.id)
+  #expect(model.storeControlEnabled)
+  #expect(!model.isBusy)
+
+  model.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if await core.choiceReminderAbortCount >= 2 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+
+  #expect(reminders.executeCount == 1)
+  let abortCount = await core.choiceReminderAbortCount
+  #expect(abortCount == 2)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(model.errorMessage?.contains("stopped before EventKit committed") == true)
+
+  // The signed pre-commit abort makes the same explicit action reachable
+  // after restart; it is not an automatic retry.
+  await model.updateEnabled(false)
+  reminders.mode = .complete
+  let restarted = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await restarted.updateEnabled(true)
+  await restarted.refreshAccountAndModels()
+  await restarted.refreshDashboard()
+  #expect(restarted.confirmedMission?.choiceConfirmationId == confirmation.id)
+  #expect(restarted.reminderLinks.isEmpty)
+  #expect(restarted.storeControlEnabled)
+  #expect(!restarted.isBusy)
+  #expect(restarted.errorMessage == nil)
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if !restarted.reminderLinks.isEmpty { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 2)
+  #expect(reminders.recoverCount == 0)
+  #expect(restarted.reminderLinks.count == 1)
+  #expect(restarted.errorMessage == nil)
+  await restarted.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func globalOffQuiescesAStartedPrecommitReminderBeforeCoreShutdownAndRetry() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .waitPrecommitUntilCancelled)
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let mission = testChoiceConfirmedMission(
+    confirmation: confirmation,
+    dispatch: [
+      ConfirmedReminderDispatch(
+        workItemId: confirmation.reminderItems[0].id,
+        token: "dispatch-choice-work-1")
+    ])
+  await core.setChoiceReminderMission(mission, executeNow: true)
+  await core.loseNextChoiceReminderAbortResponse()
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "awaitingConfirmation", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  await core.setChoiceLoopSnapshot(snapshot)
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+
+  model.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if reminders.executeCount == 1 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 1)
+  let challengesBeforeOff = await core.challengesIssued
+  await model.updateEnabled(false)
+
+  let offAbortCount = await core.choiceReminderAbortCount
+  let challengesAfterOff = await core.challengesIssued
+  #expect(reminders.precommitCancelCount == 1)
+  #expect(challengesAfterOff > challengesBeforeOff)
+  #expect(offAbortCount == 2)
+  #expect(model.errorMessage == nil)
+  #expect(reminders.executeCount == 1)
+  #expect(model.reminderLinks.isEmpty)
+  #expect(!model.storeControlEnabled)
+
+  reminders.mode = .complete
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+  model.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if !model.reminderLinks.isEmpty { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 2)
+  #expect(reminders.recoverCount == 0)
+  #expect(model.reminderLinks.count == 1)
+
+  // A repeated explicit recovery reattaches read-only and never writes again.
+  model.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if reminders.recoverCount == 1 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 2)
+  #expect(reminders.recoverCount == 1)
+  #expect(model.reminderLinks.count == 1)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func exhaustedOffAbortReconcilesProvenAbsenceAfterRestartBeforeOneExplicitRetry() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .waitPrecommitUntilCancelled)
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let mission = testChoiceConfirmedMission(
+    confirmation: confirmation,
+    dispatch: [
+      ConfirmedReminderDispatch(
+        workItemId: confirmation.reminderItems[0].id,
+        token: "dispatch-choice-work-1")
+    ])
+  await core.setChoiceReminderMission(mission, executeNow: true)
+  await core.failNextChoiceReminderAbortResponses(3)
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "awaitingConfirmation", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  await core.setChoiceLoopSnapshot(snapshot)
+  let original = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await original.updateEnabled(true)
+  await original.refreshAccountAndModels()
+  await original.refreshDashboard()
+  original.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if reminders.executeCount == 1 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  await original.updateEnabled(false)
+  #expect(reminders.precommitCancelCount == 1)
+  #expect(await core.choiceReminderAbortCount == 3)
+  #expect(original.reminderLinks.isEmpty)
+  #expect(!original.storeControlEnabled)
+
+  reminders.mode = .tamperedMirror
+  let restarted = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await restarted.updateEnabled(true)
+  await restarted.refreshAccountAndModels()
+  await restarted.refreshDashboard()
+
+  // A plausible tampered row is never misclassified as absence and cannot
+  // retire the attempt or unlock another write.
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if reminders.recoverCount == 1 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(await core.choiceReminderAbortCount == 3)
+  #expect(reminders.executeCount == 1)
+  #expect(restarted.reminderLinks.isEmpty)
+  #expect(restarted.errorMessage?.contains("changed") == true)
+
+  reminders.mode = .complete
+  // The next explicit action is still read-only recovery. Proven total
+  // absence retires the stale started attempt but never enters EventKit.
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if await core.choiceReminderAbortCount == 4 { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(await core.choiceReminderAbortCount == 4)
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 2)
+  #expect(restarted.reminderLinks.isEmpty)
+  #expect(restarted.errorMessage?.contains("choose Check Reminder again") == true)
+
+  // Only a second, separately explicit action may consume the new attempt.
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if !restarted.reminderLinks.isEmpty { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 2)
+  #expect(reminders.recoverCount == 2)
+  #expect(restarted.reminderLinks.count == 1)
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<20 { try? await Task.sleep(for: .milliseconds(5)) }
+  #expect(reminders.executeCount == 2)
+  await restarted.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func choiceReminderAmbiguousCommitRestartsIntoReadOnlyRecoveryWithoutSecondWrite() async {
+  let core = MockCore()
+  let reminders = MockReminders(mode: .commitThenFailReadback)
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let mission = testChoiceConfirmedMission(
+    confirmation: confirmation,
+    dispatch: [
+      ConfirmedReminderDispatch(
+        workItemId: confirmation.reminderItems[0].id,
+        token: "dispatch-choice-work-1")
+    ])
+  await core.setChoiceReminderMission(mission, executeNow: true)
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "awaitingConfirmation", revision: 2,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  await core.setChoiceLoopSnapshot(snapshot)
+
+  let first = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await first.updateEnabled(true)
+  await first.refreshAccountAndModels()
+  await first.refreshDashboard()
+  first.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if first.errorMessage != nil { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 0)
+  #expect(first.reminderLinks.isEmpty)
+
+  // A persisted started dispatch is ambiguous. The Host returns recover-only;
+  // the visible recovery action must never issue a second EventKit write.
+  await first.updateEnabled(false)
+  await core.setChoiceReminderMission(mission, executeNow: false)
+  let restarted = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
+  await restarted.updateEnabled(true)
+  await restarted.refreshAccountAndModels()
+  await restarted.refreshDashboard()
+  #expect(restarted.confirmedMission?.choiceConfirmationId == confirmation.id)
+  #expect(restarted.reminderLinks.isEmpty)
+  #expect(restarted.storeControlEnabled)
+  #expect(!restarted.isBusy)
+  #expect(restarted.errorMessage == nil)
+  restarted.requestChoiceReminderWrite()
+  for _ in 0..<50 {
+    if !restarted.reminderLinks.isEmpty { break }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(reminders.executeCount == 1)
+  #expect(reminders.recoverCount == 1)
+  #expect(restarted.reminderLinks.count == 1)
+  #expect(restarted.errorMessage == nil)
+  await restarted.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func choiceReceiptKeepsItsTypedPresentationAfterRestartWithoutMissionFocus() async {
+  let core = MockCore()
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let snapshot = ChoiceLoopSnapshot(
+    session: ChoiceSession(
+      id: "session-1", state: "softIdle", revision: 3,
+      modelSelectionState: ChoiceModelSelectionState(
+        state: "selected", modelProvenanceRef: "mock-selection-gpt-test-model",
+        catalogRevision: nil, reason: nil),
+      communicationProfileRevision: 0, activeChoiceSetId: nil,
+      activeInterpretationRevision: nil, openedAtMs: 0, lastInputAtMs: 1,
+      softIdleAtMs: 1_800_001, staleReviewAtMs: 86_400_001,
+      primaryDeliveryBindingId: "binding-1", pendingConfirmationId: confirmation.id,
+      backgroundMissionIds: []),
+    activeBatch: nil, interpretation: nil, activeChoiceSet: nil, lastSelection: nil,
+    confirmation: confirmation, documentManifest: testChoiceLoopManifest())
+  #expect((try? snapshot.validated()) != nil)
+  await core.setChoiceLoopSnapshot(snapshot)
+  await core.restoreFromDashboard(
+    mission: nil,
+    receipt: MissionReceipt(
+      id: "choice-receipt-1", missionId: "choice-mission-1", summary: "Verified",
+      actualModel: confirmation.modelProvenance.modelId, evidenceIds: ["evidence-1"],
+      outputHashes: [confirmation.payloadDigest], completedAtMs: 10))
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshDashboard()
+
+  #expect(model.confirmedMission == nil)
+  #expect(model.receipt?.id == "choice-receipt-1")
+  #expect(model.receiptIsForCurrentChoice)
+  #expect(model.receiptIsPresentableOnHome)
+
+  // The authenticated next-choice handoff may clear the old confirmation.
+  // The durable Receipt stays in Activity, but Home must not reinterpret it
+  // as a retired historical Done card beside the new Choice.
+  await core.setChoiceLoopSnapshot(testActiveChoiceLoopSnapshot())
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(model.receipt?.id == "choice-receipt-1")
+  #expect(!model.receiptIsForCurrentChoice)
+  #expect(!model.receiptIsPresentableOnHome)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func choiceBeginUsesOnlyCurrentSelectionAndHostDerivedAcceptance() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  #expect(model.modelEntryEnabled)
+  #expect(model.choiceLoopContinuityState == .empty)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+  #expect(model.persistedModelSelection != nil)
+  #expect(model.modelSelectionStatus == .current)
+  let accepted = ChoiceBeginAccepted(
+    requestId: "choice-request-1", operationId: "choice-operation-1",
+    choiceSessionId: "session-choice-1", acceptedSessionRevision: 1,
+    sourceEnvelopeId: "source-envelope-1", conversationTurnBatchId: "batch-choice-1",
+    state: "interpreting")
+  await core.setChoiceLoopSnapshot(testInterpretingChoiceLoopSnapshot())
+  await core.setChoiceBeginAccepted(accepted)
+  #expect(model.choiceLoopSnapshot == nil)
+  #expect(model.modelEntryEnabled)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+
+  model.choiceQuestion = "Plan one bounded task"
+  await model.submitChoiceQuestion()
+
+  let parameters = await core.choiceBeginParameters
+  #expect(parameters.count == 1)
+  #expect(parameters[0].boundedLocalQuestion == "Plan one bounded task")
+  #expect(parameters[0].expectedModelProvenanceRef == "mock-selection-gpt-test-model")
+  #expect(model.choiceLoopSnapshot?.session.id == accepted.choiceSessionId)
+  #expect(model.choiceLoopSnapshot?.session.state == "interpreting")
+  #expect(model.choiceQuestion.isEmpty)
+  #expect(await core.proposalCount == 0)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func homeComposerUsesTheExactChoiceIntakeByteBoundary() async {
+  let acceptedCore = MockCore()
+  let acceptedModel = AppModel(core: acceptedCore, broker: MockBroker()) {}
+  await acceptedModel.updateEnabled(true)
+  await acceptedModel.refreshAccountAndModels()
+  let accepted = ChoiceBeginAccepted(
+    requestId: "choice-request-1", operationId: "choice-operation-1",
+    choiceSessionId: "session-choice-1", acceptedSessionRevision: 1,
+    sourceEnvelopeId: "source-envelope-1",
+    conversationTurnBatchId: "batch-choice-1", state: "interpreting")
+  await acceptedCore.setChoiceLoopSnapshot(testInterpretingChoiceLoopSnapshot())
+  await acceptedCore.setChoiceBeginAccepted(accepted)
+
+  acceptedModel.choiceQuestion = String(repeating: "a", count: 4_096)
+  #expect(acceptedModel.dashboardControls.outcomeSubmitEnabled)
+  await acceptedModel.submitHomeComposer()
+  #expect(await acceptedCore.choiceBeginParameters.count == 1)
+  #expect(
+    (await acceptedCore.choiceBeginParameters.first)?.boundedLocalQuestion.utf8.count == 4_096)
+  #expect(acceptedModel.choiceQuestion.isEmpty)
+
+  let rejectedCore = MockCore()
+  let rejectedModel = AppModel(core: rejectedCore, broker: MockBroker()) {}
+  await rejectedModel.updateEnabled(true)
+  await rejectedModel.refreshAccountAndModels()
+  rejectedModel.choiceQuestion = String(repeating: "a", count: 4_097)
+  #expect(!rejectedModel.dashboardControls.outcomeSubmitEnabled)
+  await rejectedModel.submitHomeComposer()
+  #expect(await rejectedCore.choiceBeginParameters.isEmpty)
+  #expect(rejectedModel.choiceQuestion.utf8.count == 4_097)
+}
+
+@MainActor
+@Test
+func choiceOptionAndCancellationRemainLocalIntentOperations() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == active)
+
+  let refining = testRefiningChoiceLoopSnapshot(from: active)
+  await core.setChoiceLoopSnapshot(refining)
+  await model.selectChoiceOption(active.activeChoiceSet!.options[0])
+  let selections = await core.choiceSelections
+  #expect(selections.count == 1)
+  #expect(selections[0].type == "optionSelection")
+  #expect(selections[0].dInputBatchId == nil)
+  #expect(model.choiceLoopSnapshot?.session.state == "refining")
+  #expect(model.choiceLoopSnapshot?.lastSelection == selections[0])
+  #expect(await core.proposalCount == 0)
+
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  await core.setChoiceCancellationResponse(testCancelledChoiceLoopSnapshot(from: active))
+  await model.cancelChoiceSession()
+  #expect(model.choiceLoopSnapshot?.session.state == "cancelled")
+  #expect(await core.proposalCount == 0)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func hydratedReminderScheduleReplaysExactlyAndEditsMintANewRevision() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let snapshot = testChoiceLoopSnapshot()
+  let dueAtMs = Int64(Date().timeIntervalSince1970 * 1_000) + 3_600_000
+  let input = ChoiceReminderScheduleInput(
+    requestId: "schedule-request-1", choiceSessionId: snapshot.session.id,
+    expectedSessionRevision: snapshot.session.revision, reminderListId: "local-reminders",
+    reminderCount: 1, dueAtMs: dueAtMs, timeZone: "America/Los_Angeles")
+  let schedule = ChoiceReminderSchedule(
+    id: "schedule-1", input: input, revision: 1,
+    acceptedAtMs: Int64(Date().timeIntervalSince1970 * 1_000))
+  await core.setChoiceLoopSnapshot(snapshot)
+  await core.setChoiceReminderSchedule(schedule)
+  await core.setChoiceConfirmationResponse(
+    testChoiceConfirmation(
+      deliveryBindingId: nil, recipient: nil, deliveryScope: nil))
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+
+  await model.prepareChoiceConfirmation()
+  let replay = await core.recordedChoiceReminderScheduleInputs()
+  #expect(replay.isEmpty, "restart hydration must not mint or rewrite a schedule revision")
+
+  model.choiceReminderCount = "2"
+  model.invalidateChoiceReminderScheduleDraft()
+  await model.prepareChoiceConfirmation()
+  let edited = await core.recordedChoiceReminderScheduleInputs()
+  #expect(edited.count == 1)
+  #expect(edited[0].requestId != input.requestId)
+  #expect(edited[0].reminderCount == 2)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func nativeReminderPickerCreatesNoScheduleUntilEveryExplicitFieldIsBound() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let snapshot = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(snapshot)
+  await core.setChoiceConfirmationResponse(
+    testChoiceConfirmation(deliveryBindingId: nil, recipient: nil, deliveryScope: nil))
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+
+  #expect(model.choiceReminderDateTime.isEmpty)
+  #expect(model.choiceReminderTimeZone.isEmpty)
+  #expect(model.choiceReminderListId.isEmpty)
+  #expect(model.choiceReminderCount.isEmpty)
+
+  model.selectChoiceReminderDate(Date().addingTimeInterval(3_600))
+  #expect(model.choiceReminderDateTime.isEmpty)
+  model.selectChoiceReminderTimeZone("Etc/UTC")
+  model.selectChoiceReminderList("openopen.default-reminders")
+  await model.prepareChoiceConfirmation()
+
+  let inputs = await core.recordedChoiceReminderScheduleInputs()
+  #expect(inputs.count == 1)
+  #expect(inputs[0].timeZone == "Etc/UTC")
+  #expect(inputs[0].reminderListId == "openopen.default-reminders")
+  #expect(inputs[0].reminderCount == 1)
+  #expect(inputs[0].dueAtMs > Int64(Date().timeIntervalSince1970 * 1_000))
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func mismatchedDurableReminderScheduleCannotPublishAFalseHealthyChoiceState() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let snapshot = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(snapshot)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+  let knownGood = model.choiceLoopSnapshot
+
+  let now = Int64(Date().timeIntervalSince1970 * 1_000)
+  let mismatched = ChoiceReminderSchedule(
+    id: "schedule-mismatched",
+    input: ChoiceReminderScheduleInput(
+      requestId: "schedule-mismatched-request", choiceSessionId: "other-session",
+      expectedSessionRevision: snapshot.session.revision, reminderListId: "local-reminders",
+      reminderCount: 1, dueAtMs: now + 3_600_000, timeZone: "Etc/UTC"),
+    revision: 1, acceptedAtMs: now)
+  await core.setChoiceReminderSchedule(mismatched)
+  await model.refreshDashboard()
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.invalidContract))
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func choiceCancellationStaysReachableWhenCurrentModelSelectionDrifts() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream)
+  await model.updateEnabled(true)
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+
+  await core.setModelCatalog([
+    GptModel(
+      id: "gpt-test-model", displayName: "Changed catalog label",
+      supportedReasoningEfforts: ["high"])
+  ])
+  await model.refreshAccountAndModels()
+  #expect(!model.modelEntryEnabled)
+  #expect(model.storeControlEnabled)
+
+  await core.setChoiceCancellationResponse(testCancelledChoiceLoopSnapshot(from: active))
+  await model.cancelChoiceSession()
+  #expect(model.choiceLoopSnapshot?.session.state == "cancelled")
+  #expect(await core.proposalCount == 0)
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func durableExecutingChoiceJournalAllowsAnExplicitNextLocalQuestion() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let executing = testExecutingChoiceLoopSnapshot(from: testActiveChoiceLoopSnapshot())
+  await core.setChoiceLoopSnapshot(executing)
+  await model.refreshDashboard()
+
+  #expect(model.choiceLoopSnapshot?.session.state == "executing")
+  #expect(model.dashboardControls.outcomeInputEnabled)
+  #expect(!model.dashboardControls.outcomeSubmitEnabled)
+  #expect(await core.proposalCount == 0)
+  await model.updateEnabled(false)
+}
+
+@Test
+func documentManifestDigestMatchesRustGoldenVectorAndRejectsMutations() throws {
+  let first = DocumentManifestEntry(
+    relativePath: "sessions/session-1/SESSION.md",
+    sha256: String(repeating: "a", count: 64), byteLength: 64, mode: 0o600)
+  let second = DocumentManifestEntry(
+    relativePath: "sessions/session-1/choice-sets/choices-1.md",
+    sha256: String(repeating: "b", count: 64), byteLength: 128, mode: 0o600)
+  let entries = [first, second]
+  let digest = try #require(DocumentManifest.canonicalAggregateDigest(entries: entries))
+
+  // This is emitted by the Rust canonical_document_manifest_digest test, not
+  // recomputed by a second Swift implementation during this assertion.
+  #expect(digest == "2556788916fce4a341d7a2a2fbbd81c51d97d2af8da83e2fe890530822f4f8e7")
+  #expect(DocumentManifest.canonicalAggregateDigest(entries: [second, first]) == digest)
+
+  let changedLength = DocumentManifestEntry(
+    relativePath: first.relativePath, sha256: first.sha256,
+    byteLength: first.byteLength + 1, mode: first.mode)
+  #expect(DocumentManifest.canonicalAggregateDigest(entries: [changedLength, second]) != digest)
+
+  let changedPath = DocumentManifestEntry(
+    relativePath: "sessions/session-1/choice-sets/choices-2.md", sha256: first.sha256,
+    byteLength: first.byteLength, mode: first.mode)
+  #expect(DocumentManifest.canonicalAggregateDigest(entries: [changedPath, second]) != digest)
+
+  let changedMode = DocumentManifestEntry(
+    relativePath: first.relativePath, sha256: first.sha256,
+    byteLength: first.byteLength, mode: 0o601)
+  #expect(DocumentManifest.canonicalAggregateDigest(entries: [changedMode, second]) == nil)
+
+  let unknownPath = DocumentManifestEntry(
+    relativePath: "scratch/plan.md", sha256: first.sha256,
+    byteLength: first.byteLength, mode: first.mode)
+  #expect(DocumentManifest.canonicalAggregateDigest(entries: [unknownPath, second]) == nil)
+}
+
+@Test
+func choicePersonaProvenanceIsRequiredAndRejectsDigestDrift() throws {
+  let snapshot = testActiveChoiceLoopSnapshot()
+  let encoded = try JSONEncoder().encode(snapshot)
+  var missing = try #require(
+    JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+  var activeChoiceSet = try #require(missing["activeChoiceSet"] as? [String: Any])
+  activeChoiceSet.removeValue(forKey: "personaRevision")
+  missing["activeChoiceSet"] = activeChoiceSet
+  let missingData = try JSONSerialization.data(withJSONObject: missing)
+  #expect(throws: DecodingError.self) {
+    _ = try JSONDecoder().decode(ChoiceLoopSnapshot.self, from: missingData)
+  }
+
+  var drifted = try #require(
+    JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+  var driftedChoiceSet = try #require(drifted["activeChoiceSet"] as? [String: Any])
+  var persona = try #require(driftedChoiceSet["personaRevision"] as? [String: Any])
+  persona["aggregateDigest"] = String(repeating: "g", count: 64)
+  driftedChoiceSet["personaRevision"] = persona
+  drifted["activeChoiceSet"] = driftedChoiceSet
+  let driftedData = try JSONSerialization.data(withJSONObject: drifted)
+  let decoded = try JSONDecoder().decode(ChoiceLoopSnapshot.self, from: driftedData)
+  #expect(throws: CoreClientError.self) {
+    _ = try decoded.validated()
+  }
+}
+
+@MainActor
+@Test
+func choiceContinuityDistinguishesEmptyFromFailureAndPreservesLastKnownGood() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testChoiceLoopSnapshot()
+
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .current)
+
+  await core.failNextChoiceLoopRead()
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.readFailed))
+  #expect(model.errorMessage == nil)
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+
+  await core.failNextChoiceLoopRead()
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.readFailed))
+  #expect(model.errorMessage == nil)
+
+  await core.setChoiceLoopSnapshot(nil)
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == nil)
+  #expect(model.choiceLoopContinuityState == .empty)
+}
+
+@MainActor
+@Test
+func choiceClockUncertaintyPreservesLastKnownGoodWithoutBlockingOffOrSettings() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testChoiceLoopSnapshot()
+
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == knownGood)
+
+  await core.failNextChoiceLoopRead(
+    with: .remote(
+      code: -32_025,
+      message: "Local clock continuity is uncertain. Refresh before choosing or confirming."))
+  await model.refreshDashboard()
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.clockUncertain))
+  #expect(model.errorMessage == nil)
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+}
+
+@MainActor
+@Test
+func reminderScheduleClockFenceIsTypedAndNeverPublishesAnUnverifiedSnapshot() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.refreshDashboard()
+
+  let later = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(later)
+  await core.failNextChoiceReminderScheduleRead(
+    with: .remote(
+      code: -32_025,
+      message: "Local clock continuity is uncertain. Refresh before choosing or confirming."))
+  await model.refreshDashboard()
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.clockUncertain))
+  #expect(model.errorMessage == nil)
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+
+  await core.failNextChoiceReminderScheduleRead(
+    with: .remote(
+      code: -32_026,
+      message: "The Choice session advanced. Refresh before choosing or confirming."))
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.refreshRequired))
+  #expect(model.dashboardControls.globalToggleEnabled)
+}
+
+@MainActor
+@Test
+func choiceContinuityRejectsInvalidAggregateWithoutErasingKnownGood() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.refreshDashboard()
+
+  await core.setChoiceLoopSnapshot(
+    testChoiceLoopSnapshot(aggregateDigest: String(repeating: "b", count: 64)))
+  await model.refreshDashboard()
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.invalidContract))
+  #expect(model.errorMessage == nil)
+  #expect(model.dashboardControls.globalToggleEnabled)
+}
+
+private enum ChoiceContinuityActionFenceFixture: CaseIterable {
+  case clockUncertain
+  case refreshRequired
+  case invalidContract
+  case readFailed
+
+  var expectedState: ChoiceLoopContinuityState {
+    switch self {
+    case .clockUncertain: .needsYou(.clockUncertain)
+    case .refreshRequired: .needsYou(.refreshRequired)
+    case .invalidContract: .needsYou(.invalidContract)
+    case .readFailed: .needsYou(.readFailed)
+    }
+  }
+}
+
+private func injectChoiceContinuityFailure(
+  _ fixture: ChoiceContinuityActionFenceFixture, into core: MockCore
+) async {
+  switch fixture {
+  case .clockUncertain:
+    await core.failNextChoiceLoopRead(
+      with: .remote(
+        code: -32_025,
+        message: "Local clock continuity is uncertain. Refresh before continuing."))
+  case .refreshRequired:
+    await core.failNextChoiceReminderScheduleRead(
+      with: .remote(
+        code: -32_026,
+        message: "The Choice session advanced. Refresh before continuing."))
+  case .invalidContract:
+    await core.setChoiceLoopSnapshot(
+      testChoiceLoopSnapshot(aggregateDigest: String(repeating: "b", count: 64)))
+  case .readFailed:
+    await core.failNextChoiceLoopRead()
+  }
+}
+
+@MainActor
+@Test
+func unhealthyChoiceContinuityFencesEveryConsumingActionButKeepsSafetyControlsUsable() async {
+  for fixture in ChoiceContinuityActionFenceFixture.allCases {
+    let core = MockCore()
+    let model = AppModel(core: core, broker: MockBroker()) {}
+    await model.updateEnabled(true)
+    await model.refreshAccountAndModels()
+
+    let active = testActiveChoiceLoopSnapshot()
+    await core.setChoiceLoopSnapshot(active)
+    await core.setChoiceConfirmationResponse(
+      testChoiceConfirmation(
+        deliveryBindingId: nil, recipient: nil, deliveryScope: nil,
+        choiceSessionId: active.session.id, choiceSetId: active.activeChoiceSet!.id,
+        selectionId: "choice-selection-preview",
+        expectedSessionRevision: active.session.revision))
+    await model.refreshDashboard()
+    await model.prepareChoiceConfirmation()
+    #expect(model.choiceConfirmationPreview != nil)
+
+    let optionCalls = await core.choiceSelections.count
+    let dCalls = await core.choiceDInputs.count
+    let prepareCalls = await core.choiceConfirmationPrepareCount
+    let confirmCalls = await core.choiceConfirmations.count
+    let scheduleCalls = await core.choiceReminderScheduleInputs.count
+
+    await injectChoiceContinuityFailure(fixture, into: core)
+    await model.refreshDashboard()
+    #expect(model.choiceLoopContinuityState == fixture.expectedState)
+    #expect(!model.choiceSessionActionEnabled)
+    #expect(model.choiceConfirmationPreview != nil)
+    #expect(model.dashboardControls.globalToggleEnabled)
+    #expect(model.dashboardControls.settingsEnabled)
+
+    await model.selectChoiceOption(active.activeChoiceSet!.options[0])
+    await model.selectChoiceD("Keep this local")
+    await model.prepareChoiceConfirmation()
+    await model.confirmPreparedChoice()
+
+    #expect(await core.choiceSelections.count == optionCalls)
+    #expect(await core.choiceDInputs.count == dCalls)
+    #expect(await core.choiceConfirmationPrepareCount == prepareCalls)
+    #expect(await core.choiceConfirmations.count == confirmCalls)
+    #expect(await core.choiceReminderScheduleInputs.count == scheduleCalls)
+
+    await core.setChoiceCancellationResponse(testCancelledChoiceLoopSnapshot(from: active))
+    await model.cancelChoiceSession()
+    #expect(model.choiceLoopSnapshot?.session.state == "cancelled")
+    model.showsSettings = true
+    #expect(model.showsSettings)
+
+    // A terminal last-known-good session would normally permit a new local
+    // question. Re-introduce the continuity issue and prove begin is fenced by
+    // AppModel itself rather than merely hidden by the view.
+    await injectChoiceContinuityFailure(fixture, into: core)
+    await model.refreshDashboard()
+    #expect(model.choiceLoopContinuityState == fixture.expectedState)
+    #expect(!model.dashboardControls.outcomeInputEnabled)
+    model.choiceQuestion = "Start another bounded choice"
+    await model.submitChoiceQuestion()
+    #expect(await core.choiceBeginParameters.isEmpty)
+
+    await model.updateEnabled(false)
+    #expect(model.runtimeDisplayState == .off)
+    #expect(!model.enabled)
+  }
+}
+
+@MainActor
+@Test
+func dCardUsesTheExistingComposerWithoutBeginFallback() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+
+  model.focusChoiceDComposer()
+  #expect(model.choiceDComposerFocusRequested)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+  model.consumeChoiceDComposerFocusRequest()
+  #expect(!model.choiceDComposerFocusRequested)
+
+  model.choiceQuestion = "Use a different local direction"
+  #expect(model.dashboardControls.outcomeSubmitEnabled)
+
+  await core.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: active))
+  await model.submitHomeComposer()
+
+  #expect(await core.choiceDInputs.count == 1)
+  #expect((await core.choiceDInputs.first)?.boundedText == "Use a different local direction")
+  #expect(await core.choiceBeginParameters.isEmpty)
+  #expect(model.choiceQuestion.isEmpty)
+}
+
+@MainActor
+@Test
+func dComposerUsesTheExactChoiceIntakeByteBoundaryWithoutBeginFallback() async {
+  let acceptedCore = MockCore()
+  let acceptedModel = AppModel(core: acceptedCore, broker: MockBroker()) {}
+  await acceptedModel.updateEnabled(true)
+  await acceptedModel.refreshAccountAndModels()
+  let acceptedActive = testActiveChoiceLoopSnapshot()
+  await acceptedCore.setChoiceLoopSnapshot(acceptedActive)
+  await acceptedModel.refreshDashboard()
+  acceptedModel.focusChoiceDComposer()
+  acceptedModel.choiceQuestion = String(repeating: "d", count: 4_096)
+  #expect(acceptedModel.dashboardControls.outcomeSubmitEnabled)
+  await acceptedCore.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: acceptedActive))
+  await acceptedModel.submitHomeComposer()
+  #expect(await acceptedCore.choiceDInputs.count == 1)
+  #expect((await acceptedCore.choiceDInputs.first)?.boundedText.utf8.count == 4_096)
+  #expect(await acceptedCore.choiceBeginParameters.isEmpty)
+  #expect(acceptedModel.choiceQuestion.isEmpty)
+
+  let rejectedCore = MockCore()
+  let rejectedModel = AppModel(core: rejectedCore, broker: MockBroker()) {}
+  await rejectedModel.updateEnabled(true)
+  await rejectedModel.refreshAccountAndModels()
+  let rejectedActive = testActiveChoiceLoopSnapshot()
+  await rejectedCore.setChoiceLoopSnapshot(rejectedActive)
+  await rejectedModel.refreshDashboard()
+  rejectedModel.focusChoiceDComposer()
+  rejectedModel.choiceQuestion = String(repeating: "d", count: 4_097)
+  #expect(!rejectedModel.dashboardControls.outcomeSubmitEnabled)
+  await rejectedModel.submitHomeComposer()
+  #expect(await rejectedCore.choiceDInputs.isEmpty)
+  #expect(await rejectedCore.choiceBeginParameters.isEmpty)
+  #expect(rejectedModel.choiceQuestion.utf8.count == 4_097)
+}
+
+@MainActor
+@Test
+func globalOffRevokesTheTransientDTargetWithoutReinterpretingItsDraft() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Keep this draft across Off"
+
+  await model.updateEnabled(false)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  await model.submitHomeComposer()
+
+  #expect(model.choiceQuestion == "Keep this draft across Off")
+  #expect(await core.choiceDInputs.isEmpty)
+  #expect(await core.choiceBeginParameters.isEmpty)
+}
+
+@MainActor
+@Test
+func dResponseLossAndExplicitCancellationRetireLocalComposerBodies() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Keep only the durable D request"
+  await core.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: active))
+  await core.failNextChoiceDInputAfterAcceptance(
+    with: .requestTimedOut)
+
+  await model.submitHomeComposer()
+  for _ in 0..<100 where !model.choiceQuestion.isEmpty {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceQuestion.isEmpty)
+  #expect(await core.choiceBeginParameters.isEmpty)
+
+  // An unaccepted request remains visible for the owner, but an explicit
+  // Choice cancellation clears the local body and replay cache.
+  let secondActive = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(secondActive)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Cancel this local D draft"
+  await core.failNextChoiceDInput(with: .requestTimedOut)
+  await model.submitHomeComposer()
+  #expect(model.choiceQuestion == "Cancel this local D draft")
+  await core.setChoiceCancellationResponse(testCancelledChoiceLoopSnapshot(from: secondActive))
+  await core.failNextChoiceCancellationAfterAcceptance(with: .requestTimedOut)
+  await model.cancelChoiceSession()
+  for _ in 0..<100 where !model.choiceQuestion.isEmpty {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceQuestion.isEmpty)
+}
+
+@MainActor
+@Test
+func unexpectedAcceptedDResponseStillRetiresOnlyTheDurablyAcceptedComposerBody() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Retire this accepted D body after a malformed success"
+  await core.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: active))
+  // The mocked Core commits the exact D request, but returns the old Active
+  // snapshot. App-side state validation rejects that response; only the
+  // follow-up durable read may prove acceptance and clear local plaintext.
+  await core.returnUnexpectedChoiceDResponseAfterAcceptance(active)
+
+  await model.submitHomeComposer()
+  for _ in 0..<100 where !model.choiceQuestion.isEmpty {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceQuestion.isEmpty)
+  #expect(await core.choiceBeginParameters.isEmpty)
+}
+
+@MainActor
+@Test
+func acceptedDCoreTerminationRaceRetiresTheComposerBodyAfterGenerationRecovery() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core, broker: MockBroker(), registerLoginItem: {},
+    coreTerminationEvents: events.stream)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Retire D text after the accepted Core-termination race"
+  await core.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: active))
+  await core.failNextChoiceDInputAfterAcceptance(
+    with: .processTerminated,
+    beforeThrow: {
+      events.send(CoreTerminationEvent(generation: 1, reason: .transportFailure, exitStatus: nil))
+    })
+
+  await model.submitHomeComposer()
+  for _ in 0..<200 where !model.choiceQuestion.isEmpty {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceQuestion.isEmpty)
+  #expect(await core.choiceBeginParameters.isEmpty)
+}
+
+@MainActor
+@Test
+func staleDRejectionPreservesComposerTextAndCannotFallBackToChoiceBegin() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(active)
+  await model.refreshDashboard()
+  model.focusChoiceDComposer()
+  model.choiceQuestion = "Keep this unaccepted D draft"
+
+  // The Host rejects after a durable state advance. AppModel must retain the
+  // text and never reinterpret it as a new first local question.
+  await core.setChoiceLoopSnapshot(testRefiningChoiceLoopSnapshot(from: active))
+  await core.failNextChoiceDInput(
+    with: .remote(code: -32_001, message: "ChoiceSet is no longer current."))
+  await model.submitHomeComposer()
+  #expect(model.choiceQuestion == "Keep this unaccepted D draft")
+  #expect(await core.choiceBeginParameters.isEmpty)
+
+  // The rejection is definitive, but its continuity refresh is still
+  // read-only. The old active card must not remain the only visible path.
+  for _ in 0..<100 where model.choiceLoopSnapshot?.session.state != "refining" {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceLoopSnapshot?.session.state == "refining")
+  #expect(model.choiceQuestion == "Keep this unaccepted D draft")
+
+  await model.submitHomeComposer()
+  #expect(model.choiceQuestion == "Keep this unaccepted D draft")
+  #expect(await core.choiceBeginParameters.isEmpty)
+}
+
+@MainActor
+@Test
+func idleRefreshResumesOnceAndNeverInvokesResumeWhileOff() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  let idle = testChoiceLoopSnapshot(from: active, state: "softIdle")
+  await core.setChoiceLoopSnapshot(idle)
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+  await core.clearChoiceCallTrace()
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+  let trace = await core.choiceCallTrace
+  #expect(trace.lastIndex(of: "modelSetup")! < trace.lastIndex(of: "resume")!)
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+
+  await model.updateEnabled(false)
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+}
+
+@MainActor
+@Test
+func idleResumeFailureAllowsOneLaterNewRevisionButNeverLoopsTheSameRevision() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  let firstIdle = testChoiceLoopSnapshot(from: active, state: "softIdle")
+  await core.setChoiceLoopSnapshot(firstIdle)
+
+  // A successful resume begins the private worker/poll path. When that worker
+  // later returns a fresh idle revision, the poll is a read-only observation:
+  // it must not turn the failure into another automatic resume attempt.
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+  let laterIdle = testResumeIdleChoiceLoopSnapshot(from: active, revision: 3)
+  await core.setChoiceLoopSnapshot(laterIdle)
+  try? await Task.sleep(for: .milliseconds(1_100))
+  #expect(await core.choiceResumeCount == 1)
+
+  // A later genuine dashboard/foreground return may receive one new attempt.
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 2)
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 2)
+}
+
+@MainActor
+@Test
+func acceptedResumeResponseLossReattachesOnlyThePersistedResultWorker() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  let idle = testChoiceLoopSnapshot(from: active, state: "softIdle")
+  let ordinaryRefining = testRefiningChoiceLoopSnapshot(from: active)
+  let ownerResumeOperation = ChoiceRefinementOperation(
+    id: "resume-operation-choice-1", selectionId: "resume-soft-idle-choice-1",
+    choiceSessionId: active.session.id, sourceEnvelopeId: "source-envelope-choice-1",
+    conversationTurnBatchId: "batch-choice-1", expectedSessionRevision: 3,
+    expectedGeneration: 1, modelProvenance: active.activeChoiceSet!.modelProvenance,
+    sourceManifestDigest: active.documentManifest.aggregateDigest,
+    personaRevision: active.activeChoiceSet!.personaRevision,
+    dRequestId: nil, dInputDigest: nil, createdAtMs: 11)
+  let refining = ChoiceLoopSnapshot(
+    session: ordinaryRefining.session, activeBatch: ordinaryRefining.activeBatch,
+    interpretation: ordinaryRefining.interpretation,
+    activeChoiceSet: ordinaryRefining.activeChoiceSet,
+    lastSelection: ordinaryRefining.lastSelection, pendingRefinementOperation: ownerResumeOperation,
+    confirmation: ordinaryRefining.confirmation, documentManifest: ordinaryRefining.documentManifest
+  )
+  await core.setChoiceLoopSnapshot(idle)
+  await core.setChoiceResumeResponse(refining)
+  await core.failNextChoiceResumeAfterAcceptance(with: .requestTimedOut)
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  for _ in 0..<100 where model.choiceLoopSnapshot?.session.state != "refining" {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(await core.choiceResumeCount == 1)
+  #expect(model.choiceLoopSnapshot?.session.state == "refining")
+
+  await core.setChoiceLoopSnapshot(active)
+  for _ in 0..<150 where model.choiceLoopSnapshot?.session.state != "active" {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.choiceLoopSnapshot?.session.state == "active")
+  #expect(await core.choiceResumeCount == 1)
+}
+
+@MainActor
+@Test
+func idleChoiceRefreshRequiresAnExplicitHomeForegroundSignal() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(testChoiceLoopSnapshot(from: active, state: "softIdle"))
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+
+  // Settings/root/recovery reads preserve continuity but cannot become an
+  // owner-return event merely by presenting the root window.
+  await model.refreshDashboard()
+  #expect(await core.choiceResumeCount == 0)
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+}
+
+@MainActor
+@Test
+func dashboardRetryCannotTurnOneHomeReturnIntoTwoResumeAttempts() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(testChoiceLoopSnapshot(from: active, state: "softIdle"))
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+
+  // The first dashboard read fails and the AppModel retries internally. That
+  // retry must remain a read; the next resume is reserved for a later Home
+  // return, not an implementation retry.
+  await core.failNextDashboardRead()
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 0)
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+}
+
+@MainActor
+@Test
+func settingsFirstRootPresentationNeverSignalsAnOwnerHomeReturn() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(testChoiceLoopSnapshot(from: active, state: "softIdle"))
+  await core.setChoiceResumeResponse(testRefiningChoiceLoopSnapshot(from: active))
+  model.showsSettings = true
+
+  _ = NSApplication.shared
+  let hosting = NSHostingView(rootView: OpenOpenRootView(model: model))
+  let window = NSWindow(
+    contentRect: NSRect(x: 0, y: 0, width: 900, height: 760),
+    styleMask: [.titled, .closable], backing: .buffered, defer: false)
+  window.animationBehavior = .none
+  window.isReleasedWhenClosed = false
+  window.contentView = hosting
+  window.makeKeyAndOrderFront(nil)
+  defer {
+    window.orderOut(nil)
+    window.contentView = nil
+  }
+
+  // Give the root's read-only refresh a chance to settle.  The initial
+  // section is Settings, so DashboardView is never transiently constructed.
+  try? await Task.sleep(for: .milliseconds(80))
+  #expect(await core.choiceResumeCount == 0)
+}
+
+@MainActor
+@Test
+func recoveredCoreGenerationMayResumeTheExactPersistedOwnerResumeOnce() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core, broker: MockBroker(), registerLoginItem: {},
+    coreTerminationEvents: events.stream)
+  await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  let active = testActiveChoiceLoopSnapshot()
+  let idle = testChoiceLoopSnapshot(from: active, state: "softIdle")
+  let ordinaryRefining = testRefiningChoiceLoopSnapshot(from: active)
+  let ownerResumeOperation = ChoiceRefinementOperation(
+    id: "resume-operation-choice-1", selectionId: "resume-soft-idle-choice-1",
+    choiceSessionId: active.session.id, sourceEnvelopeId: "source-envelope-choice-1",
+    conversationTurnBatchId: "batch-choice-1", expectedSessionRevision: 3,
+    expectedGeneration: 1, modelProvenance: active.activeChoiceSet!.modelProvenance,
+    sourceManifestDigest: active.documentManifest.aggregateDigest,
+    personaRevision: active.activeChoiceSet!.personaRevision,
+    dRequestId: nil, dInputDigest: nil, createdAtMs: 11)
+  let refining = ChoiceLoopSnapshot(
+    session: ordinaryRefining.session, activeBatch: ordinaryRefining.activeBatch,
+    interpretation: ordinaryRefining.interpretation,
+    activeChoiceSet: ordinaryRefining.activeChoiceSet,
+    lastSelection: ordinaryRefining.lastSelection, pendingRefinementOperation: ownerResumeOperation,
+    confirmation: ordinaryRefining.confirmation, documentManifest: ordinaryRefining.documentManifest
+  )
+  await core.setChoiceLoopSnapshot(idle)
+  await core.setChoiceResumeResponse(refining)
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 1)
+
+  // The durable Store row is exactly the owner-resume operation returned by
+  // the first Core. A replacement generation may recover that row once; the
+  // prior generation's local dedupe must never strand the foreground session.
+  await core.setChoiceLoopSnapshot(refining)
+  await core.simulateCoreReplacement()
+  let dashboardReadsBeforeRecovery = await core.dashboardInvocationCount
+  events.send(CoreTerminationEvent(generation: 1, reason: .exited, exitStatus: 0))
+  for _ in 0..<250 where await core.dashboardInvocationCount <= dashboardReadsBeforeRecovery {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(await core.dashboardInvocationCount > dashboardReadsBeforeRecovery)
+  for _ in 0..<250
+  where model.choiceLoopSnapshot?.session.state != "refining"
+    || model.runtimeRecoveryState != .ready
+  {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.runtimeRecoveryState == .ready)
+  #expect(model.modelEntryEnabled)
+  #expect(model.choiceLoopSnapshot?.session.state == "refining")
+  #expect(model.choiceLoopSnapshot?.pendingRefinementOperation?.isOwnerResume == true)
+
+  await model.refreshDashboard(authenticatedHomeForeground: true)
+  #expect(await core.choiceResumeCount == 2)
+}
+
+@Test
+func ownerResumeRequiresStoreMintedOperationAndSelectionMarkers() {
+  let active = testActiveChoiceLoopSnapshot()
+  let forged = ChoiceRefinementOperation(
+    id: "choice-refinement-forged", selectionId: "resume-soft-idle-forged",
+    choiceSessionId: active.session.id, sourceEnvelopeId: "source-envelope-choice-1",
+    conversationTurnBatchId: "batch-choice-1", expectedSessionRevision: 3,
+    expectedGeneration: 1, modelProvenance: active.activeChoiceSet!.modelProvenance,
+    sourceManifestDigest: active.documentManifest.aggregateDigest,
+    personaRevision: active.activeChoiceSet!.personaRevision,
+    dRequestId: nil, dInputDigest: nil, createdAtMs: 11)
+  #expect(!forged.isOwnerResume)
+}
+
+@MainActor
+@Test
+func idleAndStaleReviewSnapshotsCannotConsumeAnOldChoiceSet() async {
+  for state in ["softIdle", "staleReview"] {
+    let core = MockCore()
+    let model = AppModel(core: core, broker: MockBroker()) {}
+    await model.updateEnabled(true)
+    await model.refreshAccountAndModels()
+
+    let active = testActiveChoiceLoopSnapshot()
+    await core.setChoiceLoopSnapshot(active)
+    await core.setChoiceConfirmationResponse(
+      testChoiceConfirmation(
+        deliveryBindingId: nil, recipient: nil, deliveryScope: nil,
+        choiceSessionId: active.session.id, choiceSetId: active.activeChoiceSet!.id,
+        selectionId: "choice-selection-preview",
+        expectedSessionRevision: active.session.revision))
+    await model.refreshDashboard()
+    await model.prepareChoiceConfirmation()
+    #expect(model.choiceConfirmationPreview != nil)
+
+    let gated = testChoiceLoopSnapshot(from: active, state: state)
+    await core.setChoiceLoopSnapshot(gated)
+    await model.refreshDashboard()
+    #expect(model.choiceLoopContinuityState == .current)
+    #expect(model.choiceLoopSnapshot?.session.state == state)
+    #expect(!model.choiceSessionActionEnabled)
+    #expect(model.choiceConfirmationPreview == nil)
+
+    let optionCalls = await core.choiceSelections.count
+    let dCalls = await core.choiceDInputs.count
+    let prepareCalls = await core.choiceConfirmationPrepareCount
+    let confirmCalls = await core.choiceConfirmations.count
+    await model.selectChoiceOption(active.activeChoiceSet!.options[0])
+    await model.selectChoiceD("Do not reuse the old card")
+    await model.prepareChoiceConfirmation()
+    await model.confirmPreparedChoice()
+    #expect(await core.choiceSelections.count == optionCalls)
+    #expect(await core.choiceDInputs.count == dCalls)
+    #expect(await core.choiceConfirmationPrepareCount == prepareCalls)
+    #expect(await core.choiceConfirmations.count == confirmCalls)
+
+    await core.setChoiceCancellationResponse(testCancelledChoiceLoopSnapshot(from: gated))
+    await model.cancelChoiceSession()
+    #expect(model.choiceLoopSnapshot?.session.state == "cancelled")
+    #expect(model.dashboardControls.globalToggleEnabled)
+    #expect(model.dashboardControls.settingsEnabled)
+    await model.updateEnabled(false)
+  }
+}
+
+@MainActor
+@Test
+func cancelledChoiceExposesReceiptCleanupOnlyWhenHostProvesItAvailable() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let cancelled = testCancelledChoiceLoopSnapshot(from: testActiveChoiceLoopSnapshot())
+  await core.setChoiceLoopSnapshot(cancelled)
+
+  await model.refreshDashboard()
+  #expect(model.choiceLoopSnapshot == cancelled)
+  #expect(!model.choiceMarkdownReceiptCleanupAvailable)
+
+  await core.setChoiceMarkdownReceiptCleanupAvailable(true)
+  await model.refreshDashboard()
+  #expect(model.choiceMarkdownReceiptCleanupAvailable)
+
+  await model.reconcileChoiceMarkdown()
+  #expect(await core.choiceMarkdownReceiptCleanupInvocations() == 1)
+  // A local transition result cannot inherit cleanup availability from the
+  // preceding terminal session; only a new authenticated Host read may set it.
+  #expect(!model.choiceMarkdownReceiptCleanupAvailable)
+}
+
+@MainActor
+@Test
+func markdownReconciliationFailureIsANonblockingContinuityIncident() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testExecutingChoiceLoopSnapshot(from: testActiveChoiceLoopSnapshot())
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.updateEnabled(true)
+  await model.refreshDashboard()
+
+  await core.failNextChoiceMarkdownReconcile()
+  await model.reconcileChoiceMarkdown()
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.choiceLoopContinuityState == .needsYou(.readFailed))
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+}
+
+@MainActor
+@Test
+func choiceContinuityRejectsLateRefreshAfterOffAndRecoversOnRestart() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker()) {}
+  let knownGood = testChoiceLoopSnapshot()
+  await core.setChoiceLoopSnapshot(knownGood)
+  await model.refreshDashboard()
+
+  let staleRefresh = testChoiceLoopSnapshot(sessionID: "session-2")
+  let gate = NonCooperativeRpcGate()
+  await core.setChoiceLoopSnapshot(staleRefresh)
+  await core.blockNextChoiceLoopRead(on: gate)
+  let refresh = Task { await model.refreshDashboard() }
+  for _ in 0..<100 where !gate.isWaiting {
+    try? await Task.sleep(for: .milliseconds(2))
+  }
+  #expect(gate.isWaiting)
+  model.requestEnabled(false)
+  gate.resume()
+  await refresh.value
+
+  #expect(model.choiceLoopSnapshot == knownGood)
+  #expect(model.dashboardControls.globalToggleEnabled)
+
+  await core.setChoiceLoopSnapshot(knownGood)
+  let restarted = AppModel(core: core, broker: MockBroker()) {}
+  await restarted.refreshDashboard()
+  #expect(restarted.choiceLoopSnapshot == knownGood)
+  #expect(restarted.choiceLoopContinuityState == .current)
+}
+
+@MainActor
+@Test
+func protectedOnRemainsAwaitingWhenNoCurrentModelSelectionExists() async {
   let core = MockCore(
     modelCatalog: [
       GptModel(
-        id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol",
+        id: "gpt-test-model", displayName: "Test model",
         supportedReasoningEfforts: ["low", "medium"])
     ])
+  await core.clearPersistedModelSelection()
   let events = CoreTerminationEmitter()
   let model = AppModel(
     core: core,
@@ -3348,6 +6295,130 @@ func coreTerminationImmediatelyClearsCachedStatusAndRestoresBothDurableListeners
   #expect(await core.channelSends.isEmpty)
   #expect(model.errorMessage == nil)
   await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func coreTerminationRecoveryVerifiesAnEmptyChoiceStoreBeforeRepublishingOn() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.runtimeDisplayState == .on)
+  #expect(model.choiceLoopContinuityState == .empty)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+
+  await core.simulateCoreReplacement()
+  await core.delayNextEffectIdentity(by: .milliseconds(150))
+  events.send(CoreTerminationEvent(generation: 1, reason: .exited, exitStatus: 0))
+
+  for _ in 0..<100 where model.runtimeRecoveryState != .recovering {
+    try? await Task.sleep(for: .milliseconds(5))
+  }
+  #expect(model.runtimeRecoveryState == .recovering)
+  #expect(model.runtimeDisplayState == .turningOn)
+  #expect(!model.dashboardControls.outcomeInputEnabled)
+
+  for _ in 0..<250 where model.runtimeRecoveryState != .ready {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.runtimeRecoveryState == .ready)
+  #expect(model.runtimeDisplayState == .on)
+  #expect(model.choiceLoopContinuityState == .empty)
+  #expect(model.choiceLoopSnapshot == nil)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+  #expect(await core.proposalCount == 0)
+  #expect(await core.channelSends.isEmpty)
+
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func coreTerminationRecoveryReadFailureNeverPublishesFalseOnOrLocalInput() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.runtimeDisplayState == .on)
+  #expect(model.dashboardControls.outcomeInputEnabled)
+
+  await core.simulateCoreReplacement()
+  await core.failNextChoiceLoopReadAttempts(3)
+  events.send(CoreTerminationEvent(generation: 1, reason: .exited, exitStatus: 0))
+
+  for _ in 0..<350 where model.runtimeRecoveryState != .paused {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.runtimeRecoveryState == .paused)
+  #expect(model.runtimeDisplayState == .unknown)
+  #expect(model.choiceLoopContinuityState == .needsYou(.readFailed))
+  #expect(!model.modelEntryEnabled)
+  #expect(!model.dashboardControls.outcomeInputEnabled)
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+  #expect(await core.proposalCount == 0)
+  #expect(await core.channelSends.isEmpty)
+
+  await model.updateEnabled(false)
+}
+
+@MainActor
+@Test
+func coreTerminationRecoveryRejectsLateChoiceReadFromAnOlderGeneration() async {
+  let core = MockCore()
+  let events = CoreTerminationEmitter()
+  let model = AppModel(
+    core: core,
+    broker: MockBroker(),
+    registerLoginItem: {},
+    coreTerminationEvents: events.stream
+  )
+
+  await model.updateEnabled(true)
+  #expect(model.choiceLoopSnapshot == nil)
+
+  let lateSnapshot = testChoiceLoopSnapshot(sessionID: "late-recovery-session")
+  let gate = NonCooperativeRpcGate()
+  await core.setChoiceLoopSnapshot(lateSnapshot)
+  await core.blockNextChoiceLoopRead(on: gate)
+  await core.simulateCoreReplacement()
+  events.send(CoreTerminationEvent(generation: 1, reason: .exited, exitStatus: 0))
+
+  for _ in 0..<250 where !gate.isWaiting {
+    try? await Task.sleep(for: .milliseconds(5))
+  }
+  #expect(gate.isWaiting)
+  #expect(model.runtimeRecoveryState == .recovering)
+  #expect(!model.dashboardControls.outcomeInputEnabled)
+
+  await core.setChoiceLoopSnapshot(nil)
+  model.requestEnabled(false)
+  gate.resume()
+  for _ in 0..<250 where model.runtimeDisplayState != .off {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+
+  #expect(model.runtimeDisplayState == .off)
+  #expect(!model.enabled)
+  #expect(model.choiceLoopSnapshot == nil)
+  #expect(!model.dashboardControls.outcomeInputEnabled)
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(model.dashboardControls.settingsEnabled)
+  #expect(await core.proposalCount == 0)
+  #expect(await core.channelSends.isEmpty)
 }
 
 @MainActor
@@ -3996,7 +7067,7 @@ func chatGptLoginRotatesThroughLoginOnlyThenFreshReadOnlyCodex() async {
 
   #expect(model.errorMessage == nil)
   #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
-  #expect(model.availableModels.map(\.id) == ["gpt-5.6-sol"])
+  #expect(model.availableModels.map(\.id) == ["gpt-test-model"])
   #expect(openedURLs.value.map(\.absoluteString) == ["https://example.invalid"])
   #expect(await core.codexLoginPrepareCount == 1)
   #expect(await core.loginBeginCount == 1)
@@ -4036,7 +7107,7 @@ func failedOfficialLoginLaunchDestroysLoginOnlyCodexAndDoesNotExposeModels() asy
   await model.connectChatGpt()
   #expect(model.errorMessage == nil)
   #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
-  #expect(model.availableModels.map(\.id) == ["gpt-5.6-sol"])
+  #expect(model.availableModels.map(\.id) == ["gpt-test-model"])
   #expect(await core.codexLoginPrepareCount == 2)
   #expect(await core.loginBeginCount == 2)
   #expect(await core.loginAwaitCount == 1)
@@ -4065,7 +7136,7 @@ func invalidLoginURLAndCancelledAwaitBothRetryWithoutToggleOrRestart() async {
   await model.connectChatGpt()
   #expect(model.errorMessage == nil)
   #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
-  #expect(model.availableModels.map(\.id) == ["gpt-5.6-sol"])
+  #expect(model.availableModels.map(\.id) == ["gpt-test-model"])
   #expect(await core.codexLoginPrepareCount == 3)
   #expect(await core.loginBeginCount == 3)
   #expect(await core.loginAwaitCount == 2)
@@ -4089,7 +7160,7 @@ func completedLoginModelPreparationFailureRetriesAccountWithoutSecondLogin() asy
   await model.connectChatGpt()
   #expect(model.errorMessage == nil)
   #expect(model.accountState == .chatGpt(email: "owner@example.com", planType: "plus"))
-  #expect(model.availableModels.map(\.id) == ["gpt-5.6-sol"])
+  #expect(model.availableModels.map(\.id) == ["gpt-test-model"])
   #expect(await core.loginBeginCount == 1)
   #expect(await core.loginAwaitCount == 1)
 }
@@ -4459,16 +7530,16 @@ func staleDashboardFailureCannotOverwriteANewerSuccessfulToggle() async {
 
 @MainActor
 @Test
-func accountAndModelsConsumeDistinctFreshRuntimeChallenges() async {
+func modelSetupConsumesOneFreshRuntimeChallengeForAnAtomicCatalogSnapshot() async {
   let core = MockCore()
   let model = AppModel(core: core, broker: MockBroker()) {}
   await model.updateEnabled(true)
   let before = await core.challengesIssued
   await model.refreshAccountAndModels()
   let nonces = await core.proofNonces
-  #expect(await core.challengesIssued == before + 2)
-  #expect(nonces.count == 2)
-  #expect(Set(nonces).count == 2)
+  #expect(await core.challengesIssued == before + 1)
+  #expect(nonces.count == 1)
+  #expect(Set(nonces).count == 1)
   #expect(await core.codexInitializeCount == 1)
 }
 
@@ -5078,7 +8149,9 @@ func unrecoverableStartedChannelModelSurfacesNeedYouAndKeepsCorrectionPollingLiv
   #expect(model.errorMessage == nil)
   #expect(model.channelFailureIncidents.count == 1)
   let pollsAfterNeedYou = await core.channelPollCount
-  try? await Task.sleep(for: .milliseconds(1_100))
+  for _ in 0..<200 where await core.channelPollCount <= pollsAfterNeedYou {
+    try? await Task.sleep(for: .milliseconds(20))
+  }
   #expect(await core.channelPollCount > pollsAfterNeedYou)
 
   await model.updateEnabled(false)
@@ -6310,7 +9383,7 @@ func missionParticipationCannotLeakFromAReceiptIntoTheNextMission() async {
     id: "receipt-a",
     missionId: missionA.missionId,
     summary: "Completed First Mission",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-a"],
     outputHashes: [],
     completedAtMs: 30
@@ -6763,7 +9836,7 @@ func progressAndReceiptControlsRequireTheExactRouteMissionIdentity() async {
     id: "receipt-b",
     missionId: missionB.missionId,
     summary: "Completed Second Mission",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-b"],
     outputHashes: [],
     completedAtMs: 20
@@ -6787,20 +9860,37 @@ func progressAndReceiptControlsRequireTheExactRouteMissionIdentity() async {
 func channelMissionCompletionAuthorizesAndReturnsTheExactEvidenceReceipt() async {
   let core = MockCore()
   let reminders = MockReminders()
+  let link = ReminderLink(
+    missionId: "mission-1",
+    workItemId: "work-1",
+    sourceIdentifier: "source-1",
+    calendarIdentifier: "calendar-1",
+    calendarItemIdentifier: "reminder-work-1",
+    dispatchToken: "dispatch-work-1",
+    title: "Pick one priority"
+  )
+  let mission = testConfirmedMission(
+    writeDisposition: .recoverOnly,
+    reminderDispatch: [
+      ConfirmedReminderDispatch(workItemId: "work-1", token: "dispatch-work-1")
+    ],
+    reminderLinks: [link]
+  )
   await core.setChannelPairing(testIMessagePairing())
-  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
-  await core.returnChannelRouteSetAfterNextConfirmation(
-    testChannelRouteSet(
+  await core.restoreFromDashboard(
+    mission: mission,
+    receipt: nil,
+    channelRouteSet: testChannelRouteSet(
+      missionId: mission.missionId,
       channel: .iMessage,
       conversationId: "42",
       ownerSenderId: "owner@example.invalid"
     )
   )
+  let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
   await connectTestIMessage(model)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
-  await model.confirmSuggestion()
+  await model.refreshDashboard()
   await model.checkMissionProgress()
 
   let approvals = await core.receiptReturnApprovals
@@ -6813,7 +9903,7 @@ func channelMissionCompletionAuthorizesAndReturnsTheExactEvidenceReceipt() async
   #expect(sends.first?.kind == .receipt)
   #expect(
     sends.first?.content
-      == "Done: Completed Plan the day\nEvidence: 1 verified completion\nModel: gpt-5.6-sol"
+      == "Done: Completed Plan the day\nEvidence: 1 verified completion\nModel: gpt-test-model"
   )
   #expect(model.receipt?.missionId == "mission-1")
   #expect(model.channelRouteSet?.missionId == "mission-1")
@@ -7060,9 +10150,23 @@ func mismatchedRecoveredTimestampCannotAuthorizeModelEntry() async {
   let core = MockCore()
   let model = AppModel(core: core, broker: MockBroker()) {}
   await model.updateEnabled(true)
+  await model.refreshAccountAndModels()
+  await model.refreshDashboard()
+  #expect(model.choiceLoopContinuityState == .empty)
+  let accepted = ChoiceBeginAccepted(
+    requestId: "choice-request-recovery-mismatch",
+    operationId: "choice-operation-recovery-mismatch",
+    choiceSessionId: "session-choice-1",
+    acceptedSessionRevision: 1,
+    sourceEnvelopeId: "source-envelope-recovery-mismatch",
+    conversationTurnBatchId: "batch-choice-recovery-mismatch",
+    state: "interpreting"
+  )
+  await core.setChoiceLoopSnapshot(testInterpretingChoiceLoopSnapshot())
+  await core.setChoiceBeginAccepted(accepted)
   await core.returnMismatchedRecoveryTimestamp()
-  model.prompt = "must stay local"
-  await model.submitPrompt()
+  model.choiceQuestion = "must stay local"
+  await model.submitChoiceQuestion()
   #expect(await core.proposalCount == 0)
   #expect(model.runtimeDisplayState == .unknown)
   #expect(!model.modelEntryEnabled)
@@ -7145,7 +10249,7 @@ func dashboardRejectsVisibleDoneWithoutBoundedEvidence() {
     id: "receipt-1",
     missionId: "mission-1",
     summary: "Completed Plan the day",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: [],
     outputHashes: [],
     completedAtMs: 10
@@ -7231,7 +10335,7 @@ func dashboardRejectsUnreachableOrContradictoryMissionStates() {
     id: "receipt-old",
     missionId: "mission-old",
     summary: "Completed the previous Mission",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-old"],
     outputHashes: [],
     completedAtMs: 1
@@ -7254,7 +10358,7 @@ func dashboardRejectsUnreachableOrContradictoryMissionStates() {
     id: "receipt-current",
     missionId: mission.missionId,
     summary: "Must not be Done while work is active",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-current"],
     outputHashes: [],
     completedAtMs: 2
@@ -7311,8 +10415,19 @@ func dashboardGoldenPathKeepsControlsUsableUntilEvidenceBackedDone() async {
   let incident = testChannelFailureIncident(acknowledged: true)
   let core = MockCore()
   let reminders = MockReminders()
+  let link = ReminderLink(
+    missionId: "mission-1", workItemId: "work-1",
+    sourceIdentifier: "source-1", calendarIdentifier: "calendar-1",
+    calendarItemIdentifier: "reminder-work-1", dispatchToken: "dispatch-work-1",
+    title: "Pick one priority"
+  )
+  let mission = testConfirmedMission(
+    writeDisposition: .recoverOnly,
+    reminderDispatch: [ConfirmedReminderDispatch(workItemId: "work-1", token: "dispatch-work-1")],
+    reminderLinks: [link]
+  )
   await core.restoreFromDashboard(
-    mission: nil,
+    mission: mission,
     receipt: nil,
     channelFailureIncidents: [incident]
   )
@@ -7323,17 +10438,9 @@ func dashboardGoldenPathKeepsControlsUsableUntilEvidenceBackedDone() async {
   #expect(!model.dashboardControls.outcomeInputEnabled)
 
   await model.updateEnabled(true)
-  #expect(model.dashboardControls.outcomeInputEnabled)
-  model.prompt = "Help me plan today"
-  #expect(model.dashboardControls.outcomeSubmitEnabled)
-
-  await model.submitPrompt()
-  #expect(model.suggestion != nil)
-  #expect(model.dashboardControls.suggestionConfirmationEnabled)
+  await model.refreshDashboard()
   #expect(model.channelFailureIncidents == [incident])
-
-  await model.confirmSuggestion()
-  #expect(model.confirmedMission?.missionId == "mission-1")
+  #expect(model.confirmedMission == mission)
   #expect(model.dashboardControls.missionProgressEnabled)
   #expect(!model.dashboardControls.doneVisible)
 
@@ -7350,8 +10457,19 @@ func hostedDashboardActivatesTheEvidenceGatedGoldenPathAndRestoresDone() async t
   let incident = testChannelFailureIncident(acknowledged: true)
   let core = MockCore()
   let reminders = MockReminders()
+  let link = ReminderLink(
+    missionId: "mission-1", workItemId: "work-1",
+    sourceIdentifier: "source-1", calendarIdentifier: "calendar-1",
+    calendarItemIdentifier: "reminder-work-1", dispatchToken: "dispatch-work-1",
+    title: "Pick one priority"
+  )
+  let mission = testConfirmedMission(
+    writeDisposition: .recoverOnly,
+    reminderDispatch: [ConfirmedReminderDispatch(workItemId: "work-1", token: "dispatch-work-1")],
+    reminderLinks: [link]
+  )
   await core.restoreFromDashboard(
-    mission: nil,
+    mission: mission,
     receipt: nil,
     channelFailureIncidents: [incident]
   )
@@ -7380,49 +10498,8 @@ func hostedDashboardActivatesTheEvidenceGatedGoldenPathAndRestoresDone() async t
   }
   #expect(model.modelEntryEnabled)
   hosting.layoutSubtreeIfNeeded()
-
-  let outcomeField = try #require(dashboardOutcomeField(in: hosting))
-  #expect(outcomeField.isEnabled)
-  #expect(window.makeFirstResponder(outcomeField))
-  outcomeField.currentEditor()?.insertText("Help me plan today")
-  for _ in 0..<100 where model.prompt != "Help me plan today" {
-    try? await Task.sleep(for: .milliseconds(2))
-  }
-  #expect(model.prompt == "Help me plan today")
-  hosting.layoutSubtreeIfNeeded()
-
-  #expect(model.dashboardControls.outcomeSubmitEnabled)
-  let ask = try #require(
-    dashboardInteractionAnchor(in: hosting, identifier: "openopen-dashboard-outcome-submit")
-  )
-  try clickDashboardInteractionAnchor(ask, in: window)
-  for _ in 0..<500 {
-    if model.suggestion != nil && !model.isBusy
-      && model.dashboardControls.suggestionConfirmationEnabled
-    {
-      break
-    }
-    try? await Task.sleep(for: .milliseconds(2))
-  }
-  #expect(model.suggestion != nil)
-  #expect(window.attachedSheet == nil)
-  hosting.layoutSubtreeIfNeeded()
-
-  #expect(model.dashboardControls.suggestionConfirmationEnabled)
-  let confirm = try #require(
-    dashboardInteractionAnchor(in: hosting, identifier: "openopen-dashboard-confirm-mission")
-  )
-  try clickDashboardInteractionAnchor(confirm, in: window)
-  for _ in 0..<500 {
-    if !model.reminderLinks.isEmpty && !model.isBusy
-      && model.dashboardControls.missionProgressEnabled
-    {
-      break
-    }
-    try? await Task.sleep(for: .milliseconds(2))
-  }
-  #expect(model.confirmedMission?.missionId == "mission-1")
-  #expect(model.reminderLinks.count == 1)
+  #expect(model.confirmedMission == mission)
+  #expect(model.reminderLinks == [link])
   #expect(!model.dashboardControls.doneVisible)
   hosting.layoutSubtreeIfNeeded()
 
@@ -7487,6 +10564,50 @@ func hostedDashboardActivatesTheEvidenceGatedGoldenPathAndRestoresDone() async t
 
 @MainActor
 @Test
+func frozenEditorialShellKeepsTheChoiceEntryAndOffReachableAtNarrowWidth() async {
+  let core = MockCore()
+  let model = AppModel(core: core, broker: MockBroker(), reminders: MockReminders()) {}
+
+  _ = NSApplication.shared
+  let hosting = NSHostingView(rootView: OpenOpenRootView(model: model))
+  let window = NSWindow(
+    contentRect: NSRect(x: 0, y: 0, width: 390, height: 640),
+    styleMask: [.titled, .closable],
+    backing: .buffered,
+    defer: false
+  )
+  window.animationBehavior = .none
+  window.isReleasedWhenClosed = false
+  window.contentView = hosting
+  window.makeKeyAndOrderFront(nil)
+
+  for _ in 0..<500 where model.runtimeDisplayState == .unknown {
+    try? await Task.sleep(for: .milliseconds(2))
+  }
+  hosting.layoutSubtreeIfNeeded()
+
+  #expect(model.dashboardControls.globalToggleEnabled)
+  #expect(dashboardOutcomeField(in: hosting) != nil)
+  #expect(
+    dashboardInteractionAnchor(
+      in: hosting,
+      identifier: "openopen-dashboard-outcome-submit"
+    ) != nil
+  )
+  #expect(window.attachedSheet == nil)
+
+  await model.updateEnabled(false)
+  #expect(model.runtimeDisplayState == .off)
+  #expect(model.dashboardControls.globalToggleEnabled)
+
+  window.makeFirstResponder(nil)
+  window.contentView = nil
+  window.orderOut(nil)
+  try? await Task.sleep(for: .milliseconds(30))
+}
+
+@MainActor
+@Test
 func goldenPathBoundarySnapshotsRemainActionableAfterAppRestart() async {
   let suggestion = OutcomeSuggestion(
     id: testRestartSuggestionId,
@@ -7506,7 +10627,7 @@ func goldenPathBoundarySnapshotsRemainActionableAfterAppRestart() async {
     id: "receipt-restart",
     missionId: mission.missionId,
     summary: "Completed Plan the day",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-work-1"],
     outputHashes: [],
     completedAtMs: 10
@@ -7554,8 +10675,7 @@ func heroAConfirmCreatesRemindersAndCompletedReadbackProducesReceipt() async {
   let reminders = MockReminders()
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   #expect(await core.confirmationCount == 1)
@@ -7565,8 +10685,9 @@ func heroAConfirmCreatesRemindersAndCompletedReadbackProducesReceipt() async {
   #expect(model.activeCards.count == 1)
 
   await model.checkMissionProgress()
+  #expect(model.errorMessage == nil)
   #expect(model.receipt?.missionId == "mission-1")
-  #expect(model.receipt?.actualModel == "gpt-5.6-sol")
+  #expect(model.receipt?.actualModel == "gpt-test-model")
   #expect(model.activeCards.isEmpty)
   #expect(model.confirmedMission == nil)
   #expect(model.reminderLinks.isEmpty)
@@ -7590,8 +10711,7 @@ func completionCannotPublishDoneWhenCoreOmitsEvidence() async {
   await core.returnInvalidCompletionReceipt()
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   await model.checkMissionProgress()
@@ -7612,13 +10732,12 @@ func heroASecondOutcomeCannotReuseTheCompletedMission() async {
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
 
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
   await model.checkMissionProgress()
 
-  model.prompt = "Help me plan tomorrow"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(
+    core, model: model, identifier: testSuggestionTwoId)
   #expect(model.suggestion?.id == testSuggestionTwoId)
   await model.confirmSuggestion()
 
@@ -7637,8 +10756,7 @@ func heroAInvalidCoreReminderAuthorizationCannotReachTheExternalWriter() async {
   let reminders = MockReminders()
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   #expect(reminders.executeCount == 0)
@@ -7658,6 +10776,53 @@ func heroAReminderAuthorizationPayloadHasTheRustContractVector() {
       workItems: [MissionWorkItem(id: "work-1", title: "Pick one priority")]
     ) == "188605fc48e5a3bc42efee3820582cb016a84685869bfbb6688daf79b055fab0"
   )
+}
+
+@MainActor
+@Test
+func choiceReminderRecoveryRejectsMalformedOrRemovedOwnershipMetadata() throws {
+  let confirmation = testChoiceConfirmation(
+    deliveryBindingId: "binding-1", recipient: "owner-1", deliveryScope: "same-surface")
+  let mission = testChoiceConfirmedMission(
+    confirmation: confirmation,
+    dispatch: [
+      ConfirmedReminderDispatch(
+        workItemId: confirmation.reminderItems[0].id,
+        token: "dispatch-choice-work-1")
+    ])
+  let expectedDue = DateComponents(
+    timeZone: TimeZone(identifier: "Etc/UTC"), year: 1970, month: 1, day: 1,
+    hour: 0, minute: 0, second: 0)
+
+  #expect(throws: RemindersClientError.reminderChanged("damaged")) {
+    try RemindersClient.rejectPlausibleUnverifiableReminder(
+      title: "damaged", notes: "Created by OpenOpen.\nOpenOpen metadata:not-base64",
+      dueDateComponents: nil, mission: mission)
+  }
+  #expect(throws: RemindersClientError.reminderChanged("Review the prepared plan")) {
+    try RemindersClient.rejectPlausibleUnverifiableReminder(
+      title: "Review the prepared plan", notes: nil,
+      dueDateComponents: expectedDue, mission: mission)
+  }
+  #expect(throws: RemindersClientError.reminderChanged("Unrelated owner reminder")) {
+    try RemindersClient.rejectPlausibleUnverifiableReminder(
+      title: "Unrelated owner reminder", notes: nil,
+      dueDateComponents: expectedDue, mission: mission)
+  }
+  #expect(throws: RemindersClientError.reminderChanged("Review the prepared plan")) {
+    try RemindersClient.rejectPlausibleOtherMissionReminder(
+      title: "Review the prepared plan", dueDateComponents: expectedDue,
+      markerWorkItemId: confirmation.reminderItems[0].id,
+      markerDispatchToken: "dispatch-choice-work-1", mission: mission)
+  }
+  #expect(throws: Never.self) {
+    try RemindersClient.rejectPlausibleOtherMissionReminder(
+      title: "Historical unrelated item",
+      dueDateComponents: DateComponents(
+        timeZone: TimeZone(identifier: "Etc/UTC"), year: 2030, month: 1, day: 1,
+        hour: 12, minute: 0, second: 0),
+      markerWorkItemId: "other-work", markerDispatchToken: "other-token", mission: mission)
+  }
 }
 
 @Test
@@ -7776,7 +10941,7 @@ func heroASecondMissionHostShapeSuppressesTheHistoricalReceipt() throws {
     "id": "receipt-old",
     "missionId": "mission-old",
     "summary": "Completed the previous Mission",
-    "actualModel": "gpt-5.6-sol",
+    "actualModel": "gpt-test-model",
     "evidenceIds": ["evidence-old"],
     "outputHashes": [],
     "completedAtMs": 1,
@@ -7809,7 +10974,7 @@ func heroADashboardRestoresARecoverableMissionOrReceiptAfterRestart() async {
     id: "receipt-1",
     missionId: "mission-1",
     summary: "Completed Plan the day",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-work-1"],
     outputHashes: [],
     completedAtMs: 10
@@ -7861,8 +11026,7 @@ func heroAPartialReminderReadbackCannotFabricateReceipt() async {
   let reminders = MockReminders(mode: .partial)
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
   await model.checkMissionProgress()
 
@@ -7878,8 +11042,7 @@ func heroAPostCommitReadbackFailureRetriesWithReadOnlyRecoveryAndNoSecondWrite()
   let reminders = MockReminders(mode: .commitThenFailReadback)
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   #expect(await core.confirmationCount == 1)
@@ -7907,8 +11070,7 @@ func heroAPrecommitFailureNeverIssuesASecondExternalWrite() async {
   let reminders = MockReminders(mode: .failBeforeCommit)
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   reminders.mode = .complete
@@ -7919,7 +11081,7 @@ func heroAPrecommitFailureNeverIssuesASecondExternalWrite() async {
   #expect(reminders.executeCount == 1)
   #expect(reminders.recoverCount == 1)
   #expect(model.reminderLinks.isEmpty)
-  #expect(model.errorMessage?.contains("exactly match") == true)
+  #expect(model.errorMessage?.contains("No Reminder exists") == true)
 }
 
 @MainActor
@@ -7929,8 +11091,7 @@ func strandedReminderMissionCanBeCancelledWithoutASecondExternalWrite() async {
   let reminders = MockReminders(mode: .failBeforeCommit)
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
 
   #expect(model.activeCards.map(\.id) == ["mission-1"])
@@ -8152,7 +11313,7 @@ func awaitingAccountSendsExactMissionChannelEffectsWithoutModelWork() async {
     id: "receipt-awaiting-account",
     missionId: mission.missionId,
     summary: "Completed Plan the day",
-    actualModel: "gpt-5.6-sol",
+    actualModel: "gpt-test-model",
     evidenceIds: ["evidence-work-1"],
     outputHashes: [],
     completedAtMs: 20
@@ -8339,6 +11500,7 @@ func missingAccountOrRequiredModelStillCompletesEvidenceLocallyWithoutOutbound()
   ]
 
   for core in cores {
+    await core.clearPersistedModelSelection()
     await core.restoreFromDashboard(
       mission: mission,
       receipt: nil,
@@ -8529,8 +11691,7 @@ func heroADispatchResponseLossFailsClosedWithoutAnyExternalWrite() async {
   let reminders = MockReminders()
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   await model.confirmSuggestion()
   await model.confirmSuggestion()
 
@@ -8548,8 +11709,7 @@ func heroAOffAfterEventKitCommitStillPermitsOnlyReadOnlyRecovery() async {
   let reminders = MockReminders(mode: .commitThenDelay)
   let model = AppModel(core: core, broker: MockBroker(), reminders: reminders) {}
   await model.updateEnabled(true)
-  model.prompt = "Help me plan today"
-  await model.submitPrompt()
+  await restoreLegacySuggestionForRecovery(core, model: model)
   model.requestSuggestionConfirmation()
 
   for _ in 0..<20 where reminders.executeCount == 0 {
@@ -8628,6 +11788,25 @@ func unsignedRegularCoreIsRejectedBeforeTheMasterKeyIsLoaded() async throws {
     Issue.record("an unsigned regular Core replacement must fail closed")
   } catch {}
   #expect(masterLoads.value == 0)
+}
+
+@Test
+func receiptCleanupNeverLaunchesAQuiescedCore() async throws {
+  let launchAttempts = LockIsolated(0)
+  let client = CoreProcessClient(
+    executableResolver: {
+      launchAttempts.withLock { $0 += 1 }
+      throw CoreClientError.processUnavailable
+    },
+    staticCodeValidator: { _ in },
+    runningCodeValidator: { _ in },
+    masterKeyLoader: { Data(repeating: 7, count: 32) }
+  )
+  do {
+    _ = try await client.cleanupChoiceMarkdownReceipt()
+    Issue.record("post-Off receipt cleanup must not launch Core")
+  } catch {}
+  #expect(launchAttempts.value == 0)
 }
 
 @Test

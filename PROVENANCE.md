@@ -1,5 +1,32 @@
 # Provenance Map
 
+## Current Choice Loop provenance status — 2026-07-19
+
+Current product authority is the private-agent Choice Loop in
+`docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md` and, after same-fingerprint review,
+its companion documents. This map records source adaptation only; it cannot
+select product behavior.
+
+The protected Hero route is PR1 Choice Core+Mac followed by PR2 iMessage
+same-account self-chat and a same-main Core+iMessage checkpoint App/DMG. Minimal
+B2 and minimal C2 follow as narrow proof chapters in the final B+ package. It introduces no
+newly approved third-party source or model-specific prompt dependency.
+Compatible account models receive the same bounded semantic brief. Existing
+Friday-derived Mission/Store/audit and effect-safety concepts remain subject to
+their recorded licenses and tests. One additional read-only iMessage source,
+broader B2/C2, and PR3 Discord are post-B+. Their
+isolated owned-path preparation does not authorize shared integration or real
+provider/Skill actions. The B2 local diagnostic is read-only, no-network,
+no-retention, and non-gating; the supplied real export and all path/hash/member/
+content/derived metadata stay outside the repository, evidence, and remote.
+Any bounded history excerpt reaches the selected OpenAI model only after later
+exact Owner consent. Claude/Anthropic paths remain excluded.
+
+The scheduling policy adds no third-party dependency: Host grounds Reminder
+date/time/timezone only in explicit user temporal input, requires selection
+when time is absent, and binds every exact future schedule edit to a new
+confirmation revision. Real EventKit write remains separately authorized.
+
 ## Friday
 
 - Upstream: `https://github.com/thesongzhu/Friday`
@@ -15,8 +42,10 @@ staging.
 | `crates/openopen-core/src/mission.rs` | `rust-core/crates/friday-core/src/mission.rs` | Independent OpenOpen lifecycle adapted from Friday's legal-transition and proof-before-completion invariants | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; follow-up PR run `29370433505` PASS on synthesized merge `d502b3d…`, whose tree equals head `923c88a…`; exact-head and release proof pending |
 | `crates/openopen-core/src/store.rs` | `rust-core/crates/friday-storage/src/mission.rs`, `rust-core/crates/friday-storage/src/audit.rs` | Independent encrypted lifecycle persistence and signed/tail-anchored audit design | bootstrap `19ecdd9…`; two isolated foundation reviewers PASS; local 95-test verification; follow-up PR run `29370433505` PASS on synthesized merge `d502b3d…`, whose tree equals head `923c88a…`; product-shell `e2313fe…` passes local 134-Rust/67-Swift verification, two fresh Repair20 reviewers PASS fingerprint `29a00413…`, and PR #2 run `29386477267` PASS on synthesized merge `487dae1…`, whose tree equals the head tree; the first Hero A candidate passed 139-Rust/70-Swift locally but failed both closure reviews; Repair1 passed governance but failed functional review on physical EventKit target drift; both Repair2 reviewers failed its first-write/cancellation/all-markers-missing recovery boundary; both Repair3 reviewers then failed frozen `fa9d905e…` because volatile `createOnce` authority survived possible EventKit commit; Repair4 added durable signed dispatch Evidence but governance rejected fingerprint `4cabaeb4…` because its lower-level writer still accepted reusable Mission copies; Repair5 consumes an internal one-shot dispatch start before any external boundary, passes 146 ordinary Rust plus 83 Swift tests and ad-hoc staging locally, and receives two fresh reviewer PASS reports on frozen fingerprint `4b41a04f…`; Hero A commit `774789c…` is pushed and Actions `29393462659` passes on equal-tree synthesized merge `bccdf360…`; exact-head, signed/admin, cross-UID, provider, and release proof remain pending |
 
-Workflow, Deep ZIP, and GitHub Skill adaptations remain planned and are not yet
-present or claimed. The approved competition pins are
+The following paragraph records the former competition support plan; it cannot
+redefine the current Choice contract. Workflow, Deep ZIP, and GitHub Skill
+adaptations are not present or claimed on the clean Choice baseline. The
+historical approved competition pins are
 `queelius/ctk@99784b7582a583fbae0725a5288797739dc347dd`,
 `slyubarskiy/chatgpt-conversation-extractor@b7c4372b518a006df57415b0d4287fbbdf88ed29`,
 and OpenClaw Skill design/test semantics at

@@ -2,8 +2,8 @@ use openopen_imsg_adapter::{
     AdapterConfig, AdapterError, ChatId, HISTORY_SUPPORTS_SINCE_ROWID, HistoryRequest, ImsgAdapter,
     ImsgEvent, InboundPairing, InboundRejection, ListChatsRequest, Message, MessageCursor,
     OPENOPEN_IMESSAGE_PREFIX, OutboundRecovery, OutboundRecoveryRequest,
-    SEND_HAS_CALLER_IDEMPOTENCY_KEY, SendRequest, SendState, WATCH_CURSOR_IS_EXCLUSIVE,
-    WatchRequest, normalize_inbound,
+    SEND_HAS_CALLER_IDEMPOTENCY_KEY, SelfChatMessage, SendRequest, SendState,
+    WATCH_CURSOR_IS_EXCLUSIVE, WatchRequest, classify_self_chat_message, normalize_inbound,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -435,6 +435,116 @@ fn inbound_normalization_requires_exact_pairing_owner_direction_and_address() {
     assert_eq!(
         normalize_inbound(&pairing, &inbound_message("@OpenOpen   ")),
         Err(InboundRejection::EmptyBody)
+    );
+}
+
+#[test]
+fn self_chat_classification_accepts_local_input_without_a_wake_word_and_separates_echo() {
+    let pairing = InboundPairing::new(ChatId::new(42).unwrap(), "owner@example.invalid").unwrap();
+    let mut message = inbound_message("  plan my day  ");
+    message.sender.clear();
+    message.is_from_me = true;
+
+    let classified = classify_self_chat_message(&pairing, &message).unwrap();
+    assert_eq!(
+        classified,
+        SelfChatMessage::UserAuthored(openopen_imsg_adapter::NormalizedInbound {
+            chat_id: pairing.chat_id,
+            sender: pairing.owner_sender.clone(),
+            source_rowid: 91,
+            source_guid: "watch-guid".into(),
+            body: "plan my day".into(),
+        })
+    );
+
+    message.text = format!("{OPENOPEN_IMESSAGE_PREFIX}\nHere are your choices.");
+    assert!(matches!(
+        classify_self_chat_message(&pairing, &message),
+        Ok(SelfChatMessage::OpenOpenEcho(echo))
+            if echo.chat_id == pairing.chat_id
+                && echo.source_rowid == 91
+                && echo.source_guid == "watch-guid"
+                && echo.body == "Here are your choices."
+    ));
+}
+
+#[test]
+fn self_chat_classification_rejects_wrong_scope_direction_and_ambiguous_prefixes() {
+    let pairing = InboundPairing::new(ChatId::new(42).unwrap(), "owner@example.invalid").unwrap();
+    let mut message = inbound_message("plan my day");
+    message.sender.clear();
+    message.is_from_me = true;
+
+    let mut rejected = message.clone();
+    rejected.chat_id = ChatId::new(43).unwrap();
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::ChatNotPaired)
+    );
+    rejected = message.clone();
+    rejected.is_group = true;
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::GroupChat)
+    );
+    rejected = message.clone();
+    rejected.is_from_me = false;
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::NotFromLocalUser)
+    );
+
+    for malformed in [
+        OPENOPEN_IMESSAGE_PREFIX.to_owned(),
+        format!("{OPENOPEN_IMESSAGE_PREFIX} not canonical"),
+        format!("{OPENOPEN_IMESSAGE_PREFIX}\n"),
+        format!("{OPENOPEN_IMESSAGE_PREFIX}\n {OPENOPEN_IMESSAGE_PREFIX}\nloop"),
+    ] {
+        rejected = message.clone();
+        rejected.text = malformed;
+        assert_eq!(
+            classify_self_chat_message(&pairing, &rejected),
+            Err(InboundRejection::AmbiguousProductPrefix)
+        );
+    }
+}
+
+#[test]
+fn self_chat_classification_rejects_invalid_identity_empty_nul_and_oversized_input() {
+    let pairing = InboundPairing::new(ChatId::new(42).unwrap(), "owner@example.invalid").unwrap();
+    let mut message = inbound_message("plan my day");
+    message.sender.clear();
+    message.is_from_me = true;
+
+    let mut rejected = message.clone();
+    rejected.id = 0;
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::InvalidSourceIdentity)
+    );
+    rejected = message.clone();
+    rejected.text = "   ".into();
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::EmptyBody)
+    );
+    rejected.text = "has\0nul".into();
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::BodyTooLarge)
+    );
+    rejected.text = "x".repeat(openopen_imsg_adapter::MAX_INBOUND_TEXT_BYTES + 1);
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::BodyTooLarge)
+    );
+    rejected.text = format!(
+        "ok{}",
+        " ".repeat(openopen_imsg_adapter::MAX_INBOUND_TEXT_BYTES)
+    );
+    assert_eq!(
+        classify_self_chat_message(&pairing, &rejected),
+        Err(InboundRejection::BodyTooLarge)
     );
 }
 
