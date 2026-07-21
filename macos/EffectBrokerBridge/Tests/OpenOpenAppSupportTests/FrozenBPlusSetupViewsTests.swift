@@ -83,6 +83,17 @@ func frozenSkillSetupUsesOnlyTheTypedLifecycleAuthority() throws {
   #expect(skills.contains("model.requestNextC2SkillDemoAction()"))
   #expect(skills.contains("model.confirmC2SkillDemoAction()"))
   #expect(!skills.contains("c2SkillDemoRequestIds"))
+
+  let appModel = try appModelSource()
+  #expect(appModel.contains("This Skill cannot be enabled"))
+  #expect(!appModel.contains("The reviewed Skill state could not be verified."))
+  #expect(!appModel.contains("A valid reviewed instruction-only Skill seal is required."))
+  #expect(!appModel.contains("The supplied Skill does not match the durable reviewed package."))
+  #expect(!appModel.contains("A verified no-external-effect result is required."))
+  #expect(!appModel.contains("A reviewed sealed instruction-only Skill is required"))
+  #expect(!appModel.contains("The reviewed Skill command is invalid."))
+  #expect(!appModel.contains("The confirmed instruction-only Skill step was recorded."))
+  #expect(!appModel.contains("The Skill step was not verified."))
 }
 
 @Test

@@ -2699,7 +2699,7 @@ public final class AppModel: ObservableObject {
       c2SkillDemoFeedback = nil
     } catch {
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
-      c2SkillDemoFeedback = "The reviewed Skill state could not be verified. No Skill action ran."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
     }
   }
 
@@ -2802,11 +2802,11 @@ public final class AppModel: ObservableObject {
   /// performs no acquisition, network access, script execution, or effect.
   public func provideReviewedC2SkillSeal(_ seal: C2SkillDemoSeal) {
     guard seal.isValid else {
-      c2SkillDemoFeedback = "A valid reviewed instruction-only Skill seal is required."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
       return
     }
     guard c2SkillDemoState == nil || c2SkillDemoState?.seal == seal else {
-      c2SkillDemoFeedback = "The supplied Skill does not match the durable reviewed package."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
       return
     }
     c2SkillDemoApprovedSeal = seal
@@ -2817,7 +2817,7 @@ public final class AppModel: ObservableObject {
   /// The App never manufactures this proof or invokes a Skill runtime here.
   public func provideC2FirstUseResultDigest(_ digest: String) {
     guard C2SkillDemoSeal.lowerHex(digest, count: 64) else {
-      c2SkillDemoFeedback = "A verified no-external-effect result is required."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
       return
     }
     c2SkillDemoFirstUseResultDigest = digest
@@ -2836,10 +2836,7 @@ public final class AppModel: ObservableObject {
     case .used: action = nil
     }
     guard let action else {
-      c2SkillDemoFeedback =
-        c2SkillDemoState?.stage == .runnable
-        ? "A verified no-external-effect result is required before recording first use."
-        : "A reviewed sealed instruction-only Skill is required before this step."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
       return
     }
     c2SkillDemoPendingAction = action
@@ -2881,7 +2878,7 @@ public final class AppModel: ObservableObject {
       explicitlyConfirmed: true,
       decidedAtMs: 0)
     guard command.isValid else {
-      c2SkillDemoFeedback = "The reviewed Skill command is invalid. Nothing changed."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
       return
     }
     let generation = runtimeGeneration
@@ -2900,10 +2897,10 @@ public final class AppModel: ObservableObject {
       c2SkillDemoRequestIds = response.state.receipts.map(\.requestId)
       c2SkillDemoPendingAction = nil
       if response.state.stage == .used { c2SkillDemoFirstUseResultDigest = nil }
-      c2SkillDemoFeedback = "The confirmed instruction-only Skill step was recorded."
+      c2SkillDemoFeedback = nil
     } catch {
       guard generation == runtimeGeneration else { return }
-      c2SkillDemoFeedback = "The Skill step was not verified. Nothing was enabled or run."
+      c2SkillDemoFeedback = "This Skill cannot be enabled"
     }
   }
 
