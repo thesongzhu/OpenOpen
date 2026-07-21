@@ -204,6 +204,139 @@ public struct ApplyC2SkillDemoResponse: Codable, Equatable, Sendable {
   public let receipt: C2SkillDemoReceipt
 }
 
+public enum B2MemoryDemoStage: String, Codable, Equatable, Sendable {
+  case prepared, candidates, selected, diffReview, confirmed, readBack
+}
+
+public struct B2MemoryCandidateCard: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let title: String
+  public let rationale: String
+  public let proposedLine: String
+  public let sourceBindingDigest: String
+
+  public var isValid: Bool {
+    !id.isEmpty && id.utf8.count <= 256 && !title.isEmpty && title.utf8.count <= 160
+      && !rationale.isEmpty && rationale.utf8.count <= 512 && !proposedLine.isEmpty
+      && proposedLine.utf8.count <= 4_096
+      && C2SkillDemoSeal.lowerHex(sourceBindingDigest, count: 64)
+  }
+}
+
+public struct B2MemoryImportSeal: Codable, Equatable, Sendable {
+  public let sourceDigest: String
+  public let catalogDigest: String
+  public let sourceManifestDigest: String
+  public let modelProvenance: ChoiceModelProvenance
+
+  public var isValid: Bool {
+    C2SkillDemoSeal.lowerHex(sourceDigest, count: 64)
+      && C2SkillDemoSeal.lowerHex(catalogDigest, count: 64)
+      && C2SkillDemoSeal.lowerHex(sourceManifestDigest, count: 64)
+      && modelProvenance.validated()
+  }
+}
+
+public struct B2MemoryMarkdownDiff: Codable, Equatable, Sendable {
+  public let revision: UInt64
+  public let selectedCandidateId: String
+  public let proposedLine: String
+  public let editedLine: String
+  public let expectedBase: MarkdownBaseIdentity?
+  public let finalEntry: DocumentManifestEntry
+  public let diffDigest: String
+
+  public var isValid: Bool {
+    revision > 0 && !selectedCandidateId.isEmpty && !proposedLine.isEmpty && !editedLine.isEmpty
+      && editedLine.utf8.count <= 4_096 && finalEntry.relativePath == "sources/chatgpt.md"
+      && C2SkillDemoSeal.lowerHex(diffDigest, count: 64)
+  }
+}
+
+public enum B2MemoryCommandKind: String, Codable, Equatable, Sendable {
+  case prepare, selectCandidate, editMarkdown, confirmDiff
+}
+
+public struct B2MemoryCommand: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let expectedRevision: UInt64
+  public let kind: B2MemoryCommandKind
+  public let selectedCandidateId: String?
+  public let editedLine: String?
+  public let expectedDiffDigest: String?
+  public let explicitlyConfirmed: Bool
+  public let decidedAtMs: Int64
+
+  public var isValid: Bool {
+    guard !requestId.isEmpty, requestId.utf8.count <= 256, decidedAtMs >= 0 else { return false }
+    switch kind {
+    case .prepare:
+      return expectedRevision == 0 && selectedCandidateId == nil && editedLine == nil
+        && expectedDiffDigest == nil && !explicitlyConfirmed
+    case .selectCandidate:
+      return expectedRevision > 0 && selectedCandidateId?.isEmpty == false && editedLine == nil
+        && expectedDiffDigest == nil && explicitlyConfirmed
+    case .editMarkdown:
+      return expectedRevision > 0 && selectedCandidateId == nil
+        && editedLine?.isEmpty == false && editedLine?.utf8.count ?? 4_097 <= 4_096
+        && expectedDiffDigest.map { C2SkillDemoSeal.lowerHex($0, count: 64) } == true
+        && !explicitlyConfirmed
+    case .confirmDiff:
+      return expectedRevision > 0 && selectedCandidateId == nil && editedLine == nil
+        && expectedDiffDigest.map { C2SkillDemoSeal.lowerHex($0, count: 64) } == true
+        && explicitlyConfirmed
+    }
+  }
+}
+
+public struct B2MemoryCommandReceipt: Codable, Equatable, Identifiable, Sendable {
+  public var id: String { requestId }
+  public let requestId: String
+  public let commandDigest: String
+  public let revision: UInt64
+  public let stage: B2MemoryDemoStage
+  public let receiptDigest: String
+}
+
+public struct B2MemoryReadbackReceipt: Codable, Equatable, Sendable {
+  public let confirmationDigest: String
+  public let renderReceiptDigest: String
+  public let receiptDigest: String
+}
+
+public struct B2MemoryDemoState: Codable, Equatable, Sendable {
+  public let revision: UInt64
+  public let stage: B2MemoryDemoStage
+  public let seal: B2MemoryImportSeal?
+  public let candidates: [B2MemoryCandidateCard]
+  public let selectedCandidate: B2MemoryCandidateCard?
+  public let markdownDiff: B2MemoryMarkdownDiff?
+  public let confirmationDigest: String?
+  public let readbackReceipt: B2MemoryReadbackReceipt?
+  public let receipts: [B2MemoryCommandReceipt]
+}
+
+public struct B2MemoryDemoView: Codable, Equatable, Sendable {
+  public let state: B2MemoryDemoState?
+}
+
+public struct ApplyB2MemoryDemoParameters: Codable, Sendable {
+  public let command: B2MemoryCommand
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(command: B2MemoryCommand, proof: BrokerRuntimeState) {
+    self.command = command
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ApplyB2MemoryDemoResponse: Codable, Equatable, Sendable {
+  public let state: B2MemoryDemoState
+  public let receipt: B2MemoryCommandReceipt
+}
+
 public enum ChannelKind: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
   case iMessage
   case discord

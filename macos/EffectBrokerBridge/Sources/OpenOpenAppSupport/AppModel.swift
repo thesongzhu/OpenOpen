@@ -84,6 +84,10 @@ public protocol CoreServing: Sendable {
   func modelSetup(proof: BrokerRuntimeState) async throws -> ModelSetup
   func selectedModel(proof: BrokerRuntimeState) async throws -> ModelSelection?
   func personaStatus() async throws -> PersonaStatusView?
+  func b2MemoryDemo(proof: BrokerRuntimeState) async throws -> B2MemoryDemoState?
+  func applyB2MemoryDemo(
+    _ command: B2MemoryCommand, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse
   func c2SkillDemo(proof: BrokerRuntimeState) async throws -> C2SkillDemoState?
   func applyC2SkillDemo(
     _ command: C2SkillDemoCommand, proof: BrokerRuntimeState
@@ -159,6 +163,14 @@ public protocol CoreServing: Sendable {
 }
 
 extension CoreServing {
+  public func b2MemoryDemo(proof _: BrokerRuntimeState) async throws -> B2MemoryDemoState? { nil }
+
+  public func applyB2MemoryDemo(
+    _: B2MemoryCommand, proof _: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    throw CoreClientError.contractViolation("The bounded Memory Demo is unavailable.")
+  }
+
   public func c2SkillDemo(proof _: BrokerRuntimeState) async throws -> C2SkillDemoState? { nil }
 
   public func applyC2SkillDemo(
@@ -635,6 +647,11 @@ public final class AppModel: ObservableObject {
   @Published public var selectedModelEffort = ""
   @Published public private(set) var persistedModelSelection: ModelSelection?
   @Published public private(set) var personaStatus: PersonaStatusView?
+  @Published public private(set) var b2MemoryDemoState: B2MemoryDemoState?
+  @Published public private(set) var b2MemoryPendingAction: B2MemoryCommandKind?
+  @Published public private(set) var b2MemoryPendingCandidateId: String?
+  @Published public var b2MemoryEditedLine = ""
+  @Published public private(set) var b2MemoryFeedback: String?
   @Published public private(set) var c2SkillDemoState: C2SkillDemoState?
   @Published public private(set) var c2SkillDemoPendingAction: C2SkillDemoCommandKind?
   @Published public private(set) var c2SkillDemoFeedback: String?
@@ -1407,6 +1424,7 @@ public final class AppModel: ObservableObject {
             authenticatedOwnerReturn: authenticatedHomeForeground && attempt == 0
               && runtime.enabled && protectedMatchesRuntime && desiredEnabled && accountReady)
           if runtime.enabled, protectedMatchesRuntime, desiredEnabled {
+            await refreshB2MemoryDemo(expectedGeneration: generation)
             await refreshC2SkillDemo(expectedGeneration: generation)
           }
           if choiceIMessageReplyPreview == nil,
@@ -2682,6 +2700,101 @@ public final class AppModel: ObservableObject {
     } catch {
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
       c2SkillDemoFeedback = "The reviewed Skill state could not be verified. No Skill action ran."
+    }
+  }
+
+  private func refreshB2MemoryDemo(expectedGeneration: UInt64) async {
+    guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
+      let state = try await core.b2MemoryDemo(proof: proof)
+      guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      b2MemoryDemoState = state
+      if let line = state?.markdownDiff?.editedLine, b2MemoryEditedLine.isEmpty {
+        b2MemoryEditedLine = line
+      }
+      b2MemoryFeedback = nil
+    } catch {
+      guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      b2MemoryFeedback = "The Memory Demo state could not be verified. Nothing changed."
+    }
+  }
+
+  public func requestB2CandidateSelection(_ candidateId: String) {
+    guard b2MemoryDemoState?.stage == .candidates,
+      b2MemoryDemoState?.candidates.contains(where: { $0.id == candidateId }) == true
+    else { return }
+    b2MemoryPendingCandidateId = candidateId
+    b2MemoryPendingAction = .selectCandidate
+  }
+
+  public func requestB2DiffConfirmation() {
+    guard b2MemoryDemoState?.markdownDiff?.isValid == true else { return }
+    b2MemoryPendingAction = .confirmDiff
+  }
+
+  public func cancelB2MemoryAction() {
+    b2MemoryPendingAction = nil
+    b2MemoryPendingCandidateId = nil
+  }
+
+  public func confirmB2MemoryAction() async {
+    guard let action = b2MemoryPendingAction else { return }
+    await applyB2MemoryCommand(action)
+    if b2MemoryFeedback == nil {
+      b2MemoryPendingAction = nil
+      b2MemoryPendingCandidateId = nil
+    }
+  }
+
+  public func saveB2MemoryEdit() async {
+    await applyB2MemoryCommand(.editMarkdown)
+  }
+
+  private func applyB2MemoryCommand(_ kind: B2MemoryCommandKind) async {
+    guard storeControlEnabled, !isBusy else { return }
+    let revision = b2MemoryDemoState?.revision ?? 0
+    let selectedId = kind == .selectCandidate ? b2MemoryPendingCandidateId : nil
+    let diffDigest =
+      kind == .editMarkdown || kind == .confirmDiff
+      ? b2MemoryDemoState?.markdownDiff?.diffDigest : nil
+    let editedLine =
+      kind == .editMarkdown
+      ? b2MemoryEditedLine.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+    let material =
+      "\(revision):\(kind.rawValue):\(selectedId ?? ""):\(diffDigest ?? ""):\(editedLine ?? "")"
+    let stableDigest = Self.c2StableDigest(material)
+    let command = B2MemoryCommand(
+      requestId: "memory-\(String(stableDigest.prefix(24)))",
+      expectedRevision: revision,
+      kind: kind,
+      selectedCandidateId: selectedId,
+      editedLine: editedLine,
+      expectedDiffDigest: diffDigest,
+      explicitlyConfirmed: kind == .selectCandidate || kind == .confirmDiff,
+      decidedAtMs: 0)
+    guard command.isValid else {
+      b2MemoryFeedback = "The Memory Demo command is invalid. Nothing changed."
+      return
+    }
+    let generation = runtimeGeneration
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let response = try await core.applyB2MemoryDemo(command, proof: proof)
+      try requireCurrentOnGeneration(generation)
+      guard response.receipt.requestId == command.requestId,
+        response.state.receipts.contains(response.receipt)
+      else {
+        throw CoreClientError.contractViolation("Core returned an unrelated Memory receipt.")
+      }
+      b2MemoryDemoState = response.state
+      b2MemoryEditedLine = response.state.markdownDiff?.editedLine ?? b2MemoryEditedLine
+      b2MemoryFeedback = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      b2MemoryFeedback = "The Memory Demo step was not verified. Nothing changed."
     }
   }
 

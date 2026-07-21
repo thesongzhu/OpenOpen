@@ -93,7 +93,7 @@ public struct OpenOpenRootView: View {
     case .messages:
       EditorialMessagesView(model: model)
     case .memory:
-      EditorialMemoryView()
+      EditorialMemoryView(model: model)
     case .skills:
       EditorialSkillsView(model: model)
     }
@@ -418,6 +418,7 @@ private struct EditorialMessagesView: View {
 }
 
 private struct EditorialMemoryView: View {
+  @ObservedObject var model: AppModel
   private let boundaries = [
     (
       "Processing consent",
@@ -442,28 +443,124 @@ private struct EditorialMemoryView: View {
       VStack(alignment: .leading, spacing: 16) {
         EditorialPageHeader(
           eyebrow: "One careful import",
-          title: "No memories",
-          detail: "Import one source and keep only one card you explicitly approve."
-        )
-        EditorialEmptyState(
-          title: "Add one useful memory",
-          detail:
-            "Import one source and keep only one card you explicitly approve.",
-          symbol: "notebook"
-        )
-        EditorialBoundaryCard(
-          title: "Choose one file to review",
-          detail: "OpenOpen will not scan other files or folders.",
-          actionTitle: "Choose import",
-          accessibilityIdentifier: "openopen-memory-choose-import",
-          boundaries: boundaries
-        )
+          title: pageTitle,
+          detail: "Import one source and keep only one card you explicitly approve.",
+          state: pageState)
+        memoryContent
+        if let feedback = model.b2MemoryFeedback {
+          Text(feedback).font(.caption).foregroundStyle(.orange)
+            .accessibilityIdentifier("openopen-memory-feedback")
+        }
       }
       .padding(30)
       .frame(maxWidth: 760, alignment: .leading)
     }
     .background(EditorialPalette.background)
     .accessibilityIdentifier("openopen-editorial-memory")
+    .alert(
+      pendingTitle,
+      isPresented: Binding(
+        get: { model.b2MemoryPendingAction != nil },
+        set: { if !$0 { model.cancelB2MemoryAction() } })
+    ) {
+      Button("Cancel", role: .cancel) { model.cancelB2MemoryAction() }
+      Button(pendingActionTitle) { Task { await model.confirmB2MemoryAction() } }
+    } message: {
+      Text(pendingDetail)
+    }
+  }
+
+  @ViewBuilder private var memoryContent: some View {
+    switch model.b2MemoryDemoState?.stage {
+    case nil:
+      EditorialEmptyState(
+        title: "Add one useful memory",
+        detail: "Import one source and keep only one card you explicitly approve.",
+        symbol: "notebook")
+      EditorialBoundaryCard(
+        title: "Choose one file to review",
+        detail: "OpenOpen will not scan other files or folders.",
+        actionTitle: "Choose import",
+        accessibilityIdentifier: "openopen-memory-choose-import",
+        boundaries: boundaries,
+        enabled: false)
+    case .prepared:
+      EditorialBoundaryCard(
+        title: "Review the processing scope",
+        detail: boundaries[0].1,
+        actionTitle: "Process source",
+        accessibilityIdentifier: "openopen-memory-process-source",
+        boundaries: boundaries,
+        enabled: false)
+    case .candidates:
+      ForEach(model.b2MemoryDemoState?.candidates ?? []) { card in
+        EditorialCard(title: card.title, symbol: "circle") {
+          Text(card.rationale).font(.caption).foregroundStyle(.secondary)
+          Button("Review selected") { model.requestB2CandidateSelection(card.id) }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("openopen-memory-candidate-\(card.id)")
+        }
+      }
+    case .selected, .diffReview:
+      EditorialCard(title: "Make the memory exact", symbol: "pencil") {
+        TextField("Memory wording", text: $model.b2MemoryEditedLine, axis: .vertical)
+          .accessibilityIdentifier("openopen-memory-edit-line")
+        Button("Review Markdown") { Task { await model.saveB2MemoryEdit() } }
+          .buttonStyle(.borderedProminent)
+          .accessibilityIdentifier("openopen-memory-review-markdown")
+        if let diff = model.b2MemoryDemoState?.markdownDiff {
+          Text(diff.editedLine).font(.system(.body, design: .monospaced))
+          Button("Confirm diff") { model.requestB2DiffConfirmation() }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("openopen-memory-confirm-diff")
+        }
+      }
+    case .confirmed:
+      EditorialCard(title: "Review the exact Memory change", symbol: "checkmark.circle") {
+        Text(model.b2MemoryDemoState?.markdownDiff?.editedLine ?? "")
+          .font(.system(.body, design: .monospaced))
+          .accessibilityIdentifier("openopen-memory-confirmed-readback")
+      }
+    case .readBack:
+      EditorialCard(title: "Memory receipt", symbol: "checkmark.seal") {
+        Text(model.b2MemoryDemoState?.markdownDiff?.editedLine ?? "")
+          .font(.system(.body, design: .monospaced))
+      }
+    }
+  }
+
+  private var pageTitle: String {
+    switch model.b2MemoryDemoState?.stage {
+    case nil: "No memories"
+    case .prepared: "Processing consent"
+    case .candidates: "Choose one memory"
+    case .selected: "Edit wording"
+    case .diffReview, .confirmed: "Review the exact Memory change"
+    case .readBack: "Memory receipt"
+    }
+  }
+
+  private var pageState: String { model.b2MemoryDemoState == nil ? "Ready" : "Needs you" }
+  private var pendingTitle: String {
+    switch model.b2MemoryPendingAction {
+    case .selectCandidate: "Choose one memory"
+    case .confirmDiff: "Add this one memory?"
+    default: "Confirm"
+    }
+  }
+  private var pendingActionTitle: String {
+    switch model.b2MemoryPendingAction {
+    case .selectCandidate: "Review selected"
+    case .confirmDiff: "Add memory"
+    default: "Confirm"
+    }
+  }
+  private var pendingDetail: String {
+    switch model.b2MemoryPendingAction {
+    case .selectCandidate: boundaries[1].1
+    case .confirmDiff: "This confirmation authorizes only the displayed Markdown change."
+    default: "Nothing changes until you confirm."
+    }
   }
 }
 

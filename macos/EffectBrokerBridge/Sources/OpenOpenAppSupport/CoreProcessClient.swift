@@ -614,6 +614,20 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
     return view.state
   }
 
+  public func b2MemoryDemo(proof: BrokerRuntimeState) async throws -> B2MemoryDemoState? {
+    let view: B2MemoryDemoView = try await call(
+      method: "memory.demo.read", parameters: RuntimeProofParameters(proof))
+    return view.state
+  }
+
+  public func applyB2MemoryDemo(
+    _ command: B2MemoryCommand, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    try await call(
+      method: "memory.demo.command",
+      parameters: ApplyB2MemoryDemoParameters(command: command, proof: proof))
+  }
+
   public func applyC2SkillDemo(
     _ command: C2SkillDemoCommand, proof: BrokerRuntimeState
   ) async throws -> ApplyC2SkillDemoResponse {

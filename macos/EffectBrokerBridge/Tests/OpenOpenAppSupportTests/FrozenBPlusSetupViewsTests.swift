@@ -36,8 +36,12 @@ func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
   #expect(memory.contains("written and read back successfully."))
   #expect(memory.contains("openopen-memory-choose-import"))
   #expect(!memory.contains("NSOpenPanel"))
-  #expect(!memory.contains("Task {"))
-  #expect(!memory.contains("model."))
+  #expect(memory.contains("enabled: false"))
+  #expect(!memory.contains("beginB2MemoryDemo"))
+  #expect(!memory.contains("requestB2CandidateGeneration"))
+  #expect(memory.contains("model.requestB2CandidateSelection"))
+  #expect(memory.contains("model.requestB2DiffConfirmation"))
+  #expect(memory.contains("openopen-memory-confirmed-readback"))
 }
 
 @Test
