@@ -427,6 +427,7 @@ pub enum StoreError {
 #[cfg(test)]
 mod b2_memory_demo_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn command(
         request_id: &str,
@@ -644,13 +645,38 @@ mod b2_memory_demo_tests {
             )
             .unwrap();
         assert!(!String::from_utf8_lossy(&journal_blob).contains("Finish one exact"));
-        let render_receipt = MarkdownRenderReceipt {
-            intent_id: confirmed.render_intent.as_ref().unwrap().intent_id.clone(),
-            final_entry: diff.final_entry.clone(),
-            final_device: 1,
-            final_inode: 2,
-            displaced_base: None,
-            committed_at_ms: 40,
+        let markdown_home = tempfile::tempdir().unwrap();
+        let markdown_root = markdown_home.path().join("Documents/OpenOpen");
+        std::fs::create_dir_all(&markdown_root).unwrap();
+        std::fs::set_permissions(
+            markdown_home.path().join("Documents"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&markdown_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(markdown_root.join("sources")).unwrap();
+        std::fs::set_permissions(
+            markdown_root.join("sources"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        store
+            .bind_choice_markdown_root(markdown_home.path())
+            .unwrap();
+        let render_receipt = match store
+            .publish_b2_memory_render_intent(
+                &confirmed.render_intent.as_ref().unwrap().intent_id,
+                &authorization,
+                &broker_receipt,
+                40,
+            )
+            .expect("publish exact B2 journal")
+            .expect("known journal")
+        {
+            MarkdownRenderPublication::Committed(receipt) => receipt,
+            MarkdownRenderPublication::ReconciliationRequired => {
+                panic!("fresh B2 path unexpectedly required reconciliation")
+            }
         };
         let mut conflict_receipt = render_receipt.clone();
         conflict_receipt.displaced_base = Some(MarkdownBaseIdentity {
@@ -801,19 +827,32 @@ struct B2MemorySourceTombstone {
 struct StoredB2MemoryRenderIntent {
     intent: B2MemoryRenderIntent,
     plaintext_body: Option<String>,
+    #[serde(default)]
+    render_receipt: Option<MarkdownRenderReceipt>,
     retired: bool,
 }
 
 impl StoredB2MemoryRenderIntent {
     fn is_valid(&self) -> bool {
         self.intent.is_valid()
-            && match (&self.plaintext_body, self.retired) {
-                (Some(body), false) => {
+            && match (&self.plaintext_body, &self.render_receipt, self.retired) {
+                (Some(body), _, false) => {
                     !body.contains('\0')
                         && u64::try_from(body.len()).ok() == Some(self.intent.entry.byte_length)
                         && sha256_hex(body.as_bytes()) == self.intent.content_digest
+                        && self.render_receipt.as_ref().is_none_or(|receipt| {
+                            receipt.is_valid()
+                                && receipt.intent_id == self.intent.intent_id
+                                && receipt.final_entry == self.intent.entry
+                                && receipt.displaced_base.is_none()
+                        })
                 }
-                (None, true) => true,
+                (None, Some(receipt), true) => {
+                    receipt.is_valid()
+                        && receipt.intent_id == self.intent.intent_id
+                        && receipt.final_entry == self.intent.entry
+                        && receipt.displaced_base.is_none()
+                }
                 _ => false,
             }
     }
@@ -2367,6 +2406,7 @@ impl Store {
                 let stored = StoredB2MemoryRenderIntent {
                     intent: intent.clone(),
                     plaintext_body: Some(body),
+                    render_receipt: None,
                     retired: false,
                 };
                 if !stored.is_valid() {
@@ -2685,6 +2725,107 @@ impl Store {
         Ok((state, receipt))
     }
 
+    /// Publishes the exact command-owned B2 journal through the same
+    /// descriptor-safe no-clobber boundary as Choice Markdown. The body and
+    /// path never leave Store, and the exact filesystem receipt is sealed into
+    /// the encrypted journal before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for runtime drift, a stale/tampered journal, or a
+    /// filesystem result that cannot be verified exactly.
+    pub fn publish_b2_memory_render_intent(
+        &mut self,
+        intent_id: &str,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+        committed_at_ms: i64,
+    ) -> Result<Option<MarkdownRenderPublication>, StoreError> {
+        if committed_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let root = self.open_choice_markdown_root()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let mut journal = load_b2_memory_render_intent(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if journal.retired
+            || state.stage != B2MemoryDemoStage::Confirmed
+            || state.revision != journal.intent.expected_revision
+            || state.render_intent.as_ref() != Some(&journal.intent)
+            || state.confirmation_digest.as_deref()
+                != Some(journal.intent.confirmation_digest.as_str())
+            || journal.intent.intent_id != intent_id
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let adapter = b2_markdown_render_adapter(&journal.intent);
+        if let Some(receipt) = journal.render_receipt.as_ref() {
+            return root
+                .verify_committed_receipt(&adapter, receipt)
+                .map(|()| Some(MarkdownRenderPublication::Committed(receipt.clone())))
+                .map_err(|_| StoreError::B2MemoryDemoConflict);
+        }
+        let plaintext_body = journal
+            .plaintext_body
+            .as_ref()
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if let Some(receipt) = root
+            .recover_exact_fresh_publication(&adapter, committed_at_ms)
+            .map_err(|_| StoreError::B2MemoryDemoConflict)?
+        {
+            journal.render_receipt = Some(receipt.clone());
+            update_b2_memory_render_intent(
+                &transaction,
+                &self.authority,
+                &journal,
+                committed_at_ms,
+            )?;
+            transaction.commit()?;
+            return Ok(Some(MarkdownRenderPublication::Committed(receipt)));
+        }
+        let outcome = root
+            .render_no_clobber(
+                &adapter,
+                Zeroizing::new(plaintext_body.clone()).as_bytes(),
+                None,
+                committed_at_ms,
+            )
+            .map_err(|_| StoreError::B2MemoryDemoConflict)?;
+        match outcome {
+            MarkdownRenderOutcome::ReconciliationRequired => {
+                transaction.commit()?;
+                Ok(Some(MarkdownRenderPublication::ReconciliationRequired))
+            }
+            MarkdownRenderOutcome::Committed(receipt) => {
+                root.verify_committed_receipt(&adapter, &receipt)
+                    .map_err(|_| StoreError::B2MemoryDemoConflict)?;
+                journal.render_receipt = Some(receipt.clone());
+                update_b2_memory_render_intent(
+                    &transaction,
+                    &self.authority,
+                    &journal,
+                    committed_at_ms,
+                )?;
+                transaction.commit()?;
+                Ok(Some(MarkdownRenderPublication::Committed(receipt)))
+            }
+        }
+    }
+
     /// Commits readback only for the exact command-owned fresh-file render
     /// journal. Callers cannot supply a body, path, or alternate manifest.
     ///
@@ -2741,6 +2882,7 @@ impl Store {
             || journal.intent.expected_revision != expected_revision
             || journal.intent.confirmation_digest != confirmation_digest
             || render_receipt.intent_id != journal.intent.intent_id
+            || journal.render_receipt.as_ref() != Some(render_receipt)
             || render_receipt.displaced_base.is_some()
             || state.markdown_diff.as_ref().map(|diff| &diff.final_entry)
                 != Some(&render_receipt.final_entry)
@@ -10426,6 +10568,22 @@ fn b2_memory_render_aad(intent_id: &str) -> String {
     format!("memory:render-intent:{intent_id}")
 }
 
+fn b2_markdown_render_adapter(intent: &B2MemoryRenderIntent) -> MarkdownRenderIntent {
+    // `MarkdownRoot` is an internal descriptor primitive. Choice-only fields
+    // are non-authorizing there; B2 authority is checked against its encrypted
+    // Store journal immediately before this adapter is constructed.
+    MarkdownRenderIntent {
+        id: intent.intent_id.clone(),
+        choice_session_id: "b2-memory-demo".to_owned(),
+        expected_session_revision: intent.expected_revision,
+        expected_generation: 1,
+        entry: intent.entry.clone(),
+        expected_base: None,
+        content_digest: intent.content_digest.clone(),
+        created_at_ms: intent.created_at_ms,
+    }
+}
+
 fn load_b2_memory_render_intent(
     connection: &Connection,
     authority: &LocalAuthority,
@@ -10516,6 +10674,46 @@ fn persist_b2_memory_render_intent(
     Ok(())
 }
 
+fn update_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredB2MemoryRenderIntent,
+    recorded_at_ms: i64,
+) -> Result<(), StoreError> {
+    if !record.is_valid() || record.render_receipt.is_none() || recorded_at_ms < 0 {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        record,
+        b2_memory_render_aad(&record.intent.intent_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    if transaction.execute(
+        "UPDATE b2_memory_render_journal SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE singleton_id = 1 AND intent_id = ?1",
+        params![record.intent.intent_id, blob, state_hash],
+    )? != 1
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-published-{}", record.intent.intent_id),
+            command_id: &record.intent.intent_id,
+            command_hash: &record.intent.confirmation_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: recorded_at_ms,
+            state_kind: "memory:render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
 fn retire_b2_memory_render_intent(
     transaction: &Transaction<'_>,
     authority: &LocalAuthority,
@@ -10525,6 +10723,8 @@ fn retire_b2_memory_render_intent(
     let record = StoredB2MemoryRenderIntent {
         intent: intent.clone(),
         plaintext_body: None,
+        render_receipt: load_b2_memory_render_intent(transaction, authority)?
+            .and_then(|record| record.render_receipt),
         retired: true,
     };
     if !record.is_valid() || retired_at_ms < intent.created_at_ms {

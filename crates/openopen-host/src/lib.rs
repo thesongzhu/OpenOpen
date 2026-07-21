@@ -28,16 +28,17 @@ use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
 use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
     ApprovalKind, ApprovalStatus, ApprovalTarget, B2MemoryCandidateCard, B2MemoryCommand,
-    B2MemoryCommandReceipt, B2MemoryDemoState, B2MemoryImportSeal, B2MemoryPrepareSourceRequest,
-    B2MemoryPreparedSource, B2MemoryProcessingConsent, B2MemoryProcessingResult, BatchSealReason,
-    C2SkillDemoCommand, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
-    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
-    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
-    ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
-    ChoiceDIntakeRecord, ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent,
-    ChoiceIMessageReplyPreview, ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption,
-    ChoiceRefinementOperation, ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
+    B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoState, B2MemoryImportSeal,
+    B2MemoryPrepareSourceRequest, B2MemoryPreparedSource, B2MemoryProcessingConsent,
+    B2MemoryProcessingResult, BatchSealReason, C2SkillDemoCommand, C2SkillDemoState, ChannelCursor,
+    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult,
+    ChannelKind, ChannelMessageKind, ChannelModelDisposition, ChannelModelStart,
+    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
+    ChannelRouteApproval, ChoiceBeginAccepted, ChoiceBeginRecord, ChoiceBeginRequest,
+    ChoiceConsolidatedConfirmation, ChoiceDInput, ChoiceDIntakeRecord,
+    ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview,
+    ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption, ChoiceRefinementOperation,
+    ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
     ChoiceReminderScheduleInput, ChoiceResumeResult, ChoiceSession, ChoiceSessionState,
     ConversationTurnBatch, CoreInstanceLease, DiscordPairingMetadata, DocumentManifest,
     DocumentManifestEntry, EffectAuditAnchor, EvidenceKind, InterpretationFrame,
@@ -1442,6 +1443,26 @@ impl Host {
             return;
         }
         if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        if params.command.kind == B2MemoryCommandKind::ConfirmDiff {
+            let Some(operation) = self.begin_operation(request.id, &params.proof(), responses)
+            else {
+                return;
+            };
+            let context = self.background_context(params.proof());
+            let responses = responses.clone();
+            let request_id = request.id;
+            std::thread::spawn(move || {
+                let result = context.confirm_b2_memory_diff(&operation, &params.command);
+                context.finish_operation(&operation);
+                let _ = responses.send(result.map_or_else(
+                    |error| call_failure(request_id, &error),
+                    |(state, receipt)| {
+                        success(request_id, json!({"state": state, "receipt": receipt}))
+                    },
+                ));
+            });
             return;
         }
         let result = self.store.apply_b2_memory_command(
@@ -6265,6 +6286,63 @@ struct BackgroundContext {
 }
 
 impl BackgroundContext {
+    /// Confirms and publishes the exact Store-owned B2 Markdown journal. The
+    /// public command contains no body, path, manifest, or filesystem receipt;
+    /// those remain private to Store and the descriptor-safe writer.
+    fn confirm_b2_memory_diff(
+        &self,
+        operation: &Arc<AtomicBool>,
+        command: &B2MemoryCommand,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store.bind_choice_markdown_root(&self.paths.user_home)?;
+            let (confirmed, command_receipt) = store.apply_b2_memory_command(
+                command,
+                &self.proof.authorization,
+                &self.proof.broker_receipt,
+            )?;
+            if confirmed.stage == openopen_protocol::B2MemoryDemoStage::ReadBack {
+                return Ok((confirmed, command_receipt));
+            }
+            let intent = confirmed
+                .render_intent
+                .as_ref()
+                .ok_or(StoreError::B2MemoryDemoConflict)?;
+            prepare_markdown_render_root(&self.paths.user_home, &intent.entry)
+                .map_err(|_| StoreError::B2MemoryDemoConflict)?;
+            let publication = store
+                .publish_b2_memory_render_intent(
+                    &intent.intent_id,
+                    &self.proof.authorization,
+                    &self.proof.broker_receipt,
+                    now_ms()?,
+                )?
+                .ok_or(StoreError::B2MemoryDemoConflict)?;
+            let MarkdownRenderPublication::Committed(render_receipt) = publication else {
+                return Err(HostCallError::MarkdownReconciliationRequired);
+            };
+            let read_back = store.commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed
+                    .confirmation_digest
+                    .as_deref()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?,
+                &render_receipt,
+                &self.proof.authorization,
+                &self.proof.broker_receipt,
+                now_ms()?,
+            )?;
+            Ok((read_back, command_receipt))
+        })
+    }
+
     fn prepare_b2_memory_source(
         &self,
         operation: &Arc<AtomicBool>,

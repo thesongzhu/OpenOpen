@@ -459,6 +459,51 @@ impl MarkdownRoot {
         Ok(())
     }
 
+    /// Recovers only the exact fresh-file publication whose bytes already
+    /// match the command-owned intent. This closes the crash window after the
+    /// directory fsync and before the encrypted Store receipt commits. It is
+    /// deliberately unavailable for replacement/CAS renders because those
+    /// also require the displaced-base identity from the original exchange.
+    pub(crate) fn recover_exact_fresh_publication(
+        &self,
+        intent: &MarkdownRenderIntent,
+        committed_at_ms: i64,
+    ) -> Result<Option<MarkdownRenderReceipt>, MarkdownBoundaryError> {
+        if !intent.is_valid()
+            || intent.expected_base.is_some()
+            || committed_at_ms < intent.created_at_ms
+        {
+            return Err(MarkdownBoundaryError::InvalidRenderIntent);
+        }
+        let (directory, file_name, expected_path) = self.open_parent_for_entry(&intent.entry)?;
+        let Some(expected_inode) = exact_entry_inode(&directory, OsStr::new(file_name))? else {
+            return Ok(None);
+        };
+        let file = openat(
+            &directory,
+            file_name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| MarkdownBoundaryError::ReconciliationRequired)?;
+        let identity = FileIdentity::from_fd(&file)?;
+        if identity.inode != expected_inode
+            || !fd_path_is_exact(&file, &expected_path)?
+            || !private_regular_file_matches_manifest(&file)?
+            || self.read_entry(&intent.entry).is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(MarkdownRenderReceipt {
+            intent_id: intent.id.clone(),
+            final_entry: intent.entry.clone(),
+            final_device: identity.device,
+            final_inode: identity.inode,
+            displaced_base: None,
+            committed_at_ms,
+        }))
+    }
+
     fn open_root(&self) -> Result<OwnedFd, MarkdownBoundaryError> {
         let descriptor = open_exact_directory_path(&self.root)?;
         if FileIdentity::from_fd(&descriptor)? != self.identity
@@ -1042,6 +1087,45 @@ mod tests {
         assert!(
             scanner.verify_committed_receipt(&intent, &receipt).is_err(),
             "an Owner edit after publication invalidates receipt recovery before cleanup"
+        );
+    }
+
+    #[test]
+    fn exact_fresh_publication_is_recoverable_after_receipt_commit_crash() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = canonical_temporary_root(&temporary);
+        private_directory(&root);
+        private_directory(&root.join("tasks"));
+        private_directory(&root.join("tasks/demo"));
+        let content = b"# Rendered\n";
+        let intent = render_intent("tasks/demo/STATE.md", content);
+        let scanner = MarkdownRoot::open(&root).expect("open root");
+
+        let first = match scanner
+            .render_no_clobber(&intent, content, None, 2)
+            .expect("publish before simulated Store crash")
+        {
+            MarkdownRenderOutcome::Committed(receipt) => receipt,
+            MarkdownRenderOutcome::ReconciliationRequired => panic!("unexpected reconciliation"),
+        };
+        let recovered = scanner
+            .recover_exact_fresh_publication(&intent, 3)
+            .expect("recover exact descriptor")
+            .expect("exact final is recoverable");
+        assert_eq!(recovered.intent_id, first.intent_id);
+        assert_eq!(recovered.final_entry, first.final_entry);
+        assert_eq!(recovered.final_device, first.final_device);
+        assert_eq!(recovered.final_inode, first.final_inode);
+        scanner
+            .verify_committed_receipt(&intent, &recovered)
+            .expect("recovered receipt is exact");
+
+        write_document(&root, "tasks/demo/STATE.md", b"# Owner edit\n");
+        assert!(
+            scanner
+                .recover_exact_fresh_publication(&intent, 4)
+                .expect("typed mismatch")
+                .is_none()
         );
     }
 
