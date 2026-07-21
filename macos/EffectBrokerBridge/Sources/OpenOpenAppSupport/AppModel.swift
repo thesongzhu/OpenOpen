@@ -85,6 +85,12 @@ public protocol CoreServing: Sendable {
   func selectedModel(proof: BrokerRuntimeState) async throws -> ModelSelection?
   func personaStatus() async throws -> PersonaStatusView?
   func b2MemoryDemo(proof: BrokerRuntimeState) async throws -> B2MemoryDemoState?
+  func prepareB2MemorySource(
+    _ request: B2MemoryPrepareSourceRequest, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse
+  func processB2MemorySource(
+    _ consent: B2MemoryProcessingConsent, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse
   func applyB2MemoryDemo(
     _ command: B2MemoryCommand, proof: BrokerRuntimeState
   ) async throws -> ApplyB2MemoryDemoResponse
@@ -164,6 +170,18 @@ public protocol CoreServing: Sendable {
 
 extension CoreServing {
   public func b2MemoryDemo(proof _: BrokerRuntimeState) async throws -> B2MemoryDemoState? { nil }
+
+  public func prepareB2MemorySource(
+    _: B2MemoryPrepareSourceRequest, proof _: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    throw CoreClientError.contractViolation("The bounded Memory source import is unavailable.")
+  }
+
+  public func processB2MemorySource(
+    _: B2MemoryProcessingConsent, proof _: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    throw CoreClientError.contractViolation("The bounded Memory source processing is unavailable.")
+  }
 
   public func applyB2MemoryDemo(
     _: B2MemoryCommand, proof _: BrokerRuntimeState
@@ -648,6 +666,10 @@ public final class AppModel: ObservableObject {
   @Published public private(set) var persistedModelSelection: ModelSelection?
   @Published public private(set) var personaStatus: PersonaStatusView?
   @Published public private(set) var b2MemoryDemoState: B2MemoryDemoState?
+  @Published public private(set) var b2MemoryPreparedSource: B2MemoryPreparedSource?
+  @Published public private(set) var b2MemorySourceSelectionFeedback: String?
+  @Published public private(set) var b2MemoryProcessingConsentPending = false
+  private var b2MemoryPendingPrepareRequest: B2MemoryPrepareSourceRequest?
   @Published public private(set) var b2MemoryPendingAction: B2MemoryCommandKind?
   @Published public private(set) var b2MemoryPendingCandidateId: String?
   @Published public var b2MemoryEditedLine = ""
@@ -2710,12 +2732,126 @@ public final class AppModel: ObservableObject {
       let state = try await core.b2MemoryDemo(proof: proof)
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
       b2MemoryDemoState = state
+      b2MemoryPreparedSource = state?.preparedSource
+      if state?.preparedSource?.requestId == b2MemoryPendingPrepareRequest?.requestId {
+        b2MemoryPendingPrepareRequest = nil
+      }
       if let line = state?.markdownDiff?.editedLine, b2MemoryEditedLine.isEmpty {
         b2MemoryEditedLine = line
       }
       b2MemoryFeedback = nil
     } catch {
       guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      b2MemoryFeedback = "Nothing changed"
+    }
+  }
+
+  public var b2MemoryChooseImportEnabled: Bool {
+    storeControlEnabled && !isBusy && b2MemoryDemoState == nil
+  }
+
+  public var b2MemoryProcessSourceEnabled: Bool {
+    // The Host can safely pin a selected file, but the real semantic
+    // model-processing and descriptor-bound readback route is not complete.
+    // Keep the frozen control visible and fail closed until that authority is
+    // available rather than presenting metadata-derived cards as memories.
+    false
+  }
+
+  public func chooseB2MemoryImport() async {
+    guard b2MemoryChooseImportEnabled else { return }
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.resolvesAliases = false
+    panel.title = "Choose one file to review"
+    panel.prompt = "Choose file"
+    guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
+
+    let request: B2MemoryPrepareSourceRequest
+    if let pending = b2MemoryPendingPrepareRequest, pending.selectedPath == selectedURL.path {
+      request = pending
+    } else {
+      request = B2MemoryPrepareSourceRequest(
+        requestId: "memory-source-" + UUID().uuidString.lowercased(),
+        selectedPath: selectedURL.path)
+      b2MemoryPendingPrepareRequest = request
+    }
+    guard request.isValid else {
+      b2MemorySourceSelectionFeedback = "No memory was added"
+      return
+    }
+
+    let generation = runtimeGeneration
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let response = try await core.prepareB2MemorySource(request, proof: proof)
+      try requireCurrentOnGeneration(generation)
+      guard response.state.stage == .prepared,
+        response.state.preparedSource?.requestId == request.requestId,
+        response.state.preparedSource?.isValid == true
+      else {
+        throw CoreClientError.contractViolation("Core returned an unrelated Memory source.")
+      }
+      b2MemoryDemoState = response.state
+      b2MemoryPreparedSource = response.state.preparedSource
+      b2MemoryPendingPrepareRequest = nil
+      b2MemorySourceSelectionFeedback = nil
+      b2MemoryFeedback = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      b2MemorySourceSelectionFeedback = "No memory was added"
+    }
+  }
+
+  public func requestB2MemoryProcessingConsent() {
+    guard b2MemoryProcessSourceEnabled else { return }
+    b2MemoryProcessingConsentPending = true
+  }
+
+  public func cancelB2MemoryProcessingConsent() {
+    b2MemoryProcessingConsentPending = false
+  }
+
+  public func confirmB2MemoryProcessingConsent() async {
+    guard b2MemoryProcessingConsentPending, b2MemoryProcessSourceEnabled,
+      let source = b2MemoryPreparedSource,
+      let revision = b2MemoryDemoState?.revision
+    else { return }
+    let stableDigest = Self.c2StableDigest(
+      "\(revision):\(source.requestId):\(source.sourceIdentityDigest)")
+    let consent = B2MemoryProcessingConsent(
+      requestId: "memory-process-\(String(stableDigest.prefix(24)))",
+      expectedRevision: revision,
+      sourceIdentityDigest: source.sourceIdentityDigest,
+      explicitlyConfirmed: true)
+    guard consent.isValid else {
+      b2MemoryFeedback = "Nothing changed"
+      return
+    }
+
+    let generation = runtimeGeneration
+    b2MemoryProcessingConsentPending = false
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let response = try await core.processB2MemorySource(consent, proof: proof)
+      try requireCurrentOnGeneration(generation)
+      guard response.state.stage == .candidates,
+        response.state.candidates.count <= 3,
+        !response.state.candidates.isEmpty
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid Memory candidate set.")
+      }
+      b2MemoryDemoState = response.state
+      b2MemoryPreparedSource = response.state.preparedSource
+      b2MemoryFeedback = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
       b2MemoryFeedback = "Nothing changed"
     }
   }

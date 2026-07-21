@@ -29,7 +29,7 @@ private func sourceSlice(_ source: String, from start: String, to end: String) t
 }
 
 @Test
-func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
+func frozenMemorySetupUsesOnlyTypedImportAndProcessingAuthority() throws {
   let source = try openOpenViewsSource()
   let memory = try sourceSlice(
     source,
@@ -45,7 +45,11 @@ func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
   #expect(memory.contains("written and read back successfully."))
   #expect(memory.contains("openopen-memory-choose-import"))
   #expect(!memory.contains("NSOpenPanel"))
-  #expect(memory.contains("enabled: false"))
+  #expect(memory.contains("model.b2MemoryChooseImportEnabled"))
+  #expect(memory.contains("model.chooseB2MemoryImport"))
+  #expect(memory.contains("model.b2MemoryProcessSourceEnabled"))
+  #expect(memory.contains("model.requestB2MemoryProcessingConsent"))
+  #expect(memory.contains("model.confirmB2MemoryProcessingConsent"))
   #expect(!memory.contains("beginB2MemoryDemo"))
   #expect(!memory.contains("requestB2CandidateGeneration"))
   #expect(memory.contains("model.requestB2CandidateSelection"))
@@ -56,6 +60,14 @@ func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
   #expect(!memory.contains("Nothing changes until you confirm."))
 
   let appModel = try appModelSource()
+  #expect(appModel.contains("core.prepareB2MemorySource"))
+  #expect(appModel.contains("core.processB2MemorySource"))
+  #expect(appModel.contains("B2MemoryProcessingConsent"))
+  #expect(appModel.contains("explicitlyConfirmed: true"))
+  #expect(appModel.contains("panel.title = \"Choose one file to review\""))
+  #expect(appModel.contains("panel.prompt = \"Choose file\""))
+  #expect(appModel.contains("b2MemoryPendingPrepareRequest"))
+  #expect(!appModel.contains("c2StableDigest(selectedURL.path)"))
   #expect(!appModel.contains("The Memory Demo state could not be verified."))
   #expect(!appModel.contains("The Memory Demo command is invalid."))
   #expect(!appModel.contains("The Memory Demo step was not verified."))

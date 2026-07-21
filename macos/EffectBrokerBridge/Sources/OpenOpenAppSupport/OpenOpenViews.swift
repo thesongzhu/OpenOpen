@@ -451,6 +451,10 @@ private struct EditorialMemoryView: View {
           Text(feedback).font(.caption).foregroundStyle(.orange)
             .accessibilityIdentifier("openopen-memory-feedback")
         }
+        if let feedback = model.b2MemorySourceSelectionFeedback {
+          Text(feedback).font(.caption).foregroundStyle(.orange)
+            .accessibilityIdentifier("openopen-memory-source-feedback")
+        }
       }
       .padding(30)
       .frame(maxWidth: 760, alignment: .leading)
@@ -483,7 +487,8 @@ private struct EditorialMemoryView: View {
         actionTitle: "Choose import",
         accessibilityIdentifier: "openopen-memory-choose-import",
         boundaries: boundaries,
-        enabled: false)
+        action: { Task { await model.chooseB2MemoryImport() } },
+        enabled: model.b2MemoryChooseImportEnabled)
     case .prepared:
       EditorialBoundaryCard(
         title: "Review the processing scope",
@@ -491,7 +496,22 @@ private struct EditorialMemoryView: View {
         actionTitle: "Process source",
         accessibilityIdentifier: "openopen-memory-process-source",
         boundaries: boundaries,
-        enabled: false)
+        action: { model.requestB2MemoryProcessingConsent() },
+        enabled: model.b2MemoryProcessSourceEnabled
+      )
+      .alert(
+        "Processing consent",
+        isPresented: Binding(
+          get: { model.b2MemoryProcessingConsentPending },
+          set: { if !$0 { model.cancelB2MemoryProcessingConsent() } })
+      ) {
+        Button("Cancel", role: .cancel) { model.cancelB2MemoryProcessingConsent() }
+        Button("Process source") {
+          Task { await model.confirmB2MemoryProcessingConsent() }
+        }
+      } message: {
+        Text(boundaries[0].1)
+      }
     case .candidates:
       ForEach(model.b2MemoryDemoState?.candidates ?? []) { card in
         EditorialCard(title: card.title, symbol: "circle") {
