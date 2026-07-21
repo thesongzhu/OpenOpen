@@ -7,25 +7,38 @@ use channels::{
     TransportEvent, TransportInbound,
 };
 
+#[cfg(test)]
+use openopen_codex_client::OutcomeRequest;
 use openopen_codex_client::{
-    ChatGptLogin, CodexClient, CodexError, CodexRuntimeConfig, OutcomeRequest, REQUIRED_MODEL,
+    AccountState, ChatGptLogin, ChoiceGenerationRequest, CodexClient, CodexError,
+    CodexRuntimeConfig, GptModel, SelectedModel, StructuredChoiceGeneration,
 };
 use openopen_core::{
     ActionGate, ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor,
-    BrokerEnrollmentRecord, CreateMission, CreateWorkItem, EffectKind, EvidenceClaims,
-    GateDecision, LocalAuthority, MissionCommand, MissionCommandEnvelope, NewBoundaryApproval,
-    NewReceipt, Store, StoreError, TrustedBrokerEnrollment, authorize_broker_enrollment,
-    channel_message_payload, channel_need_you_content, channel_receipt_content,
-    verify_core_instance_lease,
+    BrokerEnrollmentRecord, ChoiceIdleAdvance, ChoiceIdleClockEvidence, CreateMission,
+    CreateWorkItem, EffectKind, EvidenceClaims, GateDecision, LocalAuthority,
+    MarkdownRenderCleanup, MarkdownRenderPublication, MissionCommand, MissionCommandEnvelope,
+    NewBoundaryApproval, NewReceipt, Store, StoreError, TrustedBrokerEnrollment,
+    authorize_broker_enrollment, channel_message_payload, channel_need_you_content,
+    channel_receipt_content, verify_core_instance_lease,
 };
+use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
+use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelDeliveryReceipt, ChannelEnvelope,
-    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, ChannelDeliveryReceipt,
+    ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
     ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
-    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteSet,
-    CoreInstanceLease, DiscordPairingMetadata, EffectAuditAnchor, EvidenceKind, Mission,
-    MissionStatus, OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse,
-    RuntimeControlAuthorization, RuntimeControlReceipt, WorkItem, WorkItemStatus,
+    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
+    ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
+    ChoiceDIntakeRecord, ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption,
+    ChoiceRefinementOperation, ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
+    ChoiceReminderScheduleInput, ChoiceResumeResult, ChoiceSession, ChoiceSessionState,
+    ConversationTurnBatch, CoreInstanceLease, DiscordPairingMetadata, DocumentManifest,
+    DocumentManifestEntry, EffectAuditAnchor, EvidenceKind, InterpretationFrame,
+    MarkdownBaseIdentity, Mission, MissionStatus, ModelSelection, ModelSelectionState,
+    OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse, RuntimeControlAuthorization,
+    RuntimeControlReceipt, Selection, SourceEnvelope, WorkItem, WorkItemStatus,
+    canonical_document_manifest_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,6 +48,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -65,6 +79,8 @@ pub enum HostError {
     Store(#[from] StoreError),
     #[error("channel runtime failed to initialize")]
     ChannelRuntime,
+    #[error("persona runtime failed to initialize")]
+    Persona(#[from] PersonaError),
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +92,8 @@ pub struct HostPaths {
     pub model_input_root: PathBuf,
     pub imsg_runtime: PathBuf,
     pub user_home: PathBuf,
+    pub persona_root: PathBuf,
+    pub persona_team_identifier: String,
 }
 
 impl HostPaths {
@@ -118,8 +136,32 @@ impl HostPaths {
             model_input_root: support.join("ModelInput"),
             imsg_runtime: contents.join("Resources/iMessage/0.13.0/bin/imsg"),
             user_home: home,
+            persona_root: support.join("Persona"),
+            persona_team_identifier: current_executable_team_identifier().unwrap_or_default(),
         })
     }
+}
+
+fn current_executable_team_identifier() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let output = Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(executable)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let details = String::from_utf8_lossy(&output.stderr);
+    details.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "TeamIdentifier"
+            && value.len() == 10
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+        .then(|| value.to_owned())
+    })
 }
 
 struct LoginSession {
@@ -147,11 +189,48 @@ impl Default for OperationGate {
     }
 }
 
+const MODEL_CATALOG_SNAPSHOT_TTL_MS: i64 = 5 * 60 * 1_000;
+
+struct ModelCatalogRequest<'a> {
+    snapshot_id: &'a str,
+    catalog_fingerprint: &'a str,
+    catalog_revision: u64,
+    runtime_revision: u64,
+    now: i64,
+}
+
+/// A Host-owned, short-lived catalog result. The App receives only its opaque
+/// identity and cannot manufacture a selection from catalog data of its own.
+/// It is deliberately volatile: a Core restart, protected Off, or expiry
+/// requires a fresh account/catalog scan before any selection can be saved.
+#[derive(Clone)]
+struct ModelCatalogSnapshot {
+    id: String,
+    account: AccountState,
+    models: Vec<GptModel>,
+    catalog_fingerprint: String,
+    catalog_revision: u64,
+    runtime_revision: u64,
+    issued_at_ms: i64,
+}
+
+impl ModelCatalogSnapshot {
+    fn matches_request(&self, request: &ModelCatalogRequest<'_>) -> bool {
+        self.id == request.snapshot_id
+            && self.catalog_fingerprint == request.catalog_fingerprint
+            && self.catalog_revision == request.catalog_revision
+            && self.runtime_revision == request.runtime_revision
+            && request.now >= self.issued_at_ms
+            && request.now.saturating_sub(self.issued_at_ms) <= MODEL_CATALOG_SNAPSHOT_TTL_MS
+    }
+}
+
 #[derive(Clone, Default)]
 struct OperationState {
     gate: Arc<Mutex<OperationGate>>,
     login: Arc<Mutex<Option<LoginSession>>>,
     suggestion: Arc<Mutex<Option<OutcomeSuggestion>>>,
+    model_catalog_snapshot: Arc<Mutex<Option<ModelCatalogSnapshot>>>,
     runtime_challenge: Arc<Mutex<Option<String>>>,
     codex: Arc<Mutex<Option<CodexClient>>>,
     codex_pid: Arc<Mutex<Option<i32>>>,
@@ -159,6 +238,14 @@ struct OperationState {
 }
 
 impl OperationState {
+    fn has_active_operation(&self) -> bool {
+        self.gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .is_some()
+    }
+
     fn codex_replacement_allowed(&self) -> bool {
         let gate = self
             .gate
@@ -181,7 +268,7 @@ impl OperationState {
             .login
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (gate.active.as_ref(), login.as_ref()) {
+        let authorized = match (gate.active.as_ref(), login.as_ref()) {
             (None, None) => true,
             (Some(token), Some(_)) => {
                 token.store(true, Ordering::Release);
@@ -190,7 +277,13 @@ impl OperationState {
                 true
             }
             _ => false,
+        };
+        drop(login);
+        drop(gate);
+        if authorized {
+            self.clear_model_catalog_snapshot();
         }
+        authorized
     }
 
     fn begin_operation(&self) -> Option<Arc<AtomicBool>> {
@@ -208,6 +301,11 @@ impl OperationState {
     }
 
     fn cancel_active(&self) {
+        // A protected Off/cancel must be observable even if another path is
+        // temporarily holding a secondary operation lock (for example while
+        // installing a browser-login session). The worker checks this flag
+        // before any later state publication.
+        self.codex_cancel.store(true, Ordering::Release);
         let mut gate = self
             .gate
             .lock()
@@ -215,7 +313,6 @@ impl OperationState {
         gate.runtime = RuntimeAuthorityState::OffLatched {
             minimum_on_revision: None,
         };
-        self.codex_cancel.store(true, Ordering::Release);
         if let Some(token) = gate.active.as_ref() {
             token.store(true, Ordering::Release);
         }
@@ -228,6 +325,22 @@ impl OperationState {
         if pending_login {
             gate.active = None;
         }
+        drop(gate);
+        self.clear_model_catalog_snapshot();
+    }
+
+    /// Retires only the current model operation. Unlike protected Global Off,
+    /// this leaves the signed runtime enabled so the caller can persist a
+    /// terminal Choice cancellation and immediately regain a local next step.
+    fn cancel_active_model_operation(&self) {
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(token) = gate.active.take() {
+            token.store(true, Ordering::Release);
+        }
+        self.codex_cancel.store(true, Ordering::Release);
     }
 
     fn latch_prepared_off(&self, revision: u64) {
@@ -264,6 +377,10 @@ impl OperationState {
                 token.store(true, Ordering::Release);
             }
         }
+        drop(gate);
+        if !enabled {
+            self.clear_model_catalog_snapshot();
+        }
     }
 
     fn accept_recovered_runtime(&self, enabled: bool, revision: u64) {
@@ -290,6 +407,10 @@ impl OperationState {
                 gate.runtime = RuntimeAuthorityState::Enabled;
             }
             (RuntimeAuthorityState::Enabled | RuntimeAuthorityState::OffLatched { .. }, true) => {}
+        }
+        drop(gate);
+        if !enabled {
+            self.clear_model_catalog_snapshot();
         }
     }
 
@@ -366,6 +487,119 @@ impl OperationState {
         // signed On row inside its immediate write transaction.
         reconcile()
     }
+
+    fn publish_model_catalog_snapshot(
+        &self,
+        token: &Arc<AtomicBool>,
+        snapshot: ModelCatalogSnapshot,
+    ) -> bool {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.load(Ordering::Acquire)
+            || !matches!(gate.runtime, RuntimeAuthorityState::Enabled)
+            || !gate
+                .active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return false;
+        }
+        *self
+            .model_catalog_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        true
+    }
+
+    fn reconcile_active_model_catalog<T>(
+        &self,
+        token: &Arc<AtomicBool>,
+        request: &ModelCatalogRequest<'_>,
+        reconcile: impl FnOnce(&ModelCatalogSnapshot) -> Result<T, HostCallError>,
+    ) -> Result<T, HostCallError> {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.load(Ordering::Acquire)
+            || !matches!(gate.runtime, RuntimeAuthorityState::Enabled)
+            || !gate
+                .active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return Err(HostCallError::Codex(CodexError::Cancelled));
+        }
+        let snapshot = self
+            .model_catalog_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !snapshot
+            .as_ref()
+            .is_some_and(|value| value.matches_request(request))
+        {
+            return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+        }
+        // The operation gate remains held through the Store transaction, so
+        // protected Off cannot race a stale snapshot into durable readiness.
+        reconcile(snapshot.as_ref().expect("validated model catalog snapshot"))
+    }
+
+    /// Holds the same operation gate used by catalog selection while a
+    /// first-local-question intake verifies its persisted model binding and
+    /// commits the initial session. The caller cannot race protected Off or a
+    /// catalog/account drift into durable model readiness.
+    fn reconcile_active_model_selection<T>(
+        &self,
+        token: &Arc<AtomicBool>,
+        selection: &ModelSelection,
+        runtime_revision: u64,
+        now: i64,
+        reconcile: impl FnOnce() -> Result<T, HostCallError>,
+    ) -> Result<T, HostCallError> {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.load(Ordering::Acquire)
+            || !matches!(gate.runtime, RuntimeAuthorityState::Enabled)
+            || !gate
+                .active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return Err(HostCallError::Codex(CodexError::Cancelled));
+        }
+        let snapshot = self
+            .model_catalog_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = snapshot.as_ref().is_some_and(|value| {
+            value.runtime_revision == runtime_revision
+                && now >= value.issued_at_ms
+                && now.saturating_sub(value.issued_at_ms) <= MODEL_CATALOG_SNAPSHOT_TTL_MS
+                && model_selection_status(
+                    &value.account,
+                    &value.models,
+                    Some(selection),
+                    &value.catalog_fingerprint,
+                    value.catalog_revision,
+                ) == ModelSelectionStatus::Current
+        });
+        if !current {
+            return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+        }
+        reconcile()
+    }
+
+    fn clear_model_catalog_snapshot(&self) {
+        self.model_catalog_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 fn runtime_on_may_release(state: RuntimeAuthorityState, revision: u64) -> bool {
@@ -386,8 +620,14 @@ pub struct Host {
     paths: HostPaths,
     operations: OperationState,
     instance_nonce: String,
+    idle_boot_id: String,
     instance_lease: Arc<Mutex<Option<CoreInstanceLease>>>,
     channels: Mutex<ChannelRuntime>,
+    persona: Arc<Mutex<PersonaManager>>,
+    // Unit fixtures retain direct coverage of historical recovery records.
+    // This is never enabled by `Host::open`, so a shipped Host cannot expose
+    // a deferred channel route during the PR1 local-Choice stage.
+    allow_pr1_deferred_channel_routes_for_tests: bool,
 }
 
 impl Host {
@@ -407,24 +647,46 @@ impl Host {
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| HostError::InstanceNonce)?;
         let authority = LocalAuthority::from_master(ISSUER_ID, *master);
-        let store = Store::open(&paths.store, authority.clone())?;
+        let mut store = Store::open(&paths.store, authority.clone())?;
+        store.bind_choice_markdown_root(&paths.user_home)?;
+        let idle_boot_id = stable_idle_boot_id()?;
+        let persona = PersonaManager::open_default_only(
+            &paths.persona_root,
+            1,
+            paths.persona_team_identifier.clone(),
+        )?;
         Ok(Self {
             store,
             authority,
             paths,
             operations: OperationState::default(),
             instance_nonce: hex::encode(nonce),
+            idle_boot_id,
             instance_lease: Arc::new(Mutex::new(None)),
             channels: Mutex::new(ChannelRuntime::new().map_err(|_| HostError::ChannelRuntime)?),
+            persona: Arc::new(Mutex::new(persona)),
+            allow_pr1_deferred_channel_routes_for_tests: false,
         })
     }
 
+    #[allow(clippy::too_many_lines)] // The RPC dispatch table is deliberately auditable in one place.
     pub fn handle_line(&mut self, line: &str, responses: &Sender<RpcResponse>) {
         let Some(request) = parse_request(line, responses) else {
             return;
         };
         if request.jsonrpc != "2.0" {
             let _ = responses.send(invalid_request(Some(request.id)));
+            return;
+        }
+        // PR1 owns the local Choice Core only. Channel pairing/setup, polling,
+        // outbound, and route binding begin in later independently reviewed
+        // stages; they are not a compatibility path around Choice authority.
+        // Unit fixtures retain direct coverage of historical Store recovery,
+        // but the production Host never exposes these mutating routes.
+        if is_pr1_deferred_channel_route(&request.method)
+            && !self.allow_pr1_deferred_channel_routes_for_tests
+        {
+            let _ = responses.send(not_ready(request.id));
             return;
         }
         match request.method.as_str() {
@@ -477,12 +739,48 @@ impl Host {
             "account.login.start" => self.start_login(&request, responses),
             "account.login.await" => self.await_login(&request, responses),
             "models.list" => self.start_model_list(&request, responses),
-            "outcome.propose" => self.start_outcome(&request, responses),
-            "mission.confirm" => self.confirm_mission(&request, responses),
-            "mission.cancel" => self.cancel_mission(&request, responses),
-            "mission.reminders.begin" => self.begin_reminder_dispatch(&request, responses),
-            "mission.reminders.record" => self.record_reminder_mirror(&request, responses),
-            "mission.reminders.complete" => self.complete_reminders(&request, responses),
+            "models.setup.read" => self.read_model_setup(&request, responses),
+            "models.selection.read" => self.read_selected_model(&request, responses),
+            "models.select" => self.select_model(&request, responses),
+            "persona.status" => self.read_persona_status(&request, responses),
+            "choice.loop.read" => self.read_choice_loop(&request, responses),
+            "choice.reminder.schedule.read" => {
+                self.read_choice_reminder_schedule(&request, responses);
+            }
+            "choice.begin" => self.begin_choice(&request, responses),
+            "choice.cancel" => self.cancel_choice(&request, responses),
+            "choice.select" => self.select_choice(&request, responses),
+            "choice.resume" => self.resume_choice(&request, responses),
+            "choice.markdown.reconcile" => self.reconcile_choice_markdown(&request, responses),
+            "choice.markdown.receipt.cleanup" => {
+                self.cleanup_choice_markdown_receipt(&request, responses);
+            }
+            "choice.markdown.receipt.cleanup.available" => {
+                self.read_choice_markdown_receipt_cleanup_availability(&request, responses);
+            }
+            "choice.reminder.schedule" => self.record_choice_reminder_schedule(&request, responses),
+            "choice.confirm.prepare" => self.prepare_choice_confirmation(&request, responses),
+            "choice.confirm" => self.confirm_choice(&request, responses),
+            "choice.reminders.authorize" => {
+                self.authorize_choice_reminders(&request, responses);
+            }
+            "choice.reminders.begin" => self.begin_choice_reminder_dispatch(&request, responses),
+            "choice.reminders.abort-before-commit" => {
+                self.abort_choice_reminder_dispatch_before_commit(&request, responses);
+            }
+            "choice.reminders.record" => self.record_choice_reminder_mirror(&request, responses),
+            "choice.reminders.complete" => self.complete_choice_reminders(&request, responses),
+            // Choice confirmation is the only current foreground authority.
+            // PR1 may read a historical Mission/Receipt dashboard, but no
+            // public Mission command can create, cancel, complete, record
+            // Evidence, begin Reminder work, or send a route effect.
+            "mission.confirm"
+            | "mission.cancel"
+            | "mission.reminders.begin"
+            | "mission.reminders.record"
+            | "mission.reminders.complete" => {
+                let _ = responses.send(not_ready(request.id));
+            }
             method if is_public_family(method) => {
                 let _ = responses.send(not_ready(request.id));
             }
@@ -496,7 +794,7 @@ impl Host {
         }
     }
 
-    fn prepare_runtime(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+    fn prepare_runtime(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<SetEnabled>(request) else {
             let _ = responses.send(invalid_params(request.id));
             return;
@@ -522,6 +820,22 @@ impl Host {
             self.cancel_active();
         }
         let result = now_ms().and_then(|now| {
+            if !params.enabled {
+                // Off is an immediate cancellation boundary for an unreceipted
+                // local Choice journal. Retire the encrypted body while the
+                // current signed On revision is still authoritative; leaving
+                // it behind would strand it after Core quiesces with no legal
+                // publication or cancellation route.
+                if let Some(snapshot) = self.store.choice_loop_snapshot()?
+                    && !matches!(
+                        snapshot.session.state,
+                        ChoiceSessionState::Completed | ChoiceSessionState::Cancelled
+                    )
+                {
+                    let runtime = self.store.runtime_control()?;
+                    self.store.cancel_choice_session(runtime.revision, now)?;
+                }
+            }
             self.store
                 .prepare_runtime_control(params.enabled, now)
                 .map_err(HostCallError::Store)
@@ -2016,6 +2330,11 @@ impl Host {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Historical channel recovery remains test-only in PR1.
+    #[cfg_attr(
+        not(test),
+        allow(clippy::needless_pass_by_value, clippy::needless_return,)
+    )]
     fn execute_channel_model(
         &self,
         request: &RpcRequest,
@@ -2024,97 +2343,115 @@ impl Host {
         operation: Arc<AtomicBool>,
         start: ChannelModelStart,
     ) {
-        let model_context = match self
-            .store
-            .channel_model_context(start.envelope.channel, &start.envelope.source_message_id)
+        #[cfg(not(test))]
         {
-            Ok(value) => value,
-            Err(error) => {
-                self.finish_operation(&operation);
-                let _ = responses.send(host_failure(request.id, &error));
-                return;
-            }
-        };
-        let connection_status = self
-            .channels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status(params.channel);
-        let context = self.background_context(params.proof());
-        let responses = responses.clone();
-        let request_id = request.id;
-        std::thread::spawn(move || {
-            let result =
-                run_channel_outcome(&context, &start, &model_context).and_then(|suggestion| {
-                    context.reconcile_channel_suggestion(&operation, &start, suggestion)
-                });
-            let response = if let Ok((suggestion, is_current)) = result {
-                success(
-                    request_id,
-                    json!({
-                        "connectionStatus": connection_status,
-                        "eventStatus": if is_current { "ready" } else { "superseded" },
-                        "suggestion": is_current.then_some(suggestion),
-                    }),
-                )
-            } else {
-                let recorded = context
-                    .trusted_broker
-                    .clone()
-                    .ok_or(StoreError::MissingTrustedBrokerEnrollment)
-                    .and_then(|broker| {
-                        let mut store = Store::open_with_trusted_broker(
-                            &context.paths.store,
-                            context.authority.clone(),
-                            broker,
-                        )?;
-                        store.fail_channel_model(
-                            start.envelope.channel,
-                            &start.envelope.source_message_id,
-                            now_ms().map_err(|_| StoreError::ChannelObservationConflict)?,
-                        )?;
-                        let invalidated = store
-                            .latest_channel_suggestion_for(start.envelope.channel)?
-                            .map(|candidate| candidate.id);
-                        let incidents = store
-                            .channel_failure_incident_projection(Some(start.envelope.channel))?;
-                        if incidents.is_empty() {
-                            return Err(StoreError::ChannelObservationConflict);
-                        }
-                        Ok((invalidated, incidents))
-                    });
-                match recorded {
-                    Ok((invalidated, incidents)) => {
-                        if let Some(invalidated_id) = invalidated.as_deref() {
-                            let mut slot = context
-                                .operations
-                                .suggestion
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if slot
-                                .as_ref()
-                                .is_some_and(|candidate| candidate.id == invalidated_id)
-                            {
-                                *slot = None;
-                            }
-                        }
-                        success(
-                            request_id,
-                            json!({
-                                "connectionStatus": connection_status,
-                                "eventStatus": "needYou",
-                                "suggestion": null,
-                                "invalidateSuggestionId": invalidated,
-                                "failureIncidents": incidents,
-                            }),
-                        )
-                    }
-                    Err(error) => host_failure(request_id, &error),
+            // Channel model work is not a PR1 compatibility fallback. The
+            // public dispatcher rejects channel.poll before this point; this
+            // second fence makes an accidental internal invocation fail
+            // closed without creating a workspace, model turn, or
+            // OutcomeSuggestion.
+            let _ = params;
+            let _ = start;
+            self.finish_operation(&operation);
+            let _ = responses.send(not_ready(request.id));
+            return;
+        }
+
+        #[cfg(test)]
+        {
+            let model_context = match self
+                .store
+                .channel_model_context(start.envelope.channel, &start.envelope.source_message_id)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finish_operation(&operation);
+                    let _ = responses.send(host_failure(request.id, &error));
+                    return;
                 }
             };
-            context.finish_operation(&operation);
-            let _ = responses.send(response);
-        });
+            let connection_status = self
+                .channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status(params.channel);
+            let context = self.background_context(params.proof());
+            let responses = responses.clone();
+            let request_id = request.id;
+            std::thread::spawn(move || {
+                let result =
+                    run_channel_outcome(&context, &start, &model_context).and_then(|suggestion| {
+                        context.reconcile_channel_suggestion(&operation, &start, suggestion)
+                    });
+                let response = if let Ok((suggestion, is_current)) = result {
+                    success(
+                        request_id,
+                        json!({
+                            "connectionStatus": connection_status,
+                            "eventStatus": if is_current { "ready" } else { "superseded" },
+                            "suggestion": is_current.then_some(suggestion),
+                        }),
+                    )
+                } else {
+                    let recorded = context
+                        .trusted_broker
+                        .clone()
+                        .ok_or(StoreError::MissingTrustedBrokerEnrollment)
+                        .and_then(|broker| {
+                            let mut store = Store::open_with_trusted_broker(
+                                &context.paths.store,
+                                context.authority.clone(),
+                                broker,
+                            )?;
+                            store.fail_channel_model(
+                                start.envelope.channel,
+                                &start.envelope.source_message_id,
+                                now_ms().map_err(|_| StoreError::ChannelObservationConflict)?,
+                            )?;
+                            let invalidated = store
+                                .latest_channel_suggestion_for(start.envelope.channel)?
+                                .map(|candidate| candidate.id);
+                            let incidents = store.channel_failure_incident_projection(Some(
+                                start.envelope.channel,
+                            ))?;
+                            if incidents.is_empty() {
+                                return Err(StoreError::ChannelObservationConflict);
+                            }
+                            Ok((invalidated, incidents))
+                        });
+                    match recorded {
+                        Ok((invalidated, incidents)) => {
+                            if let Some(invalidated_id) = invalidated.as_deref() {
+                                let mut slot = context
+                                    .operations
+                                    .suggestion
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if slot
+                                    .as_ref()
+                                    .is_some_and(|candidate| candidate.id == invalidated_id)
+                                {
+                                    *slot = None;
+                                }
+                            }
+                            success(
+                                request_id,
+                                json!({
+                                    "connectionStatus": connection_status,
+                                    "eventStatus": "needYou",
+                                    "suggestion": null,
+                                    "invalidateSuggestionId": invalidated,
+                                    "failureIncidents": incidents,
+                                }),
+                            )
+                        }
+                        Err(error) => host_failure(request_id, &error),
+                    }
+                };
+                context.finish_operation(&operation);
+                let _ = responses.send(response);
+            });
+        }
     }
 
     fn channel_poll_value(
@@ -2304,50 +2641,81 @@ impl Host {
         });
     }
 
-    fn start_outcome(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
-        let Ok(params) = decode_params::<OutcomeWithProof>(request) else {
+    /// Reads one capability-bound account/catalog/selection snapshot. The
+    /// App must not compose these values from independent RPCs: a same-ID
+    /// catalog drift would otherwise make an old persisted selection look
+    /// ready until the next model turn fails closed.
+    fn read_model_setup(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
             let _ = responses.send(invalid_params(request.id));
             return;
         };
-        let outcome = params.outcome();
-        if let Err(error) = outcome.validate() {
-            let _ = responses.send(call_failure(request.id, &HostCallError::Codex(error)));
-            return;
-        }
-        let Some(token) = self.begin_operation(request.id, &params.proof(), responses) else {
+        let Some(token) = self.begin_operation(request.id, &proof, responses) else {
             return;
         };
-        let context = self.background_context(params.proof());
-        let suggestion_slot = self.operations.suggestion.clone();
+        // The persisted selection is a local read. All Codex/account/catalog
+        // I/O stays below on the background worker so stdin can immediately
+        // accept protected Off or cancellation.
+        let selection = match self.store.selected_model_selection() {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&token);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let context = self.background_context(proof);
+        let operations = self.operations.clone();
+        let runtime_revision = context.proof.authorization.revision;
         let responses = responses.clone();
         let request_id = request.id;
         std::thread::spawn(move || {
-            let result = (|| -> Result<OutcomeSuggestion, HostCallError> {
-                let workspace = ModelWorkspace::create(&context.paths.model_input_root)?;
-                let value = context.with_client(|client| {
-                    client.run_structured_outcome_in_workspace(&outcome, &workspace.path)
+            let result = (|| -> Result<ModelSetup, HostCallError> {
+                let (account, models) = context.with_client(|client| {
+                    Ok((client.read_account()?, client.list_gpt_models()?))
                 })?;
                 context.require_enabled()?;
                 if token.load(Ordering::Acquire) {
                     return Err(HostCallError::Codex(CodexError::Cancelled));
                 }
-                let mut suggestion_nonce = [0_u8; 16];
-                getrandom::fill(&mut suggestion_nonce).map_err(|_| HostCallError::Internal)?;
-                let suggested_at_ms = now_ms()?;
-                let suggestion = OutcomeSuggestion {
-                    id: format!(
-                        "suggestion-{suggested_at_ms}-{}",
-                        hex::encode(suggestion_nonce)
-                    ),
-                    title: value.title,
-                    why_now: value.why_now,
-                    proposed_steps: value.proposed_steps,
-                    source_refs: value.source_refs,
+                let catalog_fingerprint = CodexClient::model_catalog_fingerprint(&models)?;
+                let catalog_revision = CodexClient::model_catalog_revision(&catalog_fingerprint)?;
+                let issued_at_ms = now_ms()?;
+                let catalog_snapshot_id = model_catalog_snapshot_id(
+                    &account,
+                    &catalog_fingerprint,
+                    catalog_revision,
+                    runtime_revision,
+                    issued_at_ms,
+                )?;
+                let snapshot = ModelCatalogSnapshot {
+                    id: catalog_snapshot_id.clone(),
+                    account: account.clone(),
+                    models: models.clone(),
+                    catalog_fingerprint: catalog_fingerprint.clone(),
+                    catalog_revision,
+                    runtime_revision,
+                    issued_at_ms,
                 };
-                *suggestion_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(suggestion.clone());
-                Ok(suggestion)
+                if !operations.publish_model_catalog_snapshot(&token, snapshot) {
+                    return Err(HostCallError::Codex(CodexError::Cancelled));
+                }
+                let selection_status = model_selection_status(
+                    &account,
+                    &models,
+                    selection.as_ref(),
+                    &catalog_fingerprint,
+                    catalog_revision,
+                );
+                Ok(ModelSetup {
+                    account,
+                    models,
+                    selection,
+                    selection_status,
+                    catalog_snapshot_id,
+                    catalog_fingerprint,
+                    catalog_revision,
+                })
             })();
             context.finish_operation(&token);
             let _ = responses.send(result.map_or_else(
@@ -2357,6 +2725,1976 @@ impl Host {
         });
     }
 
+    fn select_model(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<SelectModel>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !valid_model_selection_request(&params) {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let proof = params.proof();
+        let Some(token) = self.begin_operation(request.id, &proof, responses) else {
+            return;
+        };
+        // Selection never refreshes the provider synchronously (or at all).
+        // It can consume only the exact, short-lived Host snapshot returned by
+        // a preceding background `models.setup.read` operation.
+        let result = now_ms().and_then(|now| {
+            self.operations.reconcile_active_model_catalog(
+                &token,
+                &ModelCatalogRequest {
+                    snapshot_id: &params.catalog_snapshot_id,
+                    catalog_fingerprint: &params.catalog_fingerprint,
+                    catalog_revision: params.catalog_revision,
+                    runtime_revision: params.authorization.revision,
+                    now,
+                },
+                |snapshot| {
+                    let selection = bind_model_selection(snapshot, &params)?;
+                    self.store
+                        .select_model_selection(&selection, now)
+                        .map_err(HostCallError::Store)
+                },
+            )
+        });
+        self.finish_operation(&token);
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    fn read_selected_model(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let response = self.store.selected_model_selection().map_or_else(
+            |error| host_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    fn read_persona_status(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        if decode_params::<NoParams>(request).is_err() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let persona = self
+            .persona
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = persona.status();
+        let _ = responses.send(success(
+            request.id,
+            PersonaStatusView {
+                status,
+                change_note: None,
+            },
+        ));
+    }
+
+    /// Continuity state is readable while protected Off so the Mac can show
+    /// honest local history and a reachable recovery path. Reading it never
+    /// starts a batch, model turn, or external effect.
+    fn read_choice_loop(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        if decode_params::<NoParams>(request).is_err() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        // A read is only a scheduler wake hint. It carries no time, state, or
+        // authority fields; when a persisted deadline is due, the Host derives
+        // both clock values and the Store performs the fenced transition.
+        let result = (|| -> Result<Option<ChoiceLoopSnapshot>, HostCallError> {
+            let snapshot = self.store.choice_loop_snapshot()?;
+            let Some(snapshot) = snapshot else {
+                return Ok(None);
+            };
+            let runtime = self.store.runtime_control()?;
+            // A restart cannot retain an in-process private worker. If a
+            // durable session is still interpreting/refining and this Host
+            // owns no worker, atomically block only that exact operation. The
+            // recovery is fail-closed and cannot invoke or retry a model.
+            if runtime.enabled && !self.operations.has_active_operation() {
+                // An authenticated `choice.resume` is the sole recovery path
+                // for the exact Store-minted owner-return operation. Reads are
+                // deliberately non-authorizing, so they leave it intact for a
+                // foreground Mac re-entry while still fail-closing every other
+                // interrupted worker.
+                let is_pending_owner_resume =
+                    snapshot.session.state == ChoiceSessionState::Refining
+                        && snapshot.pending_refinement_operation.as_ref().is_some_and(
+                            |operation| {
+                                operation.is_owner_resume()
+                                    && operation.expected_generation == runtime.revision
+                            },
+                        );
+                if !is_pending_owner_resume
+                    && let Some(recovered) = self
+                        .store
+                        .recover_interrupted_choice_operation(runtime.revision, now_ms()?)?
+                {
+                    return Ok(Some(recovered));
+                }
+            }
+            if runtime.enabled
+                && matches!(
+                    snapshot.session.state,
+                    ChoiceSessionState::Active | ChoiceSessionState::SoftIdle
+                )
+            {
+                return self
+                    .advance_choice_idle_from_scheduler(
+                        &snapshot.session.id,
+                        snapshot.session.revision,
+                        runtime.revision,
+                    )
+                    .and_then(|outcome| match outcome {
+                        ChoiceIdleAdvance::Unchanged(snapshot)
+                        | ChoiceIdleAdvance::Transitioned(snapshot) => Ok(Some(snapshot)),
+                        ChoiceIdleAdvance::Calibrated(_) => {
+                            Err(HostCallError::ChoiceClockUncertain)
+                        }
+                    });
+            }
+            Ok(Some(snapshot))
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    /// Applies a due Host-owned idle/stale transition before an operation that
+    /// could otherwise consume an old `ChoiceSet`.  The caller supplies no
+    /// clock/state authority: if the deadline is due, this returns an error
+    /// after the Store's fenced transition so the Mac must refresh its typed
+    /// continuity rather than confirm a stale preview.
+    fn reject_due_choice_deadline(
+        &mut self,
+        expected_generation: u64,
+    ) -> Result<(), HostCallError> {
+        let clock = ChoiceIdleClockEvidence {
+            boot_id: self.idle_boot_id.clone(),
+            wall_clock_ms: now_ms()?,
+            monotonic_ms: boot_scoped_monotonic_ms()?,
+        };
+        self.reject_due_choice_deadline_with_clock(expected_generation, &clock)
+    }
+
+    fn reject_due_choice_deadline_with_clock(
+        &mut self,
+        expected_generation: u64,
+        clock: &ChoiceIdleClockEvidence,
+    ) -> Result<(), HostCallError> {
+        let snapshot = self
+            .store
+            .choice_loop_snapshot()?
+            .ok_or(HostCallError::Internal)?;
+        if !matches!(
+            snapshot.session.state,
+            ChoiceSessionState::Active | ChoiceSessionState::SoftIdle
+        ) {
+            return Ok(());
+        }
+        let outcome = self.advance_choice_idle_with_clock(
+            &snapshot.session.id,
+            snapshot.session.revision,
+            expected_generation,
+            clock,
+        )?;
+        match outcome {
+            // Only a later same-boot continuous sample that leaves the exact
+            // session unchanged may authorize consumption. A first sample is
+            // calibration rather than continuity proof, while a transition
+            // requires the Mac to refresh its revision-bound ChoiceSet.
+            ChoiceIdleAdvance::Unchanged(_) => Ok(()),
+            ChoiceIdleAdvance::Calibrated(_) => Err(HostCallError::ChoiceClockUncertain),
+            ChoiceIdleAdvance::Transitioned(_) => Err(HostCallError::ChoiceRefreshRequired),
+        }
+    }
+
+    /// Converts an already-applied idle/stale transition into the same typed
+    /// refresh result as a transition performed by this request. Wrong-session
+    /// input remains a generic fail-closed contract error; only a stale
+    /// revision of the current foreground session receives this classification.
+    fn require_current_choice_revision(
+        &self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+    ) -> Result<(), HostCallError> {
+        let snapshot = self
+            .store
+            .choice_loop_snapshot()?
+            .ok_or(HostCallError::Internal)?;
+        if snapshot.session.id == choice_session_id
+            && snapshot.session.revision != expected_session_revision
+        {
+            return Err(HostCallError::ChoiceRefreshRequired);
+        }
+        Ok(())
+    }
+
+    /// The sole public intake for a first local question. It first atomically
+    /// commits an interpreting session/audit record, then only the retained
+    /// Host operation may start the sealed read-only model turn.
+    #[allow(clippy::too_many_lines)] // Keeps the single public intake's replay and runtime fences auditable together.
+    fn begin_choice(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<BeginChoice>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !params.input.is_valid() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        // Preserve the protected-Off boundary before consuming a one-time
+        // proof. A replay is readable only through a live, protected Host;
+        // otherwise the caller receives the same lease failure as every other
+        // model-entry route.
+        if !self.has_instance_lease() {
+            let _ = responses.send(failure(
+                Some(request.id),
+                -32_015,
+                "Core has no protected instance lease",
+            ));
+            return;
+        }
+        // An exact lost-response retry must resolve before this RPC reserves
+        // the exclusive worker slot. It is a Store-owned read, never a second
+        // model operation.
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let Some(request_digest) = params.input.request_digest() else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        match self
+            .store
+            .choice_begin_replay(&params.input.request_id, &request_digest)
+        {
+            Ok(Some(accepted)) => {
+                let _ = responses.send(success(request.id, accepted));
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        }
+        let Some(token) = self.begin_operation_after_validated_proof(request.id, responses) else {
+            return;
+        };
+        let persona_revision = self
+            .persona
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accept_turn();
+        let result =
+            (|| -> Result<(ChoiceBeginAccepted, Option<ChoiceBeginRecord>), HostCallError> {
+                let now = now_ms()?;
+                let selection = self
+                    .store
+                    .selected_model_selection()?
+                    .ok_or(HostCallError::Codex(CodexError::RequiredModelUnavailable))?;
+                if !choice_begin_request_matches_selection(&params.input, &selection) {
+                    return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+                }
+                let prior = self.store.choice_loop_snapshot()?;
+                let session_revision = match prior.as_ref() {
+                    None => 1,
+                    Some(snapshot)
+                        if matches!(
+                            snapshot.session.state,
+                            ChoiceSessionState::Completed
+                                | ChoiceSessionState::Cancelled
+                                | ChoiceSessionState::Executing
+                        ) =>
+                    {
+                        snapshot
+                            .session
+                            .revision
+                            .checked_add(1)
+                            .ok_or(HostCallError::Internal)?
+                    }
+                    Some(_) => return Err(HostCallError::Internal),
+                };
+                let (record, snapshot) = new_choice_begin_state(
+                    &params.input,
+                    &selection,
+                    session_revision,
+                    params.authorization.revision,
+                    &persona_revision,
+                    now,
+                )?;
+                let clock = ChoiceIdleClockEvidence {
+                    boot_id: self.idle_boot_id.clone(),
+                    wall_clock_ms: now,
+                    monotonic_ms: boot_scoped_monotonic_ms()?,
+                };
+                self.operations.reconcile_active_model_selection(
+                    &token,
+                    &selection,
+                    params.authorization.revision,
+                    now,
+                    || {
+                        let accepted = self
+                            .store
+                            .begin_choice_session_with_clock(&record, &snapshot, &clock)?;
+                        (accepted == record.accepted)
+                            .then_some((accepted, Some(record.clone())))
+                            .ok_or(HostCallError::Internal)
+                    },
+                )
+            })();
+        match result {
+            Err(error) => {
+                self.finish_operation(&token);
+                let _ = responses.send(call_failure(request.id, &error));
+            }
+            Ok((accepted, None)) => {
+                self.finish_operation(&token);
+                let _ = responses.send(success(request.id, accepted));
+            }
+            Ok((accepted, Some(record))) => {
+                let context = self.background_context(params.proof());
+                let _ = responses.send(success(request.id, accepted));
+                std::thread::spawn(move || {
+                    let result = run_initial_choice_generation(&context, &token, &record);
+                    if result.is_err() {
+                        // The durable blocked transition is a non-retry,
+                        // non-effect recovery path. It is itself fenced by
+                        // the protected runtime and active operation token.
+                        let _ = context.block_initial_choice_operation(
+                            &token,
+                            &record.accepted.operation_id,
+                            record.runtime_revision,
+                        );
+                    }
+                    context.finish_operation(&token);
+                });
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Replay preflight must remain ordered before token acquisition.
+    fn select_choice(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<SelectChoice>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        if let (Some(Selection::OptionSelection(selection)), None) =
+            (&params.selection, &params.d_input)
+        {
+            match self.store.choice_option_selection_replay(selection) {
+                Ok(Some(snapshot)) => {
+                    let _ = responses.send(success(request.id, snapshot));
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = responses.send(host_failure(request.id, &error));
+                    return;
+                }
+            }
+        }
+        // An exact D retry is a Store-owned idempotency read, not a new
+        // operation.  It must win over an active refinement token so a lost
+        // transport response cannot strand the Mac or start model work twice.
+        if let (None, Some(input)) = (&params.selection, &params.d_input) {
+            if !input.is_valid() {
+                let _ = responses.send(invalid_params(request.id));
+                return;
+            }
+            let replay = input
+                .request_digest()
+                .ok_or(HostCallError::Internal)
+                .and_then(|digest| {
+                    self.store
+                        .choice_d_replay(&input.request_id, &digest)
+                        .map_err(HostCallError::Store)
+                });
+            match replay {
+                Ok(Some(snapshot)) => {
+                    let _ = responses.send(success(request.id, snapshot));
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = responses.send(call_failure(request.id, &error));
+                    return;
+                }
+            }
+        }
+        if let Err(error) = self.reject_due_choice_deadline(params.authorization.revision) {
+            let _ = responses.send(call_failure(request.id, &error));
+            return;
+        }
+        let requested_fence = match (&params.selection, &params.d_input) {
+            (Some(Selection::OptionSelection(selection)), None) => Some((
+                selection.choice_session_id.as_str(),
+                selection.expected_session_revision,
+            )),
+            (None, Some(input)) => Some((
+                input.choice_session_id.as_str(),
+                input.expected_session_revision,
+            )),
+            _ => None,
+        };
+        if let Some((choice_session_id, expected_session_revision)) = requested_fence
+            && let Err(error) =
+                self.require_current_choice_revision(choice_session_id, expected_session_revision)
+        {
+            let _ = responses.send(call_failure(request.id, &error));
+            return;
+        }
+        let now = match now_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        // The OptionSelection timestamp is a legacy caller-side transport
+        // field, not a clock authority.  Preserve its identity fields for
+        // replay, but record the Host acceptance time in every durable state
+        // transition and deadline calculation.
+        let accepted_option = match (&params.selection, &params.d_input) {
+            (Some(Selection::OptionSelection(selection)), None) => {
+                let mut accepted = selection.clone();
+                accepted.selected_at_ms = now;
+                Some(accepted)
+            }
+            _ => None,
+        };
+        let selection = match self.store.selected_model_selection() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::Codex(CodexError::RequiredModelUnavailable),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(token) = self.begin_operation_after_validated_proof(request.id, responses) else {
+            return;
+        };
+        // D has its own bounded input shape.  In particular, the historical
+        // `NaturalConversationSelection` (which contains a persisted,
+        // Host-derived batch id) is never accepted from RPC callers.
+        let result = self.operations.reconcile_active_model_selection(
+            &token,
+            &selection,
+            params.authorization.revision,
+            now,
+            || match (&accepted_option, &params.d_input) {
+                (Some(selection), None) => self
+                    .store
+                    .commit_choice_selection(
+                        &Selection::OptionSelection(selection.clone()),
+                        params.authorization.revision,
+                        now,
+                    )
+                    .map_err(HostCallError::Store),
+                (None, Some(input)) if input.is_valid() => now_ms().and_then(|now| {
+                    let snapshot = self
+                        .store
+                        .choice_loop_snapshot()?
+                        .ok_or(HostCallError::Internal)?;
+                    let record = new_choice_d_intake_record(input, &snapshot, now)?;
+                    self.store
+                        .commit_choice_d_selection(&record, params.authorization.revision)
+                        .map_err(HostCallError::Store)
+                }),
+                _ => Err(HostCallError::Internal),
+            },
+        );
+        match result {
+            Err(error) => {
+                self.finish_operation(&token);
+                let _ = responses.send(call_failure(request.id, &error));
+            }
+            Ok(snapshot) => {
+                let Some(operation) = snapshot.pending_refinement_operation.clone() else {
+                    // A concurrent exact retry may have committed or finished
+                    // between the replay preflight and the write transaction.
+                    // It is a durable success, never an internal error.
+                    self.finish_operation(&token);
+                    let _ = responses.send(success(request.id, snapshot));
+                    return;
+                };
+                if let Some(input) = params.d_input.as_ref()
+                    && operation.d_request_id.as_deref() != Some(&input.request_id)
+                {
+                    self.finish_operation(&token);
+                    let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                    return;
+                }
+                let context = self.background_context(params.proof());
+                let _ = responses.send(success(request.id, snapshot));
+                std::thread::spawn(move || {
+                    // The worker receives only Host-derived operation metadata;
+                    // no RPC caller can supply a result or reopen a stale
+                    // refinement.  A transport/model failure durably blocks
+                    // the exact operation rather than leaving `Refining`
+                    // visible forever or retrying it.
+                    if run_private_refinement(&context, &token, &operation).is_err() {
+                        let _ = context.block_choice_refinement_operation(
+                            &token,
+                            &operation.id,
+                            operation.expected_generation,
+                        );
+                    }
+                    context.finish_operation(&token);
+                });
+            }
+        }
+    }
+
+    /// Authenticated foreground re-entry for an already durable idle Choice
+    /// session. The caller supplies only the normal protected-runtime proof;
+    /// all session, timing, provenance, manifest, persona and operation
+    /// binding is derived and persisted by the Store.
+    #[allow(clippy::too_many_lines)] // Replay must precede token acquisition and remain auditable.
+    fn resume_choice(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let selection = match self.store.selected_model_selection() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::Codex(CodexError::RequiredModelUnavailable),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let now = match now_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(token) = self.begin_operation_after_validated_proof(request.id, responses) else {
+            return;
+        };
+        let result = self.operations.reconcile_active_model_selection(
+            &token,
+            &selection,
+            proof.authorization.revision,
+            now,
+            || {
+                self.store
+                    .begin_choice_resume(proof.authorization.revision, now)
+                    .map_err(HostCallError::Store)
+            },
+        );
+        match result {
+            Err(error) => {
+                self.finish_operation(&token);
+                let _ = responses.send(call_failure(request.id, &error));
+            }
+            Ok(snapshot) => {
+                let Some(operation) = snapshot.pending_refinement_operation.clone() else {
+                    self.finish_operation(&token);
+                    let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                    return;
+                };
+                if !operation.is_owner_resume() {
+                    self.finish_operation(&token);
+                    let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                    return;
+                }
+                let context = self.background_context(proof);
+                let _ = responses.send(success(request.id, snapshot));
+                std::thread::spawn(move || {
+                    if run_private_refinement(&context, &token, &operation).is_err() {
+                        let _ = context.block_choice_refinement_operation(
+                            &token,
+                            &operation.id,
+                            operation.expected_generation,
+                        );
+                    }
+                    context.finish_operation(&token);
+                });
+            }
+        }
+    }
+
+    /// Cancels the foreground Choice path without aliasing Mission
+    /// cancellation or granting an external effect. Retiring the operation
+    /// first rejects every late private model result before Store writes its
+    /// terminal successor in one transaction.
+    fn cancel_choice(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        self.operations.cancel_active_model_operation();
+        let response = now_ms()
+            .and_then(|cancelled_at_ms| {
+                self.store
+                    .cancel_choice_session(proof.authorization.revision, cancelled_at_ms)
+                    .map_err(Into::into)
+            })
+            .map_or_else(
+                |error| call_failure(request.id, &error),
+                |value| success(request.id, value),
+            );
+        let _ = responses.send(response);
+    }
+
+    /// Resumes only the one durable, Host-created Markdown journal. This
+    /// accepts no content, path, manifest, receipt, or effect authority from
+    /// the caller. A receipt-backed executing journal is included so a crash
+    /// after receipt durability but before cleanup/body retirement remains
+    /// recoverable without publishing anything new.
+    fn reconcile_choice_markdown(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let snapshot = match self.store.choice_loop_snapshot() {
+            Ok(Some(snapshot))
+                if matches!(
+                    snapshot.session.state,
+                    ChoiceSessionState::AwaitingConfirmation
+                        | ChoiceSessionState::Executing
+                        | ChoiceSessionState::Cancelled
+                ) =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::MarkdownReconciliationRequired,
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        if snapshot.session.state == ChoiceSessionState::AwaitingConfirmation {
+            let Some(confirmation) = snapshot.confirmation.as_ref() else {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::MarkdownReconciliationRequired,
+                ));
+                return;
+            };
+            let receipt_is_durable = (|| -> Result<bool, HostCallError> {
+                let anchor = self
+                    .store
+                    .current_verified_audit_anchor()?
+                    .ok_or(HostCallError::Internal)?;
+                let mission_id = choice_mission_id(confirmation)?;
+                let mission = self
+                    .store
+                    .get_mission(&mission_id, &anchor)?
+                    .ok_or(HostCallError::Internal)?;
+                Ok(mission.status == MissionStatus::Completed
+                    && self.store.list_receipts(&anchor)?.iter().any(|receipt| {
+                        receipt.mission_id == mission_id
+                            && receipt.output_hashes.contains(&confirmation.payload_digest)
+                    }))
+            })();
+            if !matches!(receipt_is_durable, Ok(true)) {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::MarkdownReconciliationRequired,
+                ));
+                return;
+            }
+        }
+        let intent = match self
+            .store
+            .pending_markdown_render_intent_for_session(&snapshot.session.id)
+        {
+            Ok(Some(intent)) => intent,
+            Ok(None) => {
+                // Retirement keeps a body-free journal row. Missing metadata
+                // is therefore never a completed state: it is storage loss or
+                // tampering and must not make the foreground session look
+                // healthy or skip final/receipt verification.
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::MarkdownReconciliationRequired,
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(operation) = self.begin_operation_after_validated_proof(request.id, responses)
+        else {
+            return;
+        };
+        let context = self.background_context(proof);
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = context.complete_markdown_render(&operation, &intent.id, true);
+            context.finish_operation(&operation);
+            let response = result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |snapshot| success(request_id, snapshot),
+            );
+            let _ = responses.send(response);
+        });
+    }
+
+    /// Completes only post-receipt local cleanup after protected Off. The
+    /// request has no parameters: Host derives the sole executing session and
+    /// its sole render intent, verifies the immutable receipt and filesystem,
+    /// then retires encrypted private bodies. It cannot publish Markdown,
+    /// start a model, or authorize an effect.
+    fn cleanup_choice_markdown_receipt(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        if decode_params::<EmptyChoiceMarkdownReceiptCleanup>(request).is_err() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let snapshot = match self.store.choice_loop_snapshot() {
+            Ok(Some(snapshot))
+                if matches!(
+                    snapshot.session.state,
+                    ChoiceSessionState::AwaitingConfirmation
+                        | ChoiceSessionState::Executing
+                        | ChoiceSessionState::Cancelled
+                ) =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let intent = match self
+            .store
+            .pending_markdown_render_intent_for_session(&snapshot.session.id)
+        {
+            Ok(Some(intent)) => intent,
+            Ok(None) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::MarkdownReconciliationRequired,
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        // `AwaitingConfirmation` and the terminal Off successor are admitted
+        // only for the crash window after the exact receipt is durable and
+        // before retained-base cleanup advances the journal. This is still a
+        // receipt-verified deletion-only route; unreceipted journals reject.
+        if matches!(
+            snapshot.session.state,
+            ChoiceSessionState::AwaitingConfirmation | ChoiceSessionState::Cancelled
+        ) {
+            match self.store.markdown_render_receipt(&intent.id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                    return;
+                }
+                Err(error) => {
+                    let _ = responses.send(host_failure(request.id, &error));
+                    return;
+                }
+            }
+        }
+        let authority = self.authority.clone();
+        let paths = self.paths.clone();
+        let broker = self.store.trusted_broker_enrollment().cloned();
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = complete_markdown_receipt_cleanup(&authority, &paths, broker, &intent.id);
+            let response = result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |snapshot| success(request_id, snapshot),
+            );
+            let _ = responses.send(response);
+        });
+    }
+
+    /// Reads whether the one post-Off deletion-only cleanup route is available
+    /// for the current terminal Choice. It exposes no body, path, receipt, or
+    /// mutation authority; the cleanup RPC revalidates the same state again.
+    fn read_choice_markdown_receipt_cleanup_availability(
+        &self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        if decode_params::<EmptyChoiceMarkdownReceiptCleanup>(request).is_err() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let result = (|| -> Result<ChoiceMarkdownReceiptCleanupAvailability, HostCallError> {
+            let Some(snapshot) = self.store.choice_loop_snapshot()? else {
+                return Ok(ChoiceMarkdownReceiptCleanupAvailability { available: false });
+            };
+            let runtime = self.store.runtime_control()?;
+            // The deletion-only cleanup authority is the one exact successor
+            // of a protected-Off cancellation. A user cancellation while On
+            // must never advertise the post-Off route: Store would correctly
+            // reject it, and the UI must not offer a false recovery action.
+            if runtime.enabled || snapshot.session.state != ChoiceSessionState::Cancelled {
+                return Ok(ChoiceMarkdownReceiptCleanupAvailability { available: false });
+            }
+            let available = self
+                .store
+                .pending_markdown_render_intent_for_session(&snapshot.session.id)?
+                .map(|intent| {
+                    let expected_cancelled_revision = intent
+                        .expected_session_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                    self.store
+                        .markdown_render_receipt(&intent.id)
+                        .map(|receipt| {
+                            receipt.is_some_and(|receipt| {
+                                snapshot.session.revision == expected_cancelled_revision
+                                    && receipt.intent_id == intent.id
+                                    && receipt.final_entry == intent.entry
+                                    && receipt.displaced_base == intent.expected_base
+                                    && receipt.committed_at_ms >= intent.created_at_ms
+                            })
+                        })
+                })
+                .transpose()?
+                .unwrap_or(false);
+            Ok(ChoiceMarkdownReceiptCleanupAvailability { available })
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    // The RPC boundary keeps all response/error branches together so no
+    // caller-supplied confirmation can bypass a replay or runtime fence.
+    #[allow(clippy::too_many_lines)]
+    fn confirm_choice(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ConfirmChoice>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        match self.store.choice_loop_snapshot() {
+            Ok(Some(snapshot))
+                if matches!(
+                    snapshot.session.state,
+                    ChoiceSessionState::AwaitingConfirmation | ChoiceSessionState::Executing
+                ) && snapshot.confirmation.as_ref() == Some(&params.confirmation) =>
+            {
+                // The sealed confirmation id is the durable request identity.
+                // A lost RPC response therefore returns the committed state
+                // without minting a second confirmation. Confirmation and
+                // render journal are one Store transaction, so a missing
+                // intent is corruption rather than a replay-time write path.
+                if snapshot.session.state == ChoiceSessionState::Executing {
+                    let _ = responses.send(success(request.id, snapshot));
+                    return;
+                }
+                let replay = now_ms().and_then(|replayed_at_ms| {
+                    self.store
+                        .commit_choice_confirmation_and_render_intent(
+                            &params.confirmation,
+                            params.authorization.revision,
+                            replayed_at_ms,
+                        )
+                        .map_err(HostCallError::Store)
+                });
+                let response = match replay {
+                    Ok((replayed, _)) if replayed == snapshot => success(request.id, snapshot),
+                    Ok(_) => call_failure(request.id, &HostCallError::Internal),
+                    Err(error) => call_failure(request.id, &error),
+                };
+                let _ = responses.send(response);
+                return;
+            }
+            Ok(Some(snapshot)) if snapshot.confirmation.is_some() => {
+                let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        }
+        if let Err(error) = self.reject_due_choice_deadline(params.authorization.revision) {
+            let _ = responses.send(call_failure(request.id, &error));
+            return;
+        }
+        if let Err(error) = self.require_current_choice_revision(
+            &params.confirmation.choice_session_id,
+            params.confirmation.expected_session_revision,
+        ) {
+            let _ = responses.send(call_failure(request.id, &error));
+            return;
+        }
+        let snapshot = match self.store.choice_loop_snapshot() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        // A client may replay a Host-derived seal after a lost response, but
+        // it never supplies authority-bearing confirmation fields. Rebuild
+        // the entire value from the active Store snapshot and reject every
+        // self-consistent but caller-minted variation before any write.
+        let schedule = match self.store.current_choice_reminder_schedule_for_revision(
+            &snapshot.session.id,
+            snapshot.session.revision,
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::ReminderScheduleRequired,
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let host_now = match now_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        let expected = match self.derive_choice_confirmation(&snapshot, &schedule, host_now) {
+            Ok(value) if value == params.confirmation => value,
+            _ => {
+                let _ = responses.send(call_failure(request.id, &HostCallError::Internal));
+                return;
+            }
+        };
+        let selection = match self.store.selected_model_selection() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let _ = responses.send(call_failure(
+                    request.id,
+                    &HostCallError::Codex(CodexError::RequiredModelUnavailable),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(operation) = self.begin_operation_after_validated_proof(request.id, responses)
+        else {
+            return;
+        };
+        let operations = self.operations.clone();
+        let committed = operations.reconcile_active_model_selection(
+            &operation,
+            &selection,
+            params.authorization.revision,
+            host_now,
+            || {
+                self.store
+                    .commit_choice_confirmation_and_render_intent(
+                        &expected,
+                        params.authorization.revision,
+                        host_now,
+                    )
+                    .map_err(HostCallError::Store)
+            },
+        );
+        let committed = match committed {
+            Ok((snapshot, _)) => snapshot,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        self.finish_operation(&operation);
+        // Choice confirmation seals the exact later Markdown journal but does
+        // not publish it. The independently authorized Reminder write,
+        // readback Evidence, and Receipt must complete first.
+        let _ = responses.send(success(request.id, committed));
+    }
+
+    fn current_choice_confirmation(
+        &self,
+        confirmation_id: &str,
+    ) -> Result<ChoiceConsolidatedConfirmation, HostCallError> {
+        let snapshot = self
+            .store
+            .choice_loop_snapshot()?
+            .ok_or(HostCallError::Internal)?;
+        let confirmation = snapshot
+            .confirmation
+            .as_ref()
+            .filter(|confirmation| confirmation.id == confirmation_id)
+            .cloned()
+            .ok_or(HostCallError::Internal)?;
+        if !matches!(
+            snapshot.session.state,
+            ChoiceSessionState::AwaitingConfirmation | ChoiceSessionState::Executing
+        ) || confirmation.choice_session_id != snapshot.session.id
+        {
+            return Err(HostCallError::Internal);
+        }
+        let selection = self
+            .store
+            .selected_model_selection()?
+            .ok_or(HostCallError::Codex(CodexError::RequiredModelUnavailable))?;
+        let provenance = &confirmation.model_provenance;
+        if provenance.model_id != selection.model_id
+            || provenance.requested_effort != selection.requested_effort
+            || provenance.actual_effort != selection.actual_effort
+            || provenance.catalog_fingerprint != selection.catalog_fingerprint
+            || provenance.catalog_revision != selection.catalog_revision
+            || provenance.account_display_class != selection.account_display_class
+            || provenance.protocol_schema_revision != selection.protocol_schema_revision
+        {
+            return Err(HostCallError::Internal);
+        }
+        Ok(confirmation)
+    }
+
+    fn choice_confirmed_mission(
+        &self,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        disposition: ReminderWriteDisposition,
+    ) -> Result<Option<ConfirmedMission>, HostCallError> {
+        let Some(anchor) = self.store.current_verified_audit_anchor()? else {
+            return Ok(None);
+        };
+        let mission_id = choice_mission_id(confirmation)?;
+        self.store
+            .get_mission(&mission_id, &anchor)?
+            .map(|mission| {
+                confirmed_choice_mission_from_mission(
+                    &mission,
+                    confirmation,
+                    &self.authority,
+                    disposition,
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn authorize_choice_reminders(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<AuthorizeChoiceReminders>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<ConfirmedMission, HostCallError> {
+            if !valid_reminder_target(&params.reminder_target) {
+                return Err(HostCallError::Internal);
+            }
+            let confirmation = self.current_choice_confirmation(&params.confirmation_id)?;
+            if let Some(existing) =
+                self.choice_confirmed_mission(&confirmation, ReminderWriteDisposition::RecoverOnly)?
+            {
+                if existing.reminder_authorization.target == params.reminder_target {
+                    return Ok(existing);
+                }
+                return Err(HostCallError::Internal);
+            }
+            let mission_id = choice_mission_id(&confirmation)?;
+            if self.another_mission_needs_owner(&mission_id)? {
+                return Err(HostCallError::MissionAlreadyInProgress);
+            }
+            let clicked_at_ms = now_ms()?;
+            let scope_digest = confirmation.payload_digest.clone();
+            let scope_approval_id = hashed_identifier(
+                "choice-scope-approval",
+                &json!({"confirmationId": confirmation.id, "missionId": mission_id}),
+            )?;
+            let work_items = confirmation
+                .reminder_items
+                .iter()
+                .map(|item| CreateWorkItem {
+                    id: item.id.clone(),
+                    title: item.text.clone(),
+                })
+                .collect::<Vec<_>>();
+            let payload =
+                choice_reminder_write_payload(&mission_id, &confirmation, &params.reminder_target)?;
+            let proposal = reminder_write_proposal(&mission_id, &scope_digest);
+            let reminder_digest = proposal
+                .approval_digest(ApprovalKind::NewExternalWrite, Some(&payload))
+                .map_err(|_| HostCallError::Internal)?;
+            let reminder_approval_id = hashed_identifier(
+                "choice-reminder-approval",
+                &json!({"digest": reminder_digest, "missionId": mission_id}),
+            )?;
+            let needs_me_id = hashed_identifier(
+                "choice-reminder-needs-me",
+                &json!({"approvalId": reminder_approval_id, "missionId": mission_id}),
+            )?;
+            let commands = vec![
+                MissionCommand::Create {
+                    input: CreateMission {
+                        mission_id: mission_id.clone(),
+                        title: confirmation.goal.clone(),
+                        outcome:
+                            "Complete the exact confirmed Choice with verified Reminder Evidence."
+                                .to_owned(),
+                        owner_id: ISSUER_ID.to_owned(),
+                        scope_digest: scope_digest.clone(),
+                        scope_approval_id: scope_approval_id.clone(),
+                        scope_approval_prompt: "Confirm the exact prepared Choice.".to_owned(),
+                        work_items,
+                        now_ms: clicked_at_ms,
+                    },
+                },
+                MissionCommand::BeginConfirmation {
+                    mission_id: mission_id.clone(),
+                    now_ms: clicked_at_ms,
+                },
+                MissionCommand::DecideApproval {
+                    mission_id: mission_id.clone(),
+                    approval_id: scope_approval_id,
+                    actor_id: ISSUER_ID.to_owned(),
+                    decision: ApprovalDecision::Approve,
+                    now_ms: clicked_at_ms,
+                },
+                MissionCommand::Activate {
+                    mission_id: mission_id.clone(),
+                    now_ms: clicked_at_ms,
+                },
+                MissionCommand::RequestScopeChange {
+                    mission_id: mission_id.clone(),
+                    approval: NewBoundaryApproval {
+                        id: reminder_approval_id.clone(),
+                        kind: ApprovalKind::NewExternalWrite,
+                        prompt: "Add the exact confirmed item to Reminders.".to_owned(),
+                        scope_digest: reminder_digest,
+                        target: Some(ApprovalTarget::ReminderList {
+                            logical_list_id: confirmation.reminder_list_id.clone(),
+                            source_identifier: params.reminder_target.source_identifier.clone(),
+                            calendar_identifier: params.reminder_target.calendar_identifier.clone(),
+                        }),
+                    },
+                    needs_me_id,
+                    now_ms: clicked_at_ms,
+                },
+                MissionCommand::DecideApproval {
+                    mission_id: mission_id.clone(),
+                    approval_id: reminder_approval_id,
+                    actor_id: ISSUER_ID.to_owned(),
+                    decision: ApprovalDecision::Approve,
+                    now_ms: clicked_at_ms,
+                },
+                MissionCommand::Resume {
+                    mission_id: mission_id.clone(),
+                    now_ms: clicked_at_ms,
+                },
+            ];
+            let anchor = self.store.current_verified_audit_anchor()?;
+            let mission = self
+                .store
+                .execute_mission_command_batch(&mission_command_batch(
+                    anchor.as_ref(),
+                    &mission_id,
+                    commands,
+                )?)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            confirmed_choice_mission_from_mission(
+                &mission,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::CreateOnce,
+            )?
+            .ok_or(HostCallError::Internal)
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |mission| success(request.id, mission),
+        ));
+    }
+
+    fn begin_choice_reminder_dispatch(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<ChoiceReminderRequest>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<ReminderDispatchStart, HostCallError> {
+            let confirmation = self.current_choice_confirmation(&params.confirmation_id)?;
+            let anchor = self
+                .store
+                .current_verified_audit_anchor()?
+                .ok_or(HostCallError::Internal)?;
+            let mission_id = choice_mission_id(&confirmation)?;
+            let mission = self
+                .store
+                .get_mission(&mission_id, &anchor)?
+                .ok_or(HostCallError::Internal)?;
+            let confirmed = confirmed_choice_mission_from_mission(
+                &mission,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            let attempt = reminder_dispatch_attempt_state(
+                &mission,
+                &confirmed.reminder_dispatch,
+                &self.authority,
+            )?;
+            if !confirmed.reminder_links.is_empty()
+                || (!confirmed.reminder_dispatch.is_empty()
+                    && attempt.is_some_and(|attempt| !attempt.aborted))
+            {
+                return Ok(ReminderDispatchStart {
+                    mission: confirmed,
+                    execute_now: false,
+                });
+            }
+            if let Some(attempt) = attempt.filter(|attempt| attempt.aborted) {
+                let next_attempt = attempt
+                    .index
+                    .checked_add(1)
+                    .filter(|attempt| *attempt <= MAX_REMINDER_DISPATCH_ATTEMPTS)
+                    .ok_or(HostCallError::Internal)?;
+                let mission = self.persist_choice_reminder_retry_attempt(
+                    &mission,
+                    &confirmation,
+                    &confirmed.reminder_dispatch,
+                    &anchor,
+                    next_attempt,
+                )?;
+                return Ok(ReminderDispatchStart {
+                    mission,
+                    execute_now: true,
+                });
+            }
+            let observed_at_ms = now_ms()?;
+            let mut commands = Vec::with_capacity(mission.work_items.len());
+            for item in &mission.work_items {
+                let (token, sha256) =
+                    reminder_dispatch_claim(&mission, item, &confirmed.reminder_authorization)?;
+                commands.push(MissionCommand::AttachEvidence {
+                    mission_id: mission.id.clone(),
+                    evidence: self.authority.sign_evidence(EvidenceClaims {
+                        id: hashed_identifier("evidence", &json!({"kind":"reminderDispatchStarted","missionId":mission.id,"sha256":sha256,"sourceId":token,"workItemId":item.id}))?,
+                        mission_id: mission.id.clone(), work_item_id: item.id.clone(),
+                        kind: EvidenceKind::ReminderDispatchStarted, source_id: token,
+                        sha256: Some(sha256), observed_at_ms,
+                    }), now_ms: observed_at_ms,
+                });
+            }
+            let persisted = self
+                .store
+                .execute_mission_command_batch(&mission_command_batch(
+                    Some(&anchor),
+                    &mission.id,
+                    commands,
+                )?)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            let mission = confirmed_choice_mission_from_mission(
+                &persisted,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            Ok(ReminderDispatchStart {
+                mission,
+                execute_now: true,
+            })
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |start| success(request.id, start),
+        ));
+    }
+
+    fn persist_choice_reminder_retry_attempt(
+        &mut self,
+        mission: &Mission,
+        confirmation: &ChoiceConsolidatedConfirmation,
+        dispatch: &[ConfirmedReminderDispatch],
+        anchor: &AuditAnchor,
+        attempt: u32,
+    ) -> Result<ConfirmedMission, HostCallError> {
+        let observed_at_ms = now_ms()?;
+        let commands = dispatch
+            .iter()
+            .map(|dispatch| {
+                let digest = reminder_dispatch_retry_digest(&mission.id, dispatch, attempt)?;
+                Ok(MissionCommand::AttachEvidence {
+                    mission_id: mission.id.clone(),
+                    evidence: self.authority.sign_evidence(EvidenceClaims {
+                        id: hashed_identifier(
+                            "evidence",
+                            &json!({
+                                "attempt": attempt,
+                                "kind": "reminderDispatchRetryStarted",
+                                "missionId": mission.id,
+                                "sha256": digest,
+                                "sourceId": dispatch.token,
+                                "workItemId": dispatch.work_item_id,
+                            }),
+                        )?,
+                        mission_id: mission.id.clone(),
+                        work_item_id: dispatch.work_item_id.clone(),
+                        kind: EvidenceKind::ReminderDispatchRetryStarted,
+                        source_id: dispatch.token.clone(),
+                        sha256: Some(digest),
+                        observed_at_ms,
+                    }),
+                    now_ms: observed_at_ms,
+                })
+            })
+            .collect::<Result<Vec<_>, HostCallError>>()?;
+        let persisted = self
+            .store
+            .execute_mission_command_batch(&mission_command_batch(
+                Some(anchor),
+                &mission.id,
+                commands,
+            )?)?
+            .pop()
+            .ok_or(HostCallError::Internal)?
+            .mission;
+        confirmed_choice_mission_from_mission(
+            &persisted,
+            confirmation,
+            &self.authority,
+            ReminderWriteDisposition::RecoverOnly,
+        )?
+        .ok_or(HostCallError::Internal)
+    }
+
+    fn abort_choice_reminder_dispatch_before_commit(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<ChoiceReminderRequest>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<ConfirmedMission, HostCallError> {
+            let confirmation = self.current_choice_confirmation(&params.confirmation_id)?;
+            let anchor = self
+                .store
+                .current_verified_audit_anchor()?
+                .ok_or(HostCallError::Internal)?;
+            let mission_id = choice_mission_id(&confirmation)?;
+            let mission = self
+                .store
+                .get_mission(&mission_id, &anchor)?
+                .ok_or(HostCallError::Internal)?;
+            let confirmed = confirmed_choice_mission_from_mission(
+                &mission,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            if !confirmed.reminder_links.is_empty() || confirmed.reminder_dispatch.is_empty() {
+                return Err(HostCallError::Internal);
+            }
+            let attempt = reminder_dispatch_attempt_state(
+                &mission,
+                &confirmed.reminder_dispatch,
+                &self.authority,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            if attempt.aborted {
+                return Ok(confirmed);
+            }
+            let observed_at_ms = now_ms()?;
+            let commands = confirmed
+                .reminder_dispatch
+                .iter()
+                .map(|dispatch| {
+                    let digest = reminder_dispatch_abort_digest(
+                        &mission.id,
+                        dispatch,
+                        attempt.index,
+                    )?;
+                    Ok(MissionCommand::AttachEvidence {
+                        mission_id: mission.id.clone(),
+                        evidence: self.authority.sign_evidence(EvidenceClaims {
+                            id: hashed_identifier("evidence", &json!({"attempt":attempt.index,"kind":"reminderDispatchAbortedBeforeCommit","missionId":mission.id,"sha256":digest,"sourceId":dispatch.token,"workItemId":dispatch.work_item_id}))?,
+                            mission_id: mission.id.clone(),
+                            work_item_id: dispatch.work_item_id.clone(),
+                            kind: EvidenceKind::ReminderDispatchAbortedBeforeCommit,
+                            source_id: dispatch.token.clone(),
+                            sha256: Some(digest),
+                            observed_at_ms,
+                        }),
+                        now_ms: observed_at_ms,
+                    })
+                })
+                .collect::<Result<Vec<_>, HostCallError>>()?;
+            let persisted = self
+                .store
+                .execute_mission_command_batch(&mission_command_batch(
+                    Some(&anchor),
+                    &mission.id,
+                    commands,
+                )?)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            confirmed_choice_mission_from_mission(
+                &persisted,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |mission| success(request.id, mission),
+        ));
+    }
+
+    fn record_choice_reminder_mirror(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<RecordChoiceReminderMirror>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<ConfirmedMission, HostCallError> {
+            let confirmation = self.current_choice_confirmation(&params.confirmation_id)?;
+            let anchor = self
+                .store
+                .current_verified_audit_anchor()?
+                .ok_or(HostCallError::Internal)?;
+            let mission_id = choice_mission_id(&confirmation)?;
+            let mission = self
+                .store
+                .get_mission(&mission_id, &anchor)?
+                .ok_or(HostCallError::Internal)?;
+            let confirmed = confirmed_choice_mission_from_mission(
+                &mission,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            let links = validated_reminder_links(
+                &mission,
+                &confirmed.reminder_authorization.target,
+                &confirmed.reminder_dispatch,
+                params.links,
+            )
+            .ok_or(HostCallError::Internal)?;
+            if !confirmed.reminder_links.is_empty() {
+                return (confirmed.reminder_links == links)
+                    .then_some(confirmed)
+                    .ok_or(HostCallError::Internal);
+            }
+            let observed_at_ms = now_ms()?;
+            let mut commands = Vec::with_capacity(links.len());
+            for link in &links {
+                let sha256 =
+                    reminder_mirror_digest(&confirmed.reminder_authorization.target, link)?;
+                commands.push(MissionCommand::AttachEvidence {
+                    mission_id: mission.id.clone(),
+                    evidence: self.authority.sign_evidence(EvidenceClaims {
+                        id: hashed_identifier("evidence", &json!({"kind":"reminderMirrored","missionId":mission.id,"sha256":sha256,"sourceId":link.calendar_item_identifier,"workItemId":link.work_item_id}))?,
+                        mission_id: mission.id.clone(), work_item_id: link.work_item_id.clone(),
+                        kind: EvidenceKind::ReminderMirrored,
+                        source_id: link.calendar_item_identifier.clone(), sha256: Some(sha256),
+                        observed_at_ms,
+                    }), now_ms: observed_at_ms,
+                });
+            }
+            let persisted = self
+                .store
+                .execute_mission_command_batch(&mission_command_batch(
+                    Some(&anchor),
+                    &mission.id,
+                    commands,
+                )?)?
+                .pop()
+                .ok_or(HostCallError::Internal)?
+                .mission;
+            confirmed_choice_mission_from_mission(
+                &persisted,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)
+        })();
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |mission| success(request.id, mission),
+        ));
+    }
+
+    fn complete_choice_reminders(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<CompleteChoiceReminders>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let confirmation = match self.current_choice_confirmation(&params.confirmation_id) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        let result = (|| -> Result<(Receipt, String), HostCallError> {
+            let anchor = self
+                .store
+                .current_verified_audit_anchor()?
+                .ok_or(HostCallError::Internal)?;
+            let mission_id = choice_mission_id(&confirmation)?;
+            let mission = self
+                .store
+                .get_mission(&mission_id, &anchor)?
+                .ok_or(HostCallError::Internal)?;
+            let confirmed = confirmed_choice_mission_from_mission(
+                &mission,
+                &confirmation,
+                &self.authority,
+                ReminderWriteDisposition::RecoverOnly,
+            )?
+            .ok_or(HostCallError::Internal)?;
+            let completed_at_ms = now_ms()?;
+            let completions = validated_reminder_completions_with_authorization(
+                &mission,
+                &self.authority,
+                params.completions.clone(),
+                completed_at_ms,
+                mission.status == MissionStatus::Active,
+                &confirmed.reminder_authorization,
+            )
+            .ok_or(HostCallError::Internal)?;
+            let receipt = match mission.status {
+                MissionStatus::Active => self.persist_reminder_completion(
+                    &mission,
+                    &anchor,
+                    &completions,
+                    completed_at_ms,
+                    None,
+                    None,
+                )?,
+                MissionStatus::Completed => self
+                    .existing_receipt_for_completions(&mission, &anchor, &completions)?
+                    .ok_or(HostCallError::Internal)?,
+                _ => return Err(HostCallError::Internal),
+            };
+            if receipt.actual_model != confirmation.model_provenance.model_id
+                || !receipt.output_hashes.contains(&confirmation.payload_digest)
+            {
+                return Err(HostCallError::Internal);
+            }
+            let intent = self
+                .store
+                .pending_markdown_render_intent_for_session(&confirmation.choice_session_id)?
+                .ok_or(HostCallError::Internal)?;
+            Ok((receipt, intent.id))
+        })();
+        let (receipt, intent_id) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
+        };
+        let Some(operation) = self.begin_operation_after_validated_proof(request.id, responses)
+        else {
+            return;
+        };
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = context
+                .complete_markdown_render(&operation, &intent_id, false)
+                .map(|choice_loop| ChoiceReminderCompletion {
+                    receipt,
+                    choice_loop,
+                });
+            context.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |completion| success(request_id, completion),
+            ));
+        });
+    }
+
+    /// Builds the only confirmation preview from the current Host-owned
+    /// Choice snapshot. The Mac can display and explicitly confirm this exact
+    /// value, but cannot mint a recipient, scope, Markdown binding, model
+    /// provenance, or reminder/evidence payload by composing fields itself.
+    fn record_choice_reminder_schedule(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<RecordChoiceReminderSchedule>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &params.proof(), responses) {
+            return;
+        }
+        let result = (|| -> Result<ChoiceReminderSchedule, HostCallError> {
+            if !valid_choice_reminder_time_zone(&params.input.time_zone) {
+                return Err(HostCallError::ReminderScheduleRequired);
+            }
+            if let Some(existing) = self.store.choice_reminder_schedule_replay(&params.input)? {
+                return Ok(existing);
+            }
+            self.reject_due_choice_deadline(params.authorization.revision)?;
+            let accepted_at_ms = now_ms()?;
+            self.store
+                .record_choice_reminder_schedule(
+                    &params.input,
+                    params.authorization.revision,
+                    accepted_at_ms,
+                )
+                .map_err(|error| {
+                    // All schedule-shape, expiry, and current-session
+                    // conflicts are recoverable only by a new explicit local
+                    // schedule choice. Do not hide that known recovery under
+                    // the generic fail-closed transport message.
+                    if matches!(error, StoreError::ChoiceLoopStateConflict) {
+                        HostCallError::ReminderScheduleRequired
+                    } else {
+                        HostCallError::Store(error)
+                    }
+                })
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    /// Reads only the current session's sealed local schedule so the Mac can
+    /// display and explicitly revise it after a restart. It neither accepts a
+    /// caller session id nor creates effect authority.
+    fn read_choice_reminder_schedule(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        if decode_params::<NoParams>(request).is_err() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let result = (|| -> Result<Option<ChoiceReminderSchedule>, HostCallError> {
+            let runtime = self.store.runtime_control()?;
+            if runtime.enabled {
+                self.reject_due_choice_deadline(runtime.revision)?;
+            }
+            let Some(snapshot) = self.store.choice_loop_snapshot()? else {
+                return Ok(None);
+            };
+            self.store
+                .current_choice_reminder_schedule_for_revision(
+                    &snapshot.session.id,
+                    snapshot.session.revision,
+                )
+                .map_err(HostCallError::Store)
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    fn prepare_choice_confirmation(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(proof) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !self.validate_store_control_proof(request.id, &proof, responses) {
+            return;
+        }
+        let result = (|| -> Result<ChoiceConsolidatedConfirmation, HostCallError> {
+            self.reject_due_choice_deadline(proof.authorization.revision)?;
+            let snapshot = self
+                .store
+                .choice_loop_snapshot()?
+                .ok_or(HostCallError::Internal)?;
+            let schedule = self
+                .store
+                .current_choice_reminder_schedule_for_revision(
+                    &snapshot.session.id,
+                    snapshot.session.revision,
+                )?
+                .ok_or(HostCallError::ReminderScheduleRequired)?;
+            self.derive_choice_confirmation(&snapshot, &schedule, now_ms()?)
+        })();
+        let response = result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |value| success(request.id, value),
+        );
+        let _ = responses.send(response);
+    }
+
+    /// Derives the only confirmation payload accepted by `choice.confirm`.
+    /// It deliberately rebuilds all user-visible effect preparation from
+    /// durable Host state so a decoded RPC object is never a write authority.
+    fn derive_choice_confirmation(
+        &self,
+        snapshot: &ChoiceLoopSnapshot,
+        schedule: &ChoiceReminderSchedule,
+        host_now_ms: i64,
+    ) -> Result<ChoiceConsolidatedConfirmation, HostCallError> {
+        let choice_set = snapshot
+            .active_choice_set
+            .as_ref()
+            .ok_or(HostCallError::Internal)?;
+        let interpretation = snapshot
+            .interpretation
+            .as_ref()
+            .ok_or(HostCallError::Internal)?;
+        if snapshot.session.state != ChoiceSessionState::Active
+            || choice_set.choice_session_id != snapshot.session.id
+            || choice_set.session_revision != snapshot.session.revision
+            || interpretation.revision != choice_set.interpretation_revision
+        {
+            return Err(HostCallError::Internal);
+        }
+        let selection = snapshot
+            .last_selection
+            .as_ref()
+            .ok_or(HostCallError::Internal)?;
+        if schedule.input.choice_session_id != snapshot.session.id
+            || schedule.input.expected_session_revision != snapshot.session.revision
+            || schedule.accepted_at_ms < snapshot.session.last_input_at_ms
+            || schedule.input.due_at_ms <= host_now_ms
+            || !valid_choice_reminder_time_zone(&schedule.input.time_zone)
+        {
+            return Err(HostCallError::ReminderScheduleRequired);
+        }
+
+        // Alternatives in the current ChoiceSet are not a Reminder
+        // payload. The accepted refinement is represented by the current
+        // Host-owned interpretation, which is one bounded local step.
+        let steps = vec![interpretation.understood_goal.clone()];
+        let (reminder_list_id, reminder_items, reminder_count) =
+            choice_confirmation_reminders(&steps, selection, &schedule.input)?;
+        let (delivery_binding_id, recipient, delivery_scope) =
+            choice_confirmation_delivery(&snapshot.session);
+        let (
+            markdown_entry,
+            markdown_expected_base,
+            markdown_manifest_digest,
+            markdown_semantic_diff_digest,
+        ) = self.choice_confirmation_markdown_binding(
+            &snapshot.session.id,
+            &interpretation.understood_goal,
+            &steps,
+        )?;
+        let source_manifest_digest = snapshot.document_manifest.aggregate_digest.clone();
+        let mut confirmation = ChoiceConsolidatedConfirmation {
+            id: String::new(),
+            choice_session_id: snapshot.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selection_id: selection.id().to_owned(),
+            expected_session_revision: snapshot.session.revision,
+            interpretation_revision: interpretation.revision,
+            payload_revision: 0,
+            payload_digest: String::new(),
+            goal: interpretation.understood_goal.clone(),
+            steps,
+            markdown_entry,
+            markdown_expected_base,
+            markdown_manifest_digests: vec![source_manifest_digest, markdown_manifest_digest],
+            document_diff_digest: markdown_semantic_diff_digest,
+            model_provenance: choice_set.model_provenance.clone(),
+            persona_revision: choice_set.persona_revision.clone(),
+            reminder_list_id,
+            reminder_items,
+            reminder_count,
+            reminder_payload_digest: String::new(),
+            evidence_requirements: vec!["reminder-readback".to_owned()],
+            delivery_binding_id,
+            recipient,
+            delivery_scope,
+            data_categories: vec!["local-typed-state".to_owned()],
+            retention: "local-confirmation-bound".to_owned(),
+            permissions: vec!["reminders-pending-confirmation".to_owned()],
+            effect_classes: vec!["reminders".to_owned()],
+            // This is a stable, durable proposal timestamp, not the moment
+            // an ambiguous confirmation RPC happens to arrive.  `host_now_ms`
+            // above independently proves the selected instant is still future.
+            confirmed_at_ms: schedule.accepted_at_ms,
+        };
+        confirmation.reminder_payload_digest = confirmation
+            .canonical_reminder_payload_digest()
+            .ok_or(HostCallError::Internal)?;
+        let revision_material_digest = confirmation
+            .canonical_revision_material_digest(schedule.revision)
+            .ok_or(HostCallError::Internal)?;
+        confirmation.payload_revision = confirmation
+            .canonical_payload_revision(schedule.revision)
+            .ok_or(HostCallError::Internal)?;
+        confirmation.id = hashed_identifier(
+            "choice-confirmation",
+            &json!({
+                "scheduleId": schedule.id,
+                "revisionMaterialDigest": revision_material_digest,
+            }),
+        )?;
+        confirmation.payload_digest = confirmation
+            .canonical_payload_digest()
+            .ok_or(HostCallError::Internal)?;
+        confirmation
+            .is_valid()
+            .then_some(confirmation)
+            .ok_or(HostCallError::Internal)
+    }
+
+    fn choice_confirmation_markdown_binding(
+        &self,
+        choice_session_id: &str,
+        goal: &str,
+        steps: &[String],
+    ) -> Result<
+        (
+            DocumentManifestEntry,
+            Option<MarkdownBaseIdentity>,
+            String,
+            String,
+        ),
+        HostCallError,
+    > {
+        let markdown_path = format!("sessions/{choice_session_id}/CHOICE.md");
+        let expected_base = self
+            .store
+            .observe_choice_markdown_base(&markdown_path)
+            .map_err(HostCallError::Store)?;
+        let body = choice_confirmation_markdown_body(goal, steps);
+        let entry = DocumentManifestEntry {
+            relative_path: markdown_path,
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            byte_length: u64::try_from(body.len()).map_err(|_| HostCallError::Internal)?,
+            mode: 0o600,
+        };
+        let manifest_digest = canonical_document_manifest_digest(std::slice::from_ref(&entry))
+            .ok_or(HostCallError::Internal)?;
+        let semantic_diff_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&json!({
+                    "entry": &entry,
+                    "expectedBase": &expected_base,
+                    "goal": goal,
+                    "steps": steps,
+                }))
+                .map_err(|_| HostCallError::Internal)?,
+            )
+        );
+        Ok((entry, expected_base, manifest_digest, semantic_diff_digest))
+    }
+
+    #[cfg(test)]
     fn confirm_mission(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<ConfirmMission>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2457,6 +4795,8 @@ impl Host {
         let _ = responses.send(response);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Historical recovery fixtures only; production dispatch is absent.
     fn cancel_mission(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<CancelMission>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2505,6 +4845,7 @@ impl Host {
         ));
     }
 
+    #[cfg(test)]
     fn confirmed_mission_for_suggestion_id(
         &self,
         suggestion_id: &str,
@@ -2542,6 +4883,7 @@ impl Host {
             }))
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_lines)]
     fn persist_confirmed_mission(
         &mut self,
@@ -2674,6 +5016,8 @@ impl Host {
         .ok_or(HostCallError::Internal)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Historical recovery fixtures only; production dispatch is absent.
     fn record_reminder_mirror(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<RecordReminderMirror>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2757,6 +5101,7 @@ impl Host {
         let _ = responses.send(response);
     }
 
+    #[cfg(test)]
     fn begin_reminder_dispatch(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<BeginReminderDispatch>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2846,6 +5191,8 @@ impl Host {
         let _ = responses.send(response);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Historical recovery fixtures only; production dispatch is absent.
     fn complete_reminders(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<CompleteReminders>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2948,44 +5295,19 @@ impl Host {
         channel_route_set: Option<&ChannelRouteSet>,
         receipt_return_route_id: Option<&str>,
     ) -> Result<Receipt, HostCallError> {
-        let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 7);
-        let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
-        for item in &mission.work_items {
-            let completion = completions
-                .get(&item.id)
-                .expect("validated completion covers every WorkItem");
-            commands.push(MissionCommand::TransitionWorkItem {
-                mission_id: mission.id.clone(),
-                work_item_id: item.id.clone(),
-                next: WorkItemStatus::Active,
-                evidence_ids: Vec::new(),
-                now_ms: completed_at_ms,
-            });
-            let evidence_id = reminder_evidence_id(&mission.id, &item.id, completion)?;
-            commands.push(MissionCommand::AttachEvidence {
-                mission_id: mission.id.clone(),
-                evidence: self.authority.sign_evidence(EvidenceClaims {
-                    id: evidence_id.clone(),
-                    mission_id: mission.id.clone(),
-                    work_item_id: item.id.clone(),
-                    kind: EvidenceKind::ReminderCompleted,
-                    source_id: completion.source_id.clone(),
-                    sha256: None,
-                    observed_at_ms: completion.completed_at_ms,
-                }),
-                now_ms: completed_at_ms,
-            });
-            commands.push(MissionCommand::TransitionWorkItem {
-                mission_id: mission.id.clone(),
-                work_item_id: item.id.clone(),
-                next: WorkItemStatus::Completed,
-                evidence_ids: vec![evidence_id.clone()],
-                now_ms: completed_at_ms,
-            });
-            evidence_ids.push(evidence_id);
-        }
+        let selection = self
+            .store
+            .selected_model_selection()?
+            .ok_or(HostCallError::Codex(CodexError::RequiredModelUnavailable))?;
+        let (mut commands, evidence_ids) = Self::reminder_completion_commands(
+            mission,
+            completions,
+            completed_at_ms,
+            &self.authority,
+        )?;
         let mut receipt_completed_at_ms = completed_at_ms;
-        let mut receipt = new_reminder_receipt(mission, &evidence_ids, completed_at_ms)?;
+        let mut receipt =
+            new_reminder_receipt(mission, &selection, &evidence_ids, completed_at_ms)?;
         if let (Some(route_set), Some(route_id)) = (channel_route_set, receipt_return_route_id) {
             let route = approved_receipt_route(route_set, Some(route_id))?;
             receipt_completed_at_ms = completed_at_ms
@@ -3044,6 +5366,51 @@ impl Host {
             .pop()
             .and_then(|result| result.receipt)
             .ok_or(HostCallError::Internal)
+    }
+
+    fn reminder_completion_commands(
+        mission: &Mission,
+        completions: &BTreeMap<String, ReminderCompletion>,
+        completed_at_ms: i64,
+        authority: &LocalAuthority,
+    ) -> Result<(Vec<MissionCommand>, Vec<String>), HostCallError> {
+        let mut commands = Vec::with_capacity(mission.work_items.len() * 3 + 7);
+        let mut evidence_ids = Vec::with_capacity(mission.work_items.len());
+        for item in &mission.work_items {
+            let completion = completions
+                .get(&item.id)
+                .expect("validated completion covers every WorkItem");
+            commands.push(MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: item.id.clone(),
+                next: WorkItemStatus::Active,
+                evidence_ids: Vec::new(),
+                now_ms: completed_at_ms,
+            });
+            let evidence_id = reminder_evidence_id(&mission.id, &item.id, completion)?;
+            commands.push(MissionCommand::AttachEvidence {
+                mission_id: mission.id.clone(),
+                evidence: authority.sign_evidence(EvidenceClaims {
+                    id: evidence_id.clone(),
+                    mission_id: mission.id.clone(),
+                    work_item_id: item.id.clone(),
+                    kind: EvidenceKind::ReminderCompleted,
+                    source_id: completion.source_id.clone(),
+                    sha256: None,
+                    observed_at_ms: completion.completed_at_ms,
+                }),
+                now_ms: completed_at_ms,
+            });
+            commands.push(MissionCommand::TransitionWorkItem {
+                mission_id: mission.id.clone(),
+                work_item_id: item.id.clone(),
+                next: WorkItemStatus::Completed,
+                evidence_ids: vec![evidence_id.clone()],
+                now_ms: completed_at_ms,
+            });
+            evidence_ids.push(evidence_id);
+        }
+        Ok((commands, evidence_ids))
     }
 
     fn existing_receipt_for_completions(
@@ -3142,6 +5509,34 @@ impl Host {
         true
     }
 
+    /// Reserves the exclusive model-operation slot after this exact RPC has
+    /// already consumed and verified its single runtime proof. Calling the
+    /// normal proof-consuming entrypoint again would turn a valid Choice
+    /// operation into a false invalid-parameters failure.
+    fn begin_operation_after_validated_proof(
+        &self,
+        request_id: u64,
+        responses: &Sender<RpcResponse>,
+    ) -> Option<Arc<AtomicBool>> {
+        if !self.has_instance_lease() {
+            let _ = responses.send(failure(
+                Some(request_id),
+                -32_015,
+                "Core has no protected instance lease",
+            ));
+            return None;
+        }
+        let Some(token) = self.operations.begin_operation() else {
+            let _ = responses.send(failure(
+                Some(request_id),
+                -32_011,
+                "Another Codex operation is active",
+            ));
+            return None;
+        };
+        Some(token)
+    }
+
     fn consume_runtime_challenge(&self, receipt: &RuntimeControlReceipt) -> bool {
         let expected = self
             .operations
@@ -3170,11 +5565,13 @@ impl Host {
             codex: self.operations.codex.clone(),
             codex_pid: self.operations.codex_pid.clone(),
             instance_lease: self.instance_lease.clone(),
+            persona: self.persona.clone(),
         }
     }
 
     fn retire_codex_runtime(&self) {
         self.operations.codex_cancel.store(true, Ordering::Release);
+        self.operations.clear_model_catalog_snapshot();
         let client = self
             .operations
             .codex
@@ -3199,6 +5596,45 @@ impl Host {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
     }
+
+    /// Scheduler-only wake handling. No RPC exposes this transition: the Host
+    /// derives both clocks and the stable OS boot identity, while the Store
+    /// atomically checks the protected generation and persisted deadline.
+    fn advance_choice_idle_from_scheduler(
+        &mut self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+        expected_generation: u64,
+    ) -> Result<ChoiceIdleAdvance, HostCallError> {
+        let clock = ChoiceIdleClockEvidence {
+            boot_id: self.idle_boot_id.clone(),
+            wall_clock_ms: now_ms()?,
+            monotonic_ms: boot_scoped_monotonic_ms()?,
+        };
+        self.advance_choice_idle_with_clock(
+            choice_session_id,
+            expected_session_revision,
+            expected_generation,
+            &clock,
+        )
+    }
+
+    fn advance_choice_idle_with_clock(
+        &mut self,
+        choice_session_id: &str,
+        expected_session_revision: u64,
+        expected_generation: u64,
+        clock: &ChoiceIdleClockEvidence,
+    ) -> Result<ChoiceIdleAdvance, HostCallError> {
+        self.store
+            .advance_choice_idle_state_classified(
+                choice_session_id,
+                expected_session_revision,
+                expected_generation,
+                clock,
+            )
+            .map_err(Into::into)
+    }
 }
 
 impl Drop for Host {
@@ -3208,6 +5644,32 @@ impl Drop for Host {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stop_all();
         self.cancel_active();
+    }
+}
+
+/// Deletes only already-receipted private render material. This deliberately
+/// has no operation token or runtime proof: protected Off must not strand a
+/// verified local cleanup, while the absence of a body/path/receipt parameter
+/// prevents it from becoming an alternate render route.
+fn complete_markdown_receipt_cleanup(
+    authority: &LocalAuthority,
+    paths: &HostPaths,
+    trusted_broker: Option<TrustedBrokerEnrollment>,
+    intent_id: &str,
+) -> Result<ChoiceLoopSnapshot, HostCallError> {
+    let broker = trusted_broker.ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+    let mut store = Store::open_with_trusted_broker(&paths.store, authority.clone(), broker)?;
+    store.bind_choice_markdown_root(&paths.user_home)?;
+    let intent = store
+        .markdown_render_intent(intent_id)?
+        .ok_or(StoreError::ChoiceLoopStateConflict)?;
+    prepare_markdown_render_root(&paths.user_home, &intent.entry)
+        .map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+    match store.complete_verified_markdown_render_cleanup(intent_id, now_ms()?)? {
+        MarkdownRenderCleanup::Retired(snapshot) => Ok(*snapshot),
+        MarkdownRenderCleanup::ReconciliationRequired => {
+            Err(HostCallError::MarkdownReconciliationRequired)
+        }
     }
 }
 
@@ -3221,9 +5683,183 @@ struct BackgroundContext {
     codex: Arc<Mutex<Option<CodexClient>>>,
     codex_pid: Arc<Mutex<Option<i32>>>,
     instance_lease: Arc<Mutex<Option<CoreInstanceLease>>>,
+    persona: Arc<Mutex<PersonaManager>>,
 }
 
 impl BackgroundContext {
+    /// Executes the private, already-persisted Markdown journal.  A caller
+    /// cannot supply body bytes, a path, a manifest, or a receipt: all are
+    /// recovered from the encrypted Store intent and verified by the
+    /// descriptor-bound writer before a receipt can be committed.
+    fn complete_markdown_render(
+        &self,
+        operation: &Arc<AtomicBool>,
+        intent_id: &str,
+        allow_reconciliation: bool,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store.bind_choice_markdown_root(&self.paths.user_home)?;
+            let prior_receipt = store.markdown_render_receipt(intent_id)?;
+            // A durable receipt closes publication. Never re-enter the writer
+            // after a crash between retained-base cleanup and body retirement:
+            // cleanup is idempotent for an absent exact base, then retirement
+            // is the sole remaining journal transition.
+            if prior_receipt.is_some() {
+                let intent = store
+                    .markdown_render_intent(intent_id)?
+                    .ok_or(StoreError::ChoiceLoopStateConflict)?;
+                prepare_markdown_render_root(&self.paths.user_home, &intent.entry)
+                    .map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+                return match store
+                    .complete_verified_markdown_render_cleanup(intent_id, now_ms()?)?
+                {
+                    MarkdownRenderCleanup::Retired(snapshot) => Ok(*snapshot),
+                    MarkdownRenderCleanup::ReconciliationRequired => {
+                        Err(HostCallError::MarkdownReconciliationRequired)
+                    }
+                };
+            }
+            // Publishing work requires the current protected On runtime. A
+            // receipt-authenticated retirement above is deletion-only and is
+            // deliberately resumable after Off.
+            self.require_enabled()?;
+            let intent = store
+                .markdown_render_intent(intent_id)?
+                .ok_or(StoreError::ChoiceLoopStateConflict)?;
+            prepare_markdown_render_root(&self.paths.user_home, &intent.entry)
+                .map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+            let committed_at_ms = now_ms().map_err(|_| StoreError::ChoiceLoopStateConflict)?;
+            match store.publish_markdown_render_intent(
+                intent_id,
+                allow_reconciliation,
+                committed_at_ms,
+            )? {
+                Some(MarkdownRenderPublication::Committed(_)) => {}
+                Some(MarkdownRenderPublication::ReconciliationRequired) => {
+                    return Err(HostCallError::MarkdownReconciliationRequired);
+                }
+                None => return Err(StoreError::ChoiceLoopStateConflict.into()),
+            }
+            // The Store receipt is durable before the retained base can be
+            // removed. Re-open the published entry before cleanup so an Owner
+            // replacement in this narrow post-commit window cannot retire
+            // bodies or claim local continuity from a stale final file.
+            // If cleanup or subsequent retirement is interrupted, raw bodies
+            // remain encrypted and restart enters the same verified recovery
+            // path rather than claiming a completed Markdown update.
+            match store.complete_verified_markdown_render_cleanup(&intent.id, now_ms()?)? {
+                MarkdownRenderCleanup::Retired(snapshot) => Ok(*snapshot),
+                MarkdownRenderCleanup::ReconciliationRequired => {
+                    Err(HostCallError::MarkdownReconciliationRequired)
+                }
+            }
+        })
+    }
+
+    fn commit_initial_choice_result(
+        &self,
+        operation: &Arc<AtomicBool>,
+        result: &ChoiceInitialResult,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .commit_initial_choice_result(result)
+                .map_err(Into::into)
+        })
+    }
+
+    fn commit_choice_refinement_result(
+        &self,
+        operation: &Arc<AtomicBool>,
+        result: &ChoiceRefinementResult,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .commit_choice_refinement_result(result)
+                .map_err(Into::into)
+        })
+    }
+
+    fn commit_choice_resume_result(
+        &self,
+        operation: &Arc<AtomicBool>,
+        result: &ChoiceResumeResult,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .commit_choice_resume_result(result)
+                .map_err(Into::into)
+        })
+    }
+
+    fn block_initial_choice_operation(
+        &self,
+        operation: &Arc<AtomicBool>,
+        operation_id: &str,
+        expected_generation: u64,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .block_initial_choice_operation(operation_id, expected_generation, now_ms()?)
+                .map_err(Into::into)
+        })
+    }
+
+    fn block_choice_refinement_operation(
+        &self,
+        operation: &Arc<AtomicBool>,
+        operation_id: &str,
+        expected_generation: u64,
+    ) -> Result<ChoiceLoopSnapshot, HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .block_choice_refinement_operation(operation_id, expected_generation, now_ms()?)
+                .map_err(Into::into)
+        })
+    }
+
+    #[cfg(test)]
     fn reconcile_channel_suggestion(
         &self,
         operation: &Arc<AtomicBool>,
@@ -3288,6 +5924,7 @@ impl BackgroundContext {
 
     fn retire_codex_runtime(&self) {
         self.operations.codex_cancel.store(true, Ordering::Release);
+        self.operations.clear_model_catalog_snapshot();
         let client = self
             .codex
             .lock()
@@ -3303,6 +5940,113 @@ impl BackgroundContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         drop(client);
     }
+}
+
+fn choice_confirmation_reminders(
+    steps: &[String],
+    selection: &Selection,
+    schedule: &ChoiceReminderScheduleInput,
+) -> Result<(String, Vec<ChoiceReminderItem>, u32), HostCallError> {
+    if steps.is_empty() || schedule.reminder_count == 0 {
+        return Err(HostCallError::ReminderScheduleRequired);
+    }
+    // The accepted direction is the only currently-authoritative local task
+    // text. A selected count creates that many ordered payload entries from
+    // it; no question timestamp, hidden default, or unselected A/B/C card
+    // supplies an item. Later richer accepted step lists retain the same
+    // deterministic cycling rule rather than changing an existing proposal.
+    let reminder_items = steps
+        .iter()
+        .cycle()
+        .take(usize::try_from(schedule.reminder_count).map_err(|_| HostCallError::Internal)?)
+        .enumerate()
+        .map(|(index, text)| {
+            Ok(ChoiceReminderItem {
+                id: hashed_identifier(
+                    "choice-reminder-item",
+                    &json!({
+                        "selection": selection.id(),
+                        "index": index,
+                        "text": text,
+                        "dueAtMs": schedule.due_at_ms,
+                    }),
+                )?,
+                text: text.clone(),
+                // The confirmation binds a concrete timestamp rather than
+                // inventing a later local-time interpretation. Actual
+                // Reminder creation remains separately gated.
+                due_at_ms: schedule.due_at_ms,
+                time_zone: schedule.time_zone.clone(),
+                evidence_intent: "reminder-readback".to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, HostCallError>>()?;
+    let reminder_count =
+        u32::try_from(reminder_items.len()).map_err(|_| HostCallError::Internal)?;
+    if reminder_count != schedule.reminder_count {
+        return Err(HostCallError::ReminderScheduleRequired);
+    }
+    Ok((
+        schedule.reminder_list_id.clone(),
+        reminder_items,
+        reminder_count,
+    ))
+}
+
+/// A reminder proposal carries an absolute instant and a user-selected IANA
+/// zone. Parsing the zone at the Host boundary prevents an adapter or UI from
+/// persisting a merely ASCII-shaped, but non-interpretable, local-time claim.
+fn valid_choice_reminder_time_zone(value: &str) -> bool {
+    value.parse::<chrono_tz::Tz>().is_ok()
+}
+
+fn choice_confirmation_delivery(
+    session: &ChoiceSession,
+) -> (Option<String>, Option<String>, Option<String>) {
+    session
+        .primary_delivery_binding_id
+        .as_ref()
+        .map_or((None, None, None), |binding| {
+            (
+                Some(binding.clone()),
+                Some("local-owner".to_owned()),
+                Some("local-only".to_owned()),
+            )
+        })
+}
+
+fn choice_confirmation_markdown_body(goal: &str, steps: &[String]) -> String {
+    let mut body = String::from("# Confirmed choice\n\n## Goal\n\n");
+    body.push_str(goal);
+    body.push_str("\n\n## Steps\n");
+    for step in steps {
+        body.push_str("\n- ");
+        body.push_str(step);
+    }
+    body.push('\n');
+    body
+}
+
+/// Creates only the fixed private directories required by the command-owned
+/// render entry.  Every created component is immediately rechecked as an
+/// exact `0700` non-symlink directory; the writer subsequently reopens it by
+/// descriptor and refuses any replacement.
+fn prepare_markdown_render_root(
+    user_home: &Path,
+    entry: &DocumentManifestEntry,
+) -> Result<PathBuf, HostError> {
+    let root = user_home.join("Documents").join("OpenOpen");
+    create_exact_private_directory(&root)?;
+    let mut current = root.clone();
+    let components = entry.relative_path.split('/').collect::<Vec<_>>();
+    let Some((_file, parents)) = components.split_last() else {
+        return Err(HostError::InvalidSupportPath);
+    };
+    for parent in parents {
+        current.push(parent);
+        create_exact_private_directory(&current)?;
+    }
+    Ok(root)
 }
 
 struct ModelWorkspace {
@@ -3431,12 +6175,22 @@ enum HostCallError {
     Io(#[from] io::Error),
     #[error("host setup failed")]
     Host(#[from] HostError),
+    #[error("persona verification failed")]
+    Persona(#[from] PersonaError),
     #[error("channel listener is unavailable")]
     ChannelUnavailable,
     #[error("channel boundary verification failed")]
     ChannelIntegrity,
     #[error("another Mission still needs the owner")]
     MissionAlreadyInProgress,
+    #[error("local Markdown reconciliation is required")]
+    MarkdownReconciliationRequired,
+    #[error("Choose a complete future Reminder schedule before review")]
+    ReminderScheduleRequired,
+    #[error("Choice clock continuity is uncertain")]
+    ChoiceClockUncertain,
+    #[error("Choice continuity advanced; refresh is required")]
+    ChoiceRefreshRequired,
     #[error("internal failure")]
     Internal,
 }
@@ -3507,6 +6261,13 @@ impl AwaitLogin {
 struct RuntimeProof {
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonaStatusView {
+    status: PersonaStatus,
+    change_note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3632,31 +6393,123 @@ struct ReadChannelPairing {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OutcomeWithProof {
-    prompt: String,
-    allowed_source_refs: Vec<String>,
+struct SelectModel {
+    model_id: String,
+    requested_effort: String,
+    catalog_snapshot_id: String,
+    catalog_fingerprint: String,
+    catalog_revision: u64,
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
 }
 
-impl OutcomeWithProof {
+impl SelectModel {
     fn proof(&self) -> RuntimeProof {
         RuntimeProof {
             authorization: self.authorization.clone(),
             broker_receipt: self.broker_receipt.clone(),
         }
     }
+}
 
-    fn outcome(&self) -> OutcomeRequest {
-        OutcomeRequest {
-            prompt: self.prompt.clone(),
-            allowed_source_refs: self.allowed_source_refs.clone(),
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SelectChoice {
+    #[serde(default)]
+    selection: Option<Selection>,
+    #[serde(default)]
+    d_input: Option<ChoiceDInput>,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl SelectChoice {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
         }
     }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BeginChoice {
+    #[serde(flatten)]
+    input: ChoiceBeginRequest,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl BeginChoice {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmChoice {
+    confirmation: ChoiceConsolidatedConfirmation,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordChoiceReminderSchedule {
+    input: ChoiceReminderScheduleInput,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl RecordChoiceReminderSchedule {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+impl ConfirmChoice {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelSetup {
+    account: AccountState,
+    models: Vec<GptModel>,
+    /// This is retained for local audit/provenance even when it no longer
+    /// matches the current account or catalog. `selection_status` is the only
+    /// readiness authority exposed to App state.
+    selection: Option<ModelSelection>,
+    selection_status: ModelSelectionStatus,
+    catalog_snapshot_id: String,
+    catalog_fingerprint: String,
+    catalog_revision: u64,
+}
+
+#[derive(PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ModelSelectionStatus {
+    Current,
+    Unselected,
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct ConfirmMission {
     suggestion_id: String,
     reminder_target: ReminderTarget,
@@ -3664,12 +6517,26 @@ struct ConfirmMission {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmptyChoiceMarkdownReceiptCleanup {}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChoiceMarkdownReceiptCleanupAvailability {
+    available: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
+#[allow(dead_code)] // Historical recovery fixture type only.
 struct CancelMission {
     mission_id: String,
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
 }
 
+#[cfg(test)]
+#[allow(dead_code)] // Historical recovery fixture type only.
 impl CancelMission {
     fn proof(&self) -> RuntimeProof {
         RuntimeProof {
@@ -3681,6 +6548,8 @@ impl CancelMission {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
+#[allow(dead_code)] // Historical recovery fixture type only.
 struct MissionCancellation {
     mission_id: String,
     status: MissionStatus,
@@ -3695,6 +6564,7 @@ struct ReminderTarget {
 }
 
 impl ReminderTarget {
+    #[cfg(test)]
     fn approval_target(&self) -> ApprovalTarget {
         ApprovalTarget::ReminderList {
             logical_list_id: DEFAULT_REMINDERS_LIST_ID.to_owned(),
@@ -3714,6 +6584,7 @@ struct ReminderCompletion {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct CompleteReminders {
     mission_id: String,
     completions: Vec<ReminderCompletion>,
@@ -3723,12 +6594,14 @@ struct CompleteReminders {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct BeginReminderDispatch {
     mission_id: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(test)]
 struct RecordReminderMirror {
     mission_id: String,
     links: Vec<ConfirmedReminderLink>,
@@ -3797,6 +6670,14 @@ struct ConfirmedMission {
     reminder_authorization: ReminderAuthorization,
     reminder_dispatch: Vec<ConfirmedReminderDispatch>,
     reminder_links: Vec<ConfirmedReminderLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_confirmation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_payload_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_reminder_payload_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_reminder_items: Option<Vec<ChoiceReminderItem>>,
 }
 
 #[derive(Serialize)]
@@ -3804,6 +6685,84 @@ struct ConfirmedMission {
 struct ReminderDispatchStart {
     mission: ConfirmedMission,
     execute_now: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthorizeChoiceReminders {
+    confirmation_id: String,
+    reminder_target: ReminderTarget,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl AuthorizeChoiceReminders {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChoiceReminderRequest {
+    confirmation_id: String,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl ChoiceReminderRequest {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordChoiceReminderMirror {
+    confirmation_id: String,
+    links: Vec<ConfirmedReminderLink>,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl RecordChoiceReminderMirror {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompleteChoiceReminders {
+    confirmation_id: String,
+    completions: Vec<ReminderCompletion>,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl CompleteChoiceReminders {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChoiceReminderCompletion {
+    receipt: Receipt,
+    choice_loop: ChoiceLoopSnapshot,
 }
 
 #[derive(Deserialize)]
@@ -3881,15 +6840,36 @@ fn is_valid_notification(value: &Value) -> bool {
 fn is_public_family(method: &str) -> bool {
     [
         "account.",
-        "outcome.",
         "mission.",
         "channel.",
         "receipt.",
         "workflow.",
+        "choice.",
         "skill.",
     ]
     .iter()
     .any(|prefix| method.starts_with(prefix))
+}
+
+/// Channel setup and delivery are intentionally unavailable during the
+/// PR1 Choice Core stage. Read-only status and historical dashboard recovery
+/// remain outside this list.
+fn is_pr1_deferred_channel_route(method: &str) -> bool {
+    matches!(
+        method,
+        "channel.pair"
+            | "channel.route.bind"
+            | "channel.discord.setup.start"
+            | "channel.discord.setup.poll"
+            | "channel.discord.setup.confirm"
+            | "channel.discord.start"
+            | "channel.imessage.chats.prepare"
+            | "channel.imessage.chats.list"
+            | "channel.imessage.prepare"
+            | "channel.imessage.activate"
+            | "channel.poll"
+            | "channel.outbound.send"
+    )
 }
 
 fn exact_canonical_file(path: &Path) -> Result<PathBuf, HostError> {
@@ -3939,6 +6919,83 @@ fn now_ms() -> Result<i64, HostCallError> {
     i64::try_from(duration.as_millis()).map_err(|_| HostCallError::Internal)
 }
 
+/// Returns a stable, OS-derived boot identity for the persisted idle clock.
+/// A random Core instance nonce is intentionally not suitable here: it
+/// changes on a process restart while the boot-scoped monotonic clock keeps
+/// advancing.
+/// The kernel boot time is local-only, non-secret, and remains stable for one
+/// actual OS boot; its digest keeps the raw value out of diagnostics.
+fn stable_idle_boot_id() -> Result<String, HostError> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .map_err(HostError::Io)?;
+    if !output.status.success() {
+        return Err(HostError::InvalidSupportPath);
+    }
+    let raw = String::from_utf8(output.stdout).map_err(|_| HostError::InvalidSupportPath)?;
+    boot_identity_from_sysctl(&raw)
+}
+
+fn boot_identity_from_sysctl(raw: &str) -> Result<String, HostError> {
+    let (fields, _) = raw
+        .trim_start()
+        .strip_prefix('{')
+        .and_then(|value| value.split_once('}'))
+        .ok_or(HostError::InvalidSupportPath)?;
+    let mut seconds = None;
+    let mut microseconds = None;
+    for field in fields.split(',') {
+        let (name, value) = field.split_once('=').ok_or(HostError::InvalidSupportPath)?;
+        let name = name.trim();
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(HostError::InvalidSupportPath);
+        }
+        match name {
+            "sec" if seconds.is_none() => {
+                seconds = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| HostError::InvalidSupportPath)?,
+                );
+            }
+            "usec" if microseconds.is_none() => {
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| HostError::InvalidSupportPath)?;
+                if parsed >= 1_000_000 {
+                    return Err(HostError::InvalidSupportPath);
+                }
+                microseconds = Some(parsed);
+            }
+            _ => return Err(HostError::InvalidSupportPath),
+        }
+    }
+    let (seconds, microseconds) = seconds
+        .zip(microseconds)
+        .ok_or(HostError::InvalidSupportPath)?;
+    let mut canonical = b"openopen:boot-time:v1\0".to_vec();
+    canonical.extend_from_slice(&seconds.to_be_bytes());
+    canonical.extend_from_slice(&microseconds.to_be_bytes());
+    Ok(format!("boot-{:x}", Sha256::digest(canonical)))
+}
+
+/// Uses the kernel's boot-scoped monotonic clock. Unlike a process-local
+/// `Instant`, this survives Core restart on the same OS boot. Darwin may pause
+/// this clock during sleep; the Store compares it with wall progress and
+/// classifies a sleep-shaped skew as uncertainty rather than granting time
+/// authority. The separately persisted boot identity remains the reboot fence.
+fn boot_scoped_monotonic_ms() -> Result<i64, HostCallError> {
+    let value = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    value
+        .tv_sec
+        .checked_mul(1_000)
+        .and_then(|seconds| seconds.checked_add(value.tv_nsec / 1_000_000))
+        .filter(|milliseconds| *milliseconds >= 0)
+        .ok_or(HostCallError::Internal)
+}
+
 fn channel_observation(inbound: &TransportInbound) -> ChannelObservation {
     ChannelObservation {
         envelope: ChannelEnvelope {
@@ -3969,6 +7026,724 @@ fn external_channel_payload(channel: ChannelKind, content: &str) -> Result<Vec<u
     Ok(value)
 }
 
+fn model_catalog_snapshot_id(
+    account: &AccountState,
+    catalog_fingerprint: &str,
+    catalog_revision: u64,
+    runtime_revision: u64,
+    issued_at_ms: i64,
+) -> Result<String, HostCallError> {
+    hashed_identifier(
+        "model-catalog-snapshot",
+        &json!({
+            "account": account,
+            "catalogFingerprint": catalog_fingerprint,
+            "catalogRevision": catalog_revision,
+            "issuedAtMs": issued_at_ms,
+            "runtimeRevision": runtime_revision,
+        }),
+    )
+}
+
+fn bind_model_selection(
+    snapshot: &ModelCatalogSnapshot,
+    request: &SelectModel,
+) -> Result<ModelSelection, HostCallError> {
+    let AccountState::ChatGpt { plan_type, .. } = &snapshot.account else {
+        return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+    };
+    let selected = snapshot
+        .models
+        .iter()
+        .find(|model| model.id == request.model_id)
+        .ok_or(HostCallError::Codex(CodexError::RequiredModelUnavailable))?;
+    let actual_effort = if selected.supported_reasoning_efforts.is_empty() {
+        if request.requested_effort != "not_applicable" {
+            return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+        }
+        "not_applicable".to_owned()
+    } else if request.requested_effort != "not_applicable"
+        && selected
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort == &request.requested_effort)
+    {
+        request.requested_effort.clone()
+    } else {
+        return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+    };
+    let id = hashed_identifier(
+        "model-selection",
+        &json!({
+            "catalogFingerprint": snapshot.catalog_fingerprint,
+            "modelId": selected.id,
+            "requestedEffort": request.requested_effort,
+        }),
+    )?;
+    let selection = ModelSelection {
+        id,
+        model_id: selected.id.clone(),
+        requested_effort: request.requested_effort.clone(),
+        actual_effort,
+        catalog_fingerprint: snapshot.catalog_fingerprint.clone(),
+        catalog_revision: snapshot.catalog_revision,
+        account_display_class: format!("chatgpt:{plan_type}"),
+        protocol_schema_revision: 1,
+    };
+    selection
+        .is_valid()
+        .then_some(selection)
+        .ok_or(HostCallError::Internal)
+}
+
+fn choice_begin_request_matches_selection(
+    request: &ChoiceBeginRequest,
+    selection: &ModelSelection,
+) -> bool {
+    request.expected_model_provenance_ref == selection.id
+        && request.expected_catalog_fingerprint == selection.catalog_fingerprint
+        && request.expected_catalog_revision == selection.catalog_revision
+        && request.expected_protocol_revision == selection.protocol_schema_revision
+}
+
+fn choice_begin_source_manifest(
+    question: &str,
+    session_id: &str,
+    accepted_at_ms: i64,
+) -> Result<DocumentManifest, HostCallError> {
+    let entry = DocumentManifestEntry {
+        relative_path: format!("sessions/{session_id}/SESSION.md"),
+        sha256: format!("{:x}", Sha256::digest(question.as_bytes())),
+        byte_length: u64::try_from(question.len()).map_err(|_| HostCallError::Internal)?,
+        mode: 0o600,
+    };
+    let aggregate_digest = canonical_document_manifest_digest(std::slice::from_ref(&entry))
+        .ok_or(HostCallError::Internal)?;
+    Ok(DocumentManifest {
+        root_version: 1,
+        entries: vec![entry],
+        aggregate_digest,
+        generated_at_ms: accepted_at_ms,
+    })
+}
+
+fn new_choice_d_intake_record(
+    input: &ChoiceDInput,
+    snapshot: &ChoiceLoopSnapshot,
+    accepted_at_ms: i64,
+) -> Result<ChoiceDIntakeRecord, HostCallError> {
+    if !input.is_valid()
+        || snapshot.session.id != input.choice_session_id
+        || snapshot.session.revision != input.expected_session_revision
+        || snapshot.session.state != ChoiceSessionState::Active
+    {
+        return Err(HostCallError::Internal);
+    }
+    let choice_set = snapshot
+        .active_choice_set
+        .as_ref()
+        .ok_or(HostCallError::Internal)?;
+    if choice_set.id != input.choice_set_id
+        || choice_set.session_revision != input.expected_session_revision
+        || !choice_set.d_available
+    {
+        return Err(HostCallError::Internal);
+    }
+    // The caller-equivalence digest is derived solely from the bounded input
+    // supplied by the user. Host acceptance time is recorded independently
+    // on the envelope/batch and must not turn an exact retry into a new D
+    // request.
+    let request_digest = input.request_digest().ok_or(HostCallError::Internal)?;
+    let source_envelope_id = hashed_identifier(
+        "choice-d-source-envelope",
+        &json!({"requestDigest": request_digest, "sessionId": snapshot.session.id}),
+    )?;
+    let batch_id = hashed_identifier(
+        "choice-d-turn-batch",
+        &json!({"sourceEnvelopeId": source_envelope_id, "sessionId": snapshot.session.id}),
+    )?;
+    let selection_id = hashed_identifier(
+        "choice-d-selection",
+        &json!({"requestDigest": request_digest, "choiceSetId": choice_set.id}),
+    )?;
+    let source_envelope = SourceEnvelope {
+        id: source_envelope_id.clone(),
+        surface: "mac".to_owned(),
+        delivery_binding_id: snapshot
+            .session
+            .primary_delivery_binding_id
+            .clone()
+            .ok_or(HostCallError::Internal)?,
+        provider_message_id: None,
+        owner_id: ISSUER_ID.to_owned(),
+        received_at_ms: accepted_at_ms,
+        monotonic_sequence: snapshot.session.revision,
+        body_digest: format!("{:x}", Sha256::digest(input.bounded_text.as_bytes())),
+        attachment_manifest: None,
+        third_party_data: false,
+        session_hint: Some(snapshot.session.id.clone()),
+        schema_version: choice_set.model_provenance.protocol_schema_revision,
+    };
+    let batch = ConversationTurnBatch {
+        id: batch_id.clone(),
+        choice_session_id: snapshot.session.id.clone(),
+        delivery_binding_id: source_envelope.delivery_binding_id.clone(),
+        source_envelope_ids: vec![source_envelope_id],
+        opened_at_ms: accepted_at_ms,
+        quiet_deadline_ms: accepted_at_ms + openopen_protocol::CHOICE_BATCH_QUIET_WINDOW_MS,
+        hard_deadline_ms: accepted_at_ms + openopen_protocol::CHOICE_BATCH_HARD_WINDOW_MS,
+        sealed_at_ms: Some(accepted_at_ms),
+        seal_reason: Some(BatchSealReason::ImmediateRefinement),
+        revision: snapshot.session.revision,
+    };
+    let selection = openopen_protocol::NaturalConversationSelection {
+        id: selection_id,
+        choice_session_id: snapshot.session.id.clone(),
+        choice_set_id: choice_set.id.clone(),
+        d_input_batch_id: batch_id,
+        expected_session_revision: snapshot.session.revision,
+        selected_at_ms: accepted_at_ms,
+    };
+    let record = ChoiceDIntakeRecord {
+        input: input.clone(),
+        request_digest,
+        source_envelope,
+        batch,
+        selection,
+    };
+    record
+        .is_valid()
+        .then_some(record)
+        .ok_or(HostCallError::Internal)
+}
+
+/// Runs the sealed first Choice generation after, and only after, the Host has
+/// committed the interpreting intake transaction. The model controls only
+/// bounded understanding text and three directions; every identity, source,
+/// provenance, revision, and effect boundary below is Host-derived.
+fn run_initial_choice_generation(
+    context: &BackgroundContext,
+    operation: &Arc<AtomicBool>,
+    record: &ChoiceBeginRecord,
+) -> Result<ChoiceLoopSnapshot, HostCallError> {
+    context.require_enabled()?;
+    if operation.load(Ordering::Acquire) {
+        return Err(HostCallError::Codex(CodexError::Cancelled));
+    }
+    let source_ref = format!("local:{}", &record.source_manifest.aggregate_digest[..24]);
+    let persona_bundle = context
+        .persona
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .bundle_for_ref(&record.persona_revision)?;
+    let request = ChoiceGenerationRequest {
+        prompt: record.bounded_local_question.clone(),
+        allowed_source_refs: vec![source_ref.clone()],
+        selected_model: Some(SelectedModel {
+            model_id: record.model_selection.model_id.clone(),
+            reasoning_effort: (record.model_selection.actual_effort != "not_applicable")
+                .then(|| record.model_selection.actual_effort.clone()),
+            catalog_fingerprint: record.model_selection.catalog_fingerprint.clone(),
+            catalog_revision: record.model_selection.catalog_revision,
+        }),
+        persona_revision: record.persona_revision.clone(),
+        developer_instructions: persona_bundle
+            .developer_instructions(true)
+            .map_err(|_| HostCallError::Internal)?,
+    };
+    request.validate().map_err(HostCallError::Codex)?;
+    let workspace = ModelWorkspace::create(&context.paths.model_input_root)?;
+    let generated = context.with_client(|client| {
+        client.run_structured_choice_generation_in_workspace(&request, &workspace.path)
+    })?;
+    context.require_enabled()?;
+    if operation.load(Ordering::Acquire) {
+        return Err(HostCallError::Codex(CodexError::Cancelled));
+    }
+    let result = initial_choice_result_from_generation(record, generated)?;
+    context.commit_initial_choice_result(operation, &result)
+}
+
+/// Runs only the Host-owned continuation for a committed selection. The
+/// operation already contains the exact selection, generation, model/catalog,
+/// and manifest binding; no UI or RPC field supplies output authority.
+fn run_private_refinement(
+    context: &BackgroundContext,
+    operation: &Arc<AtomicBool>,
+    refinement: &ChoiceRefinementOperation,
+) -> Result<ChoiceLoopSnapshot, HostCallError> {
+    context.require_enabled()?;
+    if operation.load(Ordering::Acquire) {
+        return Err(HostCallError::Codex(CodexError::Cancelled));
+    }
+    // The operation metadata is intentionally body-free. Rehydrate its
+    // separately encrypted, audit-bound semantic context only inside this
+    // Host worker so a selected A/B/C direction or D text actually refines
+    // the accepted owner choice rather than an opaque operation identifier.
+    let (refinement_context, d_intake) = {
+        let broker = context
+            .trusted_broker
+            .clone()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        let store = Store::open_with_trusted_broker(
+            &context.paths.store,
+            context.authority.clone(),
+            broker,
+        )?;
+        (
+            store.choice_refinement_context(refinement)?,
+            store.choice_d_intake_for_refinement(refinement)?,
+        )
+    };
+    let prompt = match (
+        refinement_context.selected_option.as_ref(),
+        d_intake.as_ref(),
+    ) {
+        (Some(option), None) => format!(
+            "Refine the current local Choice using the selected direction. Current understanding: {}\nSelected direction: {}\nSelected rationale: {}\nReturn only the bounded structured Choice result.",
+            refinement_context.interpretation.understood_goal, option.direction, option.rationale,
+        ),
+        (None, Some(record)) => format!(
+            "Refine the current local Choice using the owner's D input. Current understanding: {}\nOwner input: {}\nReturn only the bounded structured Choice result.",
+            refinement_context.interpretation.understood_goal, record.input.bounded_text,
+        ),
+        (None, None) if refinement.is_owner_resume() => format!(
+            "Refresh the current local Choice after the owner's return. Current understanding: {}\nKnown context: {}\nReturn only the bounded structured Choice result.",
+            refinement_context.interpretation.understood_goal,
+            refinement_context.interpretation.current_context,
+        ),
+        _ => return Err(HostCallError::Internal),
+    };
+    if operation.load(Ordering::Acquire) {
+        return Err(HostCallError::Codex(CodexError::Cancelled));
+    }
+    let persona_bundle = context
+        .persona
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .bundle_for_ref(&refinement.persona_revision)?;
+    let request = ChoiceGenerationRequest {
+        prompt,
+        allowed_source_refs: vec![format!(
+            "local:{}",
+            &refinement.source_manifest_digest[..24]
+        )],
+        selected_model: Some(SelectedModel {
+            model_id: refinement.model_provenance.model_id.clone(),
+            reasoning_effort: (refinement.model_provenance.actual_effort != "not_applicable")
+                .then(|| refinement.model_provenance.actual_effort.clone()),
+            catalog_fingerprint: refinement.model_provenance.catalog_fingerprint.clone(),
+            catalog_revision: refinement.model_provenance.catalog_revision,
+        }),
+        persona_revision: refinement.persona_revision.clone(),
+        developer_instructions: persona_bundle
+            .developer_instructions(true)
+            .map_err(|_| HostCallError::Internal)?,
+    };
+    request.validate().map_err(HostCallError::Codex)?;
+    let workspace = ModelWorkspace::create(&context.paths.model_input_root)?;
+    let generated = context.with_client(|client| {
+        client.run_structured_choice_generation_in_workspace(&request, &workspace.path)
+    })?;
+    context.require_enabled()?;
+    if operation.load(Ordering::Acquire) {
+        return Err(HostCallError::Codex(CodexError::Cancelled));
+    }
+    if refinement.is_owner_resume() {
+        let result = resume_result_from_generation(refinement, generated)?;
+        context.commit_choice_resume_result(operation, &result)
+    } else {
+        let result = refinement_result_from_generation(refinement, generated)?;
+        context.commit_choice_refinement_result(operation, &result)
+    }
+}
+
+fn resume_result_from_generation(
+    refinement: &ChoiceRefinementOperation,
+    generated: StructuredChoiceGeneration,
+) -> Result<ChoiceResumeResult, HostCallError> {
+    let result = refinement_result_from_generation(refinement, generated)?;
+    let resume = ChoiceResumeResult { result };
+    resume
+        .is_valid()
+        .then_some(resume)
+        .ok_or(HostCallError::Internal)
+}
+
+fn refinement_result_from_generation(
+    refinement: &ChoiceRefinementOperation,
+    generated: StructuredChoiceGeneration,
+) -> Result<ChoiceRefinementResult, HostCallError> {
+    let completed_at_ms = now_ms()?.max(refinement.created_at_ms);
+    let interpretation_revision = refinement
+        .expected_session_revision
+        .checked_add(1)
+        .ok_or(HostCallError::Internal)?;
+    let options = generated
+        .options
+        .into_iter()
+        .enumerate()
+        .map(|(index, option)| {
+            Ok(ChoiceOption {
+                id: hashed_identifier(
+                    "choice-refinement-option",
+                    &json!({"operationId": refinement.id, "position": index + 1, "direction": option.direction}),
+                )?,
+                position: u8::try_from(index + 1).map_err(|_| HostCallError::Internal)?,
+                direction: option.direction,
+                rationale: option.rationale,
+                expected_result: option.expected_result,
+                information_needed: option.information_needed,
+                external_effects_preview: option.external_effects_preview,
+                source_categories: option.source_categories,
+            })
+        })
+        .collect::<Result<Vec<_>, HostCallError>>()?;
+    let choice_set = openopen_protocol::ChoiceSet {
+        id: hashed_identifier(
+            "choice-refinement-set",
+            &json!({"operationId": refinement.id, "sessionRevision": interpretation_revision}),
+        )?,
+        choice_session_id: refinement.choice_session_id.clone(),
+        session_revision: interpretation_revision,
+        interpretation_revision,
+        generated_at_ms: completed_at_ms,
+        expires_on_revision: interpretation_revision,
+        options,
+        d_available: true,
+        source_manifest_digest: refinement.source_manifest_digest.clone(),
+        model_provenance: refinement.model_provenance.clone(),
+        persona_revision: refinement.persona_revision.clone(),
+    };
+    let interpretation = InterpretationFrame {
+        choice_session_id: refinement.choice_session_id.clone(),
+        revision: interpretation_revision,
+        understood_goal: generated.understood_goal,
+        current_context: generated.current_context,
+        assumptions: generated.assumptions,
+        constraints: generated.constraints,
+        uncertainties: generated.uncertainties,
+        what_to_avoid: generated.what_to_avoid,
+        source_manifest_digest: refinement.source_manifest_digest.clone(),
+    };
+    let mut result = ChoiceRefinementResult {
+        operation_id: refinement.id.clone(),
+        selection_id: refinement.selection_id.clone(),
+        source_envelope_id: refinement.source_envelope_id.clone(),
+        conversation_turn_batch_id: refinement.conversation_turn_batch_id.clone(),
+        expected_session_revision: refinement.expected_session_revision,
+        expected_generation: refinement.expected_generation,
+        model_provenance: refinement.model_provenance.clone(),
+        source_manifest_digest: refinement.source_manifest_digest.clone(),
+        persona_revision: refinement.persona_revision.clone(),
+        interpretation,
+        choice_set,
+        result_digest: String::new(),
+        completed_at_ms,
+    };
+    result.result_digest = result
+        .canonical_result_digest()
+        .ok_or(HostCallError::Internal)?;
+    result
+        .is_valid()
+        .then_some(result)
+        .ok_or(HostCallError::Internal)
+}
+
+fn initial_choice_result_from_generation(
+    record: &ChoiceBeginRecord,
+    generated: StructuredChoiceGeneration,
+) -> Result<ChoiceInitialResult, HostCallError> {
+    let completed_at_ms = now_ms()?.max(record.accepted_at_ms);
+    let provenance_id = hashed_identifier(
+        "choice-provenance",
+        &json!({
+            "operationId": record.accepted.operation_id,
+            "catalogFingerprint": record.model_selection.catalog_fingerprint,
+            "catalogRevision": record.model_selection.catalog_revision,
+        }),
+    )?;
+    let turn_id = hashed_identifier(
+        "choice-turn",
+        &json!({
+            "operationId": record.accepted.operation_id,
+            "sourceManifest": record.source_manifest.aggregate_digest,
+        }),
+    )?;
+    let provenance = record
+        .model_selection
+        .turn_provenance(provenance_id, turn_id)
+        .ok_or(HostCallError::Internal)?;
+    let interpretation_revision = record
+        .accepted
+        .accepted_session_revision
+        .checked_add(1)
+        .ok_or(HostCallError::Internal)?;
+    let options = generated
+        .options
+        .into_iter()
+        .enumerate()
+        .map(|(index, option)| {
+            Ok(ChoiceOption {
+                id: hashed_identifier(
+                    "choice-option",
+                    &json!({
+                        "operationId": record.accepted.operation_id,
+                        "position": index + 1,
+                        "direction": option.direction,
+                    }),
+                )?,
+                position: u8::try_from(index + 1).map_err(|_| HostCallError::Internal)?,
+                direction: option.direction,
+                rationale: option.rationale,
+                expected_result: option.expected_result,
+                information_needed: option.information_needed,
+                external_effects_preview: option.external_effects_preview,
+                source_categories: option.source_categories,
+            })
+        })
+        .collect::<Result<Vec<_>, HostCallError>>()?;
+    let choice_set = openopen_protocol::ChoiceSet {
+        id: hashed_identifier(
+            "choice-set",
+            &json!({
+                "operationId": record.accepted.operation_id,
+                "sessionRevision": interpretation_revision,
+            }),
+        )?,
+        choice_session_id: record.accepted.choice_session_id.clone(),
+        session_revision: interpretation_revision,
+        interpretation_revision,
+        generated_at_ms: completed_at_ms,
+        expires_on_revision: interpretation_revision,
+        options,
+        d_available: true,
+        source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+        model_provenance: provenance.clone(),
+        persona_revision: record.persona_revision.clone(),
+    };
+    let interpretation = InterpretationFrame {
+        choice_session_id: record.accepted.choice_session_id.clone(),
+        revision: interpretation_revision,
+        understood_goal: generated.understood_goal,
+        current_context: generated.current_context,
+        assumptions: generated.assumptions,
+        constraints: generated.constraints,
+        uncertainties: generated.uncertainties,
+        what_to_avoid: generated.what_to_avoid,
+        source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+    };
+    let result = ChoiceInitialResult {
+        operation_id: record.accepted.operation_id.clone(),
+        expected_session_revision: record.accepted.accepted_session_revision,
+        expected_generation: record.runtime_revision,
+        model_provenance: provenance,
+        source_manifest_digest: record.source_manifest.aggregate_digest.clone(),
+        persona_revision: record.persona_revision.clone(),
+        interpretation,
+        choice_set,
+        completed_at_ms,
+    };
+    result
+        .is_valid()
+        .then_some(result)
+        .ok_or(HostCallError::Internal)
+}
+
+#[allow(clippy::too_many_lines)] // Keeps the complete Host-derived intake seal auditable in one place.
+fn new_choice_begin_state(
+    request: &ChoiceBeginRequest,
+    selection: &ModelSelection,
+    session_revision: u64,
+    runtime_revision: u64,
+    persona_revision: &openopen_protocol::PersonaRevisionRef,
+    accepted_at_ms: i64,
+) -> Result<(ChoiceBeginRecord, ChoiceLoopSnapshot), HostCallError> {
+    let request_digest = request.request_digest().ok_or(HostCallError::Internal)?;
+    let session_id = hashed_identifier(
+        "choice-session",
+        &json!({"requestDigest": request_digest, "revision": session_revision}),
+    )?;
+    let operation_id = hashed_identifier(
+        "choice-operation",
+        &json!({"requestDigest": request_digest, "sessionId": session_id}),
+    )?;
+    let source_envelope_id = hashed_identifier(
+        "choice-source-envelope",
+        &json!({"operationId": operation_id, "requestDigest": request_digest}),
+    )?;
+    let batch_id = hashed_identifier(
+        "choice-turn-batch",
+        &json!({"sourceEnvelopeId": source_envelope_id, "sessionId": session_id}),
+    )?;
+    let question_digest = format!(
+        "{:x}",
+        Sha256::digest(request.bounded_local_question.as_bytes())
+    );
+    let source_envelope = SourceEnvelope {
+        id: source_envelope_id.clone(),
+        surface: "mac".to_owned(),
+        delivery_binding_id: "mac-local-owner".to_owned(),
+        provider_message_id: None,
+        owner_id: ISSUER_ID.to_owned(),
+        received_at_ms: accepted_at_ms,
+        monotonic_sequence: session_revision,
+        body_digest: question_digest.clone(),
+        attachment_manifest: None,
+        third_party_data: false,
+        session_hint: None,
+        schema_version: request.expected_protocol_revision,
+    };
+    let batch = ConversationTurnBatch {
+        id: batch_id.clone(),
+        choice_session_id: session_id.clone(),
+        delivery_binding_id: source_envelope.delivery_binding_id.clone(),
+        source_envelope_ids: vec![source_envelope_id.clone()],
+        opened_at_ms: accepted_at_ms,
+        quiet_deadline_ms: accepted_at_ms + openopen_protocol::CHOICE_BATCH_QUIET_WINDOW_MS,
+        hard_deadline_ms: accepted_at_ms + openopen_protocol::CHOICE_BATCH_HARD_WINDOW_MS,
+        sealed_at_ms: Some(accepted_at_ms),
+        seal_reason: Some(BatchSealReason::InitialIntake),
+        revision: session_revision,
+    };
+    let source_manifest =
+        choice_begin_source_manifest(&request.bounded_local_question, &session_id, accepted_at_ms)?;
+    let accepted = ChoiceBeginAccepted {
+        request_id: request.request_id.clone(),
+        operation_id,
+        choice_session_id: session_id.clone(),
+        accepted_session_revision: session_revision,
+        source_envelope_id,
+        conversation_turn_batch_id: batch_id,
+        state: ChoiceSessionState::Interpreting,
+    };
+    let record = ChoiceBeginRecord {
+        accepted: accepted.clone(),
+        request_digest,
+        bounded_local_question: request.bounded_local_question.clone(),
+        source_envelope,
+        batch: batch.clone(),
+        model_selection: selection.clone(),
+        source_manifest: source_manifest.clone(),
+        persona_revision: persona_revision.clone(),
+        runtime_revision,
+        accepted_at_ms,
+    };
+    let snapshot = choice_begin_snapshot(
+        session_id,
+        batch,
+        source_manifest,
+        selection,
+        session_revision,
+        accepted_at_ms,
+    );
+    if !record.is_valid() || !snapshot.is_valid() {
+        return Err(HostCallError::Internal);
+    }
+    Ok((record, snapshot))
+}
+
+fn choice_begin_snapshot(
+    session_id: String,
+    batch: ConversationTurnBatch,
+    source_manifest: DocumentManifest,
+    selection: &ModelSelection,
+    session_revision: u64,
+    accepted_at_ms: i64,
+) -> ChoiceLoopSnapshot {
+    ChoiceLoopSnapshot {
+        session: ChoiceSession {
+            id: session_id,
+            state: ChoiceSessionState::Interpreting,
+            revision: session_revision,
+            model_selection_state: ModelSelectionState::Selected {
+                model_provenance_ref: selection.id.clone(),
+            },
+            communication_profile_revision: 0,
+            active_choice_set_id: None,
+            active_interpretation_revision: None,
+            opened_at_ms: accepted_at_ms,
+            last_input_at_ms: accepted_at_ms,
+            soft_idle_at_ms: accepted_at_ms + openopen_protocol::CHOICE_SESSION_SOFT_IDLE_MS,
+            stale_review_at_ms: accepted_at_ms + openopen_protocol::CHOICE_SESSION_STALE_REVIEW_MS,
+            primary_delivery_binding_id: Some("mac-local-owner".to_owned()),
+            pending_confirmation_id: None,
+            background_mission_ids: Vec::new(),
+        },
+        active_batch: Some(batch),
+        interpretation: None,
+        active_choice_set: None,
+        last_selection: None,
+        pending_refinement_operation: None,
+        confirmation: None,
+        document_manifest: source_manifest,
+    }
+}
+
+fn model_selection_status(
+    account: &AccountState,
+    models: &[GptModel],
+    selection: Option<&ModelSelection>,
+    catalog_fingerprint: &str,
+    catalog_revision: u64,
+) -> ModelSelectionStatus {
+    let Some(selection) = selection else {
+        return ModelSelectionStatus::Unselected;
+    };
+    let AccountState::ChatGpt { plan_type, .. } = account else {
+        return ModelSelectionStatus::Unavailable;
+    };
+    let Some(model) = models.iter().find(|model| model.id == selection.model_id) else {
+        return ModelSelectionStatus::Unavailable;
+    };
+    let effort_matches = if selection.requested_effort == "not_applicable" {
+        model.supported_reasoning_efforts.is_empty() && selection.actual_effort == "not_applicable"
+    } else {
+        selection.actual_effort == selection.requested_effort
+            && model
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort == &selection.requested_effort)
+    };
+    if selection.is_valid()
+        && selection.account_display_class == format!("chatgpt:{plan_type}")
+        && selection.catalog_fingerprint == catalog_fingerprint
+        && selection.catalog_revision == catalog_revision
+        && effort_matches
+    {
+        ModelSelectionStatus::Current
+    } else {
+        ModelSelectionStatus::Unavailable
+    }
+}
+
+fn valid_model_selection_request(request: &SelectModel) -> bool {
+    !request.model_id.is_empty()
+        && request.model_id.len() <= 128
+        && request
+            .model_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && (request.requested_effort == "not_applicable"
+            || (!request.requested_effort.is_empty()
+                && request.requested_effort.len() <= 32
+                && request
+                    .requested_effort
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')))
+        && is_lower_sha256(&request.catalog_snapshot_id)
+        && is_lower_sha256(&request.catalog_fingerprint)
+        && request.catalog_revision > 0
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(test)]
 fn run_channel_outcome(
     context: &BackgroundContext,
     start: &ChannelModelStart,
@@ -3997,6 +7772,7 @@ fn run_channel_outcome(
     Ok(suggestion)
 }
 
+#[cfg(test)]
 fn channel_outcome_request(
     start: &ChannelModelStart,
     model_context: &[(ChannelEnvelope, String)],
@@ -4039,14 +7815,22 @@ fn channel_outcome_request(
         }
         prompt
     };
+    let persona = openopen_persona::PersonaBundle::embedded_default(1)
+        .map_err(|_| HostCallError::Internal)?;
     let outcome = OutcomeRequest {
         prompt,
         allowed_source_refs,
+        selected_model: None,
+        persona_revision: persona.revision_ref.clone(),
+        developer_instructions: persona
+            .developer_instructions(true)
+            .map_err(|_| HostCallError::Internal)?,
     };
     outcome.validate()?;
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn explicit_previous_message_correction(content: &str) -> bool {
     const PREFIX: &str = "correction to previous:";
     let Some(prefix) = content.get(..PREFIX.len()) else {
@@ -4058,6 +7842,7 @@ fn explicit_previous_message_correction(content: &str) -> bool {
             .is_some_and(|remainder| !remainder.trim().is_empty())
 }
 
+#[cfg(test)]
 fn valid_outcome_suggestion(suggestion: &OutcomeSuggestion) -> bool {
     let mut source_refs = HashSet::new();
     valid_suggestion_id(&suggestion.id)
@@ -4209,6 +7994,135 @@ fn reminder_dispatch_tokens(
         .collect()
 }
 
+const MAX_REMINDER_DISPATCH_ATTEMPTS: u32 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReminderDispatchAttemptState {
+    index: u32,
+    aborted: bool,
+}
+
+fn reminder_dispatch_retry_digest(
+    mission_id: &str,
+    dispatch: &ConfirmedReminderDispatch,
+    attempt: u32,
+) -> Result<String, HostCallError> {
+    serialized_sha256(&json!({
+        "attempt": attempt,
+        "kind": "reminderDispatchRetryStarted",
+        "missionId": mission_id,
+        "token": dispatch.token,
+        "workItemId": dispatch.work_item_id,
+    }))
+}
+
+fn reminder_dispatch_abort_digest(
+    mission_id: &str,
+    dispatch: &ConfirmedReminderDispatch,
+    attempt: u32,
+) -> Result<String, HostCallError> {
+    serialized_sha256(&json!({
+        "attempt": attempt,
+        "kind": "reminderDispatchAbortedBeforeCommit",
+        "missionId": mission_id,
+        "token": dispatch.token,
+        "workItemId": dispatch.work_item_id,
+    }))
+}
+
+fn legacy_reminder_dispatch_abort_digest(
+    mission_id: &str,
+    dispatch: &ConfirmedReminderDispatch,
+) -> Result<String, HostCallError> {
+    serialized_sha256(&json!({
+        "kind": "reminderDispatchAbortedBeforeCommit",
+        "missionId": mission_id,
+        "token": dispatch.token,
+        "workItemId": dispatch.work_item_id,
+    }))
+}
+
+fn reminder_dispatch_attempt_state(
+    mission: &Mission,
+    dispatch: &[ConfirmedReminderDispatch],
+    authority: &LocalAuthority,
+) -> Result<Option<ReminderDispatchAttemptState>, HostCallError> {
+    if dispatch.is_empty() {
+        return Ok(None);
+    }
+    let retries = mission
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.kind == EvidenceKind::ReminderDispatchRetryStarted)
+        .collect::<Vec<_>>();
+    let aborted = mission
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.kind == EvidenceKind::ReminderDispatchAbortedBeforeCommit)
+        .collect::<Vec<_>>();
+    if dispatch.len() != mission.work_items.len()
+        || retries.len() % dispatch.len() != 0
+        || aborted.len() % dispatch.len() != 0
+    {
+        return Err(HostCallError::Internal);
+    }
+    let retry_count = retries.len() / dispatch.len();
+    let abort_count = aborted.len() / dispatch.len();
+    if retry_count > MAX_REMINDER_DISPATCH_ATTEMPTS as usize
+        || (abort_count != retry_count && abort_count != retry_count + 1)
+    {
+        return Err(HostCallError::Internal);
+    }
+    for claim in dispatch {
+        let matching_retries = retries
+            .iter()
+            .filter(|evidence| evidence.work_item_id == claim.work_item_id)
+            .collect::<Vec<_>>();
+        if matching_retries.len() != retry_count {
+            return Err(HostCallError::Internal);
+        }
+        for (offset, evidence) in matching_retries.iter().enumerate() {
+            authority
+                .verify_evidence(evidence)
+                .map_err(|_| HostCallError::Internal)?;
+            let attempt = u32::try_from(offset + 1).map_err(|_| HostCallError::Internal)?;
+            let digest = reminder_dispatch_retry_digest(&mission.id, claim, attempt)?;
+            if evidence.source_id != claim.token
+                || evidence.sha256.as_deref() != Some(digest.as_str())
+            {
+                return Err(HostCallError::Internal);
+            }
+        }
+        let matching_aborts = aborted
+            .iter()
+            .filter(|evidence| evidence.work_item_id == claim.work_item_id)
+            .collect::<Vec<_>>();
+        if matching_aborts.len() != abort_count {
+            return Err(HostCallError::Internal);
+        }
+        for (attempt, evidence) in matching_aborts.iter().enumerate() {
+            authority
+                .verify_evidence(evidence)
+                .map_err(|_| HostCallError::Internal)?;
+            let attempt = u32::try_from(attempt).map_err(|_| HostCallError::Internal)?;
+            let digest = reminder_dispatch_abort_digest(&mission.id, claim, attempt)?;
+            let legacy_digest = (attempt == 0)
+                .then(|| legacy_reminder_dispatch_abort_digest(&mission.id, claim))
+                .transpose()?;
+            if evidence.source_id != claim.token
+                || (evidence.sha256.as_deref() != Some(digest.as_str())
+                    && evidence.sha256.as_deref() != legacy_digest.as_deref())
+            {
+                return Err(HostCallError::Internal);
+            }
+        }
+    }
+    Ok(Some(ReminderDispatchAttemptState {
+        index: u32::try_from(retry_count).map_err(|_| HostCallError::Internal)?,
+        aborted: abort_count == retry_count + 1,
+    }))
+}
+
 fn reminder_mirror_digest(
     target: &ReminderTarget,
     link: &ConfirmedReminderLink,
@@ -4284,6 +8198,8 @@ fn reminder_mirror_links(
         .collect()
 }
 
+#[cfg(test)]
+#[allow(dead_code)] // Historical recovery fixture helper only.
 fn receipt_completion_time(
     route_set: Option<&ChannelRouteSet>,
     approved_at_ms: Option<i64>,
@@ -4340,12 +8256,34 @@ fn approved_receipt_route<'a>(
         .ok_or(HostCallError::Internal)
 }
 
+#[cfg(test)]
 fn validated_reminder_completions(
     mission: &Mission,
     authority: &LocalAuthority,
     completions: Vec<ReminderCompletion>,
     observed_now_ms: i64,
     require_pending: bool,
+) -> Option<BTreeMap<String, ReminderCompletion>> {
+    let authorization =
+        reminder_authorization_from_mission(mission, ReminderWriteDisposition::RecoverOnly)
+            .ok()??;
+    validated_reminder_completions_with_authorization(
+        mission,
+        authority,
+        completions,
+        observed_now_ms,
+        require_pending,
+        &authorization,
+    )
+}
+
+fn validated_reminder_completions_with_authorization(
+    mission: &Mission,
+    authority: &LocalAuthority,
+    completions: Vec<ReminderCompletion>,
+    observed_now_ms: i64,
+    require_pending: bool,
+    authorization: &ReminderAuthorization,
 ) -> Option<BTreeMap<String, ReminderCompletion>> {
     let expected_status = if require_pending {
         WorkItemStatus::Pending
@@ -4360,10 +8298,7 @@ fn validated_reminder_completions(
     {
         return None;
     }
-    let authorization =
-        reminder_authorization_from_mission(mission, ReminderWriteDisposition::RecoverOnly)
-            .ok()??;
-    let dispatch = reminder_dispatch_tokens(mission, &authorization, authority).ok()?;
+    let dispatch = reminder_dispatch_tokens(mission, authorization, authority).ok()?;
     let dispatch_started_at_ms = mission
         .evidence
         .iter()
@@ -4522,6 +8457,41 @@ fn reminder_write_payload<'a>(
     Ok(payload)
 }
 
+fn choice_reminder_write_payload(
+    mission_id: &str,
+    confirmation: &ChoiceConsolidatedConfirmation,
+    target: &ReminderTarget,
+) -> Result<Vec<u8>, HostCallError> {
+    let mut payload = REMINDER_WRITE_PAYLOAD_PREFIX.to_vec();
+    append_framed_field(&mut payload, mission_id)?;
+    append_framed_field(&mut payload, &confirmation.id)?;
+    append_framed_field(&mut payload, &confirmation.payload_digest)?;
+    append_framed_field(&mut payload, &confirmation.reminder_payload_digest)?;
+    append_framed_field(&mut payload, &confirmation.reminder_list_id)?;
+    append_framed_field(&mut payload, &target.source_identifier)?;
+    append_framed_field(&mut payload, &target.calendar_identifier)?;
+    for item in &confirmation.reminder_items {
+        append_framed_field(&mut payload, &item.id)?;
+        append_framed_field(&mut payload, &item.text)?;
+        payload.extend(item.due_at_ms.to_be_bytes());
+        append_framed_field(&mut payload, &item.time_zone)?;
+        append_framed_field(&mut payload, &item.evidence_intent)?;
+    }
+    Ok(payload)
+}
+
+fn choice_mission_id(
+    confirmation: &ChoiceConsolidatedConfirmation,
+) -> Result<String, HostCallError> {
+    hashed_identifier(
+        "choice-mission",
+        &json!({
+            "confirmationId": confirmation.id,
+            "payloadDigest": confirmation.payload_digest,
+        }),
+    )
+}
+
 fn append_framed_field(payload: &mut Vec<u8>, value: &str) -> Result<(), HostCallError> {
     let length = u64::try_from(value.len()).map_err(|_| HostCallError::Internal)?;
     payload.extend(length.to_be_bytes());
@@ -4575,6 +8545,101 @@ fn confirmed_mission_from_mission(
         reminder_authorization,
         reminder_dispatch,
         reminder_links,
+        choice_confirmation_id: None,
+        choice_payload_digest: None,
+        choice_reminder_payload_digest: None,
+        choice_reminder_items: None,
+    }))
+}
+
+fn confirmed_choice_mission_from_mission(
+    mission: &Mission,
+    confirmation: &ChoiceConsolidatedConfirmation,
+    authority: &LocalAuthority,
+    write_disposition: ReminderWriteDisposition,
+) -> Result<Option<ConfirmedMission>, HostCallError> {
+    if mission.status != MissionStatus::Active
+        || mission.id != choice_mission_id(confirmation)?
+        || mission.scope_digest != confirmation.payload_digest
+        || mission.work_items.len() != confirmation.reminder_items.len()
+        || !mission
+            .work_items
+            .iter()
+            .zip(&confirmation.reminder_items)
+            .all(|(work, item)| work.id == item.id && work.title == item.text)
+    {
+        return Ok(None);
+    }
+    let approvals = mission
+        .approvals
+        .iter()
+        .filter(|approval| {
+            approval.kind == ApprovalKind::NewExternalWrite
+                && approval.work_item_id.is_none()
+                && approval.status == ApprovalStatus::Approved
+                && approval.decided_by_id.as_deref() == Some(mission.owner_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [approval] = approvals.as_slice() else {
+        return Ok(None);
+    };
+    let Some(ApprovalTarget::ReminderList {
+        logical_list_id,
+        source_identifier,
+        calendar_identifier,
+    }) = approval.target.as_ref()
+    else {
+        return Ok(None);
+    };
+    if logical_list_id != &confirmation.reminder_list_id {
+        return Ok(None);
+    }
+    let target = ReminderTarget {
+        source_identifier: source_identifier.clone(),
+        calendar_identifier: calendar_identifier.clone(),
+    };
+    if !valid_reminder_target(&target) {
+        return Err(HostCallError::Internal);
+    }
+    let payload = choice_reminder_write_payload(&mission.id, confirmation, &target)?;
+    let proposal = reminder_write_proposal(&mission.id, &mission.scope_digest);
+    let approval_digest = proposal
+        .approval_digest(ApprovalKind::NewExternalWrite, Some(&payload))
+        .map_err(|_| HostCallError::Internal)?;
+    if approval.scope_digest != approval_digest
+        || ActionGate.authorize(mission, &proposal, Some(&payload)) != GateDecision::Allowed
+    {
+        return Ok(None);
+    }
+    let authorization = ReminderAuthorization {
+        mission_id: mission.id.clone(),
+        list_id: confirmation.reminder_list_id.clone(),
+        payload_sha256: format!("{:x}", Sha256::digest(&payload)),
+        approval_id: approval.id.clone(),
+        approval_digest,
+        target: target.clone(),
+        write_disposition,
+    };
+    let reminder_dispatch = reminder_dispatch_tokens(mission, &authorization, authority)?;
+    let reminder_links = reminder_mirror_links(mission, &target, &reminder_dispatch, authority)?;
+    Ok(Some(ConfirmedMission {
+        mission_id: mission.id.clone(),
+        title: mission.title.clone(),
+        work_items: mission
+            .work_items
+            .iter()
+            .map(|item| ConfirmedWorkItem {
+                id: item.id.clone(),
+                title: item.title.clone(),
+            })
+            .collect(),
+        reminder_authorization: authorization,
+        reminder_dispatch,
+        reminder_links,
+        choice_confirmation_id: Some(confirmation.id.clone()),
+        choice_payload_digest: Some(confirmation.payload_digest.clone()),
+        choice_reminder_payload_digest: Some(confirmation.reminder_payload_digest.clone()),
+        choice_reminder_items: Some(confirmation.reminder_items.clone()),
     }))
 }
 
@@ -4650,6 +8715,7 @@ fn valid_reminder_target(target: &ReminderTarget) -> bool {
 
 fn new_reminder_receipt(
     mission: &Mission,
+    selection: &ModelSelection,
     evidence_ids: &[String],
     completed_at_ms: i64,
 ) -> Result<NewReceipt, HostCallError> {
@@ -4663,8 +8729,8 @@ fn new_reminder_receipt(
             mission.title,
             mission.work_items.len()
         ),
-        actual_model: REQUIRED_MODEL.to_owned(),
-        output_hashes: Vec::new(),
+        actual_model: selection.model_id.clone(),
+        output_hashes: vec![mission.scope_digest.clone()],
         completed_at_ms,
     })
 }
@@ -4742,7 +8808,7 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
         HostCallError::Codex(CodexError::RequiredModelUnavailable) => failure(
             Some(id),
             -32_014,
-            "GPT-5.6 Sol with high reasoning is unavailable",
+            "The selected model or effort is unavailable. Review the current model setup.",
         ),
         HostCallError::Codex(CodexError::UnsupportedAccount) => {
             failure(Some(id), -32_015, "Managed ChatGPT account is required")
@@ -4758,10 +8824,32 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
         HostCallError::ChannelIntegrity => {
             failure(Some(id), -32_021, "Channel boundary verification failed")
         }
+        #[cfg(test)]
         HostCallError::MissionAlreadyInProgress => failure(
             Some(id),
             -32_022,
             "Finish the current Mission before confirming another",
+        ),
+        HostCallError::MarkdownReconciliationRequired => failure(
+            Some(id),
+            -32_023,
+            "Local Markdown needs reconciliation. No file was overwritten.",
+        ),
+        HostCallError::ReminderScheduleRequired => failure(
+            Some(id),
+            -32_024,
+            "Choose a complete future Reminder schedule before review.",
+        ),
+        HostCallError::Store(StoreError::ChoiceClockUncertain)
+        | HostCallError::ChoiceClockUncertain => failure(
+            Some(id),
+            -32_025,
+            "Local clock continuity is uncertain. Refresh before choosing or confirming.",
+        ),
+        HostCallError::ChoiceRefreshRequired => failure(
+            Some(id),
+            -32_026,
+            "The Choice session advanced. Refresh before choosing or confirming.",
         ),
         _ => failure(Some(id), -32_000, "Local operation failed closed"),
     }
@@ -4770,27 +8858,32 @@ fn call_failure(id: u64, error: &HostCallError) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTSTRAP_MAGIC, ChannelConnectionStatus, ChannelSendResult, ChatGptLogin, CodexError,
-        Host, HostCallError, HostPaths, OperationState, PollChannel, ReminderTarget, RpcRequest,
-        SendChannelMessage, TransportEvent, TransportInbound, channel_outcome_request,
-        decode_params, mission_command_batch, read_bootstrap,
+        AccountState, BOOTSTRAP_MAGIC, ChannelConnectionStatus, ChannelSendResult, ChatGptLogin,
+        CodexClient, CodexError, DEFAULT_REMINDERS_LIST_ID, GptModel, Host, HostCallError,
+        HostPaths, ModelCatalogSnapshot, ModelSelectionStatus, OperationState, PollChannel,
+        ReminderTarget, RpcRequest, SendChannelMessage, TransportEvent, TransportInbound,
+        boot_scoped_monotonic_ms, channel_outcome_request, decode_params,
+        initial_choice_result_from_generation, is_lower_sha256, mission_command_batch,
+        model_selection_status, new_choice_begin_state, read_bootstrap,
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use openopen_codex_client::{StructuredChoiceGeneration, StructuredChoiceOption};
     use openopen_core::{
-        ActionGate, ActionProposal, ActionTarget, BrokerEnrollmentRecord, CreateMission,
-        CreateWorkItem, EffectKind, GateDecision, MissionCommand, NewBoundaryApproval,
-        TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
+        ActionGate, ActionProposal, ActionTarget, BrokerEnrollmentRecord, ChoiceIdleClockEvidence,
+        CreateMission, CreateWorkItem, EffectKind, GateDecision, MissionCommand,
+        NewBoundaryApproval, StoreError, TrustedBrokerEnrollment, broker_enrollment_signing_bytes,
     };
     use openopen_discord_adapter::{InboundEnvelope as DiscordInbound, RecoveryBatch};
     use openopen_protocol::{
         ApprovalKind, ApprovalStatus, ApprovalTarget, ChannelCursor, ChannelEnvelope,
         ChannelFailureIncident, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
         ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
-        ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision, CoreInstanceLease,
-        EFFECT_PROTOCOL_VERSION, EvidenceKind, MissionStatus, OutcomeSuggestion, Receipt,
-        RpcResponse, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
-        core_instance_lease_signing_bytes, runtime_control_authorization_hash,
-        runtime_control_receipt_signing_bytes,
+        ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision, ChoiceBeginRequest,
+        ChoiceRefinementOperation, ChoiceReminderScheduleInput, ChoiceSessionState,
+        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EvidenceKind, MissionStatus, ModelSelection,
+        OptionSelection, OutcomeSuggestion, Receipt, RpcResponse, RuntimeControlAuthorization,
+        RuntimeControlReceipt, Selection, WorkItemStatus, core_instance_lease_signing_bytes,
+        runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
     };
     use rusqlite::Connection;
     use serde_json::{Value, json};
@@ -4801,6 +8894,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     fn fixture() -> (tempfile::TempDir, Host) {
         let root = tempfile::tempdir().unwrap();
@@ -4808,7 +8902,7 @@ mod tests {
         let support = root_path.join("support");
         std::fs::create_dir(&support).unwrap();
         std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let host = Host::open(
+        let mut host = Host::open(
             HostPaths {
                 store: support.join("store.sqlite3"),
                 codex_runtime: root_path.join("missing-codex"),
@@ -4817,11 +8911,52 @@ mod tests {
                 model_input_root: support.join("model-input"),
                 imsg_runtime: root_path.join("missing-imsg"),
                 user_home: root_path.clone(),
+                persona_root: support.join("persona"),
+                persona_team_identifier: "A1B2C3D4E5".to_owned(),
             },
             [7_u8; 32],
         )
         .unwrap();
+        // Historical recovery fixtures exercise direct Store state. This
+        // explicit test-only switch is not constructible through production
+        // RPC or `Host::open`.
+        host.allow_pr1_deferred_channel_routes_for_tests = true;
         (root, host)
+    }
+
+    fn persona_revision() -> openopen_protocol::PersonaRevisionRef {
+        openopen_persona::PersonaBundle::embedded_default(1)
+            .unwrap()
+            .revision_ref
+    }
+
+    #[test]
+    fn production_host_rejects_every_deferred_channel_route() {
+        let (_root, mut host) = fixture();
+        host.allow_pr1_deferred_channel_routes_for_tests = false;
+        for (id, method) in [
+            (1, "channel.pair"),
+            (2, "channel.route.bind"),
+            (3, "channel.discord.setup.start"),
+            (4, "channel.discord.setup.poll"),
+            (5, "channel.discord.setup.confirm"),
+            (6, "channel.discord.start"),
+            (7, "channel.imessage.chats.prepare"),
+            (8, "channel.imessage.chats.list"),
+            (9, "channel.imessage.prepare"),
+            (10, "channel.imessage.activate"),
+            (11, "channel.poll"),
+            (12, "channel.outbound.send"),
+        ] {
+            let response = request(
+                &mut host,
+                &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {}}).to_string(),
+            );
+            assert_eq!(
+                response.error.expect("deferred route must fail").code,
+                -32_001
+            );
+        }
     }
 
     #[test]
@@ -4836,6 +8971,322 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"mission.dashboard.read","params":{}}"#,
         );
         assert!(dashboard.error.is_none());
+    }
+
+    #[test]
+    fn choice_loop_history_read_is_available_while_runtime_is_off_and_starts_no_work() {
+        let (_root, mut host) = fixture();
+        let response = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":2,"method":"choice.loop.read","params":{}}"#,
+        );
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(host.operations.gate.lock().unwrap().active.is_none());
+        assert!(host.operations.codex.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn choice_resume_rejects_every_caller_supplied_context_field() {
+        let (_root, mut host) = fixture();
+        let response = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":3,"method":"choice.resume","params":{"text":"retry","sessionId":"caller-state"}}"#,
+        );
+        assert_eq!(response.error.expect("params rejected").code, -32_602);
+        assert!(host.operations.gate.lock().unwrap().active.is_none());
+        assert!(host.operations.codex.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // End-to-end restart/re-entry owns the complete fenced setup.
+    fn read_preserves_a_restartable_owner_resume_for_authenticated_reentry() {
+        let (_root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        install_test_core_lease(&mut host);
+        let selection = ModelSelection {
+            id: "model-selection-resume".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "high".to_owned(),
+            actual_effort: "high".to_owned(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".to_owned(),
+            protocol_schema_revision: 1,
+        };
+        host.store.select_model_selection(&selection, 2).unwrap();
+        *host.operations.model_catalog_snapshot.lock().unwrap() = Some(
+            test_model_catalog_snapshot(on.revision, super::now_ms().unwrap()),
+        );
+        let input = ChoiceBeginRequest {
+            request_id: "choice-resume-restart".to_owned(),
+            bounded_local_question: "Review the already local plan".to_owned(),
+            expected_model_provenance_ref: selection.id.clone(),
+            expected_catalog_fingerprint: selection.catalog_fingerprint.clone(),
+            expected_catalog_revision: selection.catalog_revision,
+            expected_protocol_revision: selection.protocol_schema_revision,
+        };
+        let (record, snapshot) =
+            new_choice_begin_state(&input, &selection, 1, on.revision, &persona_revision(), 10)
+                .unwrap();
+        let initial_clock = ChoiceIdleClockEvidence {
+            boot_id: "resume-restart-boot".to_owned(),
+            wall_clock_ms: record.accepted_at_ms,
+            monotonic_ms: record.accepted_at_ms,
+        };
+        host.store
+            .begin_choice_session_with_clock(&record, &snapshot, &initial_clock)
+            .unwrap();
+        let generated = StructuredChoiceGeneration {
+            understood_goal: "Review the already local plan".to_owned(),
+            current_context: "The local intake is sealed.".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            options: ["Review", "Narrow", "Prepare"]
+                .map(|direction| StructuredChoiceOption {
+                    direction: direction.to_owned(),
+                    rationale: "Keep the work bounded.".to_owned(),
+                    expected_result: "One clear next step.".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                })
+                .to_vec(),
+            source_refs: vec![format!(
+                "local:{}",
+                &record.source_manifest.aggregate_digest[..24]
+            )],
+        };
+        let active = host
+            .store
+            .commit_initial_choice_result(
+                &initial_choice_result_from_generation(&record, generated).unwrap(),
+            )
+            .unwrap();
+        let idle = host
+            .store
+            .advance_choice_idle_state_classified(
+                &active.session.id,
+                active.session.revision,
+                on.revision,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "resume-restart-boot".to_owned(),
+                    wall_clock_ms: active.session.soft_idle_at_ms,
+                    monotonic_ms: active.session.soft_idle_at_ms,
+                },
+            )
+            .unwrap()
+            .snapshot()
+            .clone();
+        assert_eq!(idle.session.state, ChoiceSessionState::SoftIdle);
+        let pending = host
+            .store
+            .begin_choice_resume(on.revision, idle.session.soft_idle_at_ms + 1)
+            .unwrap();
+        assert!(
+            pending
+                .pending_refinement_operation
+                .as_ref()
+                .is_some_and(ChoiceRefinementOperation::is_owner_resume)
+        );
+
+        // This represents the replacement Host before authenticated Mac
+        // re-entry. A non-authorizing continuity read may not block or replay
+        // the exact durable owner-resume operation.
+        let read = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":4,"method":"choice.loop.read","params":{}}"#,
+        );
+        assert_eq!(read.result.unwrap()["session"]["state"], "refining");
+        assert_eq!(
+            host.store.choice_loop_snapshot().unwrap(),
+            Some(pending),
+            "read must preserve the exact persisted resume operation"
+        );
+
+        let challenge = runtime_challenge(&mut host, 5);
+        let recovered = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "choice.resume",
+                "params": {
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(recovered.result.unwrap()["session"]["state"], "refining");
+        assert!(host.operations.gate.lock().unwrap().active.is_some());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end Host boundary test intentionally owns setup.
+    fn choice_begin_is_host_derived_replay_safe_and_missing_client_blocks_without_effect() {
+        let (_root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        install_test_core_lease(&mut host);
+        let selection = ModelSelection {
+            id: "model-selection-current".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "high".to_owned(),
+            actual_effort: "high".to_owned(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".to_owned(),
+            protocol_schema_revision: 1,
+        };
+        host.store.select_model_selection(&selection, 2).unwrap();
+        *host.operations.model_catalog_snapshot.lock().unwrap() = Some(
+            test_model_catalog_snapshot(on.revision, super::now_ms().unwrap()),
+        );
+
+        let begin = |host: &mut Host, request_id: &str, question: &str, rpc_id: u64| {
+            let challenge = runtime_challenge(host, rpc_id);
+            request(
+                host,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id + 1,
+                    "method": "choice.begin",
+                    "params": {
+                        "requestId": request_id,
+                        "boundedLocalQuestion": question,
+                        "expectedModelProvenanceRef": selection.id,
+                        "expectedCatalogFingerprint": selection.catalog_fingerprint,
+                        "expectedCatalogRevision": selection.catalog_revision,
+                        "expectedProtocolRevision": selection.protocol_schema_revision,
+                        "authorization": on,
+                        "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                    }
+                })
+                .to_string(),
+            )
+        };
+        let first = begin(&mut host, "choice-request-1", "Plan one bounded task", 800);
+        let accepted = first.result.expect("accepted begin");
+        assert_eq!(accepted["state"], "interpreting");
+        for _ in 0..10_000 {
+            if host.operations.gate.lock().unwrap().active.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(host.operations.codex.lock().unwrap().is_none());
+        assert!(host.operations.gate.lock().unwrap().active.is_none());
+        // An exact retry is a durable read even when an unrelated worker slot
+        // is occupied. It must not demand a second model turn or report the
+        // active slot as a failure.
+        let occupied = Arc::new(AtomicBool::new(false));
+        host.operations.gate.lock().unwrap().active = Some(occupied.clone());
+        let replay = begin(&mut host, "choice-request-1", "Plan one bounded task", 802);
+        assert_eq!(replay.result, Some(accepted.clone()));
+        assert!(host.operations.gate.lock().unwrap().active.is_some());
+        host.operations.gate.lock().unwrap().active = None;
+        let changed = begin(&mut host, "choice-request-1", "Changed question", 804);
+        assert!(changed.error.is_some());
+        let second = begin(&mut host, "choice-request-2", "Another question", 806);
+        assert!(second.error.is_some());
+        let blocked = host.store.choice_loop_snapshot().unwrap().unwrap();
+        assert_eq!(blocked.session.state, ChoiceSessionState::Blocked);
+        assert_eq!(blocked.active_batch, None);
+        let prepared_off = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 809,
+                "method": "mission.runtime.prepare",
+                "params": {
+                    "enabled": false,
+                }
+            })
+            .to_string(),
+        );
+        assert!(prepared_off.error.is_none());
+        assert_eq!(prepared_off.result.unwrap()["enabled"], false);
+        assert_eq!(
+            host.store
+                .choice_loop_snapshot()
+                .unwrap()
+                .unwrap()
+                .session
+                .state,
+            ChoiceSessionState::Cancelled
+        );
+    }
+
+    #[test]
+    fn initial_choice_result_derives_all_authority_from_the_accepted_record() {
+        let selection = ModelSelection {
+            id: "model-selection-current".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "high".to_owned(),
+            actual_effort: "high".to_owned(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".to_owned(),
+            protocol_schema_revision: 1,
+        };
+        let input = ChoiceBeginRequest {
+            request_id: "choice-request-result".to_owned(),
+            bounded_local_question: "Plan one bounded task".to_owned(),
+            expected_model_provenance_ref: selection.id.clone(),
+            expected_catalog_fingerprint: selection.catalog_fingerprint.clone(),
+            expected_catalog_revision: selection.catalog_revision,
+            expected_protocol_revision: selection.protocol_schema_revision,
+        };
+        let (record, _) =
+            new_choice_begin_state(&input, &selection, 1, 9, &persona_revision(), 10).unwrap();
+        let generated = StructuredChoiceGeneration {
+            understood_goal: "Plan one bounded task".to_owned(),
+            current_context: "The local intake is sealed.".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            options: ["Review", "Narrow", "Prepare"]
+                .map(|direction| StructuredChoiceOption {
+                    direction: direction.to_owned(),
+                    rationale: "Keep the work bounded.".to_owned(),
+                    expected_result: "One clear next step.".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                })
+                .to_vec(),
+            source_refs: vec![format!(
+                "local:{}",
+                &record.source_manifest.aggregate_digest[..24]
+            )],
+        };
+        let result = initial_choice_result_from_generation(&record, generated).unwrap();
+        assert_eq!(result.operation_id, record.accepted.operation_id);
+        assert_eq!(result.expected_generation, record.runtime_revision);
+        assert_eq!(
+            result.expected_session_revision,
+            record.accepted.accepted_session_revision
+        );
+        assert_eq!(
+            result.choice_set.choice_session_id,
+            record.accepted.choice_session_id
+        );
+        assert_eq!(result.choice_set.options.len(), 3);
+        assert!(result.is_valid());
     }
 
     fn fake_imsg_runtime(root: &std::path::Path) -> PathBuf {
@@ -4861,10 +9312,30 @@ for line in sys.stdin:
         executable
     }
 
-    fn request(host: &mut Host, line: &str) -> RpcResponse {
+    /// Drives the production JSON-RPC dispatcher exactly as a product caller
+    /// would. Tests for retired routes must use this rather than the legacy
+    /// state-fixture helper below.
+    fn dispatch_public(host: &mut Host, line: &str) -> RpcResponse {
         let (send, receive) = mpsc::sync_channel(32);
         host.handle_line(line, &send);
         receive.recv().unwrap()
+    }
+
+    /// Historical Mission fixtures exercise only the still-readable legacy
+    /// Store transition logic. They must not re-open a production JSON-RPC
+    /// creation route after Choice became the sole foreground authority.
+    fn request(host: &mut Host, line: &str) -> RpcResponse {
+        let request: RpcRequest = serde_json::from_str(line).expect("test RPC request");
+        let (send, receive) = mpsc::sync_channel(32);
+        match request.method.as_str() {
+            "mission.confirm" => host.confirm_mission(&request, &send),
+            "mission.cancel" => host.cancel_mission(&request, &send),
+            "mission.reminders.begin" => host.begin_reminder_dispatch(&request, &send),
+            "mission.reminders.record" => host.record_reminder_mirror(&request, &send),
+            "mission.reminders.complete" => host.complete_reminders(&request, &send),
+            _ => host.handle_line(line, &send),
+        }
+        receive.recv().expect("test RPC response")
     }
 
     fn dashboard(host: &mut Host, request_id: u64) -> Value {
@@ -4926,7 +9397,266 @@ for line in sys.stdin:
         }
     }
 
+    fn seed_model_selection(host: &mut Host) {
+        host.store
+            .select_model_selection(
+                &ModelSelection {
+                    id: "model-selection-test".to_owned(),
+                    model_id: "gpt-test-model".to_owned(),
+                    requested_effort: "not_applicable".to_owned(),
+                    actual_effort: "not_applicable".to_owned(),
+                    catalog_fingerprint: "a".repeat(64),
+                    catalog_revision: 1,
+                    account_display_class: "chatgpt:test".to_owned(),
+                    protocol_schema_revision: 1,
+                },
+                1,
+            )
+            .unwrap();
+    }
+
+    fn test_model_catalog_snapshot(
+        runtime_revision: u64,
+        issued_at_ms: i64,
+    ) -> ModelCatalogSnapshot {
+        ModelCatalogSnapshot {
+            id: "b".repeat(64),
+            account: AccountState::ChatGpt {
+                email: "owner@example.com".to_owned(),
+                plan_type: "plus".to_owned(),
+            },
+            models: vec![GptModel {
+                id: "gpt-test-model".to_owned(),
+                display_name: "Test model".to_owned(),
+                supported_reasoning_efforts: vec!["high".to_owned()],
+            }],
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            runtime_revision,
+            issued_at_ms,
+        }
+    }
+
+    #[test]
+    fn current_model_setup_rejects_same_id_catalog_and_account_drift() {
+        let account = AccountState::ChatGpt {
+            email: "owner@example.com".to_owned(),
+            plan_type: "plus".to_owned(),
+        };
+        let models = vec![GptModel {
+            id: "gpt-test-model".to_owned(),
+            display_name: "Test model".to_owned(),
+            supported_reasoning_efforts: vec!["high".to_owned()],
+        }];
+        let fingerprint = CodexClient::model_catalog_fingerprint(&models).unwrap();
+        let revision = CodexClient::model_catalog_revision(&fingerprint).unwrap();
+        let selection = ModelSelection {
+            id: "model-selection-current".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "high".to_owned(),
+            actual_effort: "high".to_owned(),
+            catalog_fingerprint: fingerprint.clone(),
+            catalog_revision: revision,
+            account_display_class: "chatgpt:plus".to_owned(),
+            protocol_schema_revision: 1,
+        };
+        assert!(matches!(
+            model_selection_status(&account, &models, Some(&selection), &fingerprint, revision),
+            ModelSelectionStatus::Current
+        ));
+
+        let same_id_drifted_catalog = vec![GptModel {
+            id: "gpt-test-model".to_owned(),
+            display_name: "Test model changed".to_owned(),
+            supported_reasoning_efforts: vec!["medium".to_owned()],
+        }];
+        let drifted_fingerprint =
+            CodexClient::model_catalog_fingerprint(&same_id_drifted_catalog).unwrap();
+        let drifted_revision = CodexClient::model_catalog_revision(&drifted_fingerprint).unwrap();
+        assert!(matches!(
+            model_selection_status(
+                &account,
+                &same_id_drifted_catalog,
+                Some(&selection),
+                &drifted_fingerprint,
+                drifted_revision
+            ),
+            ModelSelectionStatus::Unavailable
+        ));
+
+        let changed_account = AccountState::ChatGpt {
+            email: "owner@example.com".to_owned(),
+            plan_type: "free".to_owned(),
+        };
+        assert!(matches!(
+            model_selection_status(
+                &changed_account,
+                &models,
+                Some(&selection),
+                &fingerprint,
+                revision
+            ),
+            ModelSelectionStatus::Unavailable
+        ));
+    }
+
+    #[test]
+    fn model_catalog_snapshot_and_digest_contract_reject_non_hex_or_expired_selection() {
+        assert!(is_lower_sha256(&"a1".repeat(32)));
+        assert!(!is_lower_sha256(&format!("{}g", "a".repeat(63))));
+
+        let operations = OperationState::default();
+        operations.accept_recovered_runtime(true, 61);
+        let setup = operations.begin_operation().unwrap();
+        let snapshot = test_model_catalog_snapshot(61, 1_000);
+        assert!(operations.publish_model_catalog_snapshot(&setup, snapshot.clone()));
+        operations.finish_operation(&setup);
+
+        let selection = operations.begin_operation().unwrap();
+        let wrote_selection = AtomicBool::new(false);
+        let result = operations.reconcile_active_model_catalog(
+            &selection,
+            &super::ModelCatalogRequest {
+                snapshot_id: &snapshot.id,
+                catalog_fingerprint: &snapshot.catalog_fingerprint,
+                catalog_revision: snapshot.catalog_revision,
+                runtime_revision: 61,
+                now: 1_000 + super::MODEL_CATALOG_SNAPSHOT_TTL_MS + 1,
+            },
+            |_| {
+                wrote_selection.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(HostCallError::Codex(CodexError::RequiredModelUnavailable))
+        ));
+        assert!(!wrote_selection.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn product_owned_sources_do_not_reintroduce_retired_fixed_model_routes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sources = [
+            "crates/openopen-protocol/src/lib.rs",
+            "crates/openopen-codex-client/src/contracts.rs",
+            "crates/openopen-codex-client/src/lib.rs",
+            "crates/openopen-host/src/lib.rs",
+            "macos/EffectBrokerBridge/Sources/OpenOpenAppSupport/AppModel.swift",
+            "macos/EffectBrokerBridge/Sources/OpenOpenAppSupport/CoreContracts.swift",
+            "macos/EffectBrokerBridge/Sources/OpenOpenAppSupport/CoreProcessClient.swift",
+            "macos/EffectBrokerBridge/Sources/OpenOpenAppSupport/OpenOpenViews.swift",
+        ]
+        .map(|path| std::fs::read_to_string(root.join(path)).expect("read product source"));
+        let fixed_model = ["g", "p", "t", "-", "5", ".", "6", "-", "s", "o", "l"].concat();
+        let fixed_reasoning = ["sol with", " high reasoning"].concat();
+        let auto_route = ["model routing: ", "auto"].concat();
+        let retired_host_dispatch = ["\"outcome.propose\"", " =>"].concat();
+        let retired_client_dispatch = ["method: \"outcome.", "propose\""].concat();
+        let retired_core_entrypoint = ["func ", "propose("].concat();
+        for source in sources {
+            let lower = source.to_ascii_lowercase();
+            assert!(!lower.contains(&fixed_model));
+            assert!(!lower.contains(&fixed_reasoning));
+            assert!(!lower.contains(&auto_route));
+            assert!(
+                !source.contains(&retired_host_dispatch),
+                "a retired Outcome proposal must not remain in public Host dispatch"
+            );
+            assert!(
+                !source.contains(&retired_client_dispatch),
+                "a product client must not expose a retired Outcome proposal RPC"
+            );
+            assert!(
+                !source.contains(&retired_core_entrypoint),
+                "a product Core surface must not expose a retired Outcome proposal entrypoint"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_reconciliation_is_a_typed_non_overwrite_failure() {
+        let response = super::call_failure(73, &HostCallError::MarkdownReconciliationRequired);
+        let error = response.error.expect("typed RPC failure");
+        assert_eq!(error.code, -32_023);
+        assert_eq!(
+            error.message,
+            "Local Markdown needs reconciliation. No file was overwritten."
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn reminder_schedule_recovery_is_typed_and_actionable() {
+        let response = super::call_failure(74, &HostCallError::ReminderScheduleRequired);
+        let error = response.error.expect("typed RPC failure");
+        assert_eq!(error.code, -32_024);
+        assert_eq!(
+            error.message,
+            "Choose a complete future Reminder schedule before review."
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn choice_clock_and_refresh_failures_keep_distinct_typed_codes() {
+        for error in [
+            HostCallError::ChoiceClockUncertain,
+            HostCallError::Store(StoreError::ChoiceClockUncertain),
+        ] {
+            let response = super::call_failure(75, &error);
+            assert_eq!(response.error.unwrap().code, -32_025);
+        }
+        let response = super::call_failure(76, &HostCallError::ChoiceRefreshRequired);
+        assert_eq!(response.error.unwrap().code, -32_026);
+    }
+
+    #[test]
+    fn idle_evidence_uses_stable_boot_and_kernel_monotonic_sources() {
+        let boot = super::stable_idle_boot_id().expect("read OS boot identity");
+        assert_eq!(
+            super::stable_idle_boot_id().expect("re-read OS boot identity"),
+            boot
+        );
+        let first = super::boot_scoped_monotonic_ms().expect("read kernel monotonic clock");
+        std::thread::sleep(Duration::from_millis(2));
+        let second = super::boot_scoped_monotonic_ms().expect("re-read kernel monotonic clock");
+        assert!(second >= first);
+    }
+
+    #[test]
+    fn boot_identity_uses_only_strict_numeric_kernel_fields() {
+        let utc = "{ sec = 1784500000, usec = 123456 } Sun Jul 19 00:00:00 2026\n";
+        let pacific = "{ sec = 1784500000, usec = 123456 } Sat Jul 18 17:00:00 2026 PDT\n";
+        assert_eq!(
+            super::boot_identity_from_sysctl(utc).unwrap(),
+            super::boot_identity_from_sysctl(pacific).unwrap(),
+            "human-formatted timezone suffixes are not boot identity"
+        );
+        assert_ne!(
+            super::boot_identity_from_sysctl(utc).unwrap(),
+            super::boot_identity_from_sysctl(
+                "{ sec = 1784500001, usec = 123456 } Sun Jul 19 00:00:01 2026\n"
+            )
+            .unwrap()
+        );
+        for malformed in [
+            "sec = 1, usec = 2",
+            "{ sec = 1, sec = 1, usec = 2 } suffix",
+            "{ sec = -1, usec = 2 } suffix",
+            "{ sec = 1, usec = 1000000 } suffix",
+            "{ sec = 1, other = 2 } suffix",
+        ] {
+            assert!(
+                super::boot_identity_from_sysctl(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
     fn confirm_hero_mission(host: &mut Host) -> Value {
+        seed_model_selection(host);
         *host.operations.suggestion.lock().unwrap() = Some(hero_suggestion());
         request(
             host,
@@ -5118,6 +9848,101 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn global_off_cancels_stalled_model_setup_without_waiting_for_a_late_catalog() {
+        let operations = OperationState::default();
+        operations.accept_recovered_runtime(true, 41);
+        let token = operations.begin_operation().unwrap();
+        let (started_send, started_receive) = mpsc::sync_channel(1);
+        let (release_send, release_receive) = mpsc::sync_channel(1);
+        let worker_operations = operations.clone();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            started_send.send(()).unwrap();
+            release_receive.recv().unwrap();
+            worker_operations.publish_model_catalog_snapshot(
+                &worker_token,
+                test_model_catalog_snapshot(41, 1_000),
+            )
+        });
+
+        // The simulated provider worker has not returned. Protected Off only
+        // touches the operation gate, so it never waits on that worker.
+        started_receive.recv().unwrap();
+        operations.cancel_active();
+        assert!(token.load(Ordering::Acquire));
+        release_send.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        assert!(operations.model_catalog_snapshot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn model_selection_rejects_stale_cancelled_and_restarted_catalog_snapshots() {
+        let operations = OperationState::default();
+        operations.accept_recovered_runtime(true, 51);
+        let setup = operations.begin_operation().unwrap();
+        let snapshot = test_model_catalog_snapshot(51, 10_000);
+        assert!(operations.publish_model_catalog_snapshot(&setup, snapshot.clone()));
+        operations.finish_operation(&setup);
+
+        let stale_selection = operations.begin_operation().unwrap();
+        let wrote_selection = AtomicBool::new(false);
+        let stale = operations.reconcile_active_model_catalog(
+            &stale_selection,
+            &super::ModelCatalogRequest {
+                snapshot_id: &snapshot.id,
+                catalog_fingerprint: &snapshot.catalog_fingerprint,
+                catalog_revision: snapshot.catalog_revision + 1,
+                runtime_revision: 51,
+                now: 10_001,
+            },
+            |_| {
+                wrote_selection.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            stale,
+            Err(HostCallError::Codex(CodexError::RequiredModelUnavailable))
+        ));
+        assert!(!wrote_selection.load(Ordering::Acquire));
+        operations.cancel_active();
+        assert!(matches!(
+            operations.reconcile_active_model_catalog(
+                &stale_selection,
+                &super::ModelCatalogRequest {
+                    snapshot_id: &snapshot.id,
+                    catalog_fingerprint: &snapshot.catalog_fingerprint,
+                    catalog_revision: snapshot.catalog_revision,
+                    runtime_revision: 51,
+                    now: 10_001,
+                },
+                |_| Ok(())
+            ),
+            Err(HostCallError::Codex(CodexError::Cancelled))
+        ));
+
+        // A fresh Host process owns no volatile catalog snapshot, even if its
+        // protected runtime happens to be at the same revision.
+        let restarted = OperationState::default();
+        restarted.accept_recovered_runtime(true, 51);
+        let restart_selection = restarted.begin_operation().unwrap();
+        assert!(matches!(
+            restarted.reconcile_active_model_catalog(
+                &restart_selection,
+                &super::ModelCatalogRequest {
+                    snapshot_id: &snapshot.id,
+                    catalog_fingerprint: &snapshot.catalog_fingerprint,
+                    catalog_revision: snapshot.catalog_revision,
+                    runtime_revision: 51,
+                    now: 10_001,
+                },
+                |_| Ok(())
+            ),
+            Err(HostCallError::Codex(CodexError::RequiredModelUnavailable))
+        ));
+    }
+
+    #[test]
     fn pending_off_latch_rejects_old_on_replay_until_a_fresh_protected_revision() {
         let operations = OperationState::default();
         operations.accept_recovered_runtime(true, 7);
@@ -5185,12 +10010,19 @@ for line in sys.stdin:
         let racing_token = racing.begin_operation().unwrap();
         let login_guard = racing.login.lock().unwrap();
         let cancelling = racing.clone();
-        let cancel_thread = std::thread::spawn(move || cancelling.cancel_active());
-        for _ in 0..1_000 {
+        let (started_send, started_receive) = mpsc::sync_channel(1);
+        let cancel_thread = std::thread::spawn(move || {
+            started_send.send(()).unwrap();
+            cancelling.cancel_active();
+        });
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        for _ in 0..100 {
             if racing.codex_cancel.load(Ordering::Acquire) {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert!(racing.codex_cancel.load(Ordering::Acquire));
         let installing = racing.clone();
@@ -5256,7 +10088,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn off_blocks_codex_before_any_runtime_spawn() {
+    fn off_blocks_current_choice_intake_before_any_runtime_spawn() {
         let (_root, mut host) = fixture();
         let challenge = request(
             &mut host,
@@ -5269,7 +10101,36 @@ for line in sys.stdin:
             .to_owned();
         let response = request(
             &mut host,
-            &outcome_request(1, "Plan today", Some(&challenge)),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "choice.begin",
+                "params": {
+                    "requestId": "choice-off-test",
+                    "boundedLocalQuestion": "Plan today",
+                    "expectedModelProvenanceRef": "selection-off-test",
+                    "expectedCatalogFingerprint": "a".repeat(64),
+                    "expectedCatalogRevision": 1,
+                    "expectedProtocolRevision": 1,
+                    "authorization": {
+                        "protocolVersion": 1,
+                        "enabled": false,
+                        "revision": 1,
+                        "updatedAtMs": 1,
+                        "coreKeyId": "00".repeat(32),
+                        "authorizationSignatureHex": "00".repeat(64),
+                    },
+                    "brokerReceipt": {
+                        "protocolVersion": 1,
+                        "authorizationHash": "00".repeat(32),
+                        "checkpointNonce": "00".repeat(32),
+                        "requestNonce": challenge,
+                        "brokerKeyId": "00".repeat(32),
+                        "brokerSignatureHex": "00".repeat(64),
+                    }
+                }
+            })
+            .to_string(),
         );
         assert_eq!(response.error.unwrap().code, -32_015);
         assert!(
@@ -5322,6 +10183,485 @@ for line in sys.stdin:
                 .is_none()
         );
         assert!(host.operations.suggestion.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn legacy_mission_confirm_never_accepts_choice_confirmation_authority() {
+        let (_root, mut host) = fixture();
+        let response = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":303,"method":"mission.confirm","params":{"confirmation":{"id":"choice-confirmation-1"}}}"#,
+        );
+        assert_eq!(response.error.expect("invalid legacy route").code, -32_602);
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .expect("read audit anchor")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn choice_reminder_schedule_accepts_only_a_future_iana_zone_proposal() {
+        assert!(super::valid_choice_reminder_time_zone(
+            "America/Los_Angeles"
+        ));
+        assert!(super::valid_choice_reminder_time_zone("Etc/UTC"));
+        assert!(!super::valid_choice_reminder_time_zone("not/a-time-zone"));
+
+        let accepted_at_ms = super::now_ms().unwrap();
+        let valid = ChoiceReminderScheduleInput {
+            request_id: "schedule-request-1".to_owned(),
+            choice_session_id: "choice-session-1".to_owned(),
+            expected_session_revision: 1,
+            reminder_list_id: "local-reminders".to_owned(),
+            reminder_count: 1,
+            due_at_ms: accepted_at_ms + 60_000,
+            time_zone: "America/Los_Angeles".to_owned(),
+        };
+        assert!(valid.is_valid());
+        assert!(valid.due_at_ms > accepted_at_ms);
+        let expired = ChoiceReminderScheduleInput {
+            due_at_ms: accepted_at_ms,
+            ..valid
+        };
+        assert!(
+            expired.is_valid(),
+            "protocol shape alone never proves future time"
+        );
+        assert!(expired.due_at_ms <= accepted_at_ms);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end boundary test keeps every Host-derived seal visible.
+    fn choice_confirmation_binds_the_eventual_markdown_and_revisions_on_owner_edit() {
+        let (root, mut host) = fixture();
+        let broker = broker_record(&host);
+        host.store.install_trusted_broker(&broker).unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        let selection = ModelSelection {
+            id: "model-selection-confirmation".to_owned(),
+            model_id: "gpt-test-model".to_owned(),
+            requested_effort: "high".to_owned(),
+            actual_effort: "high".to_owned(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".to_owned(),
+            protocol_schema_revision: 1,
+        };
+        host.store
+            .select_model_selection(&selection, 2)
+            .expect("persist explicit model selection");
+        let input = ChoiceBeginRequest {
+            request_id: "choice-confirmation-begin".to_owned(),
+            bounded_local_question: "Prepare one bounded local plan".to_owned(),
+            expected_model_provenance_ref: selection.id.clone(),
+            expected_catalog_fingerprint: selection.catalog_fingerprint.clone(),
+            expected_catalog_revision: selection.catalog_revision,
+            expected_protocol_revision: selection.protocol_schema_revision,
+        };
+        let accepted_at_ms = super::now_ms().unwrap();
+        let (record, initial) = new_choice_begin_state(
+            &input,
+            &selection,
+            on.revision,
+            1,
+            &persona_revision(),
+            accepted_at_ms,
+        )
+        .unwrap();
+        host.store
+            .begin_choice_session_with_clock(
+                &record,
+                &initial,
+                &ChoiceIdleClockEvidence {
+                    boot_id: host.idle_boot_id.clone(),
+                    wall_clock_ms: accepted_at_ms,
+                    monotonic_ms: boot_scoped_monotonic_ms().unwrap(),
+                },
+            )
+            .expect("commit initial intake");
+        let generated = |goal: &str| StructuredChoiceGeneration {
+            understood_goal: goal.to_owned(),
+            current_context: "The exact local plan is ready for refinement.".to_owned(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            options: ["Review", "Narrow", "Prepare"]
+                .map(|direction| StructuredChoiceOption {
+                    direction: direction.to_owned(),
+                    rationale: "Keep the work bounded.".to_owned(),
+                    expected_result: "One clear next step.".to_owned(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".to_owned()],
+                })
+                .to_vec(),
+            source_refs: vec![],
+        };
+        let initial_result =
+            initial_choice_result_from_generation(&record, generated("Prepare the local plan"))
+                .expect("derive initial Choice result");
+        let active = host
+            .store
+            .commit_initial_choice_result(&initial_result)
+            .expect("commit initial Choice result");
+        let choice_set = active.active_choice_set.as_ref().expect("active ChoiceSet");
+        let selected_at_ms = initial_result.completed_at_ms + 1;
+        let selected = Selection::OptionSelection(OptionSelection {
+            id: "choice-confirmation-selection".to_owned(),
+            choice_session_id: active.session.id.clone(),
+            choice_set_id: choice_set.id.clone(),
+            selected_option_id: choice_set.options[0].id.clone(),
+            expected_session_revision: active.session.revision,
+            selected_at_ms,
+        });
+        let refining = host
+            .store
+            .commit_choice_selection(&selected, on.revision, selected_at_ms)
+            .expect("commit selected direction");
+        let operation = refining
+            .pending_refinement_operation
+            .as_ref()
+            .expect("pending refinement");
+        let refinement = super::refinement_result_from_generation(
+            operation,
+            generated("Review the prepared local plan"),
+        )
+        .expect("derive bound refinement");
+        let refined = host
+            .store
+            .commit_choice_refinement_result(&refinement)
+            .expect("commit bound refinement");
+        let schedule_at_ms = refinement.completed_at_ms + 1;
+        let schedule = host
+            .store
+            .record_choice_reminder_schedule(
+                &ChoiceReminderScheduleInput {
+                    request_id: "choice-confirmation-schedule".to_owned(),
+                    choice_session_id: refined.session.id.clone(),
+                    expected_session_revision: refined.session.revision,
+                    reminder_list_id: DEFAULT_REMINDERS_LIST_ID.to_owned(),
+                    reminder_count: 1,
+                    due_at_ms: schedule_at_ms + 60_000,
+                    time_zone: "Etc/UTC".to_owned(),
+                },
+                on.revision,
+                schedule_at_ms,
+            )
+            .expect("record effect-free schedule");
+        let create_preview = host
+            .derive_choice_confirmation(&refined, &schedule, schedule_at_ms)
+            .expect("derive no-clobber confirmation");
+        assert_eq!(
+            create_preview.persona_revision,
+            refined
+                .active_choice_set
+                .as_ref()
+                .expect("refined ChoiceSet")
+                .persona_revision,
+            "Host derives confirmation Persona provenance only from the current verified ChoiceSet"
+        );
+        assert_eq!(
+            create_preview.markdown_entry.relative_path,
+            format!("sessions/{}/CHOICE.md", refined.session.id)
+        );
+        assert!(create_preview.markdown_expected_base.is_none());
+        assert_eq!(create_preview.markdown_manifest_digests.len(), 2);
+        assert_eq!(
+            create_preview.markdown_manifest_digests[0],
+            refined.document_manifest.aggregate_digest
+        );
+        assert!(
+            !root.path().join("Documents/OpenOpen").exists(),
+            "reviewing a confirmation must not create the Markdown root"
+        );
+
+        let target = root
+            .path()
+            .join("Documents/OpenOpen")
+            .join(&create_preview.markdown_entry.relative_path);
+        let owner_parent = target.parent().expect("owner edit parent");
+        std::fs::create_dir_all(owner_parent).expect("create owner edit directories");
+        for directory in [
+            root.path().join("Documents"),
+            root.path().join("Documents/OpenOpen"),
+            root.path().join("Documents/OpenOpen/sessions"),
+            owner_parent.to_owned(),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("protect owner edit directory");
+        }
+        std::fs::write(&target, b"# Owner edit\n").expect("write owner edit");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("protect owner edit");
+        let replacement_preview = host
+            .derive_choice_confirmation(&refined, &schedule, schedule_at_ms)
+            .expect("derive descriptor-bound replacement confirmation");
+        assert!(replacement_preview.markdown_expected_base.is_some());
+        assert_ne!(
+            replacement_preview.document_diff_digest,
+            create_preview.document_diff_digest
+        );
+        assert_ne!(
+            replacement_preview.payload_revision,
+            create_preview.payload_revision
+        );
+        assert_ne!(replacement_preview.id, create_preview.id);
+        assert_ne!(
+            replacement_preview.payload_digest,
+            create_preview.payload_digest
+        );
+        let (confirmed, intent) = host
+            .store
+            .commit_choice_confirmation_and_render_intent(
+                &replacement_preview,
+                on.revision,
+                schedule_at_ms,
+            )
+            .expect("commit only the current descriptor-bound confirmation");
+        assert_eq!(
+            confirmed.session.state,
+            ChoiceSessionState::AwaitingConfirmation
+        );
+        assert_eq!(confirmed.confirmation, Some(replacement_preview));
+        assert!(
+            host.store
+                .markdown_render_receipt(&intent.id)
+                .unwrap()
+                .is_none(),
+            "Choice confirmation must not publish Markdown before Reminder Evidence and Receipt"
+        );
+        host.operations.accept_committed_runtime(true, on.revision);
+        install_test_core_lease(&mut host);
+        let confirmation = confirmed.confirmation.clone().unwrap();
+        let challenge = runtime_challenge(&mut host, 3_310);
+        let authorized = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3_311,
+                "method": "choice.reminders.authorize",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "reminderTarget": {
+                        "sourceIdentifier": "eventkit-source",
+                        "calendarIdentifier": "eventkit-calendar"
+                    },
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(authorized.error.is_none(), "{authorized:?}");
+        let authorized = authorized.result.unwrap();
+        assert_eq!(authorized["choiceConfirmationId"], confirmation.id);
+        assert_eq!(
+            authorized["choicePayloadDigest"],
+            confirmation.payload_digest
+        );
+        assert_eq!(
+            authorized["choiceReminderPayloadDigest"],
+            confirmation.reminder_payload_digest
+        );
+        assert_eq!(
+            authorized["choiceReminderItems"].as_array().unwrap().len(),
+            1
+        );
+        assert!(
+            host.store
+                .markdown_render_receipt(&intent.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let challenge = runtime_challenge(&mut host, 3_312);
+        let started = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 3_313,
+                "method": "choice.reminders.begin",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(started.error.is_none(), "{started:?}");
+        let started = started.result.unwrap();
+        assert_eq!(started["executeNow"], true);
+        let mission = &started["mission"];
+        let mission_id = mission["missionId"].as_str().unwrap();
+        let work_item_id = mission["workItems"][0]["id"].as_str().unwrap();
+        let title = mission["workItems"][0]["title"].as_str().unwrap();
+        let dispatch_token = mission["reminderDispatch"][0]["token"].as_str().unwrap();
+
+        // A signed pre-commit cancellation is durable and permits exactly a
+        // later explicit owner retry. It is distinct from an ambiguous
+        // post-commit loss, which never calls this RPC.
+        let reused_begin_proof = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 33_130,
+                "method": "choice.reminders.abort-before-commit",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(reused_begin_proof.error.unwrap().code, -32_602);
+        let challenge = runtime_challenge(&mut host, 33_131);
+        let aborted = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 33_132,
+                "method": "choice.reminders.abort-before-commit",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(aborted.error.is_none(), "{aborted:?}");
+        let challenge = runtime_challenge(&mut host, 33_133);
+        let restarted = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 33_134,
+                "method": "choice.reminders.begin",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(restarted.error.is_none(), "{restarted:?}");
+        assert_eq!(restarted.result.unwrap()["executeNow"], true);
+
+        // The retry authority is consumed in the same transaction that
+        // records its new started attempt. A lost response, process restart,
+        // or second begin can only enter read-only recovery until that exact
+        // attempt is itself proven aborted before commit.
+        let challenge = runtime_challenge(&mut host, 33_135);
+        let replayed_retry = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 33_136,
+                "method": "choice.reminders.begin",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(replayed_retry.error.is_none(), "{replayed_retry:?}");
+        assert_eq!(replayed_retry.result.unwrap()["executeNow"], false);
+
+        let challenge = runtime_challenge(&mut host, 3_314);
+        let mirrored = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 3_315,
+                "method": "choice.reminders.record",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "links": [{
+                        "missionId": mission_id,
+                        "workItemId": work_item_id,
+                        "sourceIdentifier": "eventkit-source",
+                        "calendarIdentifier": "eventkit-calendar",
+                        "calendarItemIdentifier": "eventkit-item-1",
+                        "dispatchToken": dispatch_token,
+                        "title": title
+                    }],
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(mirrored.error.is_none(), "{mirrored:?}");
+
+        let challenge = runtime_challenge(&mut host, 3_316);
+        let completed = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 3_317,
+                "method": "choice.reminders.complete",
+                "params": {
+                    "confirmationId": confirmation.id,
+                    "completions": [{
+                        "workItemId": work_item_id,
+                        "sourceId": "eventkit-item-1",
+                        "completedAtMs": super::now_ms().unwrap()
+                    }],
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(completed.error.is_none(), "{completed:?}");
+        let completed = completed.result.unwrap();
+        assert_eq!(completed["choiceLoop"]["session"]["state"], "softIdle");
+        assert_eq!(completed["receipt"]["missionId"], mission_id);
+        assert!(
+            completed["receipt"]["outputHashes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|digest| digest == &json!(confirmation.payload_digest))
+        );
+        assert_eq!(
+            completed["choiceLoop"]["documentManifest"]["aggregateDigest"],
+            confirmation.markdown_manifest_digests[1]
+        );
+        assert!(
+            target.exists(),
+            "the confirmed exact CHOICE.md is published"
+        );
+
+        *host.operations.model_catalog_snapshot.lock().unwrap() = Some(
+            test_model_catalog_snapshot(on.revision, super::now_ms().unwrap()),
+        );
+        let challenge = runtime_challenge(&mut host, 3_318);
+        let resumed = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": 3_319,
+                "method": "choice.resume",
+                "params": {
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge))
+                }
+            })
+            .to_string(),
+        );
+        assert!(resumed.error.is_none(), "{resumed:?}");
+        let resumed = resumed.result.unwrap();
+        assert_eq!(resumed["session"]["state"], "refining");
+        assert!(
+            resumed["pendingRefinementOperation"]["selectionId"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("resume-soft-idle-")),
+            "the post-Receipt owner return must mint one body-free next-choice operation"
+        );
     }
 
     #[test]
@@ -5410,6 +10750,7 @@ for line in sys.stdin:
         assert_eq!(
             states,
             vec![
+                "choice:model_selection",
                 "mission:\"proposed\"",
                 "mission:\"awaitingConfirmation\"",
                 "mission:\"awaitingConfirmation\"",
@@ -5848,7 +11189,7 @@ for line in sys.stdin:
                 .unwrap_or_else(|| panic!("completion failed: {:?}", response.error)),
         )
         .unwrap();
-        assert_eq!(receipt.actual_model, "gpt-5.6-sol");
+        assert_eq!(receipt.actual_model, "gpt-test-model");
         assert_eq!(receipt.evidence_ids.len(), mission.work_items.len());
 
         let completed_anchor = host.store.current_verified_audit_anchor().unwrap().unwrap();
@@ -5940,7 +11281,7 @@ for line in sys.stdin:
             .to_string(),
         );
         assert!(receipt.error.is_none(), "{receipt:?}");
-        assert_eq!(receipt.result.unwrap()["actualModel"], "gpt-5.6-sol");
+        assert_eq!(receipt.result.unwrap()["actualModel"], "gpt-test-model");
         let outbound_count = Connection::open(&host.paths.store)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM channel_outbound", [], |row| {
@@ -6180,10 +11521,13 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn invalid_prompt_is_rejected_before_a_codex_process_is_touched() {
+    fn retired_outcome_proposal_is_not_dispatchable_or_a_model_entry_route() {
         let (_root, mut host) = fixture();
-        let response = request(&mut host, &outcome_request(2, "   ", None));
-        assert_eq!(response.error.unwrap().code, -32_000);
+        let response = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":2,"method":"outcome.propose","params":{}}"#,
+        );
+        assert_eq!(response.error.unwrap().code, -32_601);
         assert!(
             std::fs::read_dir(&host.paths.model_input_root)
                 .unwrap()
@@ -6192,33 +11536,125 @@ for line in sys.stdin:
         );
     }
 
-    fn outcome_request(id: u64, prompt: &str, request_nonce: Option<&str>) -> String {
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "outcome.propose",
-            "params": {
-                "prompt": prompt,
-                "allowedSourceRefs": [],
-                "authorization": {
-                    "protocolVersion": 1,
-                    "enabled": false,
-                    "revision": 1,
-                    "updatedAtMs": 1,
-                    "coreKeyId": "00".repeat(32),
-                    "authorizationSignatureHex": "00".repeat(64)
-                },
-                "brokerReceipt": {
-                    "protocolVersion": 1,
-                    "authorizationHash": "00".repeat(32),
-                    "checkpointNonce": "00".repeat(32),
-                    "requestNonce": request_nonce,
-                    "brokerKeyId": "00".repeat(32),
-                    "brokerSignatureHex": "00".repeat(64)
-                }
-            }
-        })
-        .to_string()
+    #[test]
+    fn persona_default_is_read_only_and_mutable_persona_routes_are_not_public_in_pr1() {
+        let (_root, mut host) = fixture();
+        let status = request(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":18,"method":"persona.status","params":{}}"#,
+        )
+        .result
+        .expect("default Persona status is read-only");
+        assert_eq!(
+            status["status"]["active"]["personaId"],
+            "openopen.nondev.default"
+        );
+        assert_eq!(status["status"]["active"]["revision"], "draft-03-en");
+
+        for (id, method) in [
+            (19, "persona.stage"),
+            (20, "persona.activate"),
+            (21, "persona.rollback"),
+        ] {
+            let response = request(
+                &mut host,
+                &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {}}).to_string(),
+            );
+            assert_eq!(response.error.expect("must not dispatch").code, -32_601);
+        }
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .expect("verify audit")
+                .is_none(),
+            "Persona status and rejected update routes cannot create an audit event"
+        );
+    }
+
+    #[test]
+    fn receipt_cleanup_accepts_no_caller_body_path_or_receipt_fields() {
+        let (_root, mut host) = fixture();
+        let response = dispatch_public(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":22,"method":"choice.markdown.receipt.cleanup","params":{"body":"injected","path":"CHOICE.md","receipt":{"intentId":"forged"}}}"#,
+        );
+        assert_eq!(
+            response.error.expect("must reject caller material").code,
+            -32_602
+        );
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .expect("verify audit")
+                .is_none(),
+            "receipt cleanup cannot mint a journal, receipt, or audit event"
+        );
+    }
+
+    #[test]
+    fn receipt_cleanup_availability_is_read_only_and_false_without_a_receipted_cancelled_choice() {
+        let (_root, mut host) = fixture();
+        let response = dispatch_public(
+            &mut host,
+            r#"{"jsonrpc":"2.0","id":23,"method":"choice.markdown.receipt.cleanup.available","params":{}}"#,
+        );
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.unwrap()["available"], false);
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .expect("verify audit")
+                .is_none(),
+            "availability reads must not create a cleanup journal or audit event"
+        );
+    }
+
+    #[test]
+    fn retired_mission_and_reminder_mutation_routes_are_not_dispatchable() {
+        let (_root, mut host) = fixture();
+        for (id, method, params) in [
+            (
+                3,
+                "mission.confirm",
+                json!({
+                    "suggestionId": "suggestion-1700000000000-0123456789abcdef0123456789abcdef",
+                    "reminderTarget": {"sourceIdentifier": "source-1", "calendarIdentifier": "calendar-1"}
+                }),
+            ),
+            (4, "mission.cancel", json!({"missionId": "mission-1"})),
+            (
+                5,
+                "mission.reminders.begin",
+                json!({"missionId": "mission-1"}),
+            ),
+            (
+                6,
+                "mission.reminders.record",
+                json!({"missionId": "mission-1", "links": []}),
+            ),
+            (
+                7,
+                "mission.reminders.complete",
+                json!({"missionId": "mission-1", "completions": []}),
+            ),
+        ] {
+            let response = dispatch_public(
+                &mut host,
+                &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                    .to_string(),
+            );
+            assert_eq!(
+                response.error.expect("retired route must fail").code,
+                -32_001
+            );
+        }
+        assert!(
+            host.store
+                .current_verified_audit_anchor()
+                .expect("verify audit")
+                .is_none(),
+            "retired routes cannot mint a Mission or audit event"
+        );
     }
 
     #[test]
@@ -6607,11 +12043,6 @@ for line in sys.stdin:
         for (id, method, mut extra) in [
             (101, "account.read", serde_json::json!({})),
             (102, "models.list", serde_json::json!({})),
-            (
-                103,
-                "outcome.propose",
-                serde_json::json!({"allowedSourceRefs": [], "prompt": "Plan today"}),
-            ),
         ] {
             let challenge = request(
                 &mut host,
@@ -7830,6 +13261,7 @@ for line in sys.stdin:
     }
 
     fn seed_primary_discord_mission(host: &mut Host) -> String {
+        seed_model_selection(host);
         host.store
             .pair_channel(&ChannelPairing {
                 channel: ChannelKind::Discord,

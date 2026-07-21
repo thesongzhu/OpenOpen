@@ -7,12 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono-tz.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 openopen-codex-client.workspace = true
 openopen-core.workspace = true
 openopen-discord-adapter.workspace = true
 openopen-imsg-adapter.workspace = true
+openopen-persona.workspace = true
 openopen-protocol.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true

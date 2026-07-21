@@ -5,9 +5,23 @@ import Foundation
 protocol RemindersServing {
   func prepareTarget() async throws -> ReminderTarget
   func executeInitialMirror(_ start: ReminderDispatchStart) async throws -> [ReminderLink]
+  func releaseInitialMirrorClaim(for missionId: String)
   func recoverMirror(for mission: ConfirmedMission) async throws -> [ReminderLink]
   func completedReminders(for links: [ReminderLink]) async throws
     -> [ReminderCompletionInput]
+  func completedReminders(
+    for links: [ReminderLink], confirmation: ChoiceConsolidatedConfirmation
+  ) async throws -> [ReminderCompletionInput]
+}
+
+extension RemindersServing {
+  func releaseInitialMirrorClaim(for _: String) {}
+
+  func completedReminders(
+    for links: [ReminderLink], confirmation _: ChoiceConsolidatedConfirmation
+  ) async throws -> [ReminderCompletionInput] {
+    try await completedReminders(for: links)
+  }
 }
 
 enum RemindersClientError: Error, Equatable, LocalizedError {
@@ -17,10 +31,12 @@ enum RemindersClientError: Error, Equatable, LocalizedError {
   case targetUnavailable
   case ambiguousCalendar
   case eventKit(String)
+  case mirrorAbsent(String)
   case incompleteMirror(String)
   case reminderMissing(String)
   case reminderChanged(String)
   case completionDateMissing(String)
+  case cancelledBeforeCommit
 
   public var errorDescription: String? {
     switch self {
@@ -36,6 +52,8 @@ enum RemindersClientError: Error, Equatable, LocalizedError {
       "More than one Reminders list is named OpenOpen in the default account. Keep one list, then try again."
     case .eventKit(let detail):
       "Reminders could not complete the request: \(detail)"
+    case .mirrorAbsent(let title):
+      "No Reminder exists for “\(title)”. OpenOpen recorded the stopped write; choose Check Reminder again to retry explicitly."
     case .incompleteMirror(let title):
       "The OpenOpen Reminders list does not exactly match the confirmed Mission near “\(title)”."
     case .reminderMissing(let title):
@@ -44,8 +62,11 @@ enum RemindersClientError: Error, Equatable, LocalizedError {
       "The Reminder “\(title)” changed, so OpenOpen cannot use it as Evidence."
     case .completionDateMissing(let title):
       "The Reminder “\(title)” is marked complete but has no completion date, so OpenOpen cannot use it as Evidence."
+    case .cancelledBeforeCommit:
+      "The Reminder write stopped before EventKit committed it. OpenOpen recorded that no item was created."
     }
   }
+
 }
 
 @MainActor
@@ -91,18 +112,19 @@ final class RemindersClient: RemindersServing {
     let mission = start.mission
     try validate(mission)
     try executionClaims.consume(start)
-    try Task.checkCancellation()
-    try await requireFullAccess()
-    try Task.checkCancellation()
-    let calendar = try findApprovedCalendar(
-      target: mission.reminderAuthorization.target,
-      calendars: eventStore.calendars(for: .reminder)
-    )
-    let existing = try await exactLinks(for: mission, in: calendar, allowMissingAll: true)
-    try Task.checkCancellation()
-    if !existing.isEmpty { return existing }
-
+    var committed = false
     do {
+      try Task.checkCancellation()
+      try await requireFullAccess()
+      try Task.checkCancellation()
+      let calendar = try findApprovedCalendar(
+        target: mission.reminderAuthorization.target,
+        calendars: eventStore.calendars(for: .reminder)
+      )
+      let existing = try await exactLinks(for: mission, in: calendar, allowMissingAll: true)
+      try Task.checkCancellation()
+      if !existing.isEmpty { return existing }
+
       let dispatchByWorkItem = Dictionary(
         uniqueKeysWithValues: mission.reminderDispatch.map { ($0.workItemId, $0.token) }
       )
@@ -119,21 +141,35 @@ final class RemindersClient: RemindersServing {
           workItemId: workItem.id,
           dispatchToken: dispatchToken
         )
+        if let item = mission.choiceReminderItems?.first(where: { $0.id == workItem.id }) {
+          reminder.dueDateComponents = try Self.dueDateComponents(for: item)
+        }
         try eventStore.save(reminder, commit: false)
       }
       try Task.checkCancellation()
       try eventStore.commit()
+      committed = true
+
+      let links = try await exactLinks(for: mission, in: calendar, allowMissingAll: false)
+      try Task.checkCancellation()
+      return links
     } catch is CancellationError {
-      eventStore.reset()
+      if !committed {
+        eventStore.reset()
+        throw RemindersClientError.cancelledBeforeCommit
+      }
+      // Once EventKit commit returned, cancellation is ambiguous until exact
+      // readback. It must stay recovery-only and must never mint noncommit.
       throw CancellationError()
     } catch {
-      eventStore.reset()
+      if !committed { eventStore.reset() }
+      if let error = error as? RemindersClientError { throw error }
       throw Self.eventKitError(error)
     }
+  }
 
-    let links = try await exactLinks(for: mission, in: calendar, allowMissingAll: false)
-    try Task.checkCancellation()
-    return links
+  func releaseInitialMirrorClaim(for missionId: String) {
+    executionClaims.release(missionId)
   }
 
   func recoverMirror(for mission: ConfirmedMission) async throws -> [ReminderLink] {
@@ -194,6 +230,21 @@ final class RemindersClient: RemindersServing {
     }
   }
 
+  func completedReminders(
+    for links: [ReminderLink], confirmation: ChoiceConsolidatedConfirmation
+  ) async throws -> [ReminderCompletionInput] {
+    let completed = try await completedReminders(for: links)
+    for link in links {
+      guard
+        let reminder = eventStore.calendarItem(withIdentifier: link.calendarItemIdentifier)
+          as? EKReminder,
+        let item = confirmation.reminderItems.first(where: { $0.id == link.workItemId }),
+        Self.scheduleMatches(reminder.dueDateComponents, item: item)
+      else { throw RemindersClientError.reminderChanged(link.title) }
+    }
+    return completed
+  }
+
   private func requireFullAccess() async throws {
     do {
       guard try await eventStore.requestFullAccessToReminders() else {
@@ -231,9 +282,19 @@ final class RemindersClient: RemindersServing {
     )
 
     for reminder in reminders {
-      guard let marker = Self.decodeMarker(reminder.notes),
-        marker.missionId == mission.missionId
-      else { continue }
+      guard let marker = Self.decodeMarker(reminder.notes) else {
+        try Self.rejectPlausibleUnverifiableReminder(
+          title: reminder.title, notes: reminder.notes,
+          dueDateComponents: reminder.dueDateComponents, mission: mission)
+        continue
+      }
+      guard marker.missionId == mission.missionId else {
+        try Self.rejectPlausibleOtherMissionReminder(
+          title: reminder.title, dueDateComponents: reminder.dueDateComponents,
+          markerWorkItemId: marker.workItemId, markerDispatchToken: marker.dispatchToken,
+          mission: mission)
+        continue
+      }
       missionReminderCount += 1
       guard dispatchByWorkItem[marker.workItemId] == marker.dispatchToken else {
         throw RemindersClientError.reminderChanged(reminder.title)
@@ -241,7 +302,10 @@ final class RemindersClient: RemindersServing {
       remindersByWorkItem[marker.workItemId, default: []].append(reminder)
     }
 
-    if allowMissingAll, missionReminderCount == 0 { return [] }
+    if missionReminderCount == 0 {
+      if allowMissingAll { return [] }
+      throw RemindersClientError.mirrorAbsent(mission.title)
+    }
 
     let expectedIds = Set(mission.workItems.map(\.id))
     guard missionReminderCount == mission.workItems.count,
@@ -263,7 +327,10 @@ final class RemindersClient: RemindersServing {
             missionId: mission.missionId,
             workItemId: workItem.id,
             dispatchToken: dispatchByWorkItem[workItem.id] ?? ""
-          ))
+          )),
+        Self.scheduleMatches(
+          reminder.dueDateComponents,
+          item: mission.choiceReminderItems?.first(where: { $0.id == workItem.id }))
       else {
         throw RemindersClientError.reminderChanged(workItem.title)
       }
@@ -293,7 +360,8 @@ final class RemindersClient: RemindersServing {
               identifier: $0.calendarItemIdentifier,
               calendarIdentifier: $0.calendar.calendarIdentifier,
               title: $0.title,
-              notes: $0.notes
+              notes: $0.notes,
+              dueDateComponents: $0.dueDateComponents
             )
           }
         )
@@ -322,7 +390,11 @@ final class RemindersClient: RemindersServing {
     let authorization = mission.reminderAuthorization
     guard
       authorization.validates(
-        missionId: mission.missionId, workItems: mission.workItems
+        missionId: mission.missionId, workItems: mission.workItems,
+        choiceConfirmationId: mission.choiceConfirmationId,
+        choicePayloadDigest: mission.choicePayloadDigest,
+        choiceReminderPayloadDigest: mission.choiceReminderPayloadDigest,
+        choiceReminderItems: mission.choiceReminderItems
       )
     else {
       throw RemindersClientError.invalidMission(
@@ -383,6 +455,30 @@ final class RemindersClient: RemindersServing {
     return "\(markerPrefix)\(encoded.base64EncodedString())"
   }
 
+  private static func dueDateComponents(for item: ChoiceReminderItem) throws -> DateComponents {
+    guard let timeZone = TimeZone(identifier: item.timeZone) else {
+      throw RemindersClientError.invalidMission("its confirmed time zone is unavailable")
+    }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    var components = calendar.dateComponents(
+      [.year, .month, .day, .hour, .minute, .second],
+      from: Date(timeIntervalSince1970: Double(item.dueAtMs) / 1_000))
+    components.timeZone = timeZone
+    return components
+  }
+
+  private static func scheduleMatches(
+    _ observed: DateComponents?, item: ChoiceReminderItem?
+  ) -> Bool {
+    guard let item else { return observed == nil }
+    guard let observed, let expected = try? dueDateComponents(for: item) else { return false }
+    return observed.timeZone?.identifier == expected.timeZone?.identifier
+      && observed.year == expected.year && observed.month == expected.month
+      && observed.day == expected.day && observed.hour == expected.hour
+      && observed.minute == expected.minute && (observed.second ?? 0) == (expected.second ?? 0)
+  }
+
   private static func decodeMarker(_ notes: String?) -> ReminderMarker? {
     guard let notes, notes.hasPrefix(markerPrefix) else { return nil }
     let payload = String(notes.dropFirst(markerPrefix.count))
@@ -391,6 +487,47 @@ final class RemindersClient: RemindersServing {
       marker.version == 2
     else { return nil }
     return marker
+  }
+
+  /// This is the dedicated OpenOpen target calendar. Any row without a valid
+  /// marker makes total absence ambiguous: it may be a committed item whose
+  /// ownership metadata was removed or damaged. Never unlock a retry from it.
+  static func rejectPlausibleUnverifiableReminder(
+    title: String,
+    notes: String?,
+    dueDateComponents: DateComponents?,
+    mission: ConfirmedMission
+  ) throws {
+    _ = notes
+    _ = dueDateComponents
+    _ = mission
+    throw RemindersClientError.reminderChanged(title)
+  }
+
+  /// A syntactically valid marker with a changed mission identity is also not
+  /// automatically unrelated. Any collision with the current immutable
+  /// payload blocks absence; only a completely disjoint valid owned row may
+  /// be ignored as another historical Mission.
+  static func rejectPlausibleOtherMissionReminder(
+    title: String,
+    dueDateComponents: DateComponents?,
+    markerWorkItemId: String,
+    markerDispatchToken: String,
+    mission: ConfirmedMission
+  ) throws {
+    let expectedTokens = Set(mission.reminderDispatch.map(\.token))
+    let titleMatches = mission.workItems.contains(where: { $0.title == title })
+    let scheduleMatchesAny = mission.workItems.contains { item in
+      scheduleMatches(
+        dueDateComponents,
+        item: mission.choiceReminderItems?.first(where: { $0.id == item.id }))
+    }
+    if titleMatches || scheduleMatchesAny
+      || mission.workItems.contains(where: { $0.id == markerWorkItemId })
+      || expectedTokens.contains(markerDispatchToken)
+    {
+      throw RemindersClientError.reminderChanged(title)
+    }
   }
 
   private static func eventKitError(_ error: Error) -> RemindersClientError {
@@ -438,6 +575,10 @@ struct ReminderExecutionClaims {
       throw RemindersClientError.incompleteMirror(start.mission.title)
     }
   }
+
+  mutating func release(_ missionId: String) {
+    consumedMissionIds.remove(missionId)
+  }
 }
 
 private struct ReminderMarker: Codable, Equatable {
@@ -452,4 +593,5 @@ private struct ReminderSnapshot: Sendable {
   let calendarIdentifier: String
   let title: String
   let notes: String?
+  let dueDateComponents: DateComponents?
 }

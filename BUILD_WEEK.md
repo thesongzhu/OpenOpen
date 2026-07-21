@@ -5,6 +5,50 @@ come only from `docs/OPENOPEN_BUILD_WEEK_MASTER_PLAN.md`. This disclosure is a
 chronological Build Week/provenance record and cannot authorize implementation
 or override that canonical contract.
 
+## Current private-agent direction — 2026-07-19
+
+The Owner replaced the former competition critical path with the private-agent
+Choice Loop: natural expression → bounded understanding → dynamic A/B/C plus D
+→ refinement → one exact confirmation → Reminders → Evidence → Receipt →
+bounded Markdown update → next choices.
+
+The current UI is macOS-only. Mac is primary; the B+ Hero channel is the dedicated
+same-account iMessage self-chat. A local personal Discord Bot DM and one
+additional one-to-one iMessage read-only source are post-B+. The
+account's compatible GPT/Codex
+models are scanned and presented
+for explicit model and supported-effort selection. First launch and all
+product-owned visible copy are English-only: account scan → selection → one
+simple question → first dynamic A/B/C plus D, with no model work before
+selection. Reactive replies use only the latest owner-active connected channel;
+Mac does not duplicate them across channels. Fixed Sol, Auto, silent fallback,
+Connect Messages first, old Outcome/15-minute IntentSession UX, groups,
+shared/cloud Discord Bot, offline replay, Claude/Anthropic, and Repair23 input
+reuse are not current authority.
+
+Repair24 source `ca26036…` merged as `c86e590…`, and CI `29707715009` passed.
+That is source/CI identity only. The protected Hero route is PR1 Choice Core+Mac,
+PR2 iMessage same-account self-chat, and a same-main Core+iMessage checkpoint
+App/DMG proving one complete real outcome loop. Minimal B2 and minimal C2 then
+land as narrow proof chapters in the final B+ App/DMG.
+Host-owned `choice.begin` is the only public first-local-question
+intake/create route and must commit the initial session/audit atomically before
+model work. B+ B2 is one real import, at most three candidates, one Owner-
+selected card, and one separately confirmed Markdown diff. B+ C2 is one
+public instruction-only Skill and one no-external-effect use. Extra iMessage,
+Discord, broader expansion, and advanced presentation are post-B+. Real install, providers,
+permissions, Mission, Reminder, Evidence, Skill lifecycle, and release
+boundaries remain unclaimed. The supplied real ChatGPT export is authorized
+only for an isolated local, read-only, no-network, no-retention B2 diagnostic;
+neither it nor derived metadata may enter repository evidence or a remote.
+Sending bounded excerpts to the selected OpenAI model and committing selected
+Memory cards require later exact Owner consent.
+
+Reminder proposals use only explicit user temporal information. Missing time
+requires user selection; fixed/question-time defaults are forbidden. Exact
+future date/time/timezone/list/count bind confirmation and every edit
+reconfirms, while the real write remains a separate action-time gate.
+
 ## Pre-existing before July 13, 2026
 
 - Friday's general Mission, WorkItem, workflow, trust, storage, and Skill
@@ -134,7 +178,10 @@ or override that canonical contract.
   The package remains unnotarized, and no provider, administrator/cross-UID,
   `FRIDAY_ALPHA_READY`, or release proof is claimed.
 
-## Current competition additions (not yet claimed)
+## Superseded competition additions — historical only
+
+This section records the former 2026-07-17 plan and does not define the current
+Choice Loop critical path.
 
 - The optional macOS voice entry route; Hero A currently uses explicit text
   input.

@@ -1,6 +1,11 @@
 import AppKit
 import SwiftUI
 
+// Production shell contract: the immutable Owner-selected Editorial Native V3
+// artifact has SHA-256 7b251d81e228d7cec11abc473c28ff23ce47db396233eb6c4eb3bd5eed050cd3.
+// This file adapts only Host-owned typed state; it does not substitute a mock
+// state machine or grant any action authority.
+
 private final class DashboardInteractionAnchorView: NSView {
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
@@ -31,21 +36,400 @@ extension View {
 
 public struct OpenOpenRootView: View {
   @ObservedObject private var model: AppModel
+  @State private var section: EditorialSection
 
   public init(model: AppModel) {
     self.model = model
+    _section = State(initialValue: model.showsSettings ? .settings : .home)
   }
 
   public var body: some View {
-    Group {
-      if model.showsSettings {
-        SettingsView(model: model)
+    GeometryReader { geometry in
+      if geometry.size.width < 560 {
+        VStack(spacing: 0) {
+          EditorialToolbar(model: model, section: $section)
+          Divider()
+          EditorialCompactNavigation(section: $section)
+          Divider()
+          editorialContent
+        }
+        .background(EditorialPalette.background)
       } else {
-        DashboardView(model: model)
+        NavigationSplitView {
+          EditorialSidebar(section: $section)
+        } detail: {
+          VStack(spacing: 0) {
+            EditorialToolbar(model: model, section: $section)
+            Divider()
+            editorialContent
+          }
+          .background(EditorialPalette.background)
+        }
+        .navigationSplitViewStyle(.balanced)
       }
     }
-    .frame(minWidth: 720, minHeight: 520)
+    .frame(minWidth: 390, minHeight: 520)
+    // Root presentation can be opened directly into Settings.  It refreshes
+    // read-only state only; the Home card below is the sole UI owner-return
+    // signal that may resume an already-idle Choice session.
     .task { await model.refreshDashboard() }
+    .onAppear { section = model.showsSettings ? .settings : .home }
+    .onChange(of: model.showsSettings) { _, showsSettings in
+      if showsSettings { section = .settings }
+    }
+    .onChange(of: section) { _, section in
+      model.showsSettings = section == .settings
+    }
+  }
+
+  @ViewBuilder private var editorialContent: some View {
+    switch section {
+    case .home:
+      DashboardView(model: model, section: $section)
+    case .activity:
+      EditorialActivityView(model: model)
+    case .settings:
+      SettingsView(model: model)
+    case .messages, .memory, .skills:
+      EditorialUnavailableView(section: section)
+    }
+  }
+}
+
+/// The selected editorial navigation is a presentation shell only. It never
+/// creates a model, channel, Memory, Skill, or effect authority. Those remain
+/// represented by the Host-owned typed state that each production phase wires.
+private enum EditorialSection: String, CaseIterable, Hashable, Identifiable {
+  case home
+  case activity
+  case messages
+  case memory
+  case skills
+  case settings
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .home: "Home"
+    case .activity: "Activity"
+    case .messages: "Messages"
+    case .memory: "Memory"
+    case .skills: "Skills"
+    case .settings: "Settings"
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    // Match the frozen Editorial Native V3 navigation vocabulary.  These are
+    // semantic SF Symbol equivalents of its locked native-icon contract, not
+    // a second visual system.
+    case .home: "message.square.text"
+    case .activity: "list.bullet"
+    case .messages: "messages"
+    case .memory: "notebook"
+    case .skills: "shippingbox"
+    case .settings: "gearshape"
+    }
+  }
+}
+
+private enum EditorialPalette {
+  static let background = Color(nsColor: .windowBackgroundColor)
+  static let sidebar = Color(nsColor: .underPageBackgroundColor)
+  static let card = Color(nsColor: .controlBackgroundColor).opacity(0.72)
+  static let border = Color(nsColor: .separatorColor).opacity(0.65)
+  static let accent = Color(red: 51 / 255, green: 156 / 255, blue: 1)
+  static let destructive = Color(red: 226 / 255, green: 85 / 255, blue: 7 / 255)
+  static let cornerRadius: CGFloat = 20
+}
+
+private struct EditorialSidebar: View {
+  @Binding var section: EditorialSection
+
+  var body: some View {
+    List(selection: $section) {
+      Section {
+        ForEach(
+          [
+            EditorialSection.home,
+            .activity,
+            .messages,
+            .memory,
+            .skills,
+          ]
+        ) { destination in
+          Label(destination.title, systemImage: destination.symbol)
+            .tag(destination)
+            .accessibilityIdentifier("openopen-nav-\(destination.rawValue)")
+        }
+      }
+    }
+    .listStyle(.sidebar)
+    .scrollContentBackground(.hidden)
+    .background(EditorialPalette.sidebar)
+    .navigationSplitViewColumnWidth(min: 180, ideal: 180, max: 180)
+    .accessibilityIdentifier("openopen-editorial-sidebar")
+  }
+}
+
+/// The selected narrow shell turns the five primary destinations into a
+/// horizontal text navigation row rather than squeezing the desktop sidebar
+/// beside the 390-point content column.  Settings remains behind the frozen
+/// overflow action in both widths.
+private struct EditorialCompactNavigation: View {
+  @Binding var section: EditorialSection
+
+  private let destinations: [EditorialSection] = [.home, .activity, .messages, .memory, .skills]
+
+  var body: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 2) {
+        ForEach(destinations) { destination in
+          if destination == section {
+            Button(destination.title) { section = destination }
+              .buttonStyle(.borderedProminent)
+              .accessibilityIdentifier("openopen-nav-compact-\(destination.rawValue)")
+          } else {
+            Button(destination.title) { section = destination }
+              .buttonStyle(.borderless)
+              .accessibilityIdentifier("openopen-nav-compact-\(destination.rawValue)")
+          }
+        }
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 10)
+    }
+    .accessibilityIdentifier("openopen-editorial-compact-navigation")
+  }
+}
+
+private struct EditorialToolbar: View {
+  @ObservedObject var model: AppModel
+  @Binding var section: EditorialSection
+
+  private var statusLabel: String {
+    if model.runtimeDisplayState == .on, model.runtimeRecoveryState == .ready { return "On" }
+    if model.runtimeDisplayState == .off { return "Off" }
+    return "Needs you"
+  }
+
+  var body: some View {
+    ZStack {
+      HStack(spacing: 9) {
+        EditorialOpenMark()
+        Text("OpenOpen")
+          .font(.headline.weight(.medium))
+          .accessibilityIdentifier("openopen-editorial-product-title")
+        Spacer()
+        Label(statusLabel, systemImage: model.runtimeDisplayState.menuBarSymbol)
+          .font(.caption.weight(.medium))
+          .foregroundStyle(statusLabel == "Needs you" ? EditorialPalette.destructive : .secondary)
+          .accessibilityIdentifier("openopen-editorial-runtime-status")
+        Button {
+          section = .settings
+        } label: {
+          Image(systemName: "ellipsis")
+        }
+        .buttonStyle(.borderless)
+        .disabled(!model.dashboardControls.settingsEnabled)
+        .accessibilityLabel("More options")
+        .accessibilityIdentifier("openopen-editorial-more-options")
+      }
+      Text(section.title)
+        .font(.headline.weight(.medium))
+        .accessibilityIdentifier("openopen-editorial-toolbar-title")
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+    .background(EditorialPalette.background)
+  }
+}
+
+/// The frozen shell uses a restrained double-ring OpenOpen mark.  Keeping it
+/// local to the toolbar preserves the selected hierarchy without adding an
+/// asset pipeline or changing any typed product state.
+private struct EditorialOpenMark: View {
+  var body: some View {
+    ZStack {
+      Circle().stroke(.primary, lineWidth: 1)
+      Circle().stroke(.primary.opacity(0.55), lineWidth: 1).padding(4)
+    }
+    .frame(width: 17, height: 17)
+    .accessibilityHidden(true)
+  }
+}
+
+private struct EditorialActivityView: View {
+  @ObservedObject var model: AppModel
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 16) {
+        EditorialPageHeader(
+          eyebrow: "Recent",
+          title: "Activity",
+          detail:
+            "Local progress, evidence, and recovery stay visible without implying a new effect."
+        )
+        if let receipt = model.receipt {
+          EditorialCard(title: "Verified receipt", symbol: "checkmark.seal") {
+            Text(receipt.summary).font(.headline)
+            Text("Evidence: \(receipt.evidenceIds.count) Reminder completion(s)")
+              .foregroundStyle(.secondary)
+          }
+          .accessibilityIdentifier("openopen-activity-receipt")
+        }
+        if model.activeCards.isEmpty, model.receipt == nil, model.needsYou == nil {
+          EditorialEmptyState(
+            title: "No activity yet",
+            detail: "Your local Choice progress and verified receipts will appear here.",
+            symbol: "clock"
+          )
+        }
+        ForEach(model.activeCards) { card in
+          EditorialCard(title: card.title, symbol: "circle.dotted") {
+            Text(card.state).foregroundStyle(.secondary)
+          }
+        }
+        if let needsYou = model.needsYou {
+          EditorialCard(title: needsYou.title, symbol: "exclamationmark.circle") {
+            Text(needsYou.prompt)
+          }
+          .accessibilityIdentifier("openopen-activity-needs-you")
+        }
+      }
+      .padding(30)
+      .frame(maxWidth: 760, alignment: .leading)
+    }
+    .background(EditorialPalette.background)
+  }
+}
+
+private struct EditorialUnavailableView: View {
+  let section: EditorialSection
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 16) {
+        EditorialPageHeader(
+          eyebrow: section.title,
+          title: section.title,
+          detail:
+            "This surface is not active in the current verified phase. It cannot create authority or imply setup is complete."
+        )
+        EditorialEmptyState(
+          title: "Not available yet",
+          detail:
+            "OpenOpen will show this area only after its typed lifecycle has passed the required review and action-time boundaries.",
+          symbol: section.symbol
+        )
+      }
+      .padding(30)
+      .frame(maxWidth: 760, alignment: .leading)
+    }
+    .background(EditorialPalette.background)
+    .accessibilityIdentifier("openopen-editorial-\(section.rawValue)-unavailable")
+  }
+}
+
+private struct EditorialPageHeader: View {
+  let eyebrow: String
+  let title: String
+  let detail: String
+  var state: String? = nil
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      VStack(alignment: .leading, spacing: 6) {
+        Text(eyebrow.uppercased())
+          .font(.system(size: 12, weight: .medium))
+          .foregroundStyle(.secondary)
+        Text(title)
+          .font(.custom("New York", size: 24).weight(.medium))
+        Text(detail)
+          .font(.system(size: 14, weight: .regular))
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer(minLength: 8)
+      if let state {
+        Text(state)
+          .font(.caption.weight(.medium))
+          .padding(.horizontal, 8)
+          .padding(.vertical, 4)
+          .background(EditorialPalette.card, in: Capsule())
+          .overlay { Capsule().stroke(EditorialPalette.border, lineWidth: 1) }
+          .accessibilityIdentifier("openopen-editorial-page-state")
+      }
+    }
+  }
+}
+
+private struct EditorialCard<Content: View>: View {
+  let title: String
+  let symbol: String
+  @ViewBuilder let content: Content
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Label(title, systemImage: symbol)
+        .font(.headline)
+      content
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(12)
+    .background(
+      EditorialPalette.card,
+      in: RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+    )
+    .overlay {
+      RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+        .stroke(EditorialPalette.border, lineWidth: 1)
+    }
+  }
+}
+
+private struct EditorialEmptyState: View {
+  let title: String
+  let detail: String
+  let symbol: String
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Image(systemName: symbol)
+        .font(.title2)
+        .foregroundStyle(.secondary)
+      Text(title).font(.headline)
+      Text(detail).foregroundStyle(.secondary)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(12)
+    .background(
+      EditorialPalette.card,
+      in: RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+    )
+  }
+}
+
+private struct EditorialGroupBoxStyle: GroupBoxStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      configuration.label
+        .font(.headline)
+      configuration.content
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(12)
+    .background(
+      EditorialPalette.card,
+      in: RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+    )
+    .overlay {
+      RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+        .stroke(EditorialPalette.border, lineWidth: 1)
+    }
   }
 }
 
@@ -83,35 +467,27 @@ public struct OpenOpenMenuView: View {
 
 private struct DashboardView: View {
   @ObservedObject var model: AppModel
+  @Binding var section: EditorialSection
+  @FocusState private var homeComposerFocused: Bool
+
+  private var editorialPageState: String {
+    if model.runtimeRecoveryMessage != nil || model.errorMessage != nil { return "Needs you" }
+    if model.isBusy { return "Working" }
+    if model.runtimeDisplayState == .on, model.runtimeRecoveryState == .ready { return "Listening" }
+    if model.runtimeDisplayState == .off { return "Off" }
+    return "Checking"
+  }
 
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 20) {
-        HStack {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("OpenOpen")
-              .font(.largeTitle.bold())
-            Text("One useful outcome, kept within your boundaries.")
-              .foregroundStyle(.secondary)
-          }
-          Spacer()
-          Toggle(
-            model.runtimeDisplayState.label,
-            isOn: Binding(
-              get: { model.runtimeToggleValue },
-              set: { model.requestEnabled($0) }
-            )
-          )
-          .toggleStyle(.switch)
-          .disabled(!model.dashboardControls.globalToggleEnabled)
-          .accessibilityIdentifier("openopen-dashboard-global-toggle")
-          Text(model.runtimeDisplayState.label)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-          Button("Settings") { model.showsSettings = true }
-            .disabled(!model.dashboardControls.settingsEnabled)
-            .accessibilityIdentifier("openopen-dashboard-settings")
-        }
+        EditorialPageHeader(
+          eyebrow: "Today",
+          title: "Let’s make tomorrow easier.",
+          detail: "Talk naturally. OpenOpen narrows choices only when they change what happens.",
+          state: editorialPageState
+        )
+        .accessibilityIdentifier("openopen-editorial-home-header")
 
         if let errorMessage = model.errorMessage {
           LocalOperationFeedbackPanel(message: errorMessage) {
@@ -119,35 +495,53 @@ private struct DashboardView: View {
           }
         }
 
-        if let recoveryMessage = model.runtimeRecoveryState.message {
+        if let recoveryMessage = model.runtimeRecoveryMessage {
           RuntimeRecoveryBanner(
             message: recoveryMessage,
             isPaused: model.runtimeRecoveryState == .paused
           )
         }
 
-        HStack(spacing: 10) {
-          Button {
-          } label: {
-            Label("Microphone", systemImage: "mic.fill")
+        if let continuityMessage = model.choiceLoopContinuityMessage {
+          ChoiceLoopContinuityBanner(message: continuityMessage)
+        }
+
+        if model.runtimeRecoveryState == .awaitingAccount {
+          EditorialCard(title: "Welcome", symbol: "person.crop.circle.badge.checkmark") {
+            Text(
+              "One useful outcome, kept within your boundaries."
+            )
+            .foregroundStyle(.secondary)
+            Text(
+              "Start with one private conversation. OpenOpen will explain each permission before you grant it."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Button("Connect ChatGPT") { model.showsSettings = true }
+              .disabled(!model.accountSetupEnabled)
+              .accessibilityIdentifier("openopen-editorial-first-run-account-setup")
           }
-          .disabled(true)
-          .help(model.microphone.reason)
-          TextField("What outcome would help right now?", text: $model.prompt)
+        }
+
+        HStack(spacing: 10) {
+          TextField("Tell OpenOpen what you want to sort out…", text: $model.choiceQuestion)
             .textFieldStyle(.roundedBorder)
-            .onSubmit { Task { await model.submitPrompt() } }
+            .focused($homeComposerFocused)
+            .onSubmit { Task { await model.submitHomeComposer() } }
             .disabled(!model.dashboardControls.outcomeInputEnabled)
             .accessibilityIdentifier("openopen-dashboard-outcome-input")
-          Button(model.isBusy ? "Thinking…" : "Ask") {
-            Task { await model.submitPrompt() }
+          Button(model.isBusy ? "Working…" : "Send") {
+            Task { await model.submitHomeComposer() }
           }
           .disabled(!model.dashboardControls.outcomeSubmitEnabled)
           .accessibilityIdentifier("openopen-dashboard-outcome-submit")
           .dashboardInteractionAnchor("openopen-dashboard-outcome-submit")
         }
-        Text(model.microphone.reason)
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        .onChange(of: model.choiceDComposerFocusRequested) { _, requested in
+          guard requested else { return }
+          homeComposerFocused = true
+          model.consumeChoiceDComposerFocusRequest()
+        }
 
         if !model.channelFailureIncidents.isEmpty || model.channelFailureFeedback != nil
           || !model.channelListenerFeedback.isEmpty
@@ -155,104 +549,231 @@ private struct DashboardView: View {
           ChannelFailureIncidentPanel(model: model)
         }
 
-        if let suggestion = model.suggestion {
-          GroupBox("I can help") {
-            VStack(alignment: .leading, spacing: 8) {
-              Text(suggestion.title).font(.headline)
-              Text(suggestion.whyNow).foregroundStyle(.secondary)
-              ForEach(Array(suggestion.proposedSteps.enumerated()), id: \.offset) { index, step in
-                Text("\(index + 1). \(step)")
+        if let choiceSet = model.choiceLoopSnapshot?.activeChoiceSet,
+          ["active", "softIdle", "staleReview"].contains(model.choiceLoopSnapshot?.session.state)
+        {
+          VStack(spacing: 0) {
+            ForEach(choiceSet.options, id: \.id) { option in
+              EditorialChoiceRow(
+                key: ["A", "B", "C"][Int(option.position) - 1],
+                title: option.direction,
+                detail: option.rationale,
+                enabled: model.choiceSessionActionEnabled,
+                action: { Task { await model.selectChoiceOption(option) } }
+              )
+              .accessibilityIdentifier("openopen-choice-option-\(option.position)")
+            }
+            EditorialChoiceDRow(
+              enabled: model.choiceSessionActionEnabled,
+              action: { model.focusChoiceDComposer() }
+            )
+          }
+          .background(
+            EditorialPalette.card,
+            in: RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+          )
+          .overlay {
+            RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+              .stroke(EditorialPalette.border, lineWidth: 1)
+          }
+        }
+
+        if model.choiceLoopSnapshot?.session.state == "active",
+          model.choiceLoopSnapshot?.lastSelection != nil,
+          model.choiceReminderScheduleIsVisible
+        {
+          if let confirmation = model.choiceConfirmationPreview {
+            EditorialReminderProposal(
+              confirmation: confirmation,
+              formattedDateTime: { item in
+                "\(model.formattedChoiceReminderDateTime(item)) · \(item.timeZone)"
+              },
+              onEdit: { model.invalidateChoiceReminderScheduleDraft() },
+              onConfirm: { Task { await model.confirmPreparedChoice() } },
+              enabled: model.choiceSessionActionEnabled
+            )
+          } else {
+            GroupBox("A time is still needed") {
+              VStack(alignment: .leading, spacing: 8) {
+                Text(
+                  "The reminder can be prepared once you choose a date, time, and time zone. Nothing will be guessed."
+                )
+                .font(.caption)
+                if model.choiceReminderPickerIsPresented {
+                  DatePicker(
+                    "Date and time",
+                    selection: Binding(
+                      get: { model.choiceReminderPickerDate },
+                      set: { model.selectChoiceReminderDate($0) }
+                    )
+                  )
+                  .accessibilityIdentifier("openopen-choice-reminder-date-time")
+                } else {
+                  Button("Date and time") {
+                    model.presentChoiceReminderDatePicker()
+                  }
+                  .accessibilityIdentifier("openopen-choice-reminder-date-time")
+                }
+                Picker(
+                  "Time zone",
+                  selection: Binding(
+                    get: { model.choiceReminderTimeZone },
+                    set: { model.selectChoiceReminderTimeZone($0) }
+                  )
+                ) {
+                  Text("Choose time zone").tag("")
+                  ForEach(TimeZone.knownTimeZoneIdentifiers, id: \.self) { identifier in
+                    Text(identifier).tag(identifier)
+                  }
+                }
+                .accessibilityIdentifier("openopen-choice-reminder-time-zone")
+                Picker(
+                  "List",
+                  selection: Binding(
+                    get: { model.choiceReminderListId },
+                    set: { model.selectChoiceReminderList($0) }
+                  )
+                ) {
+                  Text("Choose list").tag("")
+                  Text("Reminders").tag("openopen.default-reminders")
+                }
+                .accessibilityIdentifier("openopen-choice-reminder-list")
+                Text("Quantity · 1 Reminder")
+                  .font(.caption)
+                  .accessibilityIdentifier("openopen-choice-reminder-count")
               }
+            }
+            HStack {
+              Button("Back") { model.backFromChoiceReminderSchedule() }
+                .accessibilityIdentifier("openopen-choice-reminder-back")
+              Button("Review reminder") { Task { await model.prepareChoiceConfirmation() } }
+                .disabled(
+                  !model.choiceSessionActionEnabled
+                    || !model.choiceReminderScheduleReadyForReview
+                )
+                .accessibilityIdentifier("openopen-choice-confirm-prepare")
+            }
+          }
+        }
+
+        if let state = model.choiceLoopSnapshot?.session.state,
+          state != "completed",
+          state != "cancelled" || model.choiceMarkdownReceiptCleanupAvailable
+        {
+          if state == "awaitingConfirmation", model.confirmedMission == nil {
+            GroupBox("Final confirmation") {
+              VStack(alignment: .leading, spacing: 8) {
+                Text("Ready to add one Reminder")
+                  .font(.headline)
+                Text("This next confirmation authorizes the real write to Reminders.")
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+                Button("Add Reminder") {
+                  model.requestChoiceReminderWrite()
+                }
+                .disabled(model.isBusy || !model.storeControlEnabled)
+                .accessibilityIdentifier("openopen-choice-reminder-authorize")
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+          if state == "executing" {
+            GroupBox("Local continuity saved") {
               Text(
-                "Confirming authorizes OpenOpen to create these exact items in its OpenOpen Reminders list."
+                "The prepared Markdown update is durable. Reminders and other effects remain separately gated."
               )
               .font(.caption)
               .foregroundStyle(.secondary)
-              Button(
-                model.confirmedMission == nil
-                  ? "Confirm & Create Reminders" : "Retry Reminders setup"
-              ) {
-                model.requestSuggestionConfirmation()
-              }
-              .disabled(!model.dashboardControls.suggestionConfirmationEnabled)
-              .accessibilityIdentifier("openopen-dashboard-confirm-mission")
-              .dashboardInteractionAnchor("openopen-dashboard-confirm-mission")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
+            .accessibilityIdentifier("openopen-choice-markdown-saved")
           }
-        } else {
-          ContentUnavailableView(
-            "No suggestion yet",
-            systemImage: "sparkles",
-            description: Text(
-              model.modelEntryEnabled
-                ? "Ask for an outcome above. OpenOpen shows at most one suggestion."
-                : "Turn OpenOpen on when you want it to make a model call."
-            )
-          )
+          if state == "awaitingConfirmation", model.confirmedMission != nil,
+            !model.reminderLinks.isEmpty
+          {
+            GroupBox("Adding and verifying the Reminder") {
+              VStack(alignment: .leading, spacing: 8) {
+                Text("OpenOpen is waiting for macOS, then will read back the result.")
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+                Button("Check Reminder") {
+                  Task { await model.checkChoiceReminderProgress() }
+                }
+                .disabled(model.isBusy || !model.storeControlEnabled)
+                .accessibilityIdentifier("openopen-choice-reminder-check")
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+          if state == "awaitingConfirmation",
+            model.confirmedMission?.choiceConfirmationId != nil,
+            model.reminderLinks.isEmpty
+          {
+            GroupBox("Adding and verifying the Reminder") {
+              VStack(alignment: .leading, spacing: 8) {
+                Text("OpenOpen is waiting for macOS, then will read back the result.")
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+                Button("Check Reminder") {
+                  model.requestChoiceReminderWrite()
+                }
+                .disabled(model.isBusy || !model.storeControlEnabled)
+                .accessibilityIdentifier("openopen-choice-reminder-recover")
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+          if (state == "awaitingConfirmation" && model.receipt != nil) || state == "executing"
+            || (state == "cancelled" && model.choiceMarkdownReceiptCleanupAvailable)
+          {
+            Button("Resume local save") {
+              Task { await model.reconcileChoiceMarkdown() }
+            }
+            // A receipt-backed cleanup is deletion-only and remains reachable
+            // after Global Off; publication still requires the normal On gate.
+            .disabled(model.isBusy)
+            .accessibilityIdentifier("openopen-choice-markdown-reconcile")
+          }
+          if state != "cancelled" {
+            Button("Cancel current choice") {
+              Task { await model.cancelChoiceSession() }
+            }
+            // Cancelling durable local continuity is Store control, not model
+            // work. A removed or drifted model selection must not trap a user in
+            // an active Choice session.
+            .disabled(model.isBusy || !model.storeControlEnabled)
+            .accessibilityIdentifier("openopen-choice-cancel")
+          }
         }
 
         if !model.activeCards.isEmpty {
           Text("Working on it").font(.title2.bold())
-          ForEach(model.activeCards) { card in
+          ForEach(
+            model.activeCards.filter { card in
+              model.confirmedMission?.choiceConfirmationId == nil
+                || card.id != model.confirmedMission?.missionId
+            }
+          ) { card in
             GroupBox(card.title) {
               VStack(alignment: .leading, spacing: 8) {
                 Text(card.state)
-                if model.confirmedMission?.missionId == card.id,
-                  model.reminderLinks.isEmpty
-                {
-                  Button("Set up Reminders") {
-                    model.requestSuggestionConfirmation()
-                  }
-                  .disabled(model.isBusy || !model.modelEntryEnabled)
-                } else if model.confirmedMission?.missionId == card.id {
-                  Button(
-                    model.channelRouteSet == nil ? "Check progress" : "Finish & Return Receipt"
-                  ) {
+                // Existing Mission recovery remains reachable without
+                // reinstating the retired Outcome proposal entrypoint. This
+                // only reads/continues an already durable historical route;
+                // new Choice confirmation still has its separate boundaries.
+                if model.confirmedMission?.missionId == card.id {
+                  Button("Check progress") {
                     model.requestMissionProgressCheck()
                   }
                   .disabled(!model.dashboardControls.missionProgressEnabled)
                   .accessibilityIdentifier("openopen-dashboard-check-progress")
                   .dashboardInteractionAnchor("openopen-dashboard-check-progress")
                 }
-                Button("Stop this Mission") {
-                  Task { await model.cancelMission(identifier: card.id) }
-                }
-                .disabled(!model.dashboardControls.missionCancellationEnabled)
-                .accessibilityIdentifier("openopen-dashboard-stop-mission")
                 Text(
-                  "Stops this Mission without retrying or removing any Reminders. Its audit history remains."
+                  "Historical Mission recovery stays separate from local Choice confirmation."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                if model.channelRouteSet?.missionId == card.id {
-                  Picker("Approved return route", selection: $model.selectedChannelRouteId) {
-                    ForEach(model.outboundChannelRoutes) { route in
-                      Text(
-                        "\(route.channel.displayName) · \(route.conversationId) · \(route.ownerSenderId)"
-                      )
-                      .tag(route.routeId)
-                    }
-                  }
-                  TextField("Exact progress message", text: $model.channelMessageDraft)
-                    .textFieldStyle(.roundedBorder)
-                  Text(
-                    "Send requires a fresh confirmation for this exact recipient and these exact bytes."
-                  )
-                  .font(.caption)
-                  .foregroundStyle(.secondary)
-                  Button("Approve & Send Progress") {
-                    Task { await model.sendChannelProgress() }
-                  }
-                  .disabled(
-                    model.isBusy || !model.channelEffectEntryEnabled
-                      || !model.selectedRouteAllowsProgress
-                      || model.channelMessageDraft.trimmingCharacters(
-                        in: .whitespacesAndNewlines
-                      ).isEmpty
-                  )
-                }
+                .accessibilityIdentifier("openopen-pr1-historical-mission-read-only")
               }
               .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -263,15 +784,9 @@ private struct DashboardView: View {
             VStack(alignment: .leading, spacing: 8) {
               Text(needsYou.title).font(.headline)
               Text(needsYou.prompt)
-              if model.channelRouteSet?.missionId == needsYou.missionId {
-                Button("Approve & Send Need you") {
-                  Task { await model.sendChannelNeedYou() }
-                }
-                .disabled(
-                  model.isBusy || !model.channelEffectEntryEnabled
-                    || !model.selectedRouteAllowsNeedYou
-                )
-              }
+              Text("This historical request is read-only during local Choice Core.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
@@ -294,34 +809,214 @@ private struct DashboardView: View {
             .padding(4)
           }
         }
-        if model.dashboardControls.doneVisible, let receipt = model.receipt {
-          GroupBox("Done") {
-            VStack(alignment: .leading, spacing: 8) {
-              Text(receipt.summary).font(.headline)
-              Text("Evidence: \(receipt.evidenceIds.count) Reminder completion(s)")
-                .foregroundStyle(.secondary)
-              Text("Model: \(receipt.actualModel)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-              if model.channelRouteSet?.missionId == receipt.missionId {
-                Button("Return Receipt") {
-                  Task { await model.sendChannelReceipt() }
+        if model.dashboardControls.doneVisible, model.receiptIsPresentableOnHome,
+          let receipt = model.receipt
+        {
+          Group {
+            if model.receiptIsForCurrentChoice {
+              GroupBox("Reminder added and verified") {
+                VStack(alignment: .leading, spacing: 12) {
+                  Text("Reminder added and verified").font(.headline)
+                  Text("Completed · verified just now")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                  Divider()
+                  VStack(alignment: .leading, spacing: 3) {
+                    Text("Result").font(.headline)
+                    Text(
+                      "The saved Reminder matches the confirmed date, time, time zone, list, and count."
+                    )
+                    .foregroundStyle(.secondary)
+                    Text("Verified").font(.caption).foregroundStyle(.secondary)
+                  }
+                  VStack(alignment: .leading, spacing: 3) {
+                    Text("Evidence").font(.headline)
+                    Text("Readable proof is available without exposing private content.")
+                      .foregroundStyle(.secondary)
+                    Text("\(receipt.evidenceIds.count) verified Reminder completion(s)")
+                      .font(.caption)
+                      .foregroundStyle(.secondary)
+                  }
+                  HStack(spacing: 8) {
+                    Button("View evidence") { section = .activity }
+                      .accessibilityIdentifier("openopen-choice-receipt-view-evidence")
+                    Button("Continue") {
+                      Task { await model.refreshDashboard(authenticatedHomeForeground: true) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("openopen-choice-receipt-continue")
+                  }
                 }
-                .disabled(
-                  model.isBusy || !model.channelEffectEntryEnabled
-                    || !model.selectedRouteAllowsReceipt
-                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(4)
+              }
+              .accessibilityIdentifier("openopen-choice-reminder-receipt")
+            } else {
+              GroupBox("Done") {
+                VStack(alignment: .leading, spacing: 8) {
+                  Text(receipt.summary).font(.headline)
+                  Text("Evidence: \(receipt.evidenceIds.count) Reminder completion(s)")
+                    .foregroundStyle(.secondary)
+                  Text("Model: \(receipt.actualModel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                  Text("Historical Receipt delivery is unavailable during local Choice Core.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(4)
               }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
           }
           .accessibilityIdentifier("openopen-dashboard-done")
           .dashboardInteractionAnchor("openopen-dashboard-done")
         }
         Spacer()
       }
-      .padding(24)
+      .padding(30)
+      .frame(maxWidth: 760, alignment: .leading)
+      .groupBoxStyle(EditorialGroupBoxStyle())
+    }
+    .scrollContentBackground(.hidden)
+    .background(EditorialPalette.background)
+    .task { await model.refreshDashboard(authenticatedHomeForeground: true) }
+  }
+}
+
+private struct EditorialChoiceRow: View {
+  let key: String
+  let title: String
+  let detail: String
+  let enabled: Bool
+  let action: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Text(key)
+        .font(.caption.weight(.medium))
+        .frame(width: 26, height: 26)
+        .background(EditorialPalette.background, in: Circle())
+        .overlay { Circle().stroke(EditorialPalette.border, lineWidth: 1) }
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 3) {
+        Text(title).font(.headline)
+        Text(detail).font(.caption).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 8)
+      Button("Choose", action: action)
+        .buttonStyle(.bordered)
+        .disabled(!enabled)
+        .accessibilityLabel("Choose \(key): \(title)")
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct EditorialChoiceDRow: View {
+  let enabled: Bool
+  let action: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Text("D")
+        .font(.caption.weight(.medium))
+        .frame(width: 26, height: 26)
+        .background(EditorialPalette.background, in: Circle())
+        .overlay { Circle().stroke(EditorialPalette.border, lineWidth: 1) }
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 3) {
+        Text("Something else").font(.headline)
+        Text("Describe what these options missed.").font(.caption).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 8)
+      Button("Choose", action: action)
+        .buttonStyle(.bordered)
+        .disabled(!enabled)
+        .accessibilityLabel("Choose D: Something else")
+        .accessibilityIdentifier("openopen-choice-d-submit")
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct EditorialReminderProposal: View {
+  let confirmation: ChoiceConsolidatedConfirmation
+  let formattedDateTime: (ChoiceReminderItem) -> String
+  let onEdit: () -> Void
+  let onConfirm: () -> Void
+  let enabled: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(spacing: 10) {
+        Image(systemName: "calendar.badge.checkmark")
+          .font(.title3)
+          .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Reminder proposal").font(.headline)
+          Text("Review every detail before anything happens")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+        Spacer()
+        Text("Ready to review")
+          .font(.caption.weight(.medium))
+          .foregroundStyle(.secondary)
+      }
+      Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
+        GridRow {
+          Text("Reminder").foregroundStyle(.secondary)
+          VStack(alignment: .leading, spacing: 6) {
+            ForEach(confirmation.reminderItems) { item in
+              Text(item.text)
+                .accessibilityIdentifier("openopen-choice-confirm-reminder-item-\(item.id)")
+            }
+          }
+        }
+        GridRow {
+          Text("When").foregroundStyle(.secondary)
+          VStack(alignment: .leading, spacing: 6) {
+            ForEach(confirmation.reminderItems) { item in
+              Text(formattedDateTime(item))
+                .accessibilityIdentifier("openopen-choice-confirm-reminder-date-time-\(item.id)")
+            }
+          }
+        }
+        GridRow {
+          Text("List").foregroundStyle(.secondary)
+          Text("Reminders")
+            .accessibilityIdentifier("openopen-choice-confirm-reminder-list")
+        }
+        GridRow {
+          Text("Quantity").foregroundStyle(.secondary)
+          Text(
+            "\(confirmation.reminderCount) reminder\(confirmation.reminderCount == 1 ? "" : "s")"
+          )
+          .accessibilityIdentifier("openopen-choice-confirm-reminder-count")
+        }
+      }
+      HStack {
+        Button("Edit", action: onEdit)
+          .buttonStyle(.bordered)
+          .disabled(!enabled)
+          .accessibilityIdentifier("openopen-choice-confirm-reminder-revise")
+        Spacer()
+        Button("Review and confirm", action: onConfirm)
+          .buttonStyle(.borderedProminent)
+          .disabled(!enabled)
+          .accessibilityIdentifier("openopen-choice-confirm")
+      }
+    }
+    .padding(14)
+    .background(
+      EditorialPalette.card,
+      in: RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
+    )
+    .overlay {
+      RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous).stroke(
+        EditorialPalette.border, lineWidth: 1)
     }
   }
 }
@@ -332,20 +1027,14 @@ private struct SettingsView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      HStack {
-        Button {
-          model.showsSettings = false
-        } label: {
-          Label("Dashboard", systemImage: "chevron.left")
-        }
-        Spacer()
-        Text("Settings").font(.title2.bold())
-        Spacer()
-        Color.clear.frame(width: 90, height: 1)
-      }
-      .padding()
-      Divider()
-      if let recoveryMessage = model.runtimeRecoveryState.message {
+      EditorialPageHeader(
+        eyebrow: "Settings",
+        title: "Settings",
+        detail: "Account, model, privacy, and recovery controls remain local and explicit."
+      )
+      .padding(.horizontal, 24)
+      .padding(.vertical, 20)
+      if let recoveryMessage = model.runtimeRecoveryMessage {
         RuntimeRecoveryBanner(
           message: recoveryMessage,
           isPaused: model.runtimeRecoveryState == .paused
@@ -412,6 +1101,64 @@ private struct SettingsView: View {
           description: Text("Connect ChatGPT while OpenOpen is on to load the verified catalog.")
         )
       } else {
+        Picker(
+          "Model",
+          selection: Binding(
+            get: { model.selectedModelId },
+            set: { model.chooseModel($0) }
+          )
+        ) {
+          Text("Choose a model").tag("")
+          ForEach(model.availableModels) { candidate in
+            Text(candidate.displayName).tag(candidate.id)
+          }
+        }
+        .disabled(!model.accountSetupEnabled || model.isBusy)
+        .accessibilityIdentifier("openopen-model-picker-model")
+
+        if let selected = model.selectedCatalogModel {
+          if selected.supportedReasoningEfforts.isEmpty {
+            Text("This model has no configurable effort.")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .accessibilityIdentifier("openopen-model-picker-effort-not-applicable")
+          } else {
+            Picker(
+              "Effort",
+              selection: Binding(
+                get: { model.selectedModelEffort },
+                set: { model.chooseModelEffort($0) }
+              )
+            ) {
+              Text("Choose an effort").tag("")
+              ForEach(selected.supportedReasoningEfforts, id: \.self) { effort in
+                Text(model.modelEffortLabel(effort)).tag(effort)
+              }
+            }
+            .disabled(!model.accountSetupEnabled || model.isBusy)
+            .accessibilityIdentifier("openopen-model-picker-effort")
+          }
+          Button("Save model selection") {
+            Task { await model.persistSelectedModel() }
+          }
+          .disabled(!model.modelSelectionCanBeSaved)
+          .accessibilityIdentifier("openopen-model-picker-save")
+        }
+
+        if model.modelSelectionStatus == .current {
+          Text("A model and effort selection is saved for this account catalog.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("openopen-model-picker-saved")
+        } else if model.modelSelectionStatus == .unavailable {
+          Text(
+            "The saved model selection does not match the current account catalog. Choose again."
+          )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .accessibilityIdentifier("openopen-model-picker-needs-selection")
+        }
+
         List(model.availableModels) { model in
           VStack(alignment: .leading) {
             Text(model.displayName)
@@ -423,6 +1170,23 @@ private struct SettingsView: View {
   }
 
   private var connections: some View {
+    Group {
+      if model.choiceCoreConnectionsAvailable {
+        legacyConnections
+      } else {
+        VStack(alignment: .leading, spacing: 12) {
+          Text("Connections").font(.title.bold())
+          Text("Connection setup is unavailable while local Choice Core is active.")
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("openopen-choice-core-connections-unavailable")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+      }
+    }
+  }
+
+  private var legacyConnections: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 20) {
         Text("Connections").font(.title.bold())
@@ -655,12 +1419,42 @@ private struct SettingsView: View {
   private var privacy: some View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Privacy").font(.title.bold())
+      Toggle(
+        "OpenOpen",
+        isOn: Binding(
+          get: { model.runtimeToggleValue },
+          set: { model.requestEnabled($0) }
+        )
+      )
+      .disabled(!model.dashboardControls.globalToggleEnabled)
+      .accessibilityIdentifier("openopen-editorial-global-toggle")
       Text(
         "OpenOpen is off by default. Off stops model calls and cancels an active Codex operation without deleting local state."
       )
       Text(
         "Codex credentials stay in the macOS Keychain. Model input uses a short-lived, isolated local workspace."
       )
+      if let persona = model.personaStatus {
+        Divider()
+        Text("Persona").font(.headline)
+          .accessibilityIdentifier("openopen-persona-provenance-title")
+        LabeledContent("Revision") {
+          Text("\(persona.status.active.personaId) / \(persona.status.active.revision)")
+            .textSelection(.enabled)
+        }
+        .accessibilityIdentifier("openopen-persona-provenance-revision")
+        LabeledContent("Bundle digest") {
+          Text(persona.status.active.aggregateDigest)
+            .font(.caption.monospaced())
+            .textSelection(.enabled)
+        }
+        .accessibilityIdentifier("openopen-persona-provenance-digest")
+        if let warning = persona.status.warning {
+          Label(warning, systemImage: "exclamationmark.triangle")
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("openopen-persona-provenance-warning")
+        }
+      }
       Spacer()
     }
   }
@@ -687,6 +1481,19 @@ private struct RuntimeRecoveryBanner: View {
     )
     .foregroundStyle(isPaused ? .orange : .secondary)
     .accessibilityIdentifier("core-runtime-recovery-banner")
+  }
+}
+
+private struct ChoiceLoopContinuityBanner: View {
+  let message: String
+
+  var body: some View {
+    Label(message, systemImage: "arrow.triangle.2.circlepath")
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(10)
+      .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+      .foregroundStyle(.secondary)
+      .accessibilityIdentifier("openopen-choice-continuity-needs-you")
   }
 }
 

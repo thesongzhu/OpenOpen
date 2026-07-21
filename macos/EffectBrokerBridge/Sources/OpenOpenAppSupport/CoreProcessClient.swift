@@ -599,12 +599,165 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
     try await call(method: "models.list", parameters: RuntimeProofParameters(proof))
   }
 
-  public func propose(prompt: String, proof: BrokerRuntimeState) async throws -> OutcomeSuggestion {
+  public func modelSetup(proof: BrokerRuntimeState) async throws -> ModelSetup {
+    try await call(method: "models.setup.read", parameters: RuntimeProofParameters(proof))
+  }
+
+  public func selectedModel(proof: BrokerRuntimeState) async throws -> ModelSelection? {
+    try await call(method: "models.selection.read", parameters: RuntimeProofParameters(proof))
+  }
+
+  public func personaStatus() async throws -> PersonaStatusView? {
+    let response: PersonaStatusView = try await call(
+      method: "persona.status", parameters: EmptyParameters())
+    guard response.validated() else {
+      throw CoreClientError.contractViolation("Core returned an invalid Persona status.")
+    }
+    return response
+  }
+
+  public func selectModel(
+    modelId: String,
+    requestedEffort: String,
+    catalogSnapshotId: String,
+    catalogFingerprint: String,
+    catalogRevision: UInt64,
+    proof: BrokerRuntimeState
+  ) async throws -> ModelSelection {
     try await call(
-      method: "outcome.propose",
-      parameters: OutcomeRequest(prompt: prompt, proof: proof),
-      deadline: .seconds(210)
+      method: "models.select",
+      parameters: SelectModelParameters(
+        modelId: modelId,
+        requestedEffort: requestedEffort,
+        catalogSnapshotId: catalogSnapshotId,
+        catalogFingerprint: catalogFingerprint,
+        catalogRevision: catalogRevision,
+        proof: proof)
     )
+  }
+
+  public func choiceLoop() async throws -> ChoiceLoopSnapshot? {
+    try await call(method: "choice.loop.read", parameters: EmptyParameters())
+  }
+
+  public func choiceReminderSchedule() async throws -> ChoiceReminderSchedule? {
+    try await call(method: "choice.reminder.schedule.read", parameters: EmptyParameters())
+  }
+
+  public func beginChoice(_ parameters: ChoiceBeginParameters) async throws -> ChoiceBeginAccepted {
+    try await call(method: "choice.begin", parameters: parameters)
+  }
+
+  public func selectChoice(
+    _ selection: ChoiceSelection, proof: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    try await call(
+      method: "choice.select",
+      parameters: SelectChoiceParameters(
+        selection: selection, proof: proof))
+  }
+
+  public func selectChoiceD(
+    _ input: ChoiceDInput, proof: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    try await call(
+      method: "choice.select",
+      parameters: SelectChoiceParameters(dInput: input, proof: proof))
+  }
+
+  public func resumeChoice(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    try await call(method: "choice.resume", parameters: CancelChoiceParameters(proof: proof))
+  }
+
+  public func cancelChoice(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    try await call(method: "choice.cancel", parameters: CancelChoiceParameters(proof: proof))
+  }
+
+  public func reconcileChoiceMarkdown(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot
+  {
+    try await call(
+      method: "choice.markdown.reconcile", parameters: CancelChoiceParameters(proof: proof))
+  }
+
+  public func cleanupChoiceMarkdownReceipt() async throws -> ChoiceLoopSnapshot {
+    try await call(
+      method: "choice.markdown.receipt.cleanup", parameters: EmptyParameters(),
+      startPolicy: .requireRunning)
+  }
+
+  public func choiceMarkdownReceiptCleanupAvailability() async throws
+    -> ChoiceMarkdownReceiptCleanupAvailability
+  {
+    try await call(
+      method: "choice.markdown.receipt.cleanup.available", parameters: EmptyParameters(),
+      startPolicy: .requireRunning)
+  }
+
+  public func confirmChoice(
+    _ confirmation: ChoiceConsolidatedConfirmation, proof: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    try await call(
+      method: "choice.confirm",
+      parameters: ConfirmChoiceParameters(confirmation: confirmation, proof: proof))
+  }
+
+  public func prepareChoiceConfirmation(
+    proof: BrokerRuntimeState
+  ) async throws -> ChoiceConsolidatedConfirmation {
+    try await call(
+      method: "choice.confirm.prepare",
+      parameters: PrepareChoiceConfirmationParameters(proof: proof))
+  }
+
+  public func recordChoiceReminderSchedule(
+    _ input: ChoiceReminderScheduleInput, proof: BrokerRuntimeState
+  ) async throws -> ChoiceReminderSchedule {
+    try await call(
+      method: "choice.reminder.schedule",
+      parameters: RecordChoiceReminderScheduleParameters(input: input, proof: proof))
+  }
+
+  public func authorizeChoiceReminders(
+    confirmationId: String, reminderTarget: ReminderTarget, proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    try await call(
+      method: "choice.reminders.authorize",
+      parameters: AuthorizeChoiceRemindersParameters(
+        confirmationId: confirmationId, reminderTarget: reminderTarget, proof: proof))
+  }
+
+  public func beginChoiceReminderDispatch(
+    confirmationId: String, proof: BrokerRuntimeState
+  ) async throws -> ReminderDispatchStart {
+    try await call(
+      method: "choice.reminders.begin",
+      parameters: ChoiceReminderRequestParameters(confirmationId: confirmationId, proof: proof))
+  }
+
+  public func abortChoiceReminderDispatchBeforeCommit(
+    confirmationId: String, proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    try await call(
+      method: "choice.reminders.abort-before-commit",
+      parameters: ChoiceReminderRequestParameters(confirmationId: confirmationId, proof: proof))
+  }
+
+  public func recordChoiceReminderMirror(
+    confirmationId: String, links: [ReminderLink], proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    try await call(
+      method: "choice.reminders.record",
+      parameters: RecordChoiceReminderMirrorParameters(
+        confirmationId: confirmationId, links: links, proof: proof))
+  }
+
+  public func completeChoiceReminders(
+    confirmationId: String, completions: [ReminderCompletionInput], proof: BrokerRuntimeState
+  ) async throws -> ChoiceReminderCompletion {
+    try await call(
+      method: "choice.reminders.complete",
+      parameters: CompleteChoiceRemindersParameters(
+        confirmationId: confirmationId, completions: completions, proof: proof))
   }
 
   public func confirmSuggestion(

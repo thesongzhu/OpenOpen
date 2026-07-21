@@ -9,6 +9,10 @@ public struct CoreGenerationFence: Equatable, Sendable {
 }
 
 public protocol CoreServing: Sendable {
+  /// The production Core never enables deferred channel stages during PR1.
+  /// The explicit test double override keeps historical recovery fixtures
+  /// covered without making the shipped App surface writable channel routes.
+  var permitsDeferredChannelTestRoutes: Bool { get }
   func beginCoreGenerationFence() async throws -> CoreGenerationFence
   func closeCoreGenerationFence(_ fence: CoreGenerationFence) async -> Bool
   func runtime() async throws -> RuntimeControl
@@ -75,7 +79,56 @@ public protocol CoreServing: Sendable {
   func beginLogin(proof: BrokerRuntimeState) async throws -> ChatGptLogin
   func awaitLogin(identifier: String, proof: BrokerRuntimeState) async throws
   func models(proof: BrokerRuntimeState) async throws -> [GptModel]
-  func propose(prompt: String, proof: BrokerRuntimeState) async throws -> OutcomeSuggestion
+  func modelSetup(proof: BrokerRuntimeState) async throws -> ModelSetup
+  func selectedModel(proof: BrokerRuntimeState) async throws -> ModelSelection?
+  func personaStatus() async throws -> PersonaStatusView?
+  func selectModel(
+    modelId: String,
+    requestedEffort: String,
+    catalogSnapshotId: String,
+    catalogFingerprint: String,
+    catalogRevision: UInt64,
+    proof: BrokerRuntimeState
+  ) async throws -> ModelSelection
+  func choiceLoop() async throws -> ChoiceLoopSnapshot?
+  func choiceReminderSchedule() async throws -> ChoiceReminderSchedule?
+  func beginChoice(_ parameters: ChoiceBeginParameters) async throws -> ChoiceBeginAccepted
+  func selectChoice(_ selection: ChoiceSelection, proof: BrokerRuntimeState) async throws
+    -> ChoiceLoopSnapshot
+  func selectChoiceD(
+    _ input: ChoiceDInput, proof: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot
+  func resumeChoice(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot
+  func confirmChoice(
+    _ confirmation: ChoiceConsolidatedConfirmation,
+    proof: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot
+  func prepareChoiceConfirmation(
+    proof: BrokerRuntimeState
+  ) async throws -> ChoiceConsolidatedConfirmation
+  func recordChoiceReminderSchedule(
+    _ input: ChoiceReminderScheduleInput, proof: BrokerRuntimeState
+  ) async throws -> ChoiceReminderSchedule
+  func authorizeChoiceReminders(
+    confirmationId: String, reminderTarget: ReminderTarget, proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission
+  func beginChoiceReminderDispatch(
+    confirmationId: String, proof: BrokerRuntimeState
+  ) async throws -> ReminderDispatchStart
+  func abortChoiceReminderDispatchBeforeCommit(
+    confirmationId: String, proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission
+  func recordChoiceReminderMirror(
+    confirmationId: String, links: [ReminderLink], proof: BrokerRuntimeState
+  ) async throws -> ConfirmedMission
+  func completeChoiceReminders(
+    confirmationId: String, completions: [ReminderCompletionInput], proof: BrokerRuntimeState
+  ) async throws -> ChoiceReminderCompletion
+  func cancelChoice(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot
+  func reconcileChoiceMarkdown(proof: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot
+  func cleanupChoiceMarkdownReceipt() async throws -> ChoiceLoopSnapshot
+  func choiceMarkdownReceiptCleanupAvailability() async throws
+    -> ChoiceMarkdownReceiptCleanupAvailability
   func confirmSuggestion(
     identifier: String, reminderTarget: ReminderTarget
   ) async throws -> ConfirmedMission
@@ -95,6 +148,95 @@ public protocol CoreServing: Sendable {
 }
 
 extension CoreServing {
+  public func authorizeChoiceReminders(
+    confirmationId _: String, reminderTarget _: ReminderTarget, proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Choice Reminder authorization is unavailable.")
+  }
+
+  public func beginChoiceReminderDispatch(
+    confirmationId _: String, proof _: BrokerRuntimeState
+  ) async throws -> ReminderDispatchStart {
+    throw CoreClientError.contractViolation("Choice Reminder dispatch is unavailable.")
+  }
+
+  public func abortChoiceReminderDispatchBeforeCommit(
+    confirmationId _: String, proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Choice Reminder dispatch recovery is unavailable.")
+  }
+
+  public func recordChoiceReminderMirror(
+    confirmationId _: String, links _: [ReminderLink], proof _: BrokerRuntimeState
+  ) async throws -> ConfirmedMission {
+    throw CoreClientError.contractViolation("Choice Reminder Evidence is unavailable.")
+  }
+
+  public func completeChoiceReminders(
+    confirmationId _: String, completions _: [ReminderCompletionInput],
+    proof _: BrokerRuntimeState
+  ) async throws -> ChoiceReminderCompletion {
+    throw CoreClientError.contractViolation("Choice Reminder completion is unavailable.")
+  }
+
+  public var permitsDeferredChannelTestRoutes: Bool { false }
+  public func selectChoice(_: ChoiceSelection, proof _: BrokerRuntimeState) async throws
+    -> ChoiceLoopSnapshot
+  {
+    throw CoreClientError.contractViolation("Choice selection is unavailable from this Core.")
+  }
+
+  public func selectChoiceD(
+    _: ChoiceDInput, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    throw CoreClientError.contractViolation("Choice D selection is unavailable from this Core.")
+  }
+
+  public func resumeChoice(proof _: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    throw CoreClientError.contractViolation("Choice resume is unavailable from this Core.")
+  }
+
+  public func confirmChoice(
+    _: ChoiceConsolidatedConfirmation, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceLoopSnapshot {
+    throw CoreClientError.contractViolation("Choice confirmation is unavailable from this Core.")
+  }
+
+  public func prepareChoiceConfirmation(
+    proof _: BrokerRuntimeState
+  ) async throws -> ChoiceConsolidatedConfirmation {
+    throw CoreClientError.contractViolation("Choice confirmation is unavailable from this Core.")
+  }
+
+  public func recordChoiceReminderSchedule(
+    _: ChoiceReminderScheduleInput, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceReminderSchedule {
+    throw CoreClientError.contractViolation(
+      "Choice Reminder scheduling is unavailable from this Core.")
+  }
+
+  public func cancelChoice(proof _: BrokerRuntimeState) async throws -> ChoiceLoopSnapshot {
+    throw CoreClientError.contractViolation("Choice cancellation is unavailable from this Core.")
+  }
+
+  public func reconcileChoiceMarkdown(proof _: BrokerRuntimeState) async throws
+    -> ChoiceLoopSnapshot
+  {
+    throw CoreClientError.contractViolation(
+      "Choice Markdown recovery is unavailable from this Core.")
+  }
+
+  public func cleanupChoiceMarkdownReceipt() async throws -> ChoiceLoopSnapshot {
+    throw CoreClientError.contractViolation(
+      "Choice Markdown receipt cleanup is unavailable from this Core.")
+  }
+
+  public func choiceMarkdownReceiptCleanupAvailability() async throws
+    -> ChoiceMarkdownReceiptCleanupAvailability
+  {
+    ChoiceMarkdownReceiptCleanupAvailability(available: false)
+  }
+
   public func beginCoreGenerationFence() async throws -> CoreGenerationFence {
     throw CoreClientError.contractViolation(
       "This Core client cannot bind a recovery attempt to one process generation.")
@@ -164,6 +306,49 @@ extension CoreServing {
 
   public func channelStatus(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
     throw CoreClientError.contractViolation("Channel status is unavailable in this test client.")
+  }
+
+  public func selectedModel(proof _: BrokerRuntimeState) async throws -> ModelSelection? { nil }
+
+  /// Non-production clients may omit this diagnostic projection. They never
+  /// receive a mutable Persona lifecycle route through the fallback.
+  public func personaStatus() async throws -> PersonaStatusView? { nil }
+
+  /// Test-only/default clients do not have the production atomic setup RPC.
+  /// They must never grant model readiness from this fallback: shipped
+  /// `CoreProcessClient` overrides it with `models.setup.read`.
+  public func modelSetup(proof: BrokerRuntimeState) async throws -> ModelSetup {
+    let account = try await account(proof: proof)
+    let models = try await models(proof: proof)
+    let selection = try await selectedModel(proof: proof)
+    return ModelSetup(
+      account: account,
+      models: models,
+      selection: selection,
+      selectionStatus: selection == nil ? .unselected : .unavailable,
+      catalogSnapshotId: "",
+      catalogFingerprint: "",
+      catalogRevision: 0
+    )
+  }
+
+  public func selectModel(
+    modelId _: String,
+    requestedEffort _: String,
+    catalogSnapshotId _: String,
+    catalogFingerprint _: String,
+    catalogRevision _: UInt64,
+    proof _: BrokerRuntimeState
+  ) async throws -> ModelSelection {
+    throw CoreClientError.contractViolation("Model selection is unavailable in this test client.")
+  }
+
+  public func choiceLoop() async throws -> ChoiceLoopSnapshot? { nil }
+  public func choiceReminderSchedule() async throws -> ChoiceReminderSchedule? { nil }
+
+  public func beginChoice(_ parameters: ChoiceBeginParameters) async throws -> ChoiceBeginAccepted {
+    _ = parameters
+    throw CoreClientError.contractViolation("Choice intake is unavailable in this test client.")
   }
 
   public func stopChannel(_ channel: ChannelKind) async throws -> ChannelStatusResponse {
@@ -261,11 +446,38 @@ public enum RuntimeRecoveryState: Equatable, Sendable {
     case .recovering:
       "OpenOpen is restoring its verified local runtime and approved connections."
     case .awaitingAccount:
-      "Need you: connect ChatGPT and verify GPT-5.6 Sol with high reasoning before OpenOpen finishes turning on."
+      "Need you: review your account and model setup before OpenOpen finishes turning on."
     case .paused:
       "Need you: OpenOpen paused after Core stopped. No listener, model, or outbound work is running."
     }
   }
+}
+
+/// The foreground Choice session is useful local continuity, but it is never
+/// authority for a model turn or an external effect. A failed read must remain
+/// visible without making protected Off, Settings, or Dashboard controls
+/// unreachable.
+public enum ChoiceLoopContinuityState: Equatable, Sendable {
+  case empty
+  case current
+  case needsYou(ChoiceLoopContinuityIssue)
+
+  public var message: String? {
+    switch self {
+    case .empty, .current:
+      nil
+    case .needsYou:
+      "Need you: OpenOpen could not verify your local session continuity. Review it before relying on it."
+    }
+  }
+}
+
+public enum ChoiceLoopContinuityIssue: Equatable, Sendable {
+  case readFailed
+  case invalidContract
+  case blocked
+  case clockUncertain
+  case refreshRequired
 }
 
 /// The functional Dashboard surface derived from product state.
@@ -297,9 +509,13 @@ public struct DashboardControlState: Equatable, Sendable {
     hasReceipt: Bool,
     terminalIncidentCount _: Int,
     localFeedbackPresent _: Bool,
-    prompt: String
+    prompt: String,
+    hasActiveForegroundChoiceSession: Bool = false,
+    permitsFocusedChoiceDComposer: Bool = false
   ) -> Self {
-    let inputEnabled = modelEntryEnabled && !isBusy && !hasConfirmedMission && !hasNeedsYou
+    let inputEnabled =
+      modelEntryEnabled && !isBusy && !hasConfirmedMission && !hasNeedsYou
+      && (!hasActiveForegroundChoiceSession || permitsFocusedChoiceDComposer)
     let normalizedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
     return Self(
       // Runtime-control and navigation must remain reachable independently of
@@ -308,7 +524,7 @@ public struct DashboardControlState: Equatable, Sendable {
       settingsEnabled: true,
       outcomeInputEnabled: inputEnabled,
       outcomeSubmitEnabled: inputEnabled && !normalizedPrompt.isEmpty
-        && prompt.utf8.count <= 16 * 1024,
+        && normalizedPrompt.utf8.count <= 4_096,
       suggestionConfirmationEnabled: modelEntryEnabled && !isBusy && hasSuggestion
         && (!hasConfirmedMission || suggestionMatchesConfirmedMission),
       // Reminder readback/completion and Mission cancellation are bounded
@@ -335,6 +551,16 @@ extension CoreProcessClient: CoreServing {}
 
 @MainActor
 public final class AppModel: ObservableObject {
+  /// Channel setup belongs to PR2/PR3, not the PR1 local Choice Core. The
+  /// historical connection state remains readable, but this stage never
+  /// exposes setup, pairing, token, or listener actions.
+  public var choiceCoreConnectionsAvailable: Bool { core.permitsDeferredChannelTestRoutes }
+
+  /// PR1 renders durable historical Mission/Receipt state read-only. The
+  /// shipped Core never permits the pre-Choice Mission effect family; the
+  /// explicit test double preserves recovery regression coverage without
+  /// leaving a production AppModel path that can start Reminder work.
+  private var historicalMissionEffectsAvailable: Bool { core.permitsDeferredChannelTestRoutes }
   @Published public private(set) var enabled = false
   @Published public private(set) var runtimeDisplayState: RuntimeDisplayState = .unknown
   @Published public var prompt = ""
@@ -372,10 +598,87 @@ public final class AppModel: ObservableObject {
   )
   @Published public private(set) var accountState: AccountState = .notConnected
   @Published public private(set) var availableModels: [GptModel] = []
+  @Published public var selectedModelId = ""
+  @Published public var selectedModelEffort = ""
+  @Published public private(set) var persistedModelSelection: ModelSelection?
+  @Published public private(set) var personaStatus: PersonaStatusView?
+  @Published public private(set) var modelSelectionStatus: ModelSelectionStatus = .unselected
+  @Published public private(set) var catalogSnapshotId = ""
+  @Published public private(set) var catalogFingerprint = ""
+  @Published public private(set) var catalogRevision: UInt64 = 0
+  @Published public private(set) var choiceLoopSnapshot: ChoiceLoopSnapshot?
+  @Published public private(set) var choiceMarkdownReceiptCleanupAvailable = false
+  @Published public private(set) var choiceLoopContinuityState: ChoiceLoopContinuityState = .empty
+  @Published public var choiceQuestion = ""
+  /// A one-shot local routing fence for the frozen D card.  It is deliberately
+  /// not durable authority: only the Host validates the matching active
+  /// ChoiceSet before accepting composer text as D input.
+  @Published public private(set) var choiceDComposerFocusRequested = false
+  // Empty means no user-provided schedule.  The Mac never manufactures a
+  // date, zone, or list from the question timestamp, current clock, or a
+  // hidden default; the Host independently validates the submitted instant.
+  @Published public var choiceReminderDateTime = ""
+  @Published public var choiceReminderTimeZone = ""
+  @Published public var choiceReminderListId = ""
+  @Published public var choiceReminderCount = ""
+  @Published public private(set) var choiceReminderPickerDate = Date()
+  @Published public private(set) var choiceReminderPickerIsPresented = false
+  @Published public private(set) var choiceReminderScheduleIsVisible = true
+  @Published public private(set) var choiceConfirmationPreview: ChoiceConsolidatedConfirmation?
+  // These identities survive an ambiguous in-process RPC response. They are
+  // cleared only after Host continuity proves the corresponding durable
+  // transition, never when transport delivery is uncertain.
+  private var pendingChoiceBeginRequest: (question: String, requestId: String)?
+  private var pendingChoiceOptionSelection: ChoiceSelection?
+  private var pendingChoiceDRequest: ChoiceDInput?
+  // A terminal D snapshot does not expose the private request identity. Only
+  // an ambiguous transport result may use the exact revision/session shape as
+  // a body-retirement witness; a known rejection preserves the owner's draft.
+  private var pendingChoiceDResponseMayBeAmbiguous = false
+  private var choiceDComposerTarget: (sessionId: String, choiceSetId: String, revision: UInt64)?
+  // Once the frozen D card has focused the shared composer, text remains D
+  // intent until Host acceptance or an explicit user clear. A stale target
+  // must never make the same retained text fall through to `choice.begin`.
+  private var choiceDComposerTextIsBound = false
+  // The suppression key is an observed durable state within one exact Core
+  // generation, not a session-wide latch. A replacement Core may recover the
+  // same Store-owned pending resume, and a failed resume returns a newer
+  // idle/stale revision that may receive one later genuine owner return.
+  private var automaticResumeAttemptedStates: Set<String> = []
+  private var pendingChoiceReminderSchedule:
+    (
+      dateTime: String, timeZone: String, listId: String, count: String, sessionId: String,
+      sessionRevision: UInt64, requestId: String
+    )?
+  // A visible schedule edit is not merely cosmetic: it invalidates any
+  // in-flight preview and prevents a blank draft from silently reusing an
+  // older sealed schedule after a restart or lost response.
+  private var choiceReminderScheduleDraftRevision: UInt64 = 0
+  private var choiceReminderScheduleDraftIsDirty = false
+  private var choiceReminderPickerDateIsExplicit = false
+  private var applyingChoiceReminderScheduleHydration = false
   @Published public private(set) var isBusy = false
   @Published public private(set) var errorMessage: String?
   @Published public var showsSettings = false
   @Published public private(set) var runtimeRecoveryState: RuntimeRecoveryState = .ready
+
+  /// A completed Choice Receipt remains typed after restart even though the
+  /// dashboard intentionally has no nonterminal Mission focus. Both values
+  /// come from authenticated Store projections; presentation never relies on
+  /// transient Mission focus to classify durable history.
+  public var receiptIsForCurrentChoice: Bool {
+    guard let receipt, let confirmation = choiceLoopSnapshot?.confirmation else { return false }
+    return receipt.outputHashes.contains(confirmation.payloadDigest)
+  }
+
+  /// Once authenticated continuity advances beyond the receipted Choice, the
+  /// old Receipt remains in Activity history but must not fall through to the
+  /// retired generic Done card beside a new/refining ChoiceSet.
+  public var receiptIsPresentableOnHome: Bool {
+    guard receipt != nil else { return false }
+    guard choiceLoopSnapshot != nil else { return true }
+    return receiptIsForCurrentChoice
+  }
 
   private let core: any CoreServing
   private let broker: any BrokerRuntimeServing
@@ -390,8 +693,12 @@ public final class AppModel: ObservableObject {
   private var switchTask: Task<Void, Never>?
   private var dashboardRefreshTask: Task<Void, Never>?
   private var dashboardRefreshIdentifier: UUID?
+  private var dashboardRefreshAuthenticatedHomeForeground = false
   private var heroTask: Task<Void, Never>?
   private var channelTask: Task<Void, Never>?
+  private var choiceResultTask: Task<Void, Never>?
+  private var choiceReminderWriteTask: Task<Void, Never>?
+  private var choiceReminderWriteTaskID: UUID?
   private var channelFailureAcknowledgementTasks: [String: Task<Void, Never>] = [:]
   private var channelFailureAcknowledgementTokens: [String: UUID] = [:]
   private var recoveringTerminalChannelFailure = false
@@ -401,6 +708,8 @@ public final class AppModel: ObservableObject {
   private var durablePairings: [ChannelKind: ChannelPairing] = [:]
   private var loginItemRegistered = false
   private var runtimeGeneration: UInt64 = 0
+  private var choiceLoopRefreshSequence: UInt64 = 0
+  private var hasVerifiedChoiceContinuity = false
   private var protectedRuntime: BrokerRuntimeState?
   private var authoritativeStateCertain = false
   private var brokerTrustCoreInstanceNonce: String?
@@ -417,6 +726,84 @@ public final class AppModel: ObservableObject {
   public var modelEntryEnabled: Bool {
     enabled && desiredEnabled && runtimeDisplayState == .on && runtimeRecoveryState == .ready
       && requiredAccountAndModelReady
+  }
+
+  public var runtimeRecoveryMessage: String? {
+    guard runtimeRecoveryState == .awaitingAccount else { return runtimeRecoveryState.message }
+    switch modelSelectionStatus {
+    case .unselected:
+      return
+        "Need you: choose a compatible model and its supported effort before OpenOpen finishes turning on."
+    case .unavailable:
+      return
+        "Need you: your saved model selection is no longer available. Review the current model and effort."
+    case .current:
+      return "Need you: review the current account setup before OpenOpen finishes turning on."
+    }
+  }
+
+  public var choiceLoopContinuityMessage: String? {
+    choiceLoopContinuityState.message
+  }
+
+  /// A preserved last-known-good snapshot is recovery evidence, not current
+  /// authority for another Choice/model call. Empty is valid only for a new
+  /// first question; every existing-session action requires a current read.
+  private var choiceContinuityAllowsBegin: Bool {
+    hasVerifiedChoiceContinuity
+      && (choiceLoopContinuityState == .empty || choiceLoopContinuityState == .current)
+  }
+
+  public var choiceSessionActionEnabled: Bool {
+    modelEntryEnabled && !isBusy && hasVerifiedChoiceContinuity
+      && choiceLoopContinuityState == .current && choiceLoopSnapshot?.session.state == "active"
+  }
+
+  private func requireChoiceContinuity(
+    expectedSequence: UInt64, permitsEmpty: Bool = false
+  ) throws {
+    let stateIsCurrent = choiceLoopContinuityState == .current
+    let stateIsPermittedEmpty = permitsEmpty && choiceLoopContinuityState == .empty
+    guard hasVerifiedChoiceContinuity, expectedSequence == choiceLoopRefreshSequence,
+      stateIsCurrent || stateIsPermittedEmpty
+    else {
+      throw CoreClientError.contractViolation(
+        "Refresh local Choice continuity before continuing."
+      )
+    }
+  }
+
+  public var selectedCatalogModel: GptModel? {
+    availableModels.first(where: { $0.id == selectedModelId })
+  }
+
+  public var selectedCatalogModelEfforts: [String] {
+    selectedCatalogModel?.supportedReasoningEfforts ?? []
+  }
+
+  public var modelSelectionCanBeSaved: Bool {
+    guard accountSetupEnabled,
+      !isBusy,
+      isLowerSHA256(catalogSnapshotId),
+      isLowerSHA256(catalogFingerprint),
+      catalogRevision > 0,
+      let model = selectedCatalogModel
+    else { return false }
+    if model.supportedReasoningEfforts.isEmpty {
+      return selectedModelEffort == "not_applicable"
+    }
+    return model.supportedReasoningEfforts.contains(selectedModelEffort)
+  }
+
+  public func modelEffortLabel(_ effort: String) -> String {
+    switch effort {
+    case "low": "Faster (low)"
+    case "medium": "More thoughtful (medium)"
+    case "high": "Deepest (high)"
+    case "xhigh": "Deepest (xhigh)"
+    case "max": "Deepest (max)"
+    default: "Available effort (\(effort))"
+    }
   }
 
   /// A bounded local/Store-control route for an already-confirmed Mission.
@@ -464,7 +851,7 @@ public final class AppModel: ObservableObject {
     DashboardControlState.evaluate(
       runtimeDisplayState: runtimeDisplayState,
       runtimeRecoveryState: runtimeRecoveryState,
-      modelEntryEnabled: modelEntryEnabled,
+      modelEntryEnabled: modelEntryEnabled && choiceContinuityAllowsBegin,
       storeControlEnabled: storeControlEnabled,
       isBusy: isBusy,
       hasConfirmedMission: hasNonterminalMission,
@@ -477,8 +864,34 @@ public final class AppModel: ObservableObject {
       hasReceipt: receipt != nil,
       terminalIncidentCount: channelFailureIncidents.count,
       localFeedbackPresent: errorMessage != nil || channelFailureFeedback != nil,
-      prompt: prompt
+      prompt: choiceQuestion,
+      hasActiveForegroundChoiceSession: hasActiveForegroundChoiceSession,
+      permitsFocusedChoiceDComposer: focusedChoiceDComposerIsCurrent
     )
+  }
+
+  /// The shared composer remains disabled throughout an active Choice except
+  /// when the frozen D card has installed this exact, transient target. This
+  /// is presentation-only: Host still validates the target before accepting
+  /// the text as D input.
+  private var focusedChoiceDComposerIsCurrent: Bool {
+    guard choiceDComposerTextIsBound, let target = choiceDComposerTarget,
+      let snapshot = choiceLoopSnapshot, let choiceSet = snapshot.activeChoiceSet
+    else { return false }
+    return snapshot.session.state == "active"
+      && snapshot.session.id == target.sessionId
+      && snapshot.session.revision == target.revision
+      && choiceSet.id == target.choiceSetId
+      && choiceSet.sessionRevision == target.revision
+      && choiceSet.dAvailable
+  }
+
+  private var hasActiveForegroundChoiceSession: Bool {
+    guard let snapshot = choiceLoopSnapshot else { return false }
+    // A completed local Markdown journal has no pending effect authority.
+    // Starting a new explicit question is the only way to supersede it; the
+    // Host verifies that transition atomically before accepting any intake.
+    return !["completed", "cancelled", "executing"].contains(snapshot.session.state)
   }
 
   public var accountSetupEnabled: Bool {
@@ -584,18 +997,29 @@ public final class AppModel: ObservableObject {
     startCoreLifecycleMonitoring()
   }
 
-  public func refreshDashboard() async {
+  /// Refreshes durable dashboard state.  A generic refresh (including
+  /// Settings/recovery presentation) is read-only; only the Home surface may
+  /// explicitly mark one foreground return as eligible for a private resume.
+  public func refreshDashboard(authenticatedHomeForeground: Bool = false) async {
     if let dashboardRefreshTask {
+      let existingRefreshIsHomeForeground = dashboardRefreshAuthenticatedHomeForeground
       await dashboardRefreshTask.value
+      // A root/settings refresh can race the real Home appearance.  Let that
+      // one Home appearance run exactly one follow-up refresh after the
+      // non-authorizing task, rather than promoting the in-flight task.
+      if authenticatedHomeForeground, !existingRefreshIsHomeForeground {
+        await refreshDashboard(authenticatedHomeForeground: true)
+      }
       return
     }
     let identifier = UUID()
     let task = Task { [weak self] in
       guard let self else { return }
-      await performDashboardRefresh()
+      await performDashboardRefresh(authenticatedHomeForeground: authenticatedHomeForeground)
       finishDashboardRefresh(identifier)
     }
     dashboardRefreshIdentifier = identifier
+    dashboardRefreshAuthenticatedHomeForeground = authenticatedHomeForeground
     dashboardRefreshTask = task
     await task.value
   }
@@ -603,10 +1027,254 @@ public final class AppModel: ObservableObject {
   private func finishDashboardRefresh(_ identifier: UUID) {
     guard dashboardRefreshIdentifier == identifier else { return }
     dashboardRefreshIdentifier = nil
+    dashboardRefreshAuthenticatedHomeForeground = false
     dashboardRefreshTask = nil
   }
 
-  private func performDashboardRefresh() async {
+  /// Reads the durable foreground Choice session without turning a read or
+  /// validation failure into a false empty state. The sequence token fences a
+  /// late refresh even when the runtime generation itself has not changed.
+  private func refreshChoiceLoopContinuity(
+    expectedGeneration: UInt64, authenticatedOwnerReturn: Bool = false
+  ) async {
+    choiceLoopRefreshSequence &+= 1
+    let sequence = choiceLoopRefreshSequence
+
+    do {
+      let snapshot = try await core.choiceLoop()
+      guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+        !Task.isCancelled
+      else { return }
+
+      guard let snapshot else {
+        choiceLoopSnapshot = nil
+        choiceMarkdownReceiptCleanupAvailable = false
+        hasVerifiedChoiceContinuity = true
+        choiceLoopContinuityState = .empty
+        return
+      }
+
+      do {
+        let validated = try snapshot.validated()
+        let priorSessionID = choiceLoopSnapshot?.session.id
+        if priorSessionID != nil && priorSessionID != validated.session.id {
+          clearChoiceReminderScheduleDraft()
+        }
+        let cleanupAvailable: Bool
+        if validated.session.state == "cancelled" {
+          cleanupAvailable = try await core.choiceMarkdownReceiptCleanupAvailability().available
+        } else {
+          cleanupAvailable = false
+        }
+        let schedule = try await core.choiceReminderSchedule()
+        guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+          !Task.isCancelled
+        else { return }
+        if let schedule {
+          guard schedule.validated(),
+            schedule.input.choiceSessionId == validated.session.id,
+            schedule.input.expectedSessionRevision == validated.session.revision
+          else {
+            // A non-nil schedule is durable continuity data, not optional
+            // decoration. Never publish a fresh Choice snapshot as healthy
+            // while its paired schedule is malformed or belongs to another
+            // session/revision.
+            hasVerifiedChoiceContinuity = false
+            choiceLoopContinuityState = .needsYou(.invalidContract)
+            return
+          }
+          if choiceReminderDateTime.isEmpty, choiceReminderTimeZone.isEmpty,
+            choiceReminderListId.isEmpty, choiceReminderCount.isEmpty
+          {
+            hydrateChoiceReminderSchedule(schedule)
+          }
+        }
+        if let target = choiceDComposerTarget,
+          validated.session.state != "active"
+            || validated.session.id != target.sessionId
+            || validated.activeChoiceSet?.id != target.choiceSetId
+            || validated.session.revision != target.revision
+        {
+          invalidateChoiceDComposerTarget()
+        }
+        retirePrivateChoiceIntakeBodies(after: validated)
+        choiceLoopSnapshot = validated
+        choiceMarkdownReceiptCleanupAvailable = cleanupAvailable
+        // A durable confirmation is recovery metadata, not a fresh review
+        // preview. Only `choice.confirm.prepare` may populate the actionable
+        // card for the exact current Active revision.
+        choiceConfirmationPreview = nil
+        hasVerifiedChoiceContinuity = true
+        choiceLoopContinuityState =
+          validated.session.state == "blocked" ? .needsYou(.blocked) : .current
+        if authenticatedOwnerReturn,
+          ["softIdle", "staleReview"].contains(validated.session.state)
+            || (validated.session.state == "refining"
+              && validated.pendingRefinementOperation?.isOwnerResume == true)
+        {
+          await resumeChoiceIfNeeded(expectedGeneration: expectedGeneration, snapshot: validated)
+        }
+      } catch CoreClientError.remote(let code, _) where code == -32_025 {
+        guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+          !Task.isCancelled
+        else { return }
+        hasVerifiedChoiceContinuity = false
+        choiceLoopContinuityState = .needsYou(.clockUncertain)
+      } catch CoreClientError.remote(let code, _) where code == -32_026 {
+        guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+          !Task.isCancelled
+        else { return }
+        hasVerifiedChoiceContinuity = false
+        choiceLoopContinuityState = .needsYou(.refreshRequired)
+      } catch {
+        guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+          !Task.isCancelled
+        else { return }
+        // Keep the last valid snapshot. An invalid current response is a
+        // fail-closed continuity incident, not proof that the session vanished.
+        hasVerifiedChoiceContinuity = false
+        choiceLoopContinuityState = .needsYou(.invalidContract)
+      }
+    } catch CoreClientError.remote(let code, _) where code == -32_025 {
+      guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+        !Task.isCancelled
+      else { return }
+      hasVerifiedChoiceContinuity = false
+      choiceLoopContinuityState = .needsYou(.clockUncertain)
+    } catch {
+      guard expectedGeneration == runtimeGeneration, sequence == choiceLoopRefreshSequence,
+        !Task.isCancelled
+      else { return }
+      // Keep the last valid snapshot and expose a non-blocking recovery path.
+      // In particular, do not feed this into errorMessage, which is displayed
+      // as dismissible local-operation feedback and can steal the next action.
+      hasVerifiedChoiceContinuity = false
+      choiceLoopContinuityState = .needsYou(.readFailed)
+    }
+  }
+
+  /// Exactly one automatic authenticated owner-return attempt per observed
+  /// session state and revision. A model failure gets a newer idle/stale
+  /// revision, which may receive one later foreground attempt; repeated reads
+  /// of that exact revision can never create a retry loop.
+  private func resumeChoiceIfNeeded(
+    expectedGeneration: UInt64, snapshot observed: ChoiceLoopSnapshot
+  ) async {
+    let key =
+      "\(expectedGeneration)|\(observed.session.id)|\(observed.session.state)|\(observed.session.revision)"
+    guard !automaticResumeAttemptedStates.contains(key), !isBusy,
+      expectedGeneration == runtimeGeneration,
+      let snapshot = choiceLoopSnapshot,
+      snapshot.session.id == observed.session.id,
+      snapshot.session.revision == observed.session.revision,
+      snapshot.session.state == observed.session.state,
+      ["softIdle", "staleReview"].contains(snapshot.session.state)
+        || (snapshot.session.state == "refining"
+          && snapshot.pendingRefinementOperation?.isOwnerResume == true)
+    else { return }
+    automaticResumeAttemptedStates.insert(key)
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
+      let next = try await core.resumeChoice(proof: proof).validated()
+      guard expectedGeneration == runtimeGeneration,
+        next.session.id == observed.session.id, next.session.state == "refining"
+      else { return }
+      automaticResumeAttemptedStates.insert(
+        "\(expectedGeneration)|\(next.session.id)|\(next.session.state)|\(next.session.revision)")
+      adoptCommittedChoiceLoopSnapshot(next)
+      awaitChoiceRefinementResult(
+        expectedGeneration: expectedGeneration,
+        sessionID: observed.session.id)
+    } catch {
+      guard expectedGeneration == runtimeGeneration else { return }
+      reconcileOwnerResumeAfterAmbiguousTransport(
+        expectedGeneration: expectedGeneration, sessionID: observed.session.id)
+    }
+  }
+
+  /// An accepted resume can lose its RPC response after the Host persists the
+  /// operation. Re-read from an independent task and resume result polling
+  /// only for that exact Store-owned operation; no second resume RPC is ever
+  /// issued for the same owner return.
+  private func reconcileOwnerResumeAfterAmbiguousTransport(
+    expectedGeneration: UInt64, sessionID: String
+  ) {
+    Task { [weak self] in
+      guard let self else { return }
+      await self.refreshChoiceLoopContinuity(expectedGeneration: expectedGeneration)
+      guard expectedGeneration == self.runtimeGeneration,
+        let snapshot = self.choiceLoopSnapshot,
+        snapshot.session.id == sessionID,
+        snapshot.session.state == "refining",
+        snapshot.pendingRefinementOperation?.isOwnerResume == true
+      else { return }
+      self.awaitChoiceRefinementResult(
+        expectedGeneration: expectedGeneration, sessionID: sessionID)
+    }
+  }
+
+  /// Adopts a Store-confirmed Choice transition and invalidates every older
+  /// continuity read. A late dashboard refresh must not replace a newer
+  /// select, cancel, or begin result with an earlier session revision.
+  private func adoptCommittedChoiceLoopSnapshot(_ snapshot: ChoiceLoopSnapshot) {
+    let priorChoiceRevision = choiceLoopSnapshot?.session.revision
+    choiceLoopRefreshSequence &+= 1
+    if choiceLoopSnapshot?.session.id != nil
+      && choiceLoopSnapshot?.session.id != snapshot.session.id
+    {
+      clearChoiceReminderScheduleDraft()
+    }
+    if let target = choiceDComposerTarget,
+      snapshot.session.state != "active"
+        || snapshot.session.id != target.sessionId
+        || snapshot.activeChoiceSet?.id != target.choiceSetId
+        || snapshot.session.revision != target.revision
+    {
+      invalidateChoiceDComposerTarget()
+    }
+    retirePrivateChoiceIntakeBodies(after: snapshot)
+    choiceLoopSnapshot = snapshot
+    if priorChoiceRevision != snapshot.session.revision {
+      choiceReminderScheduleIsVisible = true
+    }
+    // This is a transition result, not an independently authenticated
+    // receipt-cleanup availability read.  Never carry an availability bit
+    // from a previous cancelled session into a newer snapshot.
+    choiceMarkdownReceiptCleanupAvailable = false
+    choiceConfirmationPreview = nil
+    hasVerifiedChoiceContinuity = true
+    choiceLoopContinuityState = .current
+  }
+
+  /// Bounded local polling is only a continuity read: the accepted Host
+  /// operation owns generation and result commits. It never starts a second
+  /// model turn, writes an effect, or presents a blocking alert.
+  private func awaitInitialChoiceResult(expectedGeneration: UInt64, sessionID: String) {
+    choiceResultTask?.cancel()
+    choiceResultTask = Task { [weak self] in
+      guard let self else { return }
+      for _ in 0..<240 {
+        guard !Task.isCancelled, expectedGeneration == runtimeGeneration else { return }
+        try? await Task.sleep(for: .seconds(1))
+        guard !Task.isCancelled, expectedGeneration == runtimeGeneration else { return }
+        await refreshChoiceLoopContinuity(expectedGeneration: expectedGeneration)
+        guard !Task.isCancelled, expectedGeneration == runtimeGeneration else { return }
+        guard let snapshot = choiceLoopSnapshot, snapshot.session.id == sessionID else { return }
+        if snapshot.session.state != "interpreting" {
+          choiceResultTask = nil
+          return
+        }
+      }
+      guard expectedGeneration == runtimeGeneration,
+        choiceLoopSnapshot?.session.id == sessionID,
+        choiceLoopSnapshot?.session.state == "interpreting"
+      else { return }
+      choiceLoopContinuityState = .needsYou(.readFailed)
+      choiceResultTask = nil
+    }
+  }
+
+  private func performDashboardRefresh(authenticatedHomeForeground: Bool) async {
     let generation = runtimeGeneration
     runtimeRecoveryState = .recovering
     for (attempt, delay) in [Duration.zero, .milliseconds(250), .seconds(1)].enumerated() {
@@ -637,6 +1305,7 @@ public final class AppModel: ObservableObject {
             throw CoreClientError.requestCancelled
           }
           try applyDashboard(dashboard)
+          await refreshPersonaStatus(expectedGeneration: generation)
           protectedRuntime = protected
           let protectedMatchesRuntime =
             protected.map {
@@ -664,14 +1333,29 @@ public final class AppModel: ObservableObject {
             authoritativeStateCertain = false
             runtimeDisplayState = .unknown
           }
+          // Refresh the bounded Host-owned model catalog before an owner
+          // foreground return can consume a soft-idle/stale resume. The idle
+          // window is intentionally longer than catalog eligibility; doing
+          // this after `choice.resume` would permanently spend that exact
+          // owner-return revision on a predictable stale-catalog failure.
+          if runtime.enabled, protectedMatchesRuntime, desiredEnabled {
+            accountReady = try await refreshRecoveredAccountAndModels(
+              expectedGeneration: generation)
+            try requireCurrentOnGeneration(generation)
+          }
           if runtime.enabled, coreTerminationEvents != nil {
             let fencedDashboard = try await core.dashboard()
             try requireCurrentOnGeneration(generation)
             try applyDashboard(fencedDashboard)
             try await restoreDurableConnections(expectedGeneration: generation)
-            accountReady = try await refreshRecoveredAccountAndModels(
-              expectedGeneration: generation)
             try requireCurrentOnGeneration(generation)
+          }
+          await refreshChoiceLoopContinuity(
+            expectedGeneration: generation,
+            authenticatedOwnerReturn: authenticatedHomeForeground && attempt == 0
+              && runtime.enabled && protectedMatchesRuntime && desiredEnabled && accountReady)
+          guard generation == runtimeGeneration, switchTask == nil else {
+            throw CoreClientError.requestCancelled
           }
           return accountReady
         }
@@ -715,8 +1399,7 @@ public final class AppModel: ObservableObject {
           return
         }
         clearLiveConnectionState(status: "paused")
-        accountState = .notConnected
-        availableModels = []
+        clearTransientModelSetup()
         if attempt == 2 {
           pauseAfterRecoveryFailure()
           errorMessage = RuntimeRecoveryState.paused.message ?? userMessage(for: error)
@@ -728,20 +1411,26 @@ public final class AppModel: ObservableObject {
 
   public func requestEnabled(_ requested: Bool) {
     var coreInterruptionFailed = false
+    let reminderTaskToQuiesce = requested ? nil : choiceReminderWriteTask
     let mustInterruptActiveCore =
       !requested
       && (dashboardRefreshTask != nil || heroTask != nil || channelTask != nil
-        || coreRecoveryTask != nil
+        || coreRecoveryTask != nil || choiceReminderWriteTask != nil
         || runtimeRecoveryState == .recovering || runtimeRecoveryState == .paused || isBusy
         || offCoreInterruptionFailed
         || onRequiresReplacementCoreRestoration)
     runtimeGeneration &+= 1
+    hasVerifiedChoiceContinuity = false
     desiredEnabled = requested
     pendingRuntimeIntent = requested
     if requested {
       offCoreInterruptionFailed = false
     }
     if !requested {
+      // Off is a hard local-intent boundary. Preserve the owner-authored
+      // draft, but revoke the transient D tuple so it cannot survive a new
+      // protected runtime generation or fall through to `choice.begin`.
+      invalidateChoiceDComposerTarget()
       cancelChannelFailureAcknowledgements()
       recoveringTerminalChannelFailure = false
       dashboardRefreshTask?.cancel()
@@ -753,6 +1442,16 @@ public final class AppModel: ObservableObject {
       heroTask = nil
       channelTask?.cancel()
       channelTask = nil
+      choiceResultTask?.cancel()
+      choiceResultTask = nil
+      choiceReminderWriteTask?.cancel()
+      // Keep the exact task handle until it has either recorded a definite
+      // pre-commit abort or crossed into read-only ambiguous recovery. Core
+      // must remain alive for that durable transition before protected Off.
+      if reminderTaskToQuiesce == nil {
+        choiceReminderWriteTask = nil
+        choiceReminderWriteTaskID = nil
+      }
       connectedChannels.removeAll()
       channelListenerFeedback.removeAll()
       latestChannelMissionEvent = nil
@@ -764,27 +1463,10 @@ public final class AppModel: ObservableObject {
       discardDiscordTokenDraft()
       runtimeRecoveryState = .ready
       onRequiresAccountSetup = false
-      if mustInterruptActiveCore {
-        if shutdownCore() {
-          // The next Core is a new process generation and therefore has no
-          // in-memory broker enrollment. The exact old Core is already proven
-          // stopped, so installing trust on the quiescent replacement before
-          // it validates checkpointed runtime history preserves cancellation-
-          // before-provisioning without weakening Store verification.
-          brokerTrustCoreInstanceNonce = nil
-          codexReadyCoreInstanceNonce = nil
-          offCoreInterruptionFailed = false
-          offRequiresReplacementCoreProvisioning = true
-          onRequiresReplacementCoreRestoration = false
-          onRequiresAccountSetup = false
-        } else {
-          authoritativeStateCertain = false
-          runtimeDisplayState = .unknown
-          errorMessage = "OpenOpen could not verify that the previous Core stopped."
-          offCoreInterruptionFailed = true
-          onRequiresReplacementCoreRestoration = true
-          coreInterruptionFailed = true
-        }
+      if mustInterruptActiveCore, reminderTaskToQuiesce == nil,
+        !interruptActiveCoreForOff()
+      {
+        coreInterruptionFailed = true
       }
     }
     if requested {
@@ -802,8 +1484,37 @@ public final class AppModel: ObservableObject {
     }
     guard switchTask == nil else { return }
     switchTask = Task { [weak self] in
-      await self?.reconcileEnabledState()
+      guard let self else { return }
+      if let reminderTaskToQuiesce {
+        await reminderTaskToQuiesce.value
+        guard self.interruptActiveCoreForOff() else {
+          self.switchTask = nil
+          return
+        }
+      }
+      await self.reconcileEnabledState()
     }
+  }
+
+  private func interruptActiveCoreForOff() -> Bool {
+    if shutdownCore() {
+      // The next Core is a new process generation and therefore has no
+      // in-memory broker enrollment. The exact old Core is already proven
+      // stopped before protected Off proceeds.
+      brokerTrustCoreInstanceNonce = nil
+      codexReadyCoreInstanceNonce = nil
+      offCoreInterruptionFailed = false
+      offRequiresReplacementCoreProvisioning = true
+      onRequiresReplacementCoreRestoration = false
+      onRequiresAccountSetup = false
+      return true
+    }
+    authoritativeStateCertain = false
+    runtimeDisplayState = .unknown
+    errorMessage = "OpenOpen could not verify that the previous Core stopped."
+    offCoreInterruptionFailed = true
+    onRequiresReplacementCoreRestoration = true
+    return false
   }
 
   public func updateEnabled(_ requested: Bool) async {
@@ -895,6 +1606,11 @@ public final class AppModel: ObservableObject {
           // after the protected broker/Core transaction has durably confirmed
           // Off; the typed incident and audit history remain untouched.
           channelFailureFeedback = nil
+          // `mission.runtime.prepare(false)` first retires any unreceipted
+          // Choice journal while its On proof is still current. Re-read that
+          // terminal state after the durable Off commit so a stale local card
+          // cannot offer a publication-only recovery that is no longer legal.
+          await refreshChoiceLoopContinuity(expectedGeneration: runtimeGeneration)
         }
         runtimeDisplayState =
           control.enabled && restoringOn
@@ -910,6 +1626,12 @@ public final class AppModel: ObservableObject {
         }
         errorMessage = nil
         runtimeRecoveryState = .ready
+        if control.enabled {
+          // Local input is not ready until this exact Core generation proves
+          // either an empty Choice Store or a valid current snapshot. Channel
+          // incidents remain independent and cannot stand in for this read.
+          await refreshChoiceLoopContinuity(expectedGeneration: attemptGeneration)
+        }
         if control.enabled, !loginItemRegistered {
           do {
             try registerLoginItem()
@@ -996,6 +1718,18 @@ public final class AppModel: ObservableObject {
       return false
     }
     onRequiresAccountSetup = false
+    // Listener restoration and account/catalog recovery can overlap an older
+    // dashboard continuity read.  Re-read the durable Choice session only
+    // after those prerequisites have settled, so a healthy empty Store is not
+    // left looking like an unverified local-input failure.  Conversely, a
+    // failed read stays fail-closed and cannot publish a usable local entry.
+    await refreshChoiceLoopContinuity(expectedGeneration: expectedGeneration)
+    try requireCurrentOnGeneration(expectedGeneration)
+    guard hasVerifiedChoiceContinuity else {
+      throw CoreClientError.contractViolation(
+        "OpenOpen cannot publish On before Choice continuity is verified."
+      )
+    }
     try finishRecoveredOn(expectedGeneration: expectedGeneration)
     return true
   }
@@ -1206,8 +1940,7 @@ public final class AppModel: ObservableObject {
       channelTask?.cancel()
       channelTask = nil
       clearLiveConnectionState(status: "paused")
-      accountState = .notConnected
-      availableModels = []
+      clearTransientModelSetup()
       authoritativeStateCertain = false
       runtimeDisplayState = .turningOn
       return
@@ -1241,6 +1974,7 @@ public final class AppModel: ObservableObject {
     }
     cancelChannelFailureAcknowledgements()
     runtimeGeneration &+= 1
+    hasVerifiedChoiceContinuity = false
     let recoveryGeneration = runtimeGeneration
     switchTask?.cancel()
     switchTask = nil
@@ -1248,13 +1982,14 @@ public final class AppModel: ObservableObject {
     heroTask = nil
     channelTask?.cancel()
     channelTask = nil
+    choiceResultTask?.cancel()
+    choiceResultTask = nil
     coreRecoveryTask?.cancel()
     brokerTrustCoreInstanceNonce = nil
     codexReadyCoreInstanceNonce = nil
     connectedChannels.removeAll()
     clearLiveConnectionState(status: "paused")
-    accountState = .notConnected
-    availableModels = []
+    clearTransientModelSetup()
     authoritativeStateCertain = false
     runtimeDisplayState = .turningOn
     runtimeRecoveryState = .recovering
@@ -1323,6 +2058,19 @@ public final class AppModel: ObservableObject {
           return
         }
         onRequiresAccountSetup = false
+        // A replacement Core is not ready merely because its protected
+        // runtime, listeners, and account catalog recovered. Rebind durable
+        // Choice continuity on this exact recovery generation before
+        // publishing On, matching the startup-restore ordering above. A
+        // failed read remains a typed nonblocking continuity incident, while
+        // an Off/newer recovery generation makes the late response inert.
+        await refreshChoiceLoopContinuity(expectedGeneration: expectedGeneration)
+        try requireCurrentOnGeneration(expectedGeneration)
+        guard hasVerifiedChoiceContinuity else {
+          throw CoreClientError.contractViolation(
+            "OpenOpen cannot publish On before Choice continuity is verified."
+          )
+        }
         try finishRecoveredOn(expectedGeneration: expectedGeneration)
         errorMessage = nil
         recoveringTerminalChannelFailure = false
@@ -1388,6 +2136,17 @@ public final class AppModel: ObservableObject {
   }
 
   private func restoreDurableConnections(expectedGeneration: UInt64) async throws {
+    guard choiceCoreConnectionsAvailable else {
+      // PR1 preserves historical channel state only as dashboard data. It
+      // never starts, repairs, polls, or faults a listener before the
+      // separately reviewed channel stages own those routes.
+      connectedChannels.removeAll()
+      durablePairings.removeAll()
+      iMessageStatus = "disconnected"
+      updateDiscordConnectionFeedback("disconnected")
+      channelListenerFeedback.removeAll()
+      return
+    }
     try requireCurrentOnGeneration(expectedGeneration)
     let iMessagePairing = try await core.channelPairing(.iMessage)
     try requireCurrentOnGeneration(expectedGeneration)
@@ -1724,14 +2483,72 @@ public final class AppModel: ObservableObject {
   }
 
   private func refreshRecoveredAccountAndModels(expectedGeneration: UInt64) async throws -> Bool {
-    let accountProof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
-    let account = try await core.account(proof: accountProof)
-    let modelsProof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
-    let models = try await core.models(proof: modelsProof)
+    let setupProof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
+    let setup = try await core.modelSetup(proof: setupProof)
     try requireCurrentOnGeneration(expectedGeneration)
-    accountState = account
-    availableModels = models
+    applyAccountCatalog(setup)
     return requiredAccountAndModelReady
+  }
+
+  private func applyAccountCatalog(_ setup: ModelSetup) {
+    accountState = setup.account
+    availableModels = setup.models
+    persistedModelSelection = setup.selection
+    catalogSnapshotId = setup.catalogSnapshotId
+    catalogFingerprint = setup.catalogFingerprint
+    catalogRevision = setup.catalogRevision
+    let currentSelection = selectionMatchesCurrentSetup(setup)
+    modelSelectionStatus =
+      currentSelection ? .current : (setup.selection == nil ? .unselected : .unavailable)
+    guard currentSelection, let selection = setup.selection else {
+      selectedModelId = ""
+      selectedModelEffort = ""
+      return
+    }
+    selectedModelId = selection.modelId
+    selectedModelEffort = selection.requestedEffort
+  }
+
+  /// Clears App-only draft/readiness state when the current Core/account is no
+  /// longer available. The encrypted Store selection remains untouched for
+  /// audit and provenance, but cannot look preselected or runnable.
+  private func clearTransientModelSetup() {
+    accountState = .notConnected
+    availableModels = []
+    persistedModelSelection = nil
+    modelSelectionStatus = .unselected
+    selectedModelId = ""
+    selectedModelEffort = ""
+    catalogSnapshotId = ""
+    catalogFingerprint = ""
+    catalogRevision = 0
+  }
+
+  private func selectionMatchesCurrentSetup(_ setup: ModelSetup) -> Bool {
+    guard setup.selectionStatus == .current,
+      let selection = setup.selection,
+      isLowerSHA256(setup.catalogSnapshotId),
+      isLowerSHA256(setup.catalogFingerprint),
+      setup.catalogRevision > 0,
+      selection.catalogFingerprint == setup.catalogFingerprint,
+      selection.catalogRevision == setup.catalogRevision,
+      selection.actualEffort == selection.requestedEffort
+    else { return false }
+    guard case .chatGpt(_, let planType) = setup.account,
+      selection.accountDisplayClass == "chatgpt:\(planType)",
+      let model = setup.models.first(where: { $0.id == selection.modelId })
+    else { return false }
+    if selection.requestedEffort == "not_applicable" {
+      return selection.actualEffort == "not_applicable" && model.supportedReasoningEfforts.isEmpty
+    }
+    return model.supportedReasoningEfforts.contains(selection.requestedEffort)
+  }
+
+  private func isLowerSHA256(_ value: String) -> Bool {
+    value.utf8.count == 64
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+      }
   }
 
   private var requiredAccountAndModelReady: Bool {
@@ -1739,9 +2556,15 @@ public final class AppModel: ObservableObject {
     // stubs without that surface retain their intentionally isolated behavior;
     // the shipped App cannot take this branch.
     guard coreTerminationEvents != nil else { return true }
-    guard case .chatGpt = accountState else { return false }
+    guard case .chatGpt = accountState, modelSelectionStatus == .current else { return false }
+    guard let selection = persistedModelSelection else { return false }
     return availableModels.contains { model in
-      model.id == "gpt-5.6-sol" && model.supportedReasoningEfforts.contains("high")
+      guard model.id == selection.modelId else { return false }
+      if selection.requestedEffort == "not_applicable" {
+        return model.supportedReasoningEfforts.isEmpty && selection.actualEffort == "not_applicable"
+      }
+      return selection.actualEffort == selection.requestedEffort
+        && model.supportedReasoningEfforts.contains(selection.requestedEffort)
     }
   }
 
@@ -1762,6 +2585,22 @@ public final class AppModel: ObservableObject {
     try finishRecoveredOn(expectedGeneration: expectedGeneration)
     if runtimeIsConverged(with: true) {
       pendingRuntimeIntent = nil
+    }
+  }
+
+  /// Persona provenance is diagnostic state. A transient read failure must not
+  /// erase the last verified revision or block Off, recovery, or local Choice
+  /// controls; Core remains the authority for every model request.
+  private func refreshPersonaStatus(expectedGeneration: UInt64) async {
+    guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+    do {
+      let status = try await core.personaStatus()
+      guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      personaStatus = status
+    } catch {
+      // Preserve the last verified projection. The Host always validates
+      // Persona provenance before model work, so this read-only diagnostic
+      // cannot create a permissive fallback.
     }
   }
 
@@ -1803,9 +2642,10 @@ public final class AppModel: ObservableObject {
   private func pauseAfterRecoveryFailure() {
     channelTask?.cancel()
     channelTask = nil
+    choiceResultTask?.cancel()
+    choiceResultTask = nil
     clearLiveConnectionState(status: "paused")
-    accountState = .notConnected
-    availableModels = []
+    clearTransientModelSetup()
     onRequiresAccountSetup = false
     authoritativeStateCertain = false
     runtimeDisplayState = .unknown
@@ -1819,23 +2659,1143 @@ public final class AppModel: ObservableObject {
     return { processClient.shutdown() }
   }
 
-  public func submitPrompt() async {
-    let value = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard modelEntryEnabled, !isBusy, !hasNonterminalMission, !value.isEmpty else { return }
-    guard value.utf8.count <= 16 * 1024 else {
-      errorMessage = "Outcome requests are limited to 16 KiB."
-      return
-    }
+  public func submitChoiceQuestion() async {
+    let value = choiceQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard modelEntryEnabled, choiceContinuityAllowsBegin, !isBusy, !hasNonterminalMission,
+      !hasActiveForegroundChoiceSession, !value.isEmpty, value.utf8.count <= 4_096,
+      let selection = persistedModelSelection, modelSelectionStatus == .current
+    else { return }
+    let continuitySequence = choiceLoopRefreshSequence
     isBusy = true
     defer { isBusy = false }
     let generation = runtimeGeneration
     do {
       let proof = try await currentEnabledProof(expectedGeneration: generation)
-      let proposed = try (await core.propose(prompt: value, proof: proof)).validated()
+      let requestId: String
+      if let pendingChoiceBeginRequest, pendingChoiceBeginRequest.question == value {
+        requestId = pendingChoiceBeginRequest.requestId
+      } else {
+        requestId = UUID().uuidString.lowercased()
+        pendingChoiceBeginRequest = (value, requestId)
+      }
+      try requireChoiceContinuity(expectedSequence: continuitySequence, permitsEmpty: true)
+      let accepted = try await core.beginChoice(
+        ChoiceBeginParameters(
+          requestId: requestId,
+          boundedLocalQuestion: value,
+          selection: selection,
+          proof: proof
+        )
+      ).validated()
       try requireCurrentOnGeneration(generation)
-      suggestion = proposed
+      guard let snapshot = try await core.choiceLoop()?.validated(),
+        snapshot.session.id == accepted.choiceSessionId,
+        snapshot.session.revision == accepted.acceptedSessionRevision,
+        snapshot.session.state == "interpreting"
+      else {
+        throw CoreClientError.contractViolation("Core did not retain the first Choice session.")
+      }
+      try requireCurrentOnGeneration(generation)
+      adoptCommittedChoiceLoopSnapshot(snapshot)
+      pendingChoiceBeginRequest = nil
+      suggestion = nil
       receipt = nil
-      prompt = ""
+      choiceQuestion = ""
+      errorMessage = nil
+      awaitInitialChoiceResult(expectedGeneration: generation, sessionID: accepted.choiceSessionId)
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      // A private render can have durably advanced to AwaitingConfirmation
+      // while its background filesystem step reports typed reconciliation.
+      // Re-read once so the non-blocking resume control is reachable instead
+      // of leaving a stale Active card that can only repeat confirmation.
+      reconcileChoiceContinuityAfterAmbiguousTransport(generation: generation)
+      choiceConfirmationPreview = nil
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  /// Refines intent through the current Host-owned A/B/C ChoiceSet. It does
+  /// not confirm a Mission, create a Reminder, or authorize any effect.
+  public func selectChoiceOption(_ option: ChoiceOption) async {
+    guard choiceSessionActionEnabled, let snapshot = choiceLoopSnapshot,
+      let choiceSet = snapshot.activeChoiceSet,
+      snapshot.session.state == "active",
+      choiceSet.id == snapshot.session.activeChoiceSetId,
+      choiceSet.choiceSessionId == snapshot.session.id,
+      choiceSet.sessionRevision == snapshot.session.revision,
+      choiceSet.options.contains(where: { $0.id == option.id })
+    else { return }
+    let continuitySequence = choiceLoopRefreshSequence
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let selection: ChoiceSelection
+      if let pendingChoiceOptionSelection,
+        pendingChoiceOptionSelection.choiceSessionId == snapshot.session.id,
+        pendingChoiceOptionSelection.choiceSetId == choiceSet.id,
+        pendingChoiceOptionSelection.selectedOptionId == option.id,
+        pendingChoiceOptionSelection.expectedSessionRevision == snapshot.session.revision
+      {
+        selection = pendingChoiceOptionSelection
+      } else {
+        let selectedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        selection = ChoiceSelection(
+          type: "optionSelection",
+          id: UUID().uuidString.lowercased(),
+          choiceSessionId: snapshot.session.id,
+          choiceSetId: choiceSet.id,
+          selectedOptionId: option.id,
+          dInputBatchId: nil,
+          expectedSessionRevision: snapshot.session.revision,
+          selectedAtMs: selectedAtMs
+        )
+        pendingChoiceOptionSelection = selection
+      }
+      try requireChoiceContinuity(expectedSequence: continuitySequence)
+      let next = try await core.selectChoice(selection, proof: proof)
+        .validated()
+      try requireCurrentOnGeneration(generation)
+      guard next.session.id == snapshot.session.id,
+        next.session.revision == snapshot.session.revision + 1,
+        next.lastSelection?.id == selection.id
+      else {
+        throw CoreClientError.contractViolation("Core did not retain the selected Choice.")
+      }
+      adoptCommittedChoiceLoopSnapshot(next)
+      invalidateChoiceDComposerTarget()
+      pendingChoiceOptionSelection = nil
+      errorMessage = nil
+      awaitChoiceRefinementResult(expectedGeneration: generation, sessionID: snapshot.session.id)
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      choiceConfirmationPreview = nil
+      // A selection can be the first Host wake that turns Active into a
+      // revisioned recap. Re-read that durable successor so the user can act
+      // on the new ChoiceSet instead of being left behind a transient error.
+      reconcileChoiceContinuityAfterAmbiguousTransport(generation: generation)
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  /// Sends only the bounded D text through the typed Host intake. The Mac
+  /// never chooses a batch, binding, source envelope, or refinement result.
+  @discardableResult
+  public func selectChoiceD(_ text: String) async -> Bool {
+    let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard choiceSessionActionEnabled, let snapshot = choiceLoopSnapshot,
+      let choiceSet = snapshot.activeChoiceSet,
+      snapshot.session.state == "active",
+      choiceSet.dAvailable, value.utf8.count <= 4_096, !value.isEmpty
+    else { return false }
+    let continuitySequence = choiceLoopRefreshSequence
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    // A decodable response can still fail App-side binding validation. Once
+    // one arrives, only a later exact durable snapshot may decide whether the
+    // Host accepted the private D body; treat it as transport-ambiguous rather
+    // than mistaking a local contract error for a definitive rejection.
+    var receivedChoiceDResponse = false
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let input: ChoiceDInput
+      if let pendingChoiceDRequest,
+        pendingChoiceDRequest.boundedText == value,
+        pendingChoiceDRequest.choiceSessionId == snapshot.session.id,
+        pendingChoiceDRequest.choiceSetId == choiceSet.id,
+        pendingChoiceDRequest.expectedSessionRevision == snapshot.session.revision
+      {
+        input = pendingChoiceDRequest
+      } else {
+        input = ChoiceDInput(
+          requestId: UUID().uuidString.lowercased(), boundedText: value,
+          choiceSessionId: snapshot.session.id, choiceSetId: choiceSet.id,
+          expectedSessionRevision: snapshot.session.revision,
+          submittedAtMs: Int64(Date().timeIntervalSince1970 * 1_000))
+        pendingChoiceDRequest = input
+        pendingChoiceDResponseMayBeAmbiguous = false
+      }
+      try requireChoiceContinuity(expectedSequence: continuitySequence)
+      let response = try await core.selectChoiceD(input, proof: proof)
+      receivedChoiceDResponse = true
+      let next = try response.validated()
+      try requireCurrentOnGeneration(generation)
+      guard next.session.id == snapshot.session.id,
+        next.session.state == "refining",
+        next.session.revision == snapshot.session.revision + 1
+      else { throw CoreClientError.contractViolation("Core did not retain the D selection.") }
+      adoptCommittedChoiceLoopSnapshot(next)
+      invalidateChoiceDComposerTarget()
+      pendingChoiceDRequest = nil
+      pendingChoiceDResponseMayBeAmbiguous = false
+      errorMessage = nil
+      awaitChoiceRefinementResult(expectedGeneration: generation, sessionID: snapshot.session.id)
+      return true
+    } catch {
+      let responseMayBeAmbiguous =
+        receivedChoiceDResponse
+        || Self.transportOutcomeMayBeAmbiguous(error)
+      pendingChoiceDResponseMayBeAmbiguous = responseMayBeAmbiguous
+      if !responseMayBeAmbiguous {
+        // The Host gave a definitive rejection. Keep the draft but revoke the
+        // stale D routing tuple so a second submit cannot replay it as D or
+        // silently fall back to `choice.begin`.
+        invalidateChoiceDComposerTarget()
+      }
+      // Reads are non-authorizing. Reconcile every error so an explicit stale
+      // rejection cannot leave the Home UI on the old active ChoiceSet; the
+      // ambiguity flag above is the only thing that permits private-body
+      // retirement from the returned durable snapshot.
+      reconcileDChoiceContinuityAfterAmbiguousTransport()
+      errorMessage = userMessage(for: error)
+      return false
+    }
+  }
+
+  /// Routes the frozen D card to the existing Home composer. This is local
+  /// focus state only: it starts neither a Choice intake nor model/effect
+  /// work, and it cannot outlive the exact active ChoiceSet it names.
+  public func focusChoiceDComposer() {
+    guard choiceSessionActionEnabled, let snapshot = choiceLoopSnapshot,
+      let choiceSet = snapshot.activeChoiceSet,
+      snapshot.session.state == "active", choiceSet.dAvailable,
+      choiceSet.choiceSessionId == snapshot.session.id,
+      choiceSet.id == snapshot.session.activeChoiceSetId,
+      choiceSet.sessionRevision == snapshot.session.revision
+    else { return }
+    choiceDComposerTarget = (snapshot.session.id, choiceSet.id, snapshot.session.revision)
+    choiceDComposerTextIsBound = true
+    choiceDComposerFocusRequested = true
+  }
+
+  public func consumeChoiceDComposerFocusRequest() {
+    choiceDComposerFocusRequested = false
+  }
+
+  private func invalidateChoiceDComposerTarget() {
+    choiceDComposerTarget = nil
+    choiceDComposerFocusRequested = false
+  }
+
+  /// Private raw input belongs only to an in-flight local request. Once a
+  /// Store snapshot proves acceptance or cancellation, retain neither that
+  /// body nor a second App-side replay cache. The Host owns durable encrypted
+  /// request recovery; the Mac keeps only typed visible state.
+  private func retirePrivateChoiceIntakeBodies(after snapshot: ChoiceLoopSnapshot) {
+    if snapshot.session.state == "cancelled" {
+      pendingChoiceBeginRequest = nil
+      pendingChoiceDRequest = nil
+      pendingChoiceDResponseMayBeAmbiguous = false
+      choiceDComposerTextIsBound = false
+      choiceQuestion = ""
+      invalidateChoiceDComposerTarget()
+      return
+    }
+
+    // A begin request is only installed after the Host RPC is entered while
+    // no foreground session exists. An authenticated interpreting snapshot
+    // with its sealed batch is therefore the durable acceptance witness.
+    if pendingChoiceBeginRequest != nil,
+      snapshot.session.state == "interpreting", snapshot.activeBatch != nil
+    {
+      pendingChoiceBeginRequest = nil
+      choiceQuestion = ""
+    }
+
+    guard let request = pendingChoiceDRequest else { return }
+    let pendingOperationMatches =
+      snapshot.pendingRefinementOperation.map { operation in
+        operation.choiceSessionId == request.choiceSessionId
+          && operation.expectedSessionRevision == snapshot.session.revision
+          && operation.dRequestId == request.requestId
+          && operation.dInputDigest != nil
+      } ?? false
+    let completedSelectionMatches =
+      pendingChoiceDResponseMayBeAmbiguous
+      && (snapshot.lastSelection.map { selection in
+        selection.type == "naturalConversationSelection"
+          && selection.choiceSessionId == request.choiceSessionId
+          && selection.choiceSetId == request.choiceSetId
+          && selection.expectedSessionRevision == request.expectedSessionRevision
+          && snapshot.session.revision > request.expectedSessionRevision
+      } ?? false)
+    // A known Host rejection may be observed beside an independently advanced
+    // snapshot. Do not let that snapshot erase the owner's unaccepted draft;
+    // only a transport whose response may have been lost can prove acceptance.
+    guard pendingChoiceDResponseMayBeAmbiguous,
+      pendingOperationMatches || completedSelectionMatches
+    else { return }
+    pendingChoiceDRequest = nil
+    pendingChoiceDResponseMayBeAmbiguous = false
+    choiceDComposerTextIsBound = false
+    choiceQuestion = ""
+    invalidateChoiceDComposerTarget()
+  }
+
+  /// Transport cancellation is not durable rejection. Reconcile in a fresh
+  /// unstructured MainActor task so a cancelled RPC task cannot prevent the
+  /// Mac from observing Host acceptance and retiring its raw local body.
+  private func reconcileChoiceContinuityAfterAmbiguousTransport(generation: UInt64) {
+    Task { [weak self] in
+      await self?.refreshChoiceLoopContinuity(expectedGeneration: generation)
+    }
+  }
+
+  /// D input contains a short-lived local private body. If its RPC races a
+  /// Core replacement, use the *current* Core generation for a read-only
+  /// continuity reconciliation so a later durable acceptance can retire that
+  /// body. The snapshot still has to match the exact request before removal.
+  private func reconcileDChoiceContinuityAfterAmbiguousTransport() {
+    Task { [weak self] in
+      guard let self else { return }
+      await self.refreshChoiceLoopContinuity(expectedGeneration: self.runtimeGeneration)
+    }
+  }
+
+  /// Only an ambiguous local transport result can make a later terminal Store
+  /// snapshot evidence of accepted D input. A known validation rejection must
+  /// preserve the owner's composer draft for correction.
+  private static func transportOutcomeMayBeAmbiguous(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    switch error as? CoreClientError {
+    case .requestTimedOut, .requestCancelled, .processTerminated, .processUnavailable,
+      .malformedResponse, .oversizedFrame, .unknownResponseIdentifier:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// The sole Home-composer dispatcher. A stale D target never falls back to
+  /// `choice.begin`; retained text remains user-owned until accepted or
+  /// explicitly cancelled.
+  public func submitHomeComposer() async {
+    if choiceDComposerTextIsBound,
+      choiceQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      // Clearing an unaccepted D draft is the user's explicit cancellation of
+      // that local routing intent. It still does not create a Choice intake.
+      choiceDComposerTextIsBound = false
+      pendingChoiceDRequest = nil
+      pendingChoiceDResponseMayBeAmbiguous = false
+      invalidateChoiceDComposerTarget()
+      return
+    }
+    if choiceDComposerTextIsBound, choiceDComposerTarget == nil {
+      // The prior D target has become stale. Keep the user's draft visible;
+      // do not reinterpret it as a new first question after a state drift.
+      await refreshChoiceLoopContinuity(expectedGeneration: runtimeGeneration)
+      return
+    }
+    if let target = choiceDComposerTarget {
+      guard let snapshot = choiceLoopSnapshot,
+        let choiceSet = snapshot.activeChoiceSet,
+        choiceSessionActionEnabled,
+        snapshot.session.state == "active", choiceSet.dAvailable,
+        snapshot.session.id == target.sessionId,
+        choiceSet.id == target.choiceSetId,
+        snapshot.session.revision == target.revision,
+        choiceSet.sessionRevision == target.revision
+      else {
+        invalidateChoiceDComposerTarget()
+        await refreshChoiceLoopContinuity(expectedGeneration: runtimeGeneration)
+        return
+      }
+      if await selectChoiceD(choiceQuestion) {
+        choiceQuestion = ""
+        choiceDComposerTextIsBound = false
+      }
+      return
+    }
+    await submitChoiceQuestion()
+  }
+
+  /// Requests a Host-derived, effect-free summary for the active ChoiceSet.
+  /// This does not create a Mission, Reminder, delivery, or permission grant.
+  public func prepareChoiceConfirmation() async {
+    guard choiceSessionActionEnabled, let snapshot = choiceLoopSnapshot,
+      snapshot.session.state == "active"
+    else {
+      return
+    }
+    let continuitySequence = choiceLoopRefreshSequence
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    let draftRevision = choiceReminderScheduleDraftRevision
+    do {
+      if let schedule = try choiceReminderScheduleInput(for: snapshot) {
+        // Runtime challenges are single-use. Recording a local schedule and
+        // preparing its confirmation are two separate Host transactions, so
+        // each must carry a fresh broker-issued proof.
+        let scheduleProof = try await currentEnabledProof(expectedGeneration: generation)
+        try requireChoiceContinuity(expectedSequence: continuitySequence)
+        let stored = try await core.recordChoiceReminderSchedule(schedule, proof: scheduleProof)
+        guard stored.validated(), stored.input == schedule,
+          stored.input.choiceSessionId == snapshot.session.id,
+          stored.input.expectedSessionRevision == snapshot.session.revision
+        else {
+          throw CoreClientError.contractViolation(
+            "Core returned an invalid Choice Reminder schedule.")
+        }
+        guard draftRevision == choiceReminderScheduleDraftRevision else { return }
+        choiceReminderScheduleDraftIsDirty = false
+      } else if choiceReminderScheduleDraftIsDirty {
+        throw CoreClientError.contractViolation("Choose a complete future local Reminder schedule.")
+      }
+      try requireCurrentOnGeneration(generation)
+      guard draftRevision == choiceReminderScheduleDraftRevision else { return }
+      let confirmationProof = try await currentEnabledProof(expectedGeneration: generation)
+      try requireChoiceContinuity(expectedSequence: continuitySequence)
+      let confirmation = try await core.prepareChoiceConfirmation(proof: confirmationProof)
+      guard
+        confirmation.validated(),
+        confirmation.choiceSessionId == choiceLoopSnapshot?.session.id,
+        confirmation.expectedSessionRevision == choiceLoopSnapshot?.session.revision
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid Choice confirmation.")
+      }
+      try requireCurrentOnGeneration(generation)
+      guard draftRevision == choiceReminderScheduleDraftRevision else { return }
+      choiceConfirmationPreview = confirmation
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      reconcileChoiceContinuityAfterAmbiguousTransport(generation: generation)
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  /// Returns nil only when the user has not supplied any schedule fields.
+  /// Partial data fails locally before an RPC; complete data is still treated
+  /// as untrusted and revalidated by the Host/Store transaction.
+  private func choiceReminderScheduleInput(
+    for snapshot: ChoiceLoopSnapshot
+  ) throws -> ChoiceReminderScheduleInput? {
+    let dateTime = choiceReminderDateTime.trimmingCharacters(in: .whitespacesAndNewlines)
+    let timeZone = choiceReminderTimeZone.trimmingCharacters(in: .whitespacesAndNewlines)
+    let listId = choiceReminderListId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let count = choiceReminderCount.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !choiceReminderScheduleDraftIsDirty,
+      let pending = pendingChoiceReminderSchedule,
+      pending.sessionId == snapshot.session.id,
+      pending.sessionRevision == snapshot.session.revision
+    {
+      // A recovered exact proposal is already durable. Re-reading it for a
+      // preview must not round a displayed minute or mint another revision.
+      return nil
+    }
+    if dateTime.isEmpty && timeZone.isEmpty && listId.isEmpty && count.isEmpty {
+      return nil
+    }
+    guard !dateTime.isEmpty, !timeZone.isEmpty, !listId.isEmpty, !count.isEmpty,
+      let reminderCount = UInt32(count), (1...16).contains(reminderCount),
+      validChoiceReminderListId(listId), let zone = TimeZone(identifier: timeZone)
+    else {
+      throw CoreClientError.contractViolation("Choose a complete local Reminder schedule.")
+    }
+
+    guard let date = unambiguousLocalReminderDate(dateTime, timeZone: zone) else {
+      throw CoreClientError.contractViolation("Choose a valid local Reminder date and time.")
+    }
+    let dueAtMs = Int64((date.timeIntervalSince1970 * 1_000).rounded())
+    guard dueAtMs > Int64((Date().timeIntervalSince1970 * 1_000).rounded()) else {
+      throw CoreClientError.contractViolation("Choose a future local Reminder time.")
+    }
+
+    let requestId: String
+    if let pending = pendingChoiceReminderSchedule,
+      pending.dateTime == dateTime, pending.timeZone == timeZone, pending.listId == listId,
+      pending.count == count,
+      pending.sessionId == snapshot.session.id,
+      pending.sessionRevision == snapshot.session.revision
+    {
+      requestId = pending.requestId
+    } else {
+      requestId = "reminder-schedule-" + UUID().uuidString.lowercased()
+      pendingChoiceReminderSchedule = (
+        dateTime, timeZone, listId, count, snapshot.session.id, snapshot.session.revision, requestId
+      )
+    }
+    let input = ChoiceReminderScheduleInput(
+      requestId: requestId, choiceSessionId: snapshot.session.id,
+      expectedSessionRevision: snapshot.session.revision, reminderListId: listId,
+      reminderCount: reminderCount,
+      dueAtMs: dueAtMs, timeZone: timeZone)
+    guard input.validated() else {
+      throw CoreClientError.contractViolation("Choose a bounded Reminder schedule.")
+    }
+    return input
+  }
+
+  private func validChoiceReminderListId(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+          || $0 == 45 || $0 == 95 || $0 == 46
+      }
+  }
+
+  /// Rejects both non-existent and repeated local wall times. The wire record
+  /// binds one exact instant plus an IANA zone, so silently choosing one side
+  /// of a daylight-saving fallback would not be an explicit user selection.
+  private func unambiguousLocalReminderDate(_ value: String, timeZone: TimeZone) -> Date? {
+    let local = DateFormatter()
+    local.locale = Locale(identifier: "en_US_POSIX")
+    local.calendar = Calendar(identifier: .gregorian)
+    local.timeZone = timeZone
+    local.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    guard let parsed = local.date(from: value), local.string(from: parsed) == value else {
+      return nil
+    }
+    let utc = DateFormatter()
+    utc.locale = Locale(identifier: "en_US_POSIX")
+    utc.calendar = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(secondsFromGMT: 0)
+    utc.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    guard let wallAsUTC = utc.date(from: value) else { return nil }
+    let offsets = Set([
+      timeZone.secondsFromGMT(for: parsed),
+      timeZone.secondsFromGMT(for: parsed.addingTimeInterval(-86_400)),
+      timeZone.secondsFromGMT(for: parsed.addingTimeInterval(86_400)),
+    ])
+    let candidates = offsets.compactMap { offset -> Date? in
+      let candidate = wallAsUTC.addingTimeInterval(TimeInterval(-offset))
+      guard timeZone.secondsFromGMT(for: candidate) == offset,
+        local.string(from: candidate) == value
+      else { return nil }
+      return candidate
+    }
+    return candidates.count == 1 ? candidates[0] : nil
+  }
+
+  /// A schedule edit is never allowed to confirm a previous preview. The
+  /// Host creates the new revision only when the user chooses review again.
+  public func invalidateChoiceReminderScheduleDraft() {
+    guard !applyingChoiceReminderScheduleHydration else { return }
+    choiceReminderScheduleDraftRevision &+= 1
+    choiceReminderScheduleDraftIsDirty = true
+    choiceConfirmationPreview = nil
+    pendingChoiceReminderSchedule = nil
+  }
+
+  /// Records an explicit native date-picker interaction. Merely presenting
+  /// the picker never creates a schedule or guesses a due time.
+  public func selectChoiceReminderDate(_ date: Date) {
+    choiceReminderPickerDate = date
+    choiceReminderPickerIsPresented = true
+    choiceReminderPickerDateIsExplicit = true
+    updateChoiceReminderDateTimeFromNativeSelection()
+  }
+
+  /// Reveals the native picker without accepting its initial display value as
+  /// owner-provided schedule authority. Review remains disabled until the
+  /// owner changes the picker and every other exact schedule field is valid.
+  public func presentChoiceReminderDatePicker() {
+    choiceReminderPickerIsPresented = true
+  }
+
+  /// Frozen-UI local Back action. It changes no Store state or effect
+  /// authority; the current verified ChoiceSet remains available above.
+  public func backFromChoiceReminderSchedule() {
+    clearChoiceReminderScheduleDraft()
+    choiceReminderScheduleIsVisible = false
+  }
+
+  public var choiceReminderScheduleReadyForReview: Bool {
+    guard choiceReminderPickerDateIsExplicit,
+      let zone = TimeZone(identifier: choiceReminderTimeZone),
+      validChoiceReminderListId(choiceReminderListId), choiceReminderCount == "1",
+      let date = unambiguousLocalReminderDate(choiceReminderDateTime, timeZone: zone)
+    else { return false }
+    return date > Date()
+  }
+
+  /// Records an explicit IANA time-zone selection and re-renders the already
+  /// selected instant in that zone. No selection means no schedule proposal.
+  public func selectChoiceReminderTimeZone(_ identifier: String) {
+    choiceReminderTimeZone = identifier
+    if choiceReminderPickerDateIsExplicit {
+      updateChoiceReminderDateTimeFromNativeSelection()
+    } else {
+      invalidateChoiceReminderScheduleDraft()
+    }
+  }
+
+  public func selectChoiceReminderList(_ identifier: String) {
+    choiceReminderListId = identifier
+    choiceReminderCount = identifier.isEmpty ? "" : "1"
+    invalidateChoiceReminderScheduleDraft()
+  }
+
+  private func updateChoiceReminderDateTimeFromNativeSelection() {
+    guard choiceReminderPickerDateIsExplicit,
+      let zone = TimeZone(identifier: choiceReminderTimeZone)
+    else {
+      choiceReminderDateTime = ""
+      invalidateChoiceReminderScheduleDraft()
+      return
+    }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = zone
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    choiceReminderDateTime = formatter.string(from: choiceReminderPickerDate)
+    invalidateChoiceReminderScheduleDraft()
+  }
+
+  private func clearChoiceReminderScheduleDraft() {
+    choiceReminderDateTime = ""
+    choiceReminderTimeZone = ""
+    choiceReminderListId = ""
+    choiceReminderCount = ""
+    choiceReminderPickerDate = Date()
+    choiceReminderPickerIsPresented = false
+    choiceReminderPickerDateIsExplicit = false
+    pendingChoiceReminderSchedule = nil
+    choiceReminderScheduleDraftRevision &+= 1
+    choiceReminderScheduleDraftIsDirty = false
+    choiceConfirmationPreview = nil
+  }
+
+  private func hydrateChoiceReminderSchedule(_ schedule: ChoiceReminderSchedule) {
+    guard let zone = TimeZone(identifier: schedule.input.timeZone) else { return }
+    applyingChoiceReminderScheduleHydration = true
+    defer {
+      applyingChoiceReminderScheduleHydration = false
+      choiceReminderScheduleDraftIsDirty = false
+    }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = zone
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    choiceReminderDateTime = formatter.string(
+      from: Date(timeIntervalSince1970: TimeInterval(schedule.input.dueAtMs) / 1_000))
+    choiceReminderPickerDate = Date(
+      timeIntervalSince1970: TimeInterval(schedule.input.dueAtMs) / 1_000)
+    choiceReminderPickerIsPresented = true
+    choiceReminderPickerDateIsExplicit = true
+    choiceReminderTimeZone = schedule.input.timeZone
+    choiceReminderListId = schedule.input.reminderListId
+    choiceReminderCount = String(schedule.input.reminderCount)
+    pendingChoiceReminderSchedule = (
+      choiceReminderDateTime, choiceReminderTimeZone, choiceReminderListId, choiceReminderCount,
+      schedule.input.choiceSessionId, schedule.input.expectedSessionRevision,
+      schedule.input.requestId
+    )
+  }
+
+  public func formattedChoiceReminderDateTime(_ item: ChoiceReminderItem) -> String {
+    guard let zone = TimeZone(identifier: item.timeZone) else { return "Unavailable" }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = zone
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(item.dueAtMs) / 1_000))
+  }
+
+  public func confirmPreparedChoice() async {
+    guard choiceSessionActionEnabled, let snapshot = choiceLoopSnapshot,
+      let confirmation = choiceConfirmationPreview,
+      confirmation.choiceSessionId == snapshot.session.id,
+      confirmation.expectedSessionRevision == snapshot.session.revision
+    else {
+      return
+    }
+    let continuitySequence = choiceLoopRefreshSequence
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      try requireChoiceContinuity(expectedSequence: continuitySequence)
+      let next = try await core.confirmChoice(confirmation, proof: proof).validated()
+      try requireCurrentOnGeneration(generation)
+      guard
+        next.session.id == confirmation.choiceSessionId,
+        next.session.state == "awaitingConfirmation",
+        next.confirmation == confirmation,
+        next.session.pendingConfirmationId == confirmation.id,
+        next.session.revision == confirmation.expectedSessionRevision + 1
+      else {
+        throw CoreClientError.contractViolation(
+          "Core did not complete the exact local Choice journal."
+        )
+      }
+      adoptCommittedChoiceLoopSnapshot(next)
+      invalidateChoiceDComposerTarget()
+      choiceConfirmationPreview = nil
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      // The Store may already be AwaitingConfirmation if its private render
+      // hit a durable reconciliation boundary. Refresh once so the recovery
+      // control remains reachable instead of retaining a stale Active card.
+      await refreshChoiceLoopContinuity(expectedGeneration: generation)
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  /// The separate, explicit action-time boundary for the exact confirmed
+  /// Reminder write. Choice confirmation itself never enters this route.
+  public func requestChoiceReminderWrite() {
+    guard choiceReminderWriteTask == nil else { return }
+    let taskID = UUID()
+    choiceReminderWriteTaskID = taskID
+    choiceReminderWriteTask = Task { [weak self] in
+      guard let self else { return }
+      await self.authorizeChoiceReminderWrite()
+      guard self.choiceReminderWriteTaskID == taskID else { return }
+      self.choiceReminderWriteTask = nil
+      self.choiceReminderWriteTaskID = nil
+    }
+  }
+
+  private func authorizeChoiceReminderWrite() async {
+    guard storeControlEnabled, !isBusy, let confirmation = choiceLoopSnapshot?.confirmation,
+      choiceLoopSnapshot?.session.state == "awaitingConfirmation",
+      let ownedTaskID = choiceReminderWriteTaskID
+    else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    var abortContext: (confirmationId: String, missionId: String)?
+    do {
+      try Task.checkCancellation()
+      let target = try await reminders.prepareTarget()
+      try Task.checkCancellation()
+      let authorizeProof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      let mission = try
+        (await core.authorizeChoiceReminders(
+          confirmationId: confirmation.id, reminderTarget: target, proof: authorizeProof
+        )).validated()
+      try Task.checkCancellation()
+      try requireCurrentOnGeneration(generation)
+      guard Self.matchesChoiceMission(mission, confirmation: confirmation) else {
+        throw CoreClientError.contractViolation(
+          "Core did not bind the exact confirmed Choice to Reminders.")
+      }
+      let dispatchProof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      let start = try await core.beginChoiceReminderDispatch(
+        confirmationId: confirmation.id, proof: dispatchProof)
+      _ = try start.mission.validated()
+      guard Self.matchesChoiceMission(start.mission, confirmation: confirmation) else {
+        throw CoreClientError.contractViolation("Core returned a different Reminder dispatch.")
+      }
+      if start.executeNow {
+        abortContext = (confirmation.id, start.mission.missionId)
+      }
+      if Task.isCancelled || generation != runtimeGeneration {
+        throw RemindersClientError.cancelledBeforeCommit
+      }
+      let links =
+        start.executeNow
+        ? try await reminders.executeInitialMirror(start)
+        : try await recoverOrRetireAbsentChoiceReminder(
+          start: start, confirmationId: confirmation.id, generation: generation,
+          ownedTaskID: ownedTaskID)
+      // A proven-absent read-only recovery records the stopped attempt but
+      // deliberately returns no links. The owner must make a second explicit
+      // request before EventKit can be entered again.
+      guard !links.isEmpty else {
+        errorMessage = userMessage(for: RemindersClientError.mirrorAbsent(start.mission.title))
+        return
+      }
+      abortContext = nil
+      try Task.checkCancellation()
+      let recordProof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      let persisted = try
+        (await core.recordChoiceReminderMirror(
+          confirmationId: confirmation.id, links: links, proof: recordProof
+        )).validated()
+      try requireCurrentOnGeneration(generation)
+      guard Self.matchesChoiceMission(persisted, confirmation: confirmation),
+        persisted.reminderLinks == links
+      else {
+        throw CoreClientError.contractViolation(
+          "Core did not retain exact Reminder Evidence links.")
+      }
+      publishConfirmedMission(persisted)
+      reminderLinks = links
+      activeCards = [
+        ActiveOutcomeCard(
+          id: persisted.missionId, title: persisted.title,
+          state: "Waiting for the confirmed Reminder to be completed")
+      ]
+      errorMessage = nil
+    } catch RemindersClientError.cancelledBeforeCommit {
+      // This is the only safe retry transition: EventKit reset its uncommitted
+      // batch and the signed local client reports that bounded fact while the
+      // exact protected Core is still alive. Ambiguous post-commit failures
+      // never enter this route and remain read-only recovery.
+      if let abortContext {
+        // The local EventKit transaction is definitively reset. Release its
+        // in-process claim before the Store acknowledgement so a lost abort
+        // response cannot consume the next durable attempt and then reject it
+        // locally. The Store command itself is bounded and idempotent; it uses
+        // a fresh one-time runtime challenge on every reconciliation attempt.
+        reminders.releaseInitialMirrorClaim(for: abortContext.missionId)
+        let abortError = await Task { @MainActor [weak self] () -> String? in
+          guard let self else { return "OpenOpen could not reconcile the stopped Reminder write." }
+          return await self.reconcileChoiceReminderPrecommitAbort(
+            confirmationId: abortContext.confirmationId,
+            expectedGeneration: generation,
+            ownedTaskID: ownedTaskID)
+        }.value
+        if let abortError {
+          if generation == runtimeGeneration { errorMessage = abortError }
+          return
+        }
+      }
+      if generation == runtimeGeneration {
+        errorMessage = userMessage(for: RemindersClientError.cancelledBeforeCommit)
+      }
+    } catch {
+      if generation == runtimeGeneration {
+        errorMessage = userMessage(for: error)
+      }
+    }
+  }
+
+  private func recoverOrRetireAbsentChoiceReminder(
+    start: ReminderDispatchStart,
+    confirmationId: String,
+    generation: UInt64,
+    ownedTaskID: UUID
+  ) async throws -> [ReminderLink] {
+    do {
+      return try await reminders.recoverMirror(for: start.mission)
+    } catch RemindersClientError.mirrorAbsent {
+      // This is an authenticated read of the exact durable dispatch after a
+      // process/task boundary. Zero matching marker rows means there is no
+      // recoverable committed effect. Retire only that attempt, then require a
+      // later explicit owner action; never write EventKit in this recovery.
+      guard generation == runtimeGeneration, desiredEnabled else {
+        throw CoreClientError.requestCancelled
+      }
+      if let message = await reconcileChoiceReminderPrecommitAbort(
+        confirmationId: confirmationId,
+        expectedGeneration: generation,
+        ownedTaskID: ownedTaskID)
+      {
+        throw CoreClientError.contractViolation(message)
+      }
+      return []
+    }
+  }
+
+  private func reconcileChoiceReminderPrecommitAbort(
+    confirmationId: String,
+    expectedGeneration: UInt64,
+    ownedTaskID: UUID
+  ) async -> String? {
+    var lastMessage = "OpenOpen could not reconcile the stopped Reminder write."
+    for _ in 0..<3 {
+      do {
+        let proof =
+          if expectedGeneration == runtimeGeneration, desiredEnabled {
+            try await currentEnabledProof(
+              expectedGeneration: expectedGeneration,
+              prepareModelRuntime: false)
+          } else {
+            try await currentReminderOffQuiescenceProof(
+              previousGeneration: expectedGeneration,
+              ownedTaskID: ownedTaskID)
+          }
+        _ = try await core.abortChoiceReminderDispatchBeforeCommit(
+          confirmationId: confirmationId, proof: proof)
+        return nil
+      } catch {
+        lastMessage = userMessage(for: error)
+        // A protected Off intentionally advances the runtime generation before
+        // it cancels and awaits this exact task. Keep the bounded reconciliation
+        // loop alive in that window so a lost Store response is confirmed with
+        // a fresh one-time challenge. Each pass revalidates either current On
+        // or the exact task-owned Off-quiescence proof; drift still fails closed.
+      }
+    }
+    return lastMessage
+  }
+
+  /// Produces one fresh proof only for the exact Reminder task that protected
+  /// Off has cancelled and is currently awaiting. It cannot authorize model
+  /// work or a new effect: desired state is already Off, the visible state is
+  /// Turning Off, and the proof is passed only to the idempotent abort command
+  /// before Core shutdown and the Store Off commit.
+  private func currentReminderOffQuiescenceProof(
+    previousGeneration: UInt64,
+    ownedTaskID: UUID
+  ) async throws -> BrokerRuntimeState {
+    let (expectedGeneration, overflow) = previousGeneration.addingReportingOverflow(1)
+    guard !overflow,
+      runtimeGeneration == expectedGeneration,
+      !desiredEnabled,
+      pendingRuntimeIntent == false,
+      runtimeDisplayState == .turningOff,
+      choiceReminderWriteTaskID == ownedTaskID,
+      choiceReminderWriteTask != nil,
+      enabled,
+      confirmedEnabled,
+      let expectedProtected = protectedRuntime,
+      expectedProtected.authorization.enabled
+    else {
+      throw CoreClientError.contractViolation(
+        "The Reminder abort is no longer inside the protected Off quiescence window.")
+    }
+    _ = try await provisionBrokerTrust()
+    guard runtimeGeneration == expectedGeneration,
+      !desiredEnabled,
+      pendingRuntimeIntent == false,
+      choiceReminderWriteTaskID == ownedTaskID,
+      let protected = try await readProtectedRuntime(),
+      protected.authorization == expectedProtected.authorization
+    else {
+      throw CoreClientError.contractViolation(
+        "The protected runtime changed while reconciling the stopped Reminder write.")
+    }
+    let runtime = try await core.recoverRuntime(
+      protected.authorization,
+      brokerReceipt: protected.receipt)
+    guard runtimeGeneration == expectedGeneration,
+      !desiredEnabled,
+      pendingRuntimeIntent == false,
+      choiceReminderWriteTaskID == ownedTaskID,
+      runtime.enabled,
+      runtime.revision == protected.authorization.revision,
+      runtime.updatedAtMs == protected.authorization.updatedAtMs
+    else {
+      throw CoreClientError.contractViolation(
+        "The protected runtime changed while reconciling the stopped Reminder write.")
+    }
+    return protected
+  }
+
+  public func checkChoiceReminderProgress() async {
+    guard storeControlEnabled, !isBusy, let confirmation = choiceLoopSnapshot?.confirmation,
+      let mission = confirmedMission, !reminderLinks.isEmpty,
+      Self.matchesChoiceMission(mission, confirmation: confirmation)
+    else { return }
+    isBusy = true
+    let generation = runtimeGeneration
+    var shouldRefreshForNextChoice = false
+    do {
+      let completed = try await reminders.completedReminders(
+        for: reminderLinks, confirmation: confirmation)
+      guard completed.count == confirmation.reminderItems.count else {
+        throw CoreClientError.contractViolation(
+          "Complete every confirmed Reminder before continuing.")
+      }
+      let proof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      let completion = try await core.completeChoiceReminders(
+        confirmationId: confirmation.id, completions: completed, proof: proof)
+      let receipt = try completion.receipt.validated()
+      let next = try completion.choiceLoop.validated()
+      try requireCurrentOnGeneration(generation)
+      guard receipt.missionId == mission.missionId,
+        receipt.outputHashes.contains(confirmation.payloadDigest),
+        next.confirmation == confirmation,
+        next.session.state == "softIdle"
+      else {
+        throw CoreClientError.contractViolation(
+          "Core did not bind Receipt and Markdown to the exact confirmed Choice.")
+      }
+      self.receipt = receipt
+      adoptCommittedChoiceLoopSnapshot(next)
+      activeCards = []
+      errorMessage = nil
+      shouldRefreshForNextChoice = true
+    } catch {
+      if generation == runtimeGeneration {
+        errorMessage = userMessage(for: error)
+      }
+    }
+    isBusy = false
+    guard shouldRefreshForNextChoice, generation == runtimeGeneration else { return }
+    // An authenticated foreground return is the only authorizing wake for
+    // the private post-Receipt next-choice operation. It must occur after the
+    // effect task releases its busy fence, or the one-shot resume is lost.
+    await refreshDashboard(authenticatedHomeForeground: true)
+  }
+
+  private static func matchesChoiceMission(
+    _ mission: ConfirmedMission, confirmation: ChoiceConsolidatedConfirmation
+  ) -> Bool {
+    mission.choiceConfirmationId == confirmation.id
+      && mission.choicePayloadDigest == confirmation.payloadDigest
+      && mission.choiceReminderPayloadDigest == confirmation.reminderPayloadDigest
+      && mission.choiceReminderItems == confirmation.reminderItems
+      && mission.workItems.map(\.id) == confirmation.reminderItems.map(\.id)
+      && mission.workItems.map(\.title) == confirmation.reminderItems.map(\.text)
+  }
+
+  private func awaitChoiceRefinementResult(expectedGeneration: UInt64, sessionID: String) {
+    choiceResultTask?.cancel()
+    choiceResultTask = Task { [weak self] in
+      guard let self else { return }
+      for _ in 0..<240 {
+        guard !Task.isCancelled, expectedGeneration == runtimeGeneration else { return }
+        try? await Task.sleep(for: .seconds(1))
+        await refreshChoiceLoopContinuity(expectedGeneration: expectedGeneration)
+        guard !Task.isCancelled, expectedGeneration == runtimeGeneration,
+          let snapshot = choiceLoopSnapshot, snapshot.session.id == sessionID
+        else { return }
+        if snapshot.session.state != "refining" {
+          choiceResultTask = nil
+          return
+        }
+      }
+      guard expectedGeneration == runtimeGeneration,
+        choiceLoopSnapshot?.session.id == sessionID,
+        choiceLoopSnapshot?.session.state == "refining"
+      else { return }
+      choiceLoopContinuityState = .needsYou(.readFailed)
+      choiceResultTask = nil
+    }
+  }
+
+  /// Retires only the current foreground Choice path. It is independent from
+  /// Mission cancellation and never creates, changes, or authorizes an effect.
+  public func cancelChoiceSession() async {
+    guard !isBusy, let snapshot = choiceLoopSnapshot,
+      snapshot.session.state != "completed", snapshot.session.state != "cancelled"
+    else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(
+        expectedGeneration: generation, prepareModelRuntime: false)
+      let next = try await core.cancelChoice(proof: proof).validated()
+      try requireCurrentOnGeneration(generation)
+      guard next.session.id == snapshot.session.id,
+        next.session.state == "cancelled",
+        next.session.revision == snapshot.session.revision + 1
+      else {
+        throw CoreClientError.contractViolation("Core did not retain the cancelled Choice.")
+      }
+      adoptCommittedChoiceLoopSnapshot(next)
+      invalidateChoiceDComposerTarget()
+      pendingChoiceBeginRequest = nil
+      pendingChoiceDRequest = nil
+      choiceDComposerTextIsBound = false
+      choiceQuestion = ""
+      errorMessage = nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      reconcileChoiceContinuityAfterAmbiguousTransport(generation: generation)
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  /// Retries only a Host-created local Markdown journal after a crash or
+  /// interrupted cleanup. It has no body/path input and never authorizes a
+  /// Reminder, Mission, channel delivery, or provider work.
+  public func reconcileChoiceMarkdown() async {
+    guard !isBusy,
+      matchesChoiceMarkdownRecoveryState(
+        choiceLoopSnapshot?.session.state,
+        receiptCleanupAvailable: choiceMarkdownReceiptCleanupAvailable)
+    else { return }
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      let snapshot: ChoiceLoopSnapshot
+      if enabled {
+        let generation = runtimeGeneration
+        let proof = try await currentEnabledProof(expectedGeneration: generation)
+        snapshot = try await core.reconcileChoiceMarkdown(proof: proof).validated()
+        try requireCurrentOnGeneration(generation)
+      } else {
+        // This is deletion-only recovery of a Host-created, receipt-verified
+        // journal. It neither publishes Markdown nor starts model/effect work,
+        // so Global Off must not strand it behind an On proof.
+        snapshot = try await core.cleanupChoiceMarkdownReceipt().validated()
+      }
+      adoptCommittedChoiceLoopSnapshot(snapshot)
+      errorMessage = nil
+    } catch {
+      // A journal/receipt failure is continuity state, not dismissible local
+      // feedback. Keep the last verified snapshot and leave Off/cancel usable
+      // while making the required recovery visible across refreshes.
+      choiceLoopContinuityState = .needsYou(.readFailed)
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  private func matchesChoiceMarkdownRecoveryState(
+    _ state: String?, receiptCleanupAvailable: Bool
+  ) -> Bool {
+    state == "awaitingConfirmation" || state == "executing"
+      || (state == "cancelled" && receiptCleanupAvailable)
+  }
+
+  /// Compatibility for the existing Dashboard action wiring. The route is no
+  /// longer an Outcome proposal: it delegates only to Host-owned choice.begin.
+  public func submitPrompt() async {
+    choiceQuestion = prompt
+    await submitHomeComposer()
+    prompt = choiceQuestion
+  }
+
+  public func chooseModel(_ identifier: String) {
+    guard let model = availableModels.first(where: { $0.id == identifier }) else {
+      selectedModelId = ""
+      selectedModelEffort = ""
+      return
+    }
+    selectedModelId = model.id
+    selectedModelEffort = model.supportedReasoningEfforts.isEmpty ? "not_applicable" : ""
+  }
+
+  public func chooseModelEffort(_ effort: String) {
+    guard selectedCatalogModelEfforts.contains(effort) else {
+      selectedModelEffort = ""
+      return
+    }
+    selectedModelEffort = effort
+  }
+
+  public func persistSelectedModel() async {
+    guard modelSelectionCanBeSaved, let model = selectedCatalogModel else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let selection = try await core.selectModel(
+        modelId: model.id,
+        requestedEffort: selectedModelEffort,
+        catalogSnapshotId: catalogSnapshotId,
+        catalogFingerprint: catalogFingerprint,
+        catalogRevision: catalogRevision,
+        proof: proof)
+      try requireCurrentOnGeneration(generation)
+      guard selection.modelId == model.id,
+        selection.requestedEffort == selectedModelEffort,
+        selection.actualEffort == selectedModelEffort
+      else {
+        throw CoreClientError.contractViolation("Core did not preserve the selected model.")
+      }
+      let setupProof = try await currentEnabledProof(expectedGeneration: generation)
+      let setup = try await core.modelSetup(proof: setupProof)
+      try requireCurrentOnGeneration(generation)
+      applyAccountCatalog(setup)
+      guard modelSelectionStatus == .current, persistedModelSelection == selection else {
+        throw CoreClientError.contractViolation(
+          "Core could not bind the saved model selection to the current account catalog.")
+      }
+      try finishAccountSetupIfReady(expectedGeneration: generation)
       errorMessage = nil
     } catch {
       guard generation == runtimeGeneration else { return }
@@ -2250,6 +4210,7 @@ public final class AppModel: ObservableObject {
   }
 
   private func startChannelPolling() {
+    guard choiceCoreConnectionsAvailable else { return }
     guard channelTask == nil else { return }
     channelTask = Task { [weak self] in
       guard let self else { return }
@@ -2427,6 +4388,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func sendChannelProgress() async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Channel delivery is unavailable during local Choice Core."
+      return
+    }
     let value = channelMessageDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard channelEffectEntryEnabled, !isBusy, let mission = confirmedMission,
       channelRouteSet?.missionId == mission.missionId,
@@ -2452,6 +4417,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func sendChannelNeedYou() async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Channel delivery is unavailable during local Choice Core."
+      return
+    }
     guard channelEffectEntryEnabled, !isBusy, let needsYou,
       channelRouteSet?.missionId == needsYou.missionId,
       selectedChannelRoute(for: .needYou) != nil
@@ -2475,6 +4444,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func sendChannelReceipt() async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Channel delivery is unavailable during local Choice Core."
+      return
+    }
     guard channelEffectEntryEnabled, !isBusy, let receipt,
       channelRouteSet?.missionId == receipt.missionId,
       selectedChannelRoute(for: .receipt) != nil
@@ -2571,6 +4544,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func confirmSuggestion() async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Historical Mission actions are unavailable during local Choice Core."
+      return
+    }
     guard modelEntryEnabled, !isBusy, suggestion != nil || confirmedMission != nil else { return }
     isBusy = true
     defer { isBusy = false }
@@ -2714,6 +4691,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func cancelMission(identifier: String) async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Historical Mission actions are unavailable during local Choice Core."
+      return
+    }
     guard !isBusy, dashboardControls.missionCancellationEnabled,
       activeCards.contains(where: { $0.id == identifier })
     else { return }
@@ -2786,6 +4767,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func checkMissionProgress() async {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Historical Mission actions are unavailable during local Choice Core."
+      return
+    }
     guard storeControlEnabled, !isBusy, let mission = confirmedMission,
       !reminderLinks.isEmpty
     else {
@@ -2860,6 +4845,13 @@ public final class AppModel: ObservableObject {
   }
 
   public func requestSuggestionConfirmation() {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Historical Mission actions are unavailable during local Choice Core."
+      return
+    }
+    // This is retained only for recovery of an already-durable historical
+    // Mission. The PR1 Choice surface never invokes it to create a new
+    // proposal or Reminder effect; its own confirmation route is choice.confirm.
     guard heroTask == nil else { return }
     heroTask = Task { [weak self] in
       await self?.confirmSuggestion()
@@ -2868,6 +4860,10 @@ public final class AppModel: ObservableObject {
   }
 
   public func requestMissionProgressCheck() {
+    guard historicalMissionEffectsAvailable else {
+      errorMessage = "Historical Mission actions are unavailable during local Choice Core."
+      return
+    }
     guard heroTask == nil else { return }
     heroTask = Task { [weak self] in
       await self?.checkMissionProgress()
@@ -2877,20 +4873,15 @@ public final class AppModel: ObservableObject {
 
   public func refreshAccountAndModels() async {
     guard accountSetupEnabled else {
-      accountState = .notConnected
-      availableModels = []
+      clearTransientModelSetup()
       return
     }
     let generation = runtimeGeneration
     do {
-      let accountProof = try await currentEnabledProof(expectedGeneration: generation)
-      let account = try await core.account(proof: accountProof)
+      let setupProof = try await currentEnabledProof(expectedGeneration: generation)
+      let setup = try await core.modelSetup(proof: setupProof)
       try requireCurrentOnGeneration(generation)
-      let modelsProof = try await currentEnabledProof(expectedGeneration: generation)
-      let models = try await core.models(proof: modelsProof)
-      try requireCurrentOnGeneration(generation)
-      accountState = account
-      availableModels = models
+      applyAccountCatalog(setup)
       try finishAccountSetupIfReady(expectedGeneration: generation)
       errorMessage = nil
     } catch {
@@ -2909,14 +4900,11 @@ public final class AppModel: ObservableObject {
       let identity = try await provisionBrokerTrust()
       if managedLoginMayHaveCompleted {
         try await ensureCodexReady(coreIdentity: identity)
-        let accountProof = try await currentEnabledProof(expectedGeneration: generation)
-        let account = try await core.account(proof: accountProof)
-        if case .chatGpt = account {
-          let modelsProof = try await currentEnabledProof(expectedGeneration: generation)
-          let models = try await core.models(proof: modelsProof)
+        let setupProof = try await currentEnabledProof(expectedGeneration: generation)
+        let setup = try await core.modelSetup(proof: setupProof)
+        if case .chatGpt = setup.account {
           try requireCurrentOnGeneration(generation)
-          accountState = account
-          availableModels = models
+          applyAccountCatalog(setup)
           managedLoginMayHaveCompleted = false
           try finishAccountSetupIfReady(expectedGeneration: generation)
           errorMessage = nil
@@ -2945,13 +4933,10 @@ public final class AppModel: ObservableObject {
       try requireCurrentOnGeneration(generation)
       let currentIdentity = try await provisionBrokerTrust()
       try await ensureCodexReady(coreIdentity: currentIdentity)
-      let accountProof = try await currentEnabledProof(expectedGeneration: generation)
-      let account = try await core.account(proof: accountProof)
-      let modelsProof = try await currentEnabledProof(expectedGeneration: generation)
-      let models = try await core.models(proof: modelsProof)
+      let setupProof = try await currentEnabledProof(expectedGeneration: generation)
+      let setup = try await core.modelSetup(proof: setupProof)
       try requireCurrentOnGeneration(generation)
-      accountState = account
-      availableModels = models
+      applyAccountCatalog(setup)
       managedLoginMayHaveCompleted = false
       try finishAccountSetupIfReady(expectedGeneration: generation)
       errorMessage = nil

@@ -1,5 +1,35 @@
 # Acceptance Ledger
 
+## Current Choice Loop acceptance — 2026-07-19
+
+Current product and proof authority comes from the current private-agent
+contract at the top of the Master Plan. No row passes from an old SHA, mock,
+fixture, screenshot, CI alone, signature alone, or historical package.
+
+| Gate | Evidence required | Current result |
+| --- | --- | --- |
+| Canonical document freeze | Master/design/control/current-index patch; one fingerprint; conflict/link/diff/privacy checks; two fresh reviewers | pending final same-fingerprint review and exact staged-scope handoff |
+| Repair24 source/CI identity | exact source, merge, and CI tuple | PASS for source/CI only: `ca26036… → c86e590…`, CI `29707715009`; package/install/runtime/effect proof is not implied |
+| PR1 Choice Core + Mac | strict Choice types; Host-owned `choice.begin`; command-owned D `choice.select`; private refinement-result commit; deterministic Host idle/stale transitions; render-intent/atomic-rename/receipt Markdown recovery; English-only scan→explicit model/effort→one question→dynamic A/B/C+D; global session; exact confirmation; explicit-time-only/future Reminder proposal with missing-time selection and separate real-write gate; Reminders/Evidence/Receipt; focused/full tests; Scout; two reviewers; CI | current code fingerprint passed Rust/Swift/Scout/product/security; Reminder policy is implementation READY only after this new same-fingerprint document review and exact Advisor handoff |
+| PR1 Persona migration | reviewed default `openopen.nondev.default` bundle; bounded canonical content and digest verification; verified local revision storage; protocol/model-operation provenance; audit/replay and non-authority guarantees; mutable Persona update routes rejected in PR1; focused/full tests and fresh review | IN_PROGRESS: direct Owner authorization moves the technical migration and audit into PR1; no new Persona voice or final copy is claimed |
+| PR2 iMessage | same-account self-chat interactive inbox only; latest owner-active bound reactive reply; durable echo/dedupe/loop/restart; groups and unauthorized/proactive/new-recipient/cross-channel outbound rejected; permission recovery matrix | waits for PR1 `IMPLEMENTATION_MERGE_READY` and normal merge; the additional read-only source remains unavailable inside PR2 |
+| Core+iMessage Hero checkpoint App/DMG | same-main post-PR2 source/tree/content parity and deterministic offline verification of the complete outcome loop plus Off/restart/dedupe | waits for normal PR2 merge; no install/provider/effect claim |
+| One additional iMessage source | exactly one individually selected/revocable one-to-one read-only binding; no outbound/recipient/mirror authority; second source/groups/stale/revoked fail closed | POST_BPLUS |
+| B2 Dynamic Memory | exactly one real import; at most three candidate cards; one Owner-selected card; only its confirmed Markdown diff | B+ after Hero checkpoint from `1463057…`; real processing, selection, and diff confirmation are separate Owner gates |
+| C2 Skills | exactly one public instruction-only Skill through immutable acquisition/audit/enablement and one no-external-effect use | B+ after B2 from `f4ec71c…`; each real lifecycle step remains separately Owner gated |
+| PR3 Discord | local personal Bot DM, Keychain-only token, exact identity binding, metadata-only backlog ask | POST_BPLUS; real token/provider remains `WAIT_OWNER` |
+| Product liveness | pre/post read-only Scout; no modal/focus/repeat-alert/false-state/replay/restart/permission/Off P0/P1 | IN_PROGRESS: one model-drift cancellation P1 is repaired with focused/full Swift PASS; final pre-freeze PASS waits for the four newly approved mechanisms on one implementation fingerprint |
+| Model contract | complete compatible catalog scan; explicit persisted model and supported effort; `not_applicable`; provenance; typed Need you; no fixed Sol/Auto/fallback | pending PR1; implementation-task model is not product authority |
+| Real effect/provider proof | exact install/permission/token/send/Mission/Reminder/Evidence/runtime receipts | `WAIT_OWNER`/`WAIT_EXTERNAL` per exact node; nothing newly claimed |
+| Same-fingerprint review and CI | independent `IMPLEMENTATION_MERGE_READY` for active PR1 and PR2: applicable Scout, P0/P1/P2=`0/0/0` from two fresh reviewers, exact-head CI/content parity, normal merge | pending per active PR; later gates cannot substitute; `REAL_PRODUCT_PROOF` remains separate |
+| Final B+ App/DMG offline verification | App and DMG built after PR1, PR2, minimal B2, and minimal C2 from one verified main content; exact source/tree/content-parity binding; deterministic offline structural/signature/manifest checks; receipt with no install or provider/effect claim | waits for B+ normal merges; cannot be replaced by the Hero checkpoint or an older Repair package/receipt |
+| B+ closure and Owner-return queue | every Owner-independent B+ route merged/verified or carrying an exact evidence-backed blocker; Owner-return items prepared without secrets; reached boundaries include UTC `first_seen_at`, exact fingerprint/state/evidence/recovery; unrelated READY work continues | ACTIVE under the retained queue discipline; architecture items `OWNER_RETURN-11` through `OWNER_RETURN-19` are resolved, while every listed unresolved child node under families 01–10 remains independently PREPARE until reached; no nonexistent parent ID may freeze or advance a child, and no queue item grants an effect, credential, release, or bypass |
+
+## Historical 2026-07-18 acceptance snapshot — non-normative
+
+The following table and review history are preserved chronology. Their old
+current-gate language cannot block, satisfy, or redirect the Choice Loop route.
+
 Product state: `IMPLEMENTATION_IN_PROGRESS`
 
 Current competition gate: `BUILD_WEEK_COMPETITION_READY`. The dated current

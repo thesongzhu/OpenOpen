@@ -1119,15 +1119,51 @@ public struct ReminderWriteAuthorization: Codable, Equatable, Sendable {
     return SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
   }
 
-  public func validates(missionId: String, workItems: [MissionWorkItem]) -> Bool {
-    self.missionId == missionId
+  public func validates(
+    missionId: String, workItems: [MissionWorkItem],
+    choiceConfirmationId: String? = nil,
+    choicePayloadDigest: String? = nil,
+    choiceReminderPayloadDigest: String? = nil,
+    choiceReminderItems: [ChoiceReminderItem]? = nil
+  ) -> Bool {
+    let expectedPayload: String
+    switch (
+      choiceConfirmationId, choicePayloadDigest, choiceReminderPayloadDigest, choiceReminderItems
+    ) {
+    case (nil, nil, nil, nil):
+      expectedPayload = Self.payloadSha256(
+        missionId: missionId, target: target, workItems: workItems)
+    case (
+      .some(let confirmationId), .some(let choicePayloadDigest),
+      .some(let reminderPayloadDigest), .some(let reminderItems)
+    ):
+      var payload = Self.domain
+      Self.appendLengthPrefixed(missionId, to: &payload)
+      Self.appendLengthPrefixed(confirmationId, to: &payload)
+      Self.appendLengthPrefixed(choicePayloadDigest, to: &payload)
+      Self.appendLengthPrefixed(reminderPayloadDigest, to: &payload)
+      Self.appendLengthPrefixed(listId, to: &payload)
+      Self.appendLengthPrefixed(target.sourceIdentifier, to: &payload)
+      Self.appendLengthPrefixed(target.calendarIdentifier, to: &payload)
+      for item in reminderItems {
+        Self.appendLengthPrefixed(item.id, to: &payload)
+        Self.appendLengthPrefixed(item.text, to: &payload)
+        var dueAtMs = UInt64(bitPattern: item.dueAtMs).bigEndian
+        withUnsafeBytes(of: &dueAtMs) { payload.append(contentsOf: $0) }
+        Self.appendLengthPrefixed(item.timeZone, to: &payload)
+        Self.appendLengthPrefixed(item.evidenceIntent, to: &payload)
+      }
+      expectedPayload = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+    default:
+      return false
+    }
+    return self.missionId == missionId
       && listId == Self.logicalListId
       && Self.isLowercaseHex(payloadSha256, count: 64)
       && !approvalId.isEmpty
       && Self.isLowercaseHex(approvalDigest, count: 64)
       && target.isValid
-      && payloadSha256
-        == Self.payloadSha256(missionId: missionId, target: target, workItems: workItems)
+      && payloadSha256 == expectedPayload
   }
 
   private static func appendLengthPrefixed(_ value: String, to data: inout Data) {
@@ -1153,6 +1189,30 @@ public struct ConfirmedMission: Codable, Equatable, Identifiable, Sendable {
   public let reminderAuthorization: ReminderWriteAuthorization
   public let reminderDispatch: [ConfirmedReminderDispatch]
   public let reminderLinks: [ReminderLink]
+  public let choiceConfirmationId: String?
+  public let choicePayloadDigest: String?
+  public let choiceReminderPayloadDigest: String?
+  public let choiceReminderItems: [ChoiceReminderItem]?
+
+  public init(
+    missionId: String, title: String, workItems: [MissionWorkItem],
+    reminderAuthorization: ReminderWriteAuthorization,
+    reminderDispatch: [ConfirmedReminderDispatch], reminderLinks: [ReminderLink],
+    choiceConfirmationId: String? = nil, choicePayloadDigest: String? = nil,
+    choiceReminderPayloadDigest: String? = nil,
+    choiceReminderItems: [ChoiceReminderItem]? = nil
+  ) {
+    self.missionId = missionId
+    self.title = title
+    self.workItems = workItems
+    self.reminderAuthorization = reminderAuthorization
+    self.reminderDispatch = reminderDispatch
+    self.reminderLinks = reminderLinks
+    self.choiceConfirmationId = choiceConfirmationId
+    self.choicePayloadDigest = choicePayloadDigest
+    self.choiceReminderPayloadDigest = choiceReminderPayloadDigest
+    self.choiceReminderItems = choiceReminderItems
+  }
 
   public func validated() throws -> Self {
     guard Self.validField(missionId, maximumBytes: 256),
@@ -1163,7 +1223,16 @@ public struct ConfirmedMission: Codable, Equatable, Identifiable, Sendable {
         Self.validField($0.id, maximumBytes: 256)
           && Self.validField($0.title, maximumBytes: 16 * 1024)
       }),
-      reminderAuthorization.validates(missionId: missionId, workItems: workItems),
+      reminderAuthorization.validates(
+        missionId: missionId, workItems: workItems,
+        choiceConfirmationId: choiceConfirmationId,
+        choicePayloadDigest: choicePayloadDigest,
+        choiceReminderPayloadDigest: choiceReminderPayloadDigest,
+        choiceReminderItems: choiceReminderItems),
+      Self.validChoiceBinding(
+        confirmationId: choiceConfirmationId, payloadDigest: choicePayloadDigest,
+        reminderPayloadDigest: choiceReminderPayloadDigest,
+        reminderItems: choiceReminderItems, workItems: workItems),
       reminderDispatch.isEmpty || reminderDispatch.count == workItems.count,
       Set(reminderDispatch.map(\.workItemId)).count == reminderDispatch.count,
       Set(reminderDispatch.map(\.token)).count == reminderDispatch.count,
@@ -1217,8 +1286,39 @@ public struct ConfirmedMission: Codable, Equatable, Identifiable, Sendable {
         writeDisposition: .recoverOnly
       ),
       reminderDispatch: reminderDispatch,
-      reminderLinks: reminderLinks
+      reminderLinks: reminderLinks, choiceConfirmationId: choiceConfirmationId,
+      choicePayloadDigest: choicePayloadDigest,
+      choiceReminderPayloadDigest: choiceReminderPayloadDigest,
+      choiceReminderItems: choiceReminderItems
     )
+  }
+
+  private static func validChoiceBinding(
+    confirmationId: String?, payloadDigest: String?, reminderPayloadDigest: String?,
+    reminderItems: [ChoiceReminderItem]?,
+    workItems: [MissionWorkItem]
+  ) -> Bool {
+    switch (confirmationId, payloadDigest, reminderPayloadDigest, reminderItems) {
+    case (nil, nil, nil, nil): return true
+    case (
+      .some(let confirmationId), .some(let payloadDigest), .some(let reminderPayloadDigest),
+      .some(let reminderItems)
+    ):
+      return validField(confirmationId, maximumBytes: 256)
+        && payloadDigest.utf8.count == 64
+        && payloadDigest.utf8.allSatisfy {
+          (48...57).contains($0) || (97...102).contains($0)
+        }
+        && reminderPayloadDigest.utf8.count == 64
+        && reminderPayloadDigest.utf8.allSatisfy {
+          (48...57).contains($0) || (97...102).contains($0)
+        }
+        && reminderItems.count == workItems.count
+        && zip(reminderItems, workItems).allSatisfy { item, work in
+          item.validated() && item.id == work.id && item.text == work.title
+        }
+    default: return false
+    }
   }
 }
 
@@ -1231,6 +1331,69 @@ public struct ConfirmedReminderDispatch: Codable, Equatable, Identifiable, Senda
 public struct ReminderDispatchStart: Codable, Equatable, Sendable {
   public let mission: ConfirmedMission
   public let executeNow: Bool
+}
+
+public struct ChoiceReminderCompletion: Codable, Equatable, Sendable {
+  public let receipt: MissionReceipt
+  public let choiceLoop: ChoiceLoopSnapshot
+}
+
+public struct AuthorizeChoiceRemindersParameters: Codable, Sendable {
+  public let confirmationId: String
+  public let reminderTarget: ReminderTarget
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    confirmationId: String, reminderTarget: ReminderTarget, proof: BrokerRuntimeState
+  ) {
+    self.confirmationId = confirmationId
+    self.reminderTarget = reminderTarget
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChoiceReminderRequestParameters: Codable, Sendable {
+  public let confirmationId: String
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(confirmationId: String, proof: BrokerRuntimeState) {
+    self.confirmationId = confirmationId
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct RecordChoiceReminderMirrorParameters: Codable, Sendable {
+  public let confirmationId: String
+  public let links: [ReminderLink]
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(confirmationId: String, links: [ReminderLink], proof: BrokerRuntimeState) {
+    self.confirmationId = confirmationId
+    self.links = links
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct CompleteChoiceRemindersParameters: Codable, Sendable {
+  public let confirmationId: String
+  public let completions: [ReminderCompletionInput]
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    confirmationId: String, completions: [ReminderCompletionInput], proof: BrokerRuntimeState
+  ) {
+    self.confirmationId = confirmationId
+    self.completions = completions
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
 }
 
 public struct ReminderLink: Codable, Equatable, Identifiable, Sendable {
@@ -1268,7 +1431,7 @@ public struct MissionReceipt: Codable, Equatable, Identifiable, Sendable {
       !summary.isEmpty,
       summary == summary.trimmingCharacters(in: .whitespacesAndNewlines),
       summary.utf8.count <= 16 * 1024,
-      actualModel == "gpt-5.6-sol",
+      Self.validModelIdentifier(actualModel),
       !evidenceIds.isEmpty,
       evidenceIds.count <= 128,
       Set(evidenceIds).count == evidenceIds.count,
@@ -1283,6 +1446,14 @@ public struct MissionReceipt: Codable, Equatable, Identifiable, Sendable {
       )
     }
     return self
+  }
+
+  private static func validModelIdentifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+          || $0 == 45 || $0 == 95 || $0 == 46
+      }
   }
 
   private static func validBoundedIdentity(_ value: String) -> Bool {
@@ -1578,6 +1749,1092 @@ public struct GptModel: Codable, Equatable, Identifiable, Sendable {
   public let supportedReasoningEfforts: [String]
 }
 
+public struct ModelSelection: Codable, Equatable, Sendable {
+  public let id: String
+  public let modelId: String
+  public let requestedEffort: String
+  public let actualEffort: String
+  public let catalogFingerprint: String
+  public let catalogRevision: UInt64
+  public let accountDisplayClass: String
+  public let protocolSchemaRevision: UInt64
+}
+
+/// A Host-verified status for a persisted selection against one account and
+/// one complete compatible-model catalog snapshot. `unavailable` retains the
+/// underlying selection for audit, but is never model-entry authority.
+public enum ModelSelectionStatus: String, Codable, Equatable, Sendable {
+  case current
+  case unselected
+  case unavailable
+}
+
+/// One RPC response binds the account, catalog, catalog identity, and durable
+/// selection. The App must not compose readiness from independent reads.
+public struct ModelSetup: Codable, Equatable, Sendable {
+  public let account: AccountState
+  public let models: [GptModel]
+  public let selection: ModelSelection?
+  public let selectionStatus: ModelSelectionStatus
+  /// Opaque, short-lived identity for the Host-owned catalog snapshot. It is
+  /// required to persist a choice; catalog data supplied by the UI has no
+  /// authority on its own.
+  public let catalogSnapshotId: String
+  public let catalogFingerprint: String
+  public let catalogRevision: UInt64
+}
+
+public struct SelectModelParameters: Codable, Sendable {
+  public let modelId: String
+  public let requestedEffort: String
+  public let catalogSnapshotId: String
+  public let catalogFingerprint: String
+  public let catalogRevision: UInt64
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    modelId: String,
+    requestedEffort: String,
+    catalogSnapshotId: String,
+    catalogFingerprint: String,
+    catalogRevision: UInt64,
+    proof: BrokerRuntimeState
+  ) {
+    self.modelId = modelId
+    self.requestedEffort = requestedEffort
+    self.catalogSnapshotId = catalogSnapshotId
+    self.catalogFingerprint = catalogFingerprint
+    self.catalogRevision = catalogRevision
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct SelectChoiceParameters: Codable, Sendable {
+  public let selection: ChoiceSelection?
+  public let dInput: ChoiceDInput?
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(selection: ChoiceSelection, proof: BrokerRuntimeState) {
+    self.selection = selection
+    dInput = nil
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+
+  public init(dInput: ChoiceDInput, proof: BrokerRuntimeState) {
+    selection = nil
+    self.dInput = dInput
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct CancelChoiceParameters: Codable, Sendable {
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(proof: BrokerRuntimeState) {
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+/// The only public first-local-question request. Trusted envelope, delivery
+/// binding, batch, session, and audit fields are deliberately absent: Host
+/// derives and persists them before any model work can begin.
+public struct ChoiceBeginParameters: Codable, Sendable {
+  public let requestId: String
+  public let boundedLocalQuestion: String
+  public let expectedModelProvenanceRef: String
+  public let expectedCatalogFingerprint: String
+  public let expectedCatalogRevision: UInt64
+  public let expectedProtocolRevision: UInt64
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    requestId: String,
+    boundedLocalQuestion: String,
+    selection: ModelSelection,
+    proof: BrokerRuntimeState
+  ) {
+    self.requestId = requestId
+    self.boundedLocalQuestion = boundedLocalQuestion
+    expectedModelProvenanceRef = selection.id
+    expectedCatalogFingerprint = selection.catalogFingerprint
+    expectedCatalogRevision = selection.catalogRevision
+    expectedProtocolRevision = selection.protocolSchemaRevision
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChoiceBeginAccepted: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let operationId: String
+  public let choiceSessionId: String
+  public let acceptedSessionRevision: UInt64
+  public let sourceEnvelopeId: String
+  public let conversationTurnBatchId: String
+  public let state: String
+
+  public func validated() throws -> Self {
+    guard ChoiceLoopContract.identifier(requestId), ChoiceLoopContract.identifier(operationId),
+      ChoiceLoopContract.identifier(choiceSessionId), acceptedSessionRevision > 0,
+      ChoiceLoopContract.identifier(sourceEnvelopeId),
+      ChoiceLoopContract.identifier(conversationTurnBatchId), state == "interpreting"
+    else {
+      throw CoreClientError.contractViolation("Core returned an invalid first Choice acceptance.")
+    }
+    return self
+  }
+}
+
+public struct ConfirmChoiceParameters: Codable, Sendable {
+  public let confirmation: ChoiceConsolidatedConfirmation
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(
+    confirmation: ChoiceConsolidatedConfirmation, proof: BrokerRuntimeState
+  ) {
+    self.confirmation = confirmation
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct PrepareChoiceConfirmationParameters: Codable, Sendable {
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(proof: BrokerRuntimeState) {
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+/// An effect-free, revisioned local schedule proposal.  The Host validates
+/// the selected IANA zone and future instant again before persistence; this
+/// contract only keeps the Mac from presenting an unbounded wire value.
+public struct ChoiceReminderScheduleInput: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let choiceSessionId: String
+  public let expectedSessionRevision: UInt64
+  public let reminderListId: String
+  public let reminderCount: UInt32
+  public let dueAtMs: Int64
+  public let timeZone: String
+
+  public func validated() -> Bool {
+    ChoiceLoopContract.identifier(requestId)
+      && ChoiceLoopContract.identifier(choiceSessionId)
+      && expectedSessionRevision > 0
+      && ChoiceLoopContract.identifier(reminderListId)
+      && (1...16).contains(reminderCount)
+      && dueAtMs >= 0
+      && ChoiceLoopContract.text(timeZone, maximum: 128)
+      && timeZone.unicodeScalars.allSatisfy { $0.value < 128 }
+      && TimeZone(identifier: timeZone) != nil
+  }
+}
+
+public struct ChoiceReminderSchedule: Codable, Equatable, Sendable, Identifiable {
+  public let id: String
+  public let input: ChoiceReminderScheduleInput
+  public let revision: UInt64
+  public let acceptedAtMs: Int64
+
+  public func validated() -> Bool {
+    ChoiceLoopContract.identifier(id) && input.validated() && revision > 0
+      && acceptedAtMs >= 0 && input.dueAtMs > acceptedAtMs
+  }
+}
+
+public struct RecordChoiceReminderScheduleParameters: Codable, Sendable {
+  public let input: ChoiceReminderScheduleInput
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(input: ChoiceReminderScheduleInput, proof: BrokerRuntimeState) {
+    self.input = input
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+/// Read-only continuity state returned by the typed Choice Loop RPC. This
+/// state never grants a Mission, Reminder, channel, or model authority.
+public struct ChoiceLoopSnapshot: Codable, Equatable, Sendable {
+  public let session: ChoiceSession
+  public let activeBatch: ConversationTurnBatch?
+  public let interpretation: InterpretationFrame?
+  public let activeChoiceSet: ChoiceSet?
+  public let lastSelection: ChoiceSelection?
+  public var pendingRefinementOperation: ChoiceRefinementOperation? = nil
+  public let confirmation: ChoiceConsolidatedConfirmation?
+  public let documentManifest: DocumentManifest
+
+  public func validated() throws -> Self {
+    guard session.validated(), documentManifest.validated() else {
+      throw CoreClientError.contractViolation("Core returned invalid Choice Loop state.")
+    }
+    if (session.state == "completed" || session.state == "cancelled")
+      && (activeBatch != nil || interpretation != nil || activeChoiceSet != nil
+        || lastSelection != nil || pendingRefinementOperation != nil || confirmation != nil
+        || session.pendingConfirmationId != nil)
+    {
+      throw CoreClientError.contractViolation("Core returned replayable terminal Choice state.")
+    }
+    if let activeBatch {
+      guard activeBatch.validated(), activeBatch.choiceSessionId == session.id,
+        activeBatch.revision == session.revision
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid Choice batch.")
+      }
+    }
+    if let interpretation {
+      guard interpretation.validated(), interpretation.choiceSessionId == session.id,
+        interpretation.sourceManifestDigest == documentManifest.aggregateDigest,
+        session.activeInterpretationRevision == interpretation.revision
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid interpretation.")
+      }
+    } else if session.activeInterpretationRevision != nil {
+      throw CoreClientError.contractViolation("Core returned an incomplete interpretation state.")
+    }
+    if let activeChoiceSet {
+      guard activeChoiceSet.validated(), activeChoiceSet.choiceSessionId == session.id,
+        activeChoiceSet.sessionRevision == session.revision,
+        activeChoiceSet.sourceManifestDigest == documentManifest.aggregateDigest,
+        session.activeChoiceSetId == activeChoiceSet.id,
+        session.activeInterpretationRevision == activeChoiceSet.interpretationRevision
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid ChoiceSet.")
+      }
+    } else if session.activeChoiceSetId != nil {
+      throw CoreClientError.contractViolation("Core returned an incomplete ChoiceSet state.")
+    }
+    if let lastSelection {
+      guard lastSelection.validated(), lastSelection.choiceSessionId == session.id,
+        lastSelection.expectedSessionRevision < session.revision,
+        lastSelection.selectedAtMs <= session.lastInputAtMs
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid Choice selection.")
+      }
+    }
+    if let pendingRefinementOperation {
+      guard pendingRefinementOperation.validated(),
+        pendingRefinementOperation.choiceSessionId == session.id,
+        pendingRefinementOperation.expectedSessionRevision == session.revision,
+        pendingRefinementOperation.sourceManifestDigest == documentManifest.aggregateDigest,
+        session.state == "refining",
+        pendingRefinementOperation.isOwnerResume
+          || lastSelection?.id == pendingRefinementOperation.selectionId
+      else {
+        throw CoreClientError.contractViolation("Core returned an unbound Choice refinement.")
+      }
+    } else if session.state == "refining" {
+      throw CoreClientError.contractViolation("Core omitted the pending Choice refinement.")
+    }
+    if let confirmation {
+      guard confirmation.validated(), confirmation.choiceSessionId == session.id,
+        session.pendingConfirmationId == confirmation.id,
+        ["awaitingConfirmation", "executing", "softIdle"].contains(session.state),
+        confirmation.expectedSessionRevision
+          + (session.state == "awaitingConfirmation" ? 1 : 2) == session.revision,
+        confirmation.deliveryBindingId == session.primaryDeliveryBindingId
+      else {
+        throw CoreClientError.contractViolation("Core returned an invalid Choice confirmation.")
+      }
+    } else if session.pendingConfirmationId != nil {
+      throw CoreClientError.contractViolation("Core returned an incomplete Choice confirmation.")
+    }
+    return self
+  }
+}
+
+public struct ChoiceSession: Codable, Equatable, Sendable {
+  public let id: String
+  public let state: String
+  public let revision: UInt64
+  public let modelSelectionState: ChoiceModelSelectionState
+  public let communicationProfileRevision: UInt64
+  public let activeChoiceSetId: String?
+  public let activeInterpretationRevision: UInt64?
+  public let openedAtMs: Int64
+  public let lastInputAtMs: Int64
+  public let softIdleAtMs: Int64
+  public let staleReviewAtMs: Int64
+  public let primaryDeliveryBindingId: String?
+  public let pendingConfirmationId: String?
+  public let backgroundMissionIds: [String]
+
+  func validated() -> Bool {
+    let validStates: Set<String> = [
+      "interpreting", "active", "refining", "softIdle", "staleReview", "awaitingConfirmation",
+      "executing",
+      "completed", "cancelled", "blocked",
+    ]
+    return ChoiceLoopContract.identifier(id)
+      && validStates.contains(state)
+      && revision > 0
+      && modelSelectionState.validated()
+      && openedAtMs >= 0
+      && lastInputAtMs >= openedAtMs
+      && softIdleAtMs == lastInputAtMs + 1_800_000
+      && staleReviewAtMs == lastInputAtMs + 86_400_000
+      && (activeChoiceSetId.map(ChoiceLoopContract.identifier) ?? true)
+      && (activeInterpretationRevision.map { $0 > 0 } ?? true)
+      && (primaryDeliveryBindingId.map(ChoiceLoopContract.identifier) ?? true)
+      && (pendingConfirmationId.map(ChoiceLoopContract.identifier) ?? true)
+      && backgroundMissionIds.count <= 32
+      && Set(backgroundMissionIds).count == backgroundMissionIds.count
+      && backgroundMissionIds.allSatisfy(ChoiceLoopContract.identifier)
+  }
+}
+
+public struct ChoiceModelSelectionState: Codable, Equatable, Sendable {
+  public let state: String
+  public let modelProvenanceRef: String?
+  public let catalogRevision: UInt64?
+  public let reason: String?
+
+  func validated() -> Bool {
+    switch state {
+    case "unselected":
+      return modelProvenanceRef == nil && catalogRevision == nil && reason == nil
+    case "selected":
+      return modelProvenanceRef.map(ChoiceLoopContract.identifier) == true
+        && catalogRevision == nil && reason == nil
+    case "unavailable":
+      return modelProvenanceRef == nil && (catalogRevision ?? 0) > 0
+        && reason.map { ChoiceLoopContract.text($0, maximum: 512) } == true
+    default:
+      return false
+    }
+  }
+}
+
+public struct ConversationTurnBatch: Codable, Equatable, Sendable {
+  public let id: String
+  public let choiceSessionId: String
+  public let deliveryBindingId: String
+  public let sourceEnvelopeIds: [String]
+  public let openedAtMs: Int64
+  public let quietDeadlineMs: Int64
+  public let hardDeadlineMs: Int64
+  public let sealedAtMs: Int64?
+  public let sealReason: String?
+  public let revision: UInt64
+
+  func validated() -> Bool {
+    let validReasons: Set<String> = [
+      "initialIntake", "quietDeadline", "hardDeadline", "attachmentContinuation", "immediateOff",
+      "immediateCancel",
+      "immediateConfirm",
+      "immediateRefinement",
+    ]
+    let sealsTogether = (sealedAtMs == nil) == (sealReason == nil)
+    return ChoiceLoopContract.identifier(id)
+      && ChoiceLoopContract.identifier(choiceSessionId)
+      && ChoiceLoopContract.identifier(deliveryBindingId)
+      && !sourceEnvelopeIds.isEmpty && sourceEnvelopeIds.count <= 64
+      && Set(sourceEnvelopeIds).count == sourceEnvelopeIds.count
+      && sourceEnvelopeIds.allSatisfy(ChoiceLoopContract.identifier)
+      && openedAtMs >= 0
+      && quietDeadlineMs == openedAtMs + 2_500
+      && hardDeadlineMs == openedAtMs + 8_000
+      && quietDeadlineMs <= hardDeadlineMs
+      && (sealedAtMs.map { $0 >= openedAtMs && $0 <= hardDeadlineMs } ?? true)
+      && sealsTogether && (sealReason.map(validReasons.contains) ?? true)
+      && revision > 0
+  }
+}
+
+/// A strict view of the tagged Rust Selection enum. It is data-only intent
+/// refinement and never effect authority.
+public struct ChoiceSelection: Codable, Equatable, Sendable {
+  public let type: String
+  public let id: String
+  public let choiceSessionId: String
+  public let choiceSetId: String
+  public let selectedOptionId: String?
+  public let dInputBatchId: String?
+  public let expectedSessionRevision: UInt64
+  public let selectedAtMs: Int64
+
+  fileprivate func validated() -> Bool {
+    let common =
+      ChoiceLoopContract.identifier(id)
+      && ChoiceLoopContract.identifier(choiceSessionId)
+      && ChoiceLoopContract.identifier(choiceSetId)
+      && expectedSessionRevision > 0 && selectedAtMs >= 0
+    switch type {
+    case "optionSelection":
+      return common && selectedOptionId.map(ChoiceLoopContract.identifier) == true
+        && dInputBatchId == nil
+    case "naturalConversationSelection":
+      return common && dInputBatchId.map(ChoiceLoopContract.identifier) == true
+        && selectedOptionId == nil
+    default:
+      return false
+    }
+  }
+}
+
+/// The only untrusted input shape for the product-owned D direction. The Mac
+/// supplies bounded text and an idempotent request identity only; the Host
+/// derives every envelope, batch, selection, binding, and acceptance time.
+public struct ChoiceDInput: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let boundedText: String
+  public let choiceSessionId: String
+  public let choiceSetId: String
+  public let expectedSessionRevision: UInt64
+  public let submittedAtMs: Int64
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.identifier(requestId)
+      && ChoiceLoopContract.text(boundedText, maximum: 4 * 1_024)
+      && ChoiceLoopContract.identifier(choiceSessionId)
+      && ChoiceLoopContract.identifier(choiceSetId)
+      && expectedSessionRevision > 0 && submittedAtMs >= 0
+  }
+}
+
+/// Metadata for a Host-owned private refinement operation. D text remains
+/// Store-private and is represented only by its digest here.
+public struct ChoiceRefinementOperation: Codable, Equatable, Sendable {
+  public let id: String
+  public let selectionId: String
+  public let choiceSessionId: String
+  public let sourceEnvelopeId: String
+  public let conversationTurnBatchId: String
+  public let expectedSessionRevision: UInt64
+  public let expectedGeneration: UInt64
+  public let modelProvenance: ChoiceModelProvenance
+  public let sourceManifestDigest: String
+  public let personaRevision: PersonaRevisionRef
+  public let dRequestId: String?
+  public let dInputDigest: String?
+  public let createdAtMs: Int64
+
+  fileprivate func validated() -> Bool {
+    let dShapeIsComplete =
+      (dRequestId == nil && dInputDigest == nil)
+      || (dRequestId != nil && dInputDigest != nil)
+    return ChoiceLoopContract.identifier(id)
+      && ChoiceLoopContract.identifier(selectionId)
+      && ChoiceLoopContract.identifier(choiceSessionId) && expectedSessionRevision > 0
+      && ChoiceLoopContract.identifier(sourceEnvelopeId)
+      && ChoiceLoopContract.identifier(conversationTurnBatchId)
+      && expectedGeneration > 0 && modelProvenance.validated()
+      && ChoiceLoopContract.sha256(sourceManifestDigest)
+      && personaRevision.validated()
+      && (dRequestId.map(ChoiceLoopContract.identifier) ?? true)
+      && (dInputDigest.map(ChoiceLoopContract.sha256) ?? true)
+      && dShapeIsComplete && createdAtMs >= 0
+  }
+
+  /// Store-minted resume metadata is intentionally not an RPC field. The Mac
+  /// uses it only to ask the Host to recover an exact persisted operation
+  /// after a Host restart; it never creates, edits, or otherwise trusts it as
+  /// user authority.
+  var isOwnerResume: Bool {
+    id.hasPrefix("resume-")
+      && (selectionId.hasPrefix("resume-soft-idle-")
+        || selectionId.hasPrefix("resume-stale-review-"))
+  }
+}
+
+public struct ChoiceReminderItem: Codable, Equatable, Sendable, Identifiable {
+  public let id: String
+  public let text: String
+  public let dueAtMs: Int64
+  public let timeZone: String
+  public let evidenceIntent: String
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.identifier(id) && ChoiceLoopContract.text(text, maximum: 1_024)
+      && dueAtMs >= 0 && ChoiceLoopContract.text(timeZone, maximum: 128)
+      && timeZone.unicodeScalars.allSatisfy { $0.value < 128 }
+      && ChoiceLoopContract.text(evidenceIntent, maximum: 1_024)
+  }
+}
+
+public struct ChoiceConsolidatedConfirmation: Codable, Equatable, Sendable {
+  public let id: String
+  public let choiceSessionId: String
+  public let choiceSetId: String
+  public let selectionId: String
+  public let expectedSessionRevision: UInt64
+  public let interpretationRevision: UInt64
+  public let payloadRevision: UInt64
+  public let payloadDigest: String
+  public let goal: String
+  public let steps: [String]
+  public let markdownEntry: DocumentManifestEntry
+  public let markdownExpectedBase: MarkdownBaseIdentity?
+  public let markdownManifestDigests: [String]
+  public let documentDiffDigest: String
+  public let modelProvenance: ChoiceModelProvenance
+  public let personaRevision: PersonaRevisionRef
+  public let reminderListId: String
+  public let reminderItems: [ChoiceReminderItem]
+  public let reminderCount: UInt32
+  public let reminderPayloadDigest: String
+  public let evidenceRequirements: [String]
+  public let deliveryBindingId: String?
+  public let recipient: String?
+  public let deliveryScope: String?
+  public let dataCategories: [String]
+  public let retention: String
+  public let permissions: [String]
+  public let effectClasses: [String]
+  public let confirmedAtMs: Int64
+
+  /// Matches the Rust protocol's domain-separated typed byte preimage. This
+  /// deliberately avoids JSON key, null, number, Unicode, and escaping
+  /// differences at the Host/Mac security boundary.
+  func canonicalPayloadDigest() -> String? {
+    guard let bytes = canonicalPayloadPreimage() else { return nil }
+    return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+  }
+
+  func canonicalPayloadPreimage() -> Data? {
+    var bytes = Data("openopen:choice-consolidated-confirmation:v1\0".utf8)
+
+    func appendLength(_ count: Int, to bytes: inout Data) -> Bool {
+      guard var value = UInt64(exactly: count)?.bigEndian else { return false }
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+      return true
+    }
+    func appendField(_ name: String, to bytes: inout Data) -> Bool {
+      guard appendLength(name.utf8.count, to: &bytes) else { return false }
+      bytes.append(contentsOf: name.utf8)
+      return true
+    }
+    func appendObject(_ count: UInt32, to bytes: inout Data) {
+      bytes.append(0x05)
+      var value = count.bigEndian
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+    }
+    func appendArray(_ count: Int, to bytes: inout Data) -> Bool {
+      guard var value = UInt32(exactly: count)?.bigEndian else { return false }
+      bytes.append(0x06)
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+      return true
+    }
+    func appendString(_ value: String, to bytes: inout Data) -> Bool {
+      bytes.append(0x01)
+      guard appendLength(value.utf8.count, to: &bytes) else { return false }
+      bytes.append(contentsOf: value.utf8)
+      return true
+    }
+    func appendOptionalString(_ value: String?, to bytes: inout Data) -> Bool {
+      guard let value else {
+        bytes.append(0x00)
+        return true
+      }
+      return appendString(value, to: &bytes)
+    }
+    func appendUInt64(_ value: UInt64, to bytes: inout Data) {
+      bytes.append(0x02)
+      var value = value.bigEndian
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+    }
+    func appendInt64(_ value: Int64, to bytes: inout Data) {
+      bytes.append(0x03)
+      var value = value.bigEndian
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+    }
+    func appendUInt32(_ value: UInt32, to bytes: inout Data) {
+      bytes.append(0x04)
+      var value = value.bigEndian
+      withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
+    }
+    func appendStrings(_ values: [String], to bytes: inout Data) -> Bool {
+      guard appendArray(values.count, to: &bytes) else { return false }
+      for value in values where !appendString(value, to: &bytes) { return false }
+      return true
+    }
+    func appendEntry(_ entry: DocumentManifestEntry, to bytes: inout Data) -> Bool {
+      appendObject(4, to: &bytes)
+      guard appendField("relativePath", to: &bytes),
+        appendString(entry.relativePath, to: &bytes), appendField("sha256", to: &bytes),
+        appendString(entry.sha256, to: &bytes), appendField("byteLength", to: &bytes)
+      else { return false }
+      appendUInt64(entry.byteLength, to: &bytes)
+      guard appendField("mode", to: &bytes) else { return false }
+      appendUInt32(entry.mode, to: &bytes)
+      return true
+    }
+    func appendBase(_ base: MarkdownBaseIdentity?, to bytes: inout Data) -> Bool {
+      guard let base else {
+        bytes.append(0x00)
+        return true
+      }
+      appendObject(3, to: &bytes)
+      guard appendField("entry", to: &bytes), appendEntry(base.entry, to: &bytes),
+        appendField("device", to: &bytes)
+      else { return false }
+      appendUInt64(base.device, to: &bytes)
+      guard appendField("inode", to: &bytes) else { return false }
+      appendUInt64(base.inode, to: &bytes)
+      return true
+    }
+    func appendModel(_ model: ChoiceModelProvenance, to bytes: inout Data) -> Bool {
+      appendObject(9, to: &bytes)
+      guard appendField("id", to: &bytes), appendString(model.id, to: &bytes),
+        appendField("modelId", to: &bytes), appendString(model.modelId, to: &bytes),
+        appendField("requestedEffort", to: &bytes),
+        appendString(model.requestedEffort, to: &bytes),
+        appendField("actualEffort", to: &bytes), appendString(model.actualEffort, to: &bytes),
+        appendField("catalogFingerprint", to: &bytes),
+        appendString(model.catalogFingerprint, to: &bytes),
+        appendField("catalogRevision", to: &bytes)
+      else { return false }
+      appendUInt64(model.catalogRevision, to: &bytes)
+      guard appendField("accountDisplayClass", to: &bytes),
+        appendString(model.accountDisplayClass, to: &bytes),
+        appendField("protocolSchemaRevision", to: &bytes)
+      else { return false }
+      appendUInt64(model.protocolSchemaRevision, to: &bytes)
+      return appendField("turnId", to: &bytes) && appendString(model.turnId, to: &bytes)
+    }
+    func appendPersona(_ persona: PersonaRevisionRef, to bytes: inout Data) -> Bool {
+      appendObject(4, to: &bytes)
+      return appendField("personaId", to: &bytes) && appendString(persona.personaId, to: &bytes)
+        && appendField("revision", to: &bytes) && appendString(persona.revision, to: &bytes)
+        && appendField("aggregateDigest", to: &bytes)
+        && appendString(persona.aggregateDigest, to: &bytes)
+        && appendField("instructionsDigest", to: &bytes)
+        && appendString(persona.instructionsDigest, to: &bytes)
+    }
+    func appendItems(_ items: [ChoiceReminderItem], to bytes: inout Data) -> Bool {
+      guard appendArray(items.count, to: &bytes) else { return false }
+      for item in items {
+        appendObject(5, to: &bytes)
+        guard appendField("id", to: &bytes), appendString(item.id, to: &bytes),
+          appendField("text", to: &bytes), appendString(item.text, to: &bytes),
+          appendField("dueAtMs", to: &bytes)
+        else { return false }
+        appendInt64(item.dueAtMs, to: &bytes)
+        guard appendField("timeZone", to: &bytes), appendString(item.timeZone, to: &bytes),
+          appendField("evidenceIntent", to: &bytes),
+          appendString(item.evidenceIntent, to: &bytes)
+        else { return false }
+      }
+      return true
+    }
+
+    appendObject(29, to: &bytes)
+    guard appendField("id", to: &bytes), appendString(id, to: &bytes),
+      appendField("choiceSessionId", to: &bytes), appendString(choiceSessionId, to: &bytes),
+      appendField("choiceSetId", to: &bytes), appendString(choiceSetId, to: &bytes),
+      appendField("selectionId", to: &bytes), appendString(selectionId, to: &bytes),
+      appendField("expectedSessionRevision", to: &bytes)
+    else { return nil }
+    appendUInt64(expectedSessionRevision, to: &bytes)
+    guard appendField("interpretationRevision", to: &bytes) else { return nil }
+    appendUInt64(interpretationRevision, to: &bytes)
+    guard appendField("payloadRevision", to: &bytes) else { return nil }
+    appendUInt64(payloadRevision, to: &bytes)
+    guard appendField("payloadDigest", to: &bytes), appendString("", to: &bytes),
+      appendField("goal", to: &bytes), appendString(goal, to: &bytes),
+      appendField("steps", to: &bytes), appendStrings(steps, to: &bytes),
+      appendField("markdownEntry", to: &bytes), appendEntry(markdownEntry, to: &bytes),
+      appendField("markdownExpectedBase", to: &bytes),
+      appendBase(markdownExpectedBase, to: &bytes),
+      appendField("markdownManifestDigests", to: &bytes),
+      appendStrings(markdownManifestDigests, to: &bytes),
+      appendField("documentDiffDigest", to: &bytes),
+      appendString(documentDiffDigest, to: &bytes),
+      appendField("modelProvenance", to: &bytes), appendModel(modelProvenance, to: &bytes),
+      appendField("personaRevision", to: &bytes), appendPersona(personaRevision, to: &bytes),
+      appendField("reminderListId", to: &bytes), appendString(reminderListId, to: &bytes),
+      appendField("reminderItems", to: &bytes), appendItems(reminderItems, to: &bytes),
+      appendField("reminderCount", to: &bytes)
+    else { return nil }
+    appendUInt32(reminderCount, to: &bytes)
+    guard appendField("reminderPayloadDigest", to: &bytes),
+      appendString(reminderPayloadDigest, to: &bytes),
+      appendField("evidenceRequirements", to: &bytes),
+      appendStrings(evidenceRequirements, to: &bytes),
+      appendField("deliveryBindingId", to: &bytes),
+      appendOptionalString(deliveryBindingId, to: &bytes),
+      appendField("recipient", to: &bytes), appendOptionalString(recipient, to: &bytes),
+      appendField("deliveryScope", to: &bytes),
+      appendOptionalString(deliveryScope, to: &bytes),
+      appendField("dataCategories", to: &bytes), appendStrings(dataCategories, to: &bytes),
+      appendField("retention", to: &bytes), appendString(retention, to: &bytes),
+      appendField("permissions", to: &bytes), appendStrings(permissions, to: &bytes),
+      appendField("effectClasses", to: &bytes), appendStrings(effectClasses, to: &bytes),
+      appendField("confirmedAtMs", to: &bytes)
+    else { return nil }
+    appendInt64(confirmedAtMs, to: &bytes)
+    return bytes
+  }
+
+  func canonicalReminderPayloadDigest() -> String? {
+    guard reminderCount == UInt32(reminderItems.count) else { return nil }
+    var bytes = Data()
+    func appendText(_ value: String) -> Bool {
+      guard let count = UInt64(exactly: value.utf8.count) else { return false }
+      var bigEndian = count.bigEndian
+      withUnsafeBytes(of: &bigEndian) { bytes.append(contentsOf: $0) }
+      bytes.append(contentsOf: value.utf8)
+      return true
+    }
+    guard appendText(reminderListId) else { return nil }
+    var count = reminderCount.bigEndian
+    withUnsafeBytes(of: &count) { bytes.append(contentsOf: $0) }
+    for item in reminderItems {
+      guard appendText(item.id), appendText(item.text) else { return nil }
+      var dueAtMs = item.dueAtMs.bigEndian
+      withUnsafeBytes(of: &dueAtMs) { bytes.append(contentsOf: $0) }
+      guard appendText(item.timeZone), appendText(item.evidenceIntent) else { return nil }
+    }
+    return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+  }
+
+  func validated() -> Bool {
+    let deliveryShapeIsComplete: Bool
+    switch (deliveryBindingId, recipient, deliveryScope) {
+    case (.none, .none, .none), (.some, .some, .some):
+      deliveryShapeIsComplete = true
+    default:
+      deliveryShapeIsComplete = false
+    }
+    return ChoiceLoopContract.identifier(id) && ChoiceLoopContract.identifier(choiceSessionId)
+      && ChoiceLoopContract.identifier(choiceSetId) && ChoiceLoopContract.identifier(selectionId)
+      && expectedSessionRevision > 0
+      && interpretationRevision > 0 && payloadRevision > 0
+      && ChoiceLoopContract.sha256(payloadDigest)
+      && canonicalPayloadDigest() == payloadDigest
+      && ChoiceLoopContract.text(goal, maximum: 4 * 1_024) && !steps.isEmpty
+      && ChoiceLoopContract.list(steps, maximumItems: 64, maximumText: 1_024)
+      && markdownEntry.validated()
+      && (markdownExpectedBase.map {
+        $0.validated() && $0.entry.relativePath == markdownEntry.relativePath
+      } ?? true)
+      && markdownManifestDigests.count == 2
+      && markdownManifestDigests.allSatisfy(ChoiceLoopContract.sha256)
+      && DocumentManifest.canonicalAggregateDigest(entries: [markdownEntry])
+        == markdownManifestDigests[1]
+      && ChoiceLoopContract.sha256(documentDiffDigest) && modelProvenance.validated()
+      && personaRevision.validated()
+      && ChoiceLoopContract.identifier(reminderListId) && !reminderItems.isEmpty
+      && reminderItems.count <= 64 && reminderCount == UInt32(reminderItems.count)
+      && reminderItems.allSatisfy { $0.validated() }
+      && ChoiceLoopContract.sha256(reminderPayloadDigest)
+      && canonicalReminderPayloadDigest() == reminderPayloadDigest
+      && ChoiceLoopContract.list(evidenceRequirements, maximumItems: 32, maximumText: 1_024)
+      && (deliveryBindingId.map(ChoiceLoopContract.identifier) ?? true)
+      && (recipient.map(ChoiceLoopContract.identifier) ?? true)
+      && (deliveryScope.map { ChoiceLoopContract.text($0, maximum: 512) } ?? true)
+      && deliveryShapeIsComplete
+      && ChoiceLoopContract.list(dataCategories, maximumItems: 32, maximumText: 256)
+      && ChoiceLoopContract.text(retention, maximum: 512)
+      && ChoiceLoopContract.list(permissions, maximumItems: 32, maximumText: 256)
+      && ChoiceLoopContract.list(effectClasses, maximumItems: 32, maximumText: 256)
+      && confirmedAtMs >= 0
+  }
+}
+
+public struct InterpretationFrame: Codable, Equatable, Sendable {
+  public let choiceSessionId: String
+  public let revision: UInt64
+  public let understoodGoal: String
+  public let currentContext: String
+  public let assumptions: [String]
+  public let constraints: [String]
+  public let uncertainties: [String]
+  public let whatToAvoid: [String]
+  public let sourceManifestDigest: String
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.identifier(choiceSessionId) && revision > 0
+      && ChoiceLoopContract.text(understoodGoal, maximum: 4 * 1_024)
+      && ChoiceLoopContract.text(currentContext, maximum: 8 * 1_024)
+      && ChoiceLoopContract.list(assumptions, maximumItems: 64, maximumText: 1_024)
+      && ChoiceLoopContract.list(constraints, maximumItems: 64, maximumText: 1_024)
+      && ChoiceLoopContract.list(uncertainties, maximumItems: 64, maximumText: 1_024)
+      && ChoiceLoopContract.list(whatToAvoid, maximumItems: 64, maximumText: 1_024)
+      && ChoiceLoopContract.sha256(sourceManifestDigest)
+  }
+}
+
+public struct ChoiceSet: Codable, Equatable, Sendable {
+  public let id: String
+  public let choiceSessionId: String
+  public let sessionRevision: UInt64
+  public let interpretationRevision: UInt64
+  public let generatedAtMs: Int64
+  public let expiresOnRevision: UInt64
+  public let options: [ChoiceOption]
+  public let dAvailable: Bool
+  public let sourceManifestDigest: String
+  public let modelProvenance: ChoiceModelProvenance
+  public let personaRevision: PersonaRevisionRef
+
+  fileprivate func validated() -> Bool {
+    let positions = Set(options.map(\.position))
+    let directions = Set(options.map(\.direction))
+    return ChoiceLoopContract.identifier(id)
+      && ChoiceLoopContract.identifier(choiceSessionId)
+      && sessionRevision > 0 && interpretationRevision > 0 && generatedAtMs >= 0
+      && expiresOnRevision >= sessionRevision && dAvailable
+      && options.count == 3 && positions == Set<UInt8>([1, 2, 3]) && directions.count == 3
+      && options.allSatisfy { $0.validated() }
+      && ChoiceLoopContract.sha256(sourceManifestDigest)
+      && modelProvenance.validated()
+      && personaRevision.validated()
+  }
+}
+
+/// Immutable provenance for the verified local Persona bundle used to
+/// generate a Choice. It is metadata only and grants no model/effect
+/// authority to the Mac.
+public struct PersonaRevisionRef: Codable, Equatable, Sendable {
+  public let personaId: String
+  public let revision: String
+  public let aggregateDigest: String
+  public let instructionsDigest: String
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.identifier(personaId) && ChoiceLoopContract.identifier(revision)
+      && ChoiceLoopContract.sha256(aggregateDigest)
+      && ChoiceLoopContract.sha256(instructionsDigest)
+  }
+}
+
+/// Read-only projection of the embedded Persona revision currently used by
+/// Core. It carries provenance only; the Mac cannot stage, activate, or roll
+/// back Persona content through this contract.
+public struct PersonaStatus: Codable, Equatable, Sendable {
+  public let active: PersonaRevisionRef
+  public let staged: PersonaRevisionRef?
+  public let warning: String?
+  public let changeNotePending: Bool
+
+  func validated() -> Bool {
+    active.validated()
+      && (staged == nil || staged?.validated() == true)
+      && (warning == nil || ChoiceLoopContract.text(warning ?? "", maximum: 1_024))
+  }
+}
+
+public struct PersonaStatusView: Codable, Equatable, Sendable {
+  public let status: PersonaStatus
+  public let changeNote: String?
+
+  func validated() -> Bool {
+    status.validated()
+      && (changeNote == nil || ChoiceLoopContract.text(changeNote ?? "", maximum: 1_024))
+  }
+}
+
+public struct ChoiceOption: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let position: UInt8
+  public let direction: String
+  public let rationale: String
+  public let expectedResult: String
+  public let informationNeeded: [String]
+  public let externalEffectsPreview: [String]
+  public let sourceCategories: [String]
+
+  fileprivate func validated() -> Bool {
+    (1...3).contains(position) && ChoiceLoopContract.identifier(id)
+      && ChoiceLoopContract.text(direction, maximum: 512)
+      && ChoiceLoopContract.text(rationale, maximum: 1_024)
+      && ChoiceLoopContract.text(expectedResult, maximum: 1_024)
+      && ChoiceLoopContract.list(informationNeeded, maximumItems: 16, maximumText: 512)
+      && ChoiceLoopContract.list(externalEffectsPreview, maximumItems: 16, maximumText: 512)
+      && ChoiceLoopContract.list(sourceCategories, maximumItems: 16, maximumText: 128)
+  }
+}
+
+public struct ChoiceModelProvenance: Codable, Equatable, Sendable {
+  public let id: String
+  public let modelId: String
+  public let requestedEffort: String
+  public let actualEffort: String
+  public let catalogFingerprint: String
+  public let catalogRevision: UInt64
+  public let accountDisplayClass: String
+  public let protocolSchemaRevision: UInt64
+  public let turnId: String
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.text(id, maximum: 128) && ChoiceLoopContract.modelId(modelId)
+      && ChoiceLoopContract.effort(requestedEffort) && ChoiceLoopContract.effort(actualEffort)
+      && ChoiceLoopContract.sha256(catalogFingerprint) && catalogRevision > 0
+      && ChoiceLoopContract.text(accountDisplayClass, maximum: 256)
+      && protocolSchemaRevision > 0 && ChoiceLoopContract.text(turnId, maximum: 128)
+  }
+}
+
+public struct DocumentManifest: Codable, Equatable, Sendable {
+  public let rootVersion: UInt64
+  public let entries: [DocumentManifestEntry]
+  public let aggregateDigest: String
+  public let generatedAtMs: Int64
+
+  public static func canonicalAggregateDigest(entries: [DocumentManifestEntry]) -> String? {
+    guard !entries.isEmpty,
+      entries.count <= 256,
+      entries.allSatisfy({ $0.validated() }),
+      Set(entries.map { $0.relativePath.lowercased() }).count == entries.count
+    else { return nil }
+
+    var bytes = Data("openopen:document-manifest:v1\0".utf8)
+    for entry in entries.sorted(by: { $0.relativePath < $1.relativePath }) {
+      appendLengthDelimited(Data(entry.relativePath.utf8), to: &bytes)
+      appendLengthDelimited(Data(entry.sha256.utf8), to: &bytes)
+      var byteLength = entry.byteLength.bigEndian
+      appendLengthDelimited(Data(bytes: &byteLength, count: MemoryLayout<UInt64>.size), to: &bytes)
+      var mode = entry.mode.bigEndian
+      appendLengthDelimited(Data(bytes: &mode, count: MemoryLayout<UInt32>.size), to: &bytes)
+    }
+    return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+  }
+
+  fileprivate func validated() -> Bool {
+    rootVersion > 0 && generatedAtMs >= 0
+      && aggregateDigest == Self.canonicalAggregateDigest(entries: entries)
+  }
+
+  private static func appendLengthDelimited(_ value: Data, to bytes: inout Data) {
+    var length = UInt64(value.count).bigEndian
+    withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+    bytes.append(value)
+  }
+}
+
+public struct DocumentManifestEntry: Codable, Equatable, Sendable {
+  public let relativePath: String
+  public let sha256: String
+  public let byteLength: UInt64
+  public let mode: UInt32
+
+  fileprivate func validated() -> Bool {
+    ChoiceLoopContract.documentPath(relativePath) && ChoiceLoopContract.sha256(sha256)
+      && byteLength <= 512 * 1_024 && mode == 0o600
+  }
+}
+
+public struct MarkdownBaseIdentity: Codable, Equatable, Sendable {
+  public let entry: DocumentManifestEntry
+  public let device: UInt64
+  public let inode: UInt64
+
+  fileprivate func validated() -> Bool {
+    entry.validated() && device > 0 && inode > 0
+  }
+}
+
+private enum ChoiceLoopContract {
+  static func sha256(_ value: String) -> Bool {
+    value.utf8.count == 64
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+      }
+  }
+
+  static func identifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+          || $0 == 45 || $0 == 95 || $0 == 46
+      }
+  }
+
+  static func text(_ value: String, maximum: Int) -> Bool {
+    !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+      && value.utf8.count <= maximum
+      && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+  }
+
+  static func list(_ values: [String], maximumItems: Int, maximumText: Int) -> Bool {
+    values.count <= maximumItems && values.allSatisfy { text($0, maximum: maximumText) }
+  }
+
+  static func effort(_ value: String) -> Bool {
+    value == "not_applicable"
+      || (!value.isEmpty && value.utf8.count <= 32
+        && value.utf8.allSatisfy {
+          ($0 >= 97 && $0 <= 122) || $0 == 45
+        })
+  }
+
+  static func modelId(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+          || $0 == 45 || $0 == 95 || $0 == 46
+      }
+  }
+
+  static func documentPath(_ value: String) -> Bool {
+    let components = value.split(separator: "/").map(String.init)
+    return !value.isEmpty && value.utf8.count <= 512
+      && value.unicodeScalars.allSatisfy { $0.isASCII }
+      && !value.hasPrefix("/") && !value.contains("//")
+      && components.allSatisfy { component in
+        !component.isEmpty && component != "." && component != ".."
+          && component.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+              || $0 == 45 || $0 == 95 || $0 == 46
+          }
+      }
+      && matchesDocumentManifestPath(components)
+  }
+
+  static func matchesDocumentManifestPath(_ components: [String]) -> Bool {
+    if components == ["INDEX.md"] || components == ["profile", "USER.md"]
+      || components == ["profile", "COMMUNICATION.md"] || components == ["sources", "INDEX.md"]
+    {
+      return true
+    }
+    if components.count == 2, components[0] == "sources" {
+      return dynamicMarkdownName(components[1])
+    }
+    if components.count == 3, components[0] == "tasks" {
+      return identifier(components[1])
+        && [
+          "OVERVIEW.md", "STATE.md", "DECISIONS.md", "QUESTIONS.md", "MODEL_BRIEF.md",
+        ].contains(components[2])
+    }
+    if components.count == 4,
+      components[0] == "tasks"
+        && (components[2] == "paths" || components[2] == "updates")
+    {
+      return identifier(components[1]) && dynamicMarkdownName(components[3])
+    }
+    if components.count == 3, components[0] == "sessions",
+      ["SESSION.md", "CHOICE.md"].contains(components[2])
+    {
+      return identifier(components[1])
+    }
+    if components.count == 4, components[0] == "sessions", components[2] == "choice-sets" {
+      return identifier(components[1]) && dynamicMarkdownName(components[3])
+    }
+    return false
+  }
+
+  static func dynamicMarkdownName(_ value: String) -> Bool {
+    value.utf8.count > 3 && value.hasSuffix(".md")
+      && identifier(String(value.dropLast(3)))
+  }
+}
+
 public struct OutcomeRequest: Codable, Sendable {
   public let prompt: String
   public let allowedSourceRefs: [String]
@@ -1593,6 +2850,14 @@ public struct OutcomeRequest: Codable, Sendable {
     self.allowedSourceRefs = allowedSourceRefs
     authorization = proof.authorization
     brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChoiceMarkdownReceiptCleanupAvailability: Codable, Equatable, Sendable {
+  public let available: Bool
+
+  public init(available: Bool) {
+    self.available = available
   }
 }
 
