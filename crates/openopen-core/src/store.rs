@@ -13,6 +13,7 @@ use openopen_protocol::{
     ApprovalKind, ApprovalStatus, B2_MEMORY_MARKDOWN_PATH, B2MemoryCandidateCard, B2MemoryCommand,
     B2MemoryCommandKind, B2MemoryCommandReceipt, B2MemoryDemoStage, B2MemoryDemoState,
     B2MemoryImportSeal, B2MemoryMarkdownDiff, B2MemoryPreparedSource, B2MemoryProcessingConsent,
+    B2MemoryProcessingOperation, B2MemoryProcessingResult, B2MemoryRenderIntent,
     C2SkillDemoCommand, C2SkillDemoCommandKind, C2SkillDemoReceipt, C2SkillDemoStage,
     C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
     ChannelFailureAcknowledgement, ChannelFailureClass, ChannelFailureIncident,
@@ -79,6 +80,8 @@ const B2_MEMORY_DEMO_ENTITY: &str = "b2-demo-memory";
 const B2_MEMORY_SOURCE_ACTION: &str = "memory.source_prepared";
 const B2_MEMORY_SOURCE_ENTITY: &str = "b2-demo-memory-source";
 const B2_MEMORY_SOURCE_RETIRED_ACTION: &str = "memory.source_retired";
+const B2_MEMORY_PROCESSING_ACTION: &str = "memory.processing_started";
+const B2_MEMORY_RENDER_ACTION: &str = "memory.render_intent_created";
 /// The App contract accepts a bounded current incident projection. The full
 /// verified/audited history remains durable in the Store; this limit only
 /// bounds one UI/RPC response.
@@ -263,6 +266,14 @@ CREATE TABLE IF NOT EXISTS b2_memory_source_tombstone (
  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), request_id TEXT NOT NULL UNIQUE,
  source_identity_digest TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
  blob_hash TEXT NOT NULL, retired_at_ms INTEGER NOT NULL CHECK (retired_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_processing_operation (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), operation_id TEXT NOT NULL UNIQUE,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_render_journal (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), intent_id TEXT NOT NULL UNIQUE,
+ encrypted_blob BLOB NOT NULL, blob_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
 );
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
@@ -477,6 +488,16 @@ mod b2_memory_demo_tests {
 
         let selection = super::choice_begin_tests::selection();
         store.select_model_selection(&selection, 11).unwrap();
+        let (choice_begin, choice_snapshot) = super::choice_begin_tests::begin_state(
+            "Remember one synthetic preference",
+            "b2-choice-begin",
+        );
+        store
+            .begin_choice_session(&choice_begin, &choice_snapshot)
+            .unwrap();
+        store
+            .commit_initial_choice_result(&super::choice_begin_tests::initial_result(&choice_begin))
+            .unwrap();
         let provenance = selection
             .turn_provenance("b2-provenance".to_owned(), "b2-turn".to_owned())
             .expect("provenance");
@@ -508,41 +529,53 @@ mod b2_memory_demo_tests {
             source_identity_digest: source_record.source.source_identity_digest.clone(),
             explicitly_confirmed: true,
         };
-        let candidates = store
-            .commit_b2_memory_candidates(
+        let operation = store
+            .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 20)
+            .expect("durable processing operation");
+        assert_eq!(
+            store
+                .begin_b2_memory_processing(&consent, &seal, &authorization, &broker_receipt, 21,)
+                .unwrap(),
+            operation
+        );
+        let mut changed_seal = seal.clone();
+        changed_seal.source_manifest_digest = "9".repeat(64);
+        assert!(matches!(
+            store.begin_b2_memory_processing(
                 &consent,
-                &seal,
-                &cards,
+                &changed_seal,
                 &authorization,
                 &broker_receipt,
-                20,
-            )
+                21,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        let mut result = B2MemoryProcessingResult {
+            operation_id: operation.operation_id.clone(),
+            candidates: cards,
+            result_digest: String::new(),
+            completed_at_ms: 22,
+        };
+        result.result_digest = result.canonical_digest().unwrap();
+        let candidates = store
+            .commit_b2_memory_processing_result(&result, &authorization, &broker_receipt)
             .expect("private candidate result");
         assert_eq!(candidates.0.candidates.len(), 2);
         assert!(store.b2_memory_prepared_source().unwrap().is_none());
         assert_eq!(
             store
-                .commit_b2_memory_candidates(
-                    &consent,
-                    &seal,
-                    &cards,
-                    &authorization,
-                    &broker_receipt,
-                    21,
-                )
+                .commit_b2_memory_processing_result(&result, &authorization, &broker_receipt)
                 .unwrap(),
             candidates
         );
-        let mut changed_consent = consent.clone();
-        changed_consent.source_identity_digest = "f".repeat(64);
+        let mut changed_result = result.clone();
+        changed_result.completed_at_ms += 1;
+        changed_result.result_digest = changed_result.canonical_digest().unwrap();
         assert!(matches!(
-            store.commit_b2_memory_candidates(
-                &changed_consent,
-                &seal,
-                &cards,
+            store.commit_b2_memory_processing_result(
+                &changed_result,
                 &authorization,
                 &broker_receipt,
-                21,
             ),
             Err(StoreError::B2MemoryDemoConflict)
         ));
@@ -602,24 +635,78 @@ mod b2_memory_demo_tests {
             .apply_b2_memory_command(&confirm, &authorization, &broker_receipt)
             .expect("confirm");
         let diff = confirmed.markdown_diff.as_ref().unwrap();
+        let journal_blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_render_journal WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&journal_blob).contains("Finish one exact"));
         let render_receipt = MarkdownRenderReceipt {
-            intent_id: "b2-memory-render".to_owned(),
+            intent_id: confirmed.render_intent.as_ref().unwrap().intent_id.clone(),
             final_entry: diff.final_entry.clone(),
             final_device: 1,
             final_inode: 2,
             displaced_base: None,
             committed_at_ms: 40,
         };
+        let mut conflict_receipt = render_receipt.clone();
+        conflict_receipt.displaced_base = Some(MarkdownBaseIdentity {
+            entry: diff.final_entry.clone(),
+            device: 9,
+            inode: 9,
+        });
+        assert!(matches!(
+            store.commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &conflict_receipt,
+                &authorization,
+                &broker_receipt,
+                40,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
         let read_back = store
             .commit_b2_memory_readback(
                 confirmed.revision,
                 confirmed.confirmation_digest.as_deref().unwrap(),
                 &render_receipt,
+                &authorization,
+                &broker_receipt,
                 40,
             )
             .expect("readback");
         assert_eq!(read_back.stage, B2MemoryDemoStage::ReadBack);
         assert!(read_back.readback_receipt.is_some());
+        assert_eq!(
+            store
+                .commit_b2_memory_readback(
+                    confirmed.revision,
+                    confirmed.confirmation_digest.as_deref().unwrap(),
+                    &render_receipt,
+                    &authorization,
+                    &broker_receipt,
+                    41,
+                )
+                .unwrap(),
+            read_back
+        );
+        let (off_authorization, off_receipt) =
+            super::choice_begin_tests::commit_runtime_revision(&mut store, false, 50);
+        assert!(matches!(
+            store.commit_b2_memory_readback(
+                confirmed.revision,
+                confirmed.confirmation_digest.as_deref().unwrap(),
+                &render_receipt,
+                &off_authorization,
+                &off_receipt,
+                51,
+            ),
+            Err(StoreError::RuntimeDisabled | StoreError::RuntimeControlMismatch)
+        ));
 
         let blob: Vec<u8> = store
             .connection
@@ -707,6 +794,29 @@ struct B2MemorySourceTombstone {
     source_digest: String,
     processing_request_id: String,
     retired_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredB2MemoryRenderIntent {
+    intent: B2MemoryRenderIntent,
+    plaintext_body: Option<String>,
+    retired: bool,
+}
+
+impl StoredB2MemoryRenderIntent {
+    fn is_valid(&self) -> bool {
+        self.intent.is_valid()
+            && match (&self.plaintext_body, self.retired) {
+                (Some(body), false) => {
+                    !body.contains('\0')
+                        && u64::try_from(body.len()).ok() == Some(self.intent.entry.byte_length)
+                        && sha256_hex(body.as_bytes()) == self.intent.content_digest
+                }
+                (None, true) => true,
+                _ => false,
+            }
+    }
 }
 
 impl B2MemorySourceTombstone {
@@ -2083,11 +2193,14 @@ impl Store {
             revision: 1,
             stage: B2MemoryDemoStage::Prepared,
             prepared_source: Some(record.source.clone()),
+            processing_operation: None,
+            processing_result_digest: None,
             seal: None,
             candidates: Vec::new(),
             selected_candidate: None,
             markdown_diff: None,
             confirmation_digest: None,
+            render_intent: None,
             readback_receipt: None,
             receipts: vec![receipt.clone()],
         };
@@ -2150,11 +2263,14 @@ impl Store {
             revision: 0,
             stage: B2MemoryDemoStage::Prepared,
             prepared_source: None,
+            processing_operation: None,
+            processing_result_digest: None,
             seal: None,
             candidates: Vec::new(),
             selected_candidate: None,
             markdown_diff: None,
             confirmation_digest: None,
+            render_intent: None,
             readback_receipt: None,
             receipts: Vec::new(),
         });
@@ -2223,6 +2339,41 @@ impl Store {
                     "finalEntry": diff.final_entry,
                     "expectedBase": diff.expected_base,
                 }))?);
+                if diff.expected_base.is_some() {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                let confirmation_digest = state
+                    .confirmation_digest
+                    .clone()
+                    .ok_or(StoreError::B2MemoryDemoConflict)?;
+                let body = format!("{}\n", diff.edited_line);
+                let intent = B2MemoryRenderIntent {
+                    intent_id: format!(
+                        "b2-render-{}",
+                        &sha256_json(&json!({
+                            "confirmation": confirmation_digest,
+                            "entry": diff.final_entry,
+                            "revision": current_revision.checked_add(1),
+                        }))?[..32]
+                    ),
+                    expected_revision: current_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::B2MemoryDemoConflict)?,
+                    confirmation_digest,
+                    entry: diff.final_entry.clone(),
+                    content_digest: diff.final_entry.sha256.clone(),
+                    created_at_ms: command.decided_at_ms,
+                };
+                let stored = StoredB2MemoryRenderIntent {
+                    intent: intent.clone(),
+                    plaintext_body: Some(body),
+                    retired: false,
+                };
+                if !stored.is_valid() {
+                    return Err(StoreError::B2MemoryDemoConflict);
+                }
+                persist_b2_memory_render_intent(&transaction, &self.authority, &stored)?;
+                state.render_intent = Some(intent);
                 B2MemoryDemoStage::Confirmed
             }
             _ => return Err(StoreError::B2MemoryDemoConflict),
@@ -2256,34 +2407,166 @@ impl Store {
         Ok((state, receipt))
     }
 
+    /// Starts the sole durable processing operation before any source excerpt
+    /// may reach the selected model. All provenance other than the explicit
+    /// consent and Host-derived source seal is re-derived from current Store
+    /// state inside this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale consent, runtime/model/persona/manifest
+    /// drift, changed replay, or failed encrypted/audited persistence.
+    #[allow(clippy::too_many_lines)] // One transaction keeps every authority binding atomic.
+    pub fn begin_b2_memory_processing(
+        &mut self,
+        consent: &B2MemoryProcessingConsent,
+        seal: &B2MemoryImportSeal,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
+        started_at_ms: i64,
+    ) -> Result<B2MemoryProcessingOperation, StoreError> {
+        if !consent.is_valid() || !seal.is_valid() || started_at_ms < 0 {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let selection = load_choice_model_selection(&transaction, &self.authority)?
+            .ok_or(StoreError::ChoiceModelSelectionConflict)?;
+        let choice = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let persona_revision = choice
+            .active_choice_set
+            .as_ref()
+            .map(|choice_set| choice_set.persona_revision.clone())
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if let Some(existing) = load_b2_memory_processing_operation(&transaction, &self.authority)?
+        {
+            let expected_request = sha256_json(consent)?;
+            return (existing.request_id == consent.request_id
+                && existing.runtime_revision == authorization.revision
+                && existing.source_identity_digest == source.source.source_identity_digest
+                && existing.source_digest == seal.source_digest
+                && existing.model_provenance == seal.model_provenance
+                && existing.catalog_digest == seal.catalog_digest
+                && existing.source_manifest_digest == seal.source_manifest_digest
+                && existing.persona_revision == persona_revision
+                && existing.document_manifest_digest == choice.document_manifest.aggregate_digest
+                && model_provenance_matches_selection(&existing.model_provenance, &selection)
+                && state.processing_operation.as_ref() == Some(&existing)
+                && state.stage == B2MemoryDemoStage::Processing
+                && state.receipts.iter().any(|receipt| {
+                    receipt.request_id == consent.request_id
+                        && receipt.command_digest == expected_request
+                }))
+            .then_some(existing)
+            .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        if state.stage != B2MemoryDemoStage::Prepared
+            || state.revision != consent.expected_revision
+            || state.prepared_source.as_ref() != Some(&source.source)
+            || source.source.source_identity_digest != consent.source_identity_digest
+            || seal.source_digest != source.source_digest
+            || !model_provenance_matches_selection(&seal.model_provenance, &selection)
+        {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        let operation_id = format!(
+            "b2-processing-{}",
+            &sha256_json(&json!({
+                "request": consent,
+                "runtimeRevision": authorization.revision,
+                "seal": seal,
+                "persona": persona_revision,
+                "documentManifest": choice.document_manifest.aggregate_digest,
+            }))?[..32]
+        );
+        let operation = B2MemoryProcessingOperation {
+            operation_id,
+            request_id: consent.request_id.clone(),
+            expected_revision: consent.expected_revision,
+            runtime_revision: authorization.revision,
+            source_identity_digest: source.source.source_identity_digest.clone(),
+            source_digest: source.source_digest.clone(),
+            model_provenance: seal.model_provenance.clone(),
+            catalog_digest: seal.catalog_digest.clone(),
+            protocol_version: EFFECT_PROTOCOL_VERSION,
+            persona_revision,
+            document_manifest_digest: choice.document_manifest.aggregate_digest.clone(),
+            source_manifest_digest: seal.source_manifest_digest.clone(),
+            started_at_ms,
+        };
+        if !operation.is_valid() {
+            return Err(StoreError::B2MemoryDemoConflict);
+        }
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        state.stage = B2MemoryDemoStage::Processing;
+        state.processing_operation = Some(operation.clone());
+        state.seal = Some(seal.clone());
+        let command_digest = sha256_json(consent)?;
+        let receipt = B2MemoryCommandReceipt {
+            request_id: consent.request_id.clone(),
+            command_digest: command_digest.clone(),
+            revision: state.revision,
+            stage: B2MemoryDemoStage::Processing,
+            receipt_digest: sha256_json(&json!({
+                "operationId": operation.operation_id,
+                "revision": state.revision,
+            }))?,
+        };
+        state.receipts.push(receipt);
+        persist_b2_memory_processing_operation(&transaction, &self.authority, &operation)?;
+        persist_b2_memory_demo_state(
+            &transaction,
+            &self.authority,
+            &state,
+            &consent.request_id,
+            &command_digest,
+            started_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
     /// Private Host result commit for one explicitly-consented, descriptor-
-    /// pinned scan. The caller cannot provide candidates through public RPC.
+    /// pinned scan. The result is accepted only for the exact durable operation.
     ///
     /// # Errors
     ///
     /// Returns an error for stale consent, source/model drift, changed replay,
     /// invalid candidates, protected Off, or failed atomic persistence.
     #[allow(clippy::too_many_lines)] // One transaction keeps validation, commit, retirement, and audit atomic.
-    pub fn commit_b2_memory_candidates(
+    pub fn commit_b2_memory_processing_result(
         &mut self,
-        consent: &B2MemoryProcessingConsent,
-        seal: &B2MemoryImportSeal,
-        candidates: &[B2MemoryCandidateCard],
+        result: &B2MemoryProcessingResult,
         authorization: &RuntimeControlAuthorization,
         broker_receipt: &RuntimeControlReceipt,
-        completed_at_ms: i64,
     ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), StoreError> {
-        if !consent.is_valid()
-            || !seal.is_valid()
-            || candidates.is_empty()
-            || candidates.len() > 3
-            || candidates.iter().any(|card| !card.is_valid())
-            || candidates
+        if !result.is_valid()
+            || result
+                .candidates
                 .iter()
                 .map(|card| &card.id)
                 .collect::<HashSet<_>>()
                 .len()
-                != candidates.len()
+                != result.candidates.len()
         {
             return Err(StoreError::B2MemoryDemoConflict);
         }
@@ -2302,41 +2585,54 @@ impl Store {
         verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
         let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
-        let command_digest = sha256_json(consent)?;
+        let command_digest = result.result_digest.clone();
         if let Some(receipt) = state
             .receipts
             .iter()
-            .find(|receipt| receipt.request_id == consent.request_id)
+            .find(|receipt| receipt.request_id == result.operation_id)
             .cloned()
         {
             return (receipt.command_digest == command_digest
                 && receipt.stage == B2MemoryDemoStage::Candidates
                 && state.stage == B2MemoryDemoStage::Candidates
-                && state.seal.as_ref() == Some(seal)
-                && state.candidates == candidates)
+                && state.processing_result_digest.as_ref() == Some(&result.result_digest)
+                && state.candidates == result.candidates)
                 .then_some((state, receipt))
                 .ok_or(StoreError::B2MemoryDemoConflict);
         }
+        let operation = load_b2_memory_processing_operation(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
         let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
-        if source.source.source_identity_digest != consent.source_identity_digest
+        if operation.operation_id != result.operation_id
+            || source.source.source_identity_digest != operation.source_identity_digest
             || state.prepared_source.as_ref() != Some(&source.source)
-            || seal.source_digest != source.source_digest
+            || operation.source_digest != source.source_digest
+            || authorization.revision != operation.runtime_revision
         {
             return Err(StoreError::B2MemoryDemoConflict);
         }
         let selection = load_choice_model_selection(&transaction, &self.authority)?
             .ok_or(StoreError::ChoiceModelSelectionConflict)?;
-        if !model_provenance_matches_selection(&seal.model_provenance, &selection) {
+        if !model_provenance_matches_selection(&operation.model_provenance, &selection) {
             return Err(StoreError::ChoiceModelSelectionConflict);
         }
-        if state.stage == B2MemoryDemoStage::Candidates
-            && state.seal.as_ref() == Some(seal)
-            && state.candidates == candidates
-        {
-            return Err(StoreError::B2MemoryDemoConflict);
-        }
-        if state.stage != B2MemoryDemoStage::Prepared || state.revision != consent.expected_revision
+        let choice = load_choice_loop_snapshot(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let current_persona = choice
+            .active_choice_set
+            .as_ref()
+            .map(|choice_set| &choice_set.persona_revision)
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if state.stage != B2MemoryDemoStage::Processing
+            || state.processing_operation.as_ref() != Some(&operation)
+            || state.revision
+                != operation
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::B2MemoryDemoConflict)?
+            || current_persona != &operation.persona_revision
+            || choice.document_manifest.aggregate_digest != operation.document_manifest_digest
         {
             return Err(StoreError::B2MemoryDemoConflict);
         }
@@ -2345,10 +2641,10 @@ impl Store {
             .checked_add(1)
             .ok_or(StoreError::B2MemoryDemoConflict)?;
         state.stage = B2MemoryDemoStage::Candidates;
-        state.seal = Some(seal.clone());
-        state.candidates = candidates.to_vec();
+        state.processing_result_digest = Some(result.result_digest.clone());
+        state.candidates.clone_from(&result.candidates);
         let receipt = B2MemoryCommandReceipt {
-            request_id: consent.request_id.clone(),
+            request_id: result.operation_id.clone(),
             command_digest: command_digest.clone(),
             revision: state.revision,
             stage: B2MemoryDemoStage::Candidates,
@@ -2363,9 +2659,9 @@ impl Store {
             &transaction,
             &self.authority,
             &state,
-            &consent.request_id,
+            &result.operation_id,
             &command_digest,
-            completed_at_ms,
+            result.completed_at_ms,
         )?;
         persist_b2_memory_source_tombstone(
             &transaction,
@@ -2373,49 +2669,85 @@ impl Store {
             &B2MemorySourceTombstone {
                 source: source.source,
                 source_digest: source.source_digest,
-                processing_request_id: consent.request_id.clone(),
-                retired_at_ms: completed_at_ms,
+                processing_request_id: operation.request_id,
+                retired_at_ms: result.completed_at_ms,
             },
         )?;
         transaction.execute(
             "DELETE FROM b2_memory_prepared_source WHERE singleton_id = 1",
             [],
         )?;
+        transaction.execute(
+            "DELETE FROM b2_memory_processing_operation WHERE singleton_id = 1",
+            [],
+        )?;
         transaction.commit()?;
         Ok((state, receipt))
     }
 
-    /// Private exact readback test boundary. It is deliberately not reachable
-    /// from Host until the descriptor-bound B2 render journal is implemented.
-    #[cfg(test)]
-    fn commit_b2_memory_readback(
+    /// Commits readback only for the exact command-owned fresh-file render
+    /// journal. Callers cannot supply a body, path, or alternate manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale or changed receipt, an existing/replaced
+    /// target, runtime drift, or failed encrypted/audited persistence.
+    pub fn commit_b2_memory_readback(
         &mut self,
         expected_revision: u64,
         confirmation_digest: &str,
         render_receipt: &MarkdownRenderReceipt,
+        authorization: &RuntimeControlAuthorization,
+        broker_receipt: &RuntimeControlReceipt,
         completed_at_ms: i64,
     ) -> Result<B2MemoryDemoState, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_runtime_enabled(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        require_runtime_checkpoint_in_connection(
+            &transaction,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+            authorization,
+            broker_receipt,
+        )?;
+        require_no_effect_fence(&transaction)?;
         verified_audit_tail(&transaction, &self.authority)?;
         verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
         let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let supplied_render_digest = sha256_json(
+            &serde_json::to_value(render_receipt)
+                .map_err(|error| CryptoError::Serialization(error.to_string()))?,
+        )?;
+        if state.stage == B2MemoryDemoStage::ReadBack {
+            return state
+                .readback_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    receipt.confirmation_digest == confirmation_digest
+                        && receipt.render_receipt_digest == supplied_render_digest
+                })
+                .then_some(state)
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
+        let journal = load_b2_memory_render_intent(&transaction, &self.authority)?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
         if state.stage != B2MemoryDemoStage::Confirmed
             || state.revision != expected_revision
             || state.confirmation_digest.as_deref() != Some(confirmation_digest)
             || !render_receipt.is_valid()
+            || state.render_intent.as_ref() != Some(&journal.intent)
+            || journal.intent.expected_revision != expected_revision
+            || journal.intent.confirmation_digest != confirmation_digest
+            || render_receipt.intent_id != journal.intent.intent_id
+            || render_receipt.displaced_base.is_some()
             || state.markdown_diff.as_ref().map(|diff| &diff.final_entry)
                 != Some(&render_receipt.final_entry)
         {
             return Err(StoreError::B2MemoryDemoConflict);
         }
-        let render_receipt_digest = sha256_json(
-            &serde_json::to_value(render_receipt)
-                .map_err(|error| CryptoError::Serialization(error.to_string()))?,
-        )?;
+        let render_receipt_digest = supplied_render_digest;
         let receipt = openopen_protocol::B2MemoryReadbackReceipt {
             confirmation_digest: confirmation_digest.to_owned(),
             render_receipt_digest: render_receipt_digest.clone(),
@@ -2430,12 +2762,19 @@ impl Store {
         state.stage = B2MemoryDemoStage::ReadBack;
         state.readback_receipt = Some(receipt);
         state.candidates.clear();
+        state.render_intent = None;
         persist_b2_memory_demo_state(
             &transaction,
             &self.authority,
             &state,
             "b2-private-readback",
             &render_receipt_digest,
+            completed_at_ms,
+        )?;
+        retire_b2_memory_render_intent(
+            &transaction,
+            &self.authority,
+            &journal.intent,
             completed_at_ms,
         )?;
         transaction.commit()?;
@@ -9431,6 +9770,8 @@ fn verify_all_bindings(
     let _ = load_c2_skill_demo_state(connection, authority)?;
     let _ = load_b2_memory_prepared_source(connection, authority)?;
     let _ = load_b2_memory_source_tombstone(connection, authority)?;
+    let _ = load_b2_memory_processing_operation(connection, authority)?;
+    let _ = load_b2_memory_render_intent(connection, authority)?;
     let _ = load_b2_memory_demo_state(connection, authority)?;
     let choice_snapshot = load_choice_loop_snapshot(connection, authority)?;
     verify_choice_private_bindings(connection, authority, choice_snapshot.as_ref())?;
@@ -9613,6 +9954,7 @@ fn b2_memory_diff(
         .ok_or(StoreError::B2MemoryDemoConflict)
 }
 
+#[allow(clippy::too_many_lines)] // Keep the complete stage invariant visible in one validator.
 fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreError> {
     if state.revision == 0
         || !state
@@ -9638,10 +9980,31 @@ fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreE
     }
     match state.stage {
         B2MemoryDemoStage::Prepared => {
-            if state.seal.is_some()
+            if state.processing_operation.is_some()
+                || state.processing_result_digest.is_some()
+                || state.seal.is_some()
                 || !state.candidates.is_empty()
                 || state.selected_candidate.is_some()
                 || state.markdown_diff.is_some()
+                || state.render_intent.is_some()
+            {
+                return Err(StoreError::B2MemoryDemoConflict);
+            }
+        }
+        B2MemoryDemoStage::Processing => {
+            if !state
+                .processing_operation
+                .as_ref()
+                .is_some_and(B2MemoryProcessingOperation::is_valid)
+                || state.processing_result_digest.is_some()
+                || !state
+                    .seal
+                    .as_ref()
+                    .is_some_and(B2MemoryImportSeal::is_valid)
+                || !state.candidates.is_empty()
+                || state.selected_candidate.is_some()
+                || state.markdown_diff.is_some()
+                || state.render_intent.is_some()
             {
                 return Err(StoreError::B2MemoryDemoConflict);
             }
@@ -9656,6 +10019,15 @@ fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreE
                 || state.candidates.iter().any(|card| !card.is_valid())
                 || state.selected_candidate.is_some()
                 || state.markdown_diff.is_some()
+                || !state
+                    .processing_result_digest
+                    .as_deref()
+                    .is_some_and(is_sha256_hex)
+                || !state
+                    .processing_operation
+                    .as_ref()
+                    .is_some_and(B2MemoryProcessingOperation::is_valid)
+                || state.render_intent.is_some()
             {
                 return Err(StoreError::B2MemoryDemoConflict);
             }
@@ -9677,6 +10049,14 @@ fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreE
                     .markdown_diff
                     .as_ref()
                     .is_some_and(B2MemoryMarkdownDiff::is_valid)
+                || !state
+                    .processing_result_digest
+                    .as_deref()
+                    .is_some_and(is_sha256_hex)
+                || !state
+                    .processing_operation
+                    .as_ref()
+                    .is_some_and(B2MemoryProcessingOperation::is_valid)
             {
                 return Err(StoreError::B2MemoryDemoConflict);
             }
@@ -9695,6 +10075,14 @@ fn validate_b2_memory_demo_state(state: &B2MemoryDemoState) -> Result<(), StoreE
                     && is_sha256_hex(&receipt.render_receipt_digest)
                     && is_sha256_hex(&receipt.receipt_digest)
             })
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    if (state.stage == B2MemoryDemoStage::Confirmed)
+        != state
+            .render_intent
+            .as_ref()
+            .is_some_and(B2MemoryRenderIntent::is_valid)
     {
         return Err(StoreError::B2MemoryDemoConflict);
     }
@@ -9939,6 +10327,232 @@ fn persist_b2_memory_source_tombstone(
             entity_id: B2_MEMORY_SOURCE_ENTITY,
             created_at_ms: tombstone.retired_at_ms,
             state_kind: "memory:source_tombstone",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn b2_memory_processing_aad(operation_id: &str) -> String {
+    format!("memory:processing-operation:{operation_id}")
+}
+
+fn load_b2_memory_processing_operation(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemoryProcessingOperation>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT operation_id, encrypted_blob, blob_hash, started_at_ms
+             FROM b2_memory_processing_operation WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((operation_id, blob, expected_hash, started_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_PROCESSING_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:processing_operation",
+        &blob,
+    )?;
+    let operation: B2MemoryProcessingOperation =
+        authority.decrypt_json(&blob, b2_memory_processing_aad(&operation_id).as_bytes())?;
+    if !operation.is_valid()
+        || operation.operation_id != operation_id
+        || operation.started_at_ms != started_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(operation))
+}
+
+fn persist_b2_memory_processing_operation(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    operation: &B2MemoryProcessingOperation,
+) -> Result<(), StoreError> {
+    if !operation.is_valid() {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        operation,
+        b2_memory_processing_aad(&operation.operation_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_processing_operation
+            (singleton_id, operation_id, encrypted_blob, blob_hash, started_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            operation.operation_id,
+            blob,
+            state_hash,
+            operation.started_at_ms
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-processing-{}", operation.operation_id),
+            command_id: &operation.request_id,
+            command_hash: &sha256_json(operation)?,
+            actor: "owner",
+            action: B2_MEMORY_PROCESSING_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: operation.started_at_ms,
+            state_kind: "memory:processing_operation",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn b2_memory_render_aad(intent_id: &str) -> String {
+    format!("memory:render-intent:{intent_id}")
+}
+
+fn load_b2_memory_render_intent(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<StoredB2MemoryRenderIntent>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT intent_id, encrypted_blob, blob_hash, created_at_ms
+             FROM b2_memory_render_journal WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((intent_id, blob, expected_hash, created_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_RENDER_ACTION,
+        B2_MEMORY_DEMO_ENTITY,
+        "memory:render_intent",
+        &blob,
+    )?;
+    let record: StoredB2MemoryRenderIntent =
+        authority.decrypt_json(&blob, b2_memory_render_aad(&intent_id).as_bytes())?;
+    if !record.is_valid()
+        || record.intent.intent_id != intent_id
+        || record.intent.created_at_ms != created_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(record))
+}
+
+fn persist_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    record: &StoredB2MemoryRenderIntent,
+) -> Result<(), StoreError> {
+    if !record.is_valid() || record.intent.entry.relative_path != B2_MEMORY_MARKDOWN_PATH {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    if let Some(existing) = load_b2_memory_render_intent(transaction, authority)? {
+        return (existing == *record)
+            .then_some(())
+            .ok_or(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        record,
+        b2_memory_render_aad(&record.intent.intent_id).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_render_journal
+            (singleton_id, intent_id, encrypted_blob, blob_hash, created_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            record.intent.intent_id,
+            blob,
+            state_hash,
+            record.intent.created_at_ms
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-{}", record.intent.intent_id),
+            command_id: &record.intent.intent_id,
+            command_hash: &record.intent.confirmation_digest,
+            actor: "owner",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: record.intent.created_at_ms,
+            state_kind: "memory:render_intent",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
+fn retire_b2_memory_render_intent(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    intent: &B2MemoryRenderIntent,
+    retired_at_ms: i64,
+) -> Result<(), StoreError> {
+    let record = StoredB2MemoryRenderIntent {
+        intent: intent.clone(),
+        plaintext_body: None,
+        retired: true,
+    };
+    if !record.is_valid() || retired_at_ms < intent.created_at_ms {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob =
+        authority.encrypt_json(&record, b2_memory_render_aad(&intent.intent_id).as_bytes())?;
+    let state_hash = blob_hash(&blob);
+    if transaction.execute(
+        "UPDATE b2_memory_render_journal SET encrypted_blob = ?2, blob_hash = ?3
+         WHERE singleton_id = 1 AND intent_id = ?1",
+        params![intent.intent_id, blob, state_hash],
+    )? != 1
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!("b2-memory-render-retired-{}", intent.intent_id),
+            command_id: &intent.intent_id,
+            command_hash: &intent.confirmation_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_RENDER_ACTION,
+            entity_id: B2_MEMORY_DEMO_ENTITY,
+            created_at_ms: retired_at_ms,
+            state_kind: "memory:render_intent",
             state_hash: &state_hash,
         },
     )?;
@@ -15689,7 +16303,7 @@ mod choice_begin_tests {
         runtime_control_receipt_signing_bytes,
     };
 
-    fn commit_runtime_revision(
+    pub(super) fn commit_runtime_revision(
         store: &mut Store,
         enabled: bool,
         updated_at_ms: i64,

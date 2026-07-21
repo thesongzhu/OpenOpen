@@ -2959,11 +2959,109 @@ pub const B2_MEMORY_MARKDOWN_PATH: &str = "sources/chatgpt.md";
 #[serde(rename_all = "camelCase")]
 pub enum B2MemoryDemoStage {
     Prepared,
+    Processing,
     Candidates,
     Selected,
     DiffReview,
     Confirmed,
     ReadBack,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryProcessingOperation {
+    pub operation_id: String,
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub runtime_revision: u64,
+    pub source_identity_digest: String,
+    pub source_digest: String,
+    pub model_provenance: ModelProvenance,
+    pub catalog_digest: String,
+    pub protocol_version: u32,
+    pub persona_revision: PersonaRevisionRef,
+    pub document_manifest_digest: String,
+    pub source_manifest_digest: String,
+    pub started_at_ms: i64,
+}
+
+impl B2MemoryProcessingOperation {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.operation_id)
+            && bounded_identifier(&self.request_id)
+            && self.expected_revision > 0
+            && self.runtime_revision > 0
+            && sha256_hex(&self.source_identity_digest)
+            && sha256_hex(&self.source_digest)
+            && self.model_provenance.is_valid()
+            && sha256_hex(&self.catalog_digest)
+            && self.protocol_version == EFFECT_PROTOCOL_VERSION
+            && self.persona_revision.is_valid()
+            && sha256_hex(&self.document_manifest_digest)
+            && sha256_hex(&self.source_manifest_digest)
+            && self.started_at_ms >= 0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryProcessingResult {
+    pub operation_id: String,
+    pub candidates: Vec<B2MemoryCandidateCard>,
+    pub result_digest: String,
+    pub completed_at_ms: i64,
+}
+
+impl B2MemoryProcessingResult {
+    #[must_use]
+    pub fn canonical_digest(&self) -> Option<String> {
+        (bounded_identifier(&self.operation_id)
+            && !self.candidates.is_empty()
+            && self.candidates.len() <= 3
+            && self.candidates.iter().all(B2MemoryCandidateCard::is_valid)
+            && self.completed_at_ms >= 0)
+            .then(|| {
+                serde_json::to_vec(&serde_json::json!({
+                    "operationId": self.operation_id,
+                    "candidates": self.candidates,
+                    "completedAtMs": self.completed_at_ms,
+                }))
+                .ok()
+            })
+            .flatten()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.canonical_digest().as_deref() == Some(self.result_digest.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryRenderIntent {
+    pub intent_id: String,
+    pub expected_revision: u64,
+    pub confirmation_digest: String,
+    pub entry: DocumentManifestEntry,
+    pub content_digest: String,
+    pub created_at_ms: i64,
+}
+
+impl B2MemoryRenderIntent {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.intent_id)
+            && self.expected_revision > 0
+            && sha256_hex(&self.confirmation_digest)
+            && self.entry.relative_path == B2_MEMORY_MARKDOWN_PATH
+            && document_manifest_entries_are_valid(std::slice::from_ref(&self.entry))
+            && self.entry.mode == 0o600
+            && self.content_digest == self.entry.sha256
+            && self.created_at_ms >= 0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3191,11 +3289,17 @@ pub struct B2MemoryDemoState {
     pub stage: B2MemoryDemoStage,
     #[serde(default)]
     pub prepared_source: Option<B2MemoryPreparedSource>,
+    #[serde(default)]
+    pub processing_operation: Option<B2MemoryProcessingOperation>,
+    #[serde(default)]
+    pub processing_result_digest: Option<String>,
     pub seal: Option<B2MemoryImportSeal>,
     pub candidates: Vec<B2MemoryCandidateCard>,
     pub selected_candidate: Option<B2MemoryCandidateCard>,
     pub markdown_diff: Option<B2MemoryMarkdownDiff>,
     pub confirmation_digest: Option<String>,
+    #[serde(default)]
+    pub render_intent: Option<B2MemoryRenderIntent>,
     pub readback_receipt: Option<B2MemoryReadbackReceipt>,
     pub receipts: Vec<B2MemoryCommandReceipt>,
 }
@@ -4094,6 +4198,35 @@ mod choice_contract_tests {
             document_manifest: manifest,
         };
         assert!(!snapshot.is_valid());
+    }
+}
+
+#[cfg(test)]
+mod b2_memory_contract_tests {
+    use super::{B2MemoryCandidateCard, B2MemoryProcessingResult};
+
+    #[test]
+    fn processing_result_digest_binds_all_candidate_bytes_and_completion() {
+        let mut result = B2MemoryProcessingResult {
+            operation_id: "b2-operation-1".to_owned(),
+            candidates: vec![B2MemoryCandidateCard {
+                id: "candidate-1".to_owned(),
+                title: "One preference".to_owned(),
+                rationale: "Synthetic rationale".to_owned(),
+                proposed_line: "- Keep one bounded preference.".to_owned(),
+                source_binding_digest: "a".repeat(64),
+            }],
+            result_digest: String::new(),
+            completed_at_ms: 10,
+        };
+        result.result_digest = result.canonical_digest().unwrap();
+        assert!(result.is_valid());
+        let mut changed = result.clone();
+        changed.candidates[0].proposed_line.push_str(" Changed.");
+        assert!(!changed.is_valid());
+        let mut empty = result;
+        empty.candidates.clear();
+        assert!(!empty.is_valid());
     }
 }
 
