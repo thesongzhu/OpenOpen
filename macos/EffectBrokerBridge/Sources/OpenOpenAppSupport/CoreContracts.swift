@@ -431,15 +431,30 @@ public struct ChannelPairing: Codable, Equatable, Sendable {
     guard expectedChannel == nil || channel == expectedChannel,
       ChannelContractValidation.providerId(ownerSenderId),
       ChannelContractValidation.providerId(conversationId),
-      requireExplicitAddress == (channel != .iMessage),
       pairedAtMs >= 0
     else {
       throw CoreClientError.contractViolation("Core returned an invalid durable channel pairing.")
     }
     switch (channel, imessage, discord) {
-    case (.iMessage, _, nil):
+    case (.iMessage, nil, nil):
+      // Historical rows remain readable so AppModel can present the typed
+      // re-selection path. They are never eligible to start the PR2 listener.
       break
+    case (.iMessage, .some(let imessage), nil):
+      guard !requireExplicitAddress,
+        ChannelContractValidation.providerId(imessage.chatGuid),
+        ChannelContractValidation.providerId(imessage.chatIdentifier),
+        imessage.service == "iMessage",
+        imessage.participantIds == [ownerSenderId]
+      else {
+        throw CoreClientError.contractViolation(
+          "Core returned invalid self-chat pairing metadata.")
+      }
     case (.discord, nil, .some(let discord)):
+      guard requireExplicitAddress else {
+        throw CoreClientError.contractViolation(
+          "Core returned invalid Discord pairing metadata.")
+      }
       _ = try discord.validated()
     default:
       throw CoreClientError.contractViolation("Core returned mismatched channel pairing metadata.")
