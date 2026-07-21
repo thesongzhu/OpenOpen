@@ -90,7 +90,9 @@ public struct OpenOpenRootView: View {
       EditorialActivityView(model: model)
     case .settings:
       SettingsView(model: model)
-    case .messages, .memory, .skills:
+    case .messages:
+      EditorialMessagesView(model: model)
+    case .memory, .skills:
       EditorialUnavailableView(section: section)
     }
   }
@@ -304,6 +306,112 @@ private struct EditorialActivityView: View {
       .frame(maxWidth: 760, alignment: .leading)
     }
     .background(EditorialPalette.background)
+  }
+}
+
+private struct EditorialMessagesView: View {
+  @ObservedObject var model: AppModel
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 16) {
+        EditorialPageHeader(
+          eyebrow: "Private inbox",
+          title: model.iMessageIsConnected
+            ? "Self-chat connected" : "Connect one private self-chat",
+          detail: model.iMessageIsConnected
+            ? "Messages from this one conversation can now be processed when they address OpenOpen."
+            : "Only the conversation you explicitly choose can become OpenOpen’s inbox."
+        )
+        EditorialCard(title: "Messages", symbol: "messages") {
+          if model.iMessageIsConnected {
+            Label("Connected", systemImage: "checkmark.circle.fill")
+              .foregroundStyle(.green)
+              .accessibilityIdentifier("openopen-messages-connected")
+          } else {
+            Button("Load Messages conversations") {
+              Task { await model.refreshIMessageChats() }
+            }
+            .disabled(!model.modelEntryEnabled || model.isBusy)
+            .accessibilityIdentifier("openopen-messages-load-conversations")
+            Picker(
+              "Approved conversation",
+              selection: Binding(
+                get: { model.iMessageChatId },
+                set: { model.selectIMessageChat($0) }
+              )
+            ) {
+              Text("Choose a conversation").tag("")
+              ForEach(model.iMessageChats) { chat in
+                Text("\(chat.displayName) · \(chat.service)").tag(chat.chatId)
+              }
+            }
+            .disabled(model.iMessageChats.isEmpty)
+            .accessibilityIdentifier("openopen-messages-self-chat-picker")
+            Picker(
+              "Approved owner",
+              selection: Binding(
+                get: { model.iMessageOwnerSender },
+                set: { model.selectIMessageOwner($0) }
+              )
+            ) {
+              Text("Choose the owner").tag("")
+              ForEach(model.iMessageOwnerOptions, id: \.self) { participant in
+                Text(participant).tag(participant)
+              }
+            }
+            .disabled(model.iMessageOwnerOptions.isEmpty)
+            .accessibilityIdentifier("openopen-messages-owner-picker")
+            Button(
+              model.iMessageHasDurablePairing
+                ? "Reconnect approved iMessage" : "Use selected chat"
+            ) {
+              Task { await model.connectIMessage() }
+            }
+            .disabled(!model.iMessageConnectionActionEnabled)
+            .accessibilityIdentifier("openopen-messages-connect")
+          }
+          if let feedback = model.channelListenerFeedback[.iMessage] {
+            Text(feedback)
+              .font(.caption)
+              .foregroundStyle(.orange)
+              .accessibilityIdentifier("openopen-messages-recovery")
+          }
+        }
+
+        if let preview = model.choiceIMessageReplyPreview {
+          EditorialCard(
+            title: model.choiceIMessageReplyStatus == "delivered" ? "Reply sent" : "Reply ready",
+            symbol: model.choiceIMessageReplyStatus == "delivered"
+              ? "checkmark.circle" : "arrowshape.turn.up.left"
+          ) {
+            Text(preview.destination).font(.caption).foregroundStyle(.secondary)
+            Text(preview.visibleBody)
+              .textSelection(.enabled)
+              .accessibilityIdentifier("openopen-messages-reply-body")
+            if model.choiceIMessageReplyStatus == "delivered" {
+              Text("Sent and verified")
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("openopen-messages-reply-delivered")
+            } else {
+              Button(model.choiceIMessageReplyStatus == "authorized" ? "Verify delivery" : "Send") {
+                Task { await model.authorizeCurrentChoiceIMessageReply() }
+              }
+              .buttonStyle(.borderedProminent)
+              .disabled(
+                !model.choiceIMessageReplySendEnabled
+                  && !model.choiceIMessageReplyRecoveryEnabled
+              )
+              .accessibilityIdentifier("openopen-messages-reply-authorize")
+            }
+          }
+        }
+      }
+      .padding(30)
+      .frame(maxWidth: 760, alignment: .leading)
+    }
+    .background(EditorialPalette.background)
+    .accessibilityIdentifier("openopen-editorial-messages")
   }
 }
 
@@ -575,6 +683,36 @@ private struct DashboardView: View {
           .overlay {
             RoundedRectangle(cornerRadius: EditorialPalette.cornerRadius, style: .continuous)
               .stroke(EditorialPalette.border, lineWidth: 1)
+          }
+        }
+
+        if let preview = model.choiceIMessageReplyPreview {
+          GroupBox("iMessage reply") {
+            VStack(alignment: .leading, spacing: 8) {
+              Text(preview.destination)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              Text(preview.visibleBody)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("openopen-choice-imessage-reply-body")
+              if model.choiceIMessageReplyStatus == "delivered" {
+                Text("Sent and verified")
+                  .foregroundStyle(.secondary)
+                  .accessibilityIdentifier("openopen-choice-imessage-reply-delivered")
+              } else {
+                Button(
+                  model.choiceIMessageReplyStatus == "authorized"
+                    ? "Verify delivery" : "Send reply"
+                ) {
+                  Task { await model.authorizeCurrentChoiceIMessageReply() }
+                }
+                .disabled(
+                  !model.choiceIMessageReplySendEnabled
+                    && !model.choiceIMessageReplyRecoveryEnabled
+                )
+                .accessibilityIdentifier("openopen-choice-imessage-reply-authorize")
+              }
+            }
           }
         }
 
@@ -1193,7 +1331,7 @@ private struct SettingsView: View {
         GroupBox("iMessage — \(model.iMessageStatus)") {
           VStack(alignment: .leading, spacing: 10) {
             Text(
-              "Choose one Messages conversation and its approved owner. Inbound work must begin with @OpenOpen."
+              "Choose your dedicated Messages self-chat. Every message in that chat is addressed to OpenOpen."
             )
             .foregroundStyle(.secondary)
             Button("Load Messages conversations") {
@@ -1254,77 +1392,79 @@ private struct SettingsView: View {
           }
           .padding(4)
         }
-        GroupBox("Discord — \(model.discordStatus)") {
-          VStack(alignment: .leading, spacing: 10) {
-            Text(
-              "Use an official Bot Gateway token. V1 accepts one paired owner in one approved channel and requires @OpenOpen."
-            )
-            .foregroundStyle(.secondary)
-            Button("Enter or replace bot token securely") {
-              model.discardDiscordTokenDraft()
-              showsDiscordTokenSheet = true
-            }
-            .accessibilityIdentifier(DiscordSecureEntryAccessibility.openButton)
-            Text(
-              "1. Create a bot in Discord's Developer Portal and enable Message Content. OpenOpen derives its IDs from the token; IDs cannot be typed manually."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Button(
-              model.discordSetup == nil
-                ? "Continue with saved token" : "Restart setup with saved token"
-            ) {
-              Task { await model.connectDiscord() }
-            }
-            .disabled(!model.discordConnectionActionEnabled)
-            if let feedback = model.discordSetupFeedback {
-              Label(
-                feedback,
-                systemImage: discordFeedbackIcon
-              )
-              .foregroundStyle(discordFeedbackColor)
-              .font(.caption)
-            }
-            if let feedback = model.channelListenerFeedback[.discord] {
-              Text(feedback)
-                .font(.caption)
-                .foregroundStyle(.orange)
-            }
-            if let setup = model.discordSetup {
+        if model.discordSetupVisible {
+          GroupBox("Discord — \(model.discordStatus)") {
+            VStack(alignment: .leading, spacing: 10) {
               Text(
-                "2. Install \(setup.identity.botName) with exactly View Channel, Send Messages, Read Message History, and Attach Files."
+                "Use an official Bot Gateway token. V1 accepts one paired owner in one approved channel and requires @OpenOpen."
               )
-              .font(.caption)
-              if let installURL = URL(string: setup.installUrl) {
-                Link("Open official Discord install page", destination: installURL)
+              .foregroundStyle(.secondary)
+              Button("Enter or replace bot token securely") {
+                model.discardDiscordTokenDraft()
+                showsDiscordTokenSheet = true
               }
-              Text("3. In the intended channel, the owner sends exactly:")
-                .font(.caption)
-              Text(verbatim: setup.pairingInstruction)
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-              Button("Check pairing message & permissions") {
-                Task { await model.checkDiscordPairingMessage() }
-              }
-              .disabled(!model.discordSetupCheckEnabled)
-            }
-            if let candidate = model.discordPairingCandidate {
+              .accessibilityIdentifier(DiscordSecureEntryAccessibility.openButton)
               Text(
-                "Confirm owner \(candidate.ownerName) in #\(candidate.channelName), \(candidate.guildName). Live intents, permissions, and history readback passed."
+                "1. Create a bot in Discord's Developer Portal and enable Message Content. OpenOpen derives its IDs from the token; IDs cannot be typed manually."
               )
               .font(.caption)
-              Button("Confirm this owner & channel") {
-                Task { await model.confirmDiscordPairing() }
+              .foregroundStyle(.secondary)
+              Button(
+                model.discordSetup == nil
+                  ? "Continue with saved token" : "Restart setup with saved token"
+              ) {
+                Task { await model.connectDiscord() }
               }
-              .disabled(!model.discordSetupConfirmationEnabled)
+              .disabled(!model.discordConnectionActionEnabled)
+              if let feedback = model.discordSetupFeedback {
+                Label(
+                  feedback,
+                  systemImage: discordFeedbackIcon
+                )
+                .foregroundStyle(discordFeedbackColor)
+                .font(.caption)
+              }
+              if let feedback = model.channelListenerFeedback[.discord] {
+                Text(feedback)
+                  .font(.caption)
+                  .foregroundStyle(.orange)
+              }
+              if let setup = model.discordSetup {
+                Text(
+                  "2. Install \(setup.identity.botName) with exactly View Channel, Send Messages, Read Message History, and Attach Files."
+                )
+                .font(.caption)
+                if let installURL = URL(string: setup.installUrl) {
+                  Link("Open official Discord install page", destination: installURL)
+                }
+                Text("3. In the intended channel, the owner sends exactly:")
+                  .font(.caption)
+                Text(verbatim: setup.pairingInstruction)
+                  .font(.system(.caption, design: .monospaced))
+                  .textSelection(.enabled)
+                Button("Check pairing message & permissions") {
+                  Task { await model.checkDiscordPairingMessage() }
+                }
+                .disabled(!model.discordSetupCheckEnabled)
+              }
+              if let candidate = model.discordPairingCandidate {
+                Text(
+                  "Confirm owner \(candidate.ownerName) in #\(candidate.channelName), \(candidate.guildName). Live intents, permissions, and history readback passed."
+                )
+                .font(.caption)
+                Button("Confirm this owner & channel") {
+                  Task { await model.confirmDiscordPairing() }
+                }
+                .disabled(!model.discordSetupConfirmationEnabled)
+              }
+              Text(
+                "Outbound Discord messages suppress all mentions. The token remains Keychain-only."
+              )
+              .font(.caption)
+              .foregroundStyle(.secondary)
             }
-            Text(
-              "Outbound Discord messages suppress all mentions. The token remains Keychain-only."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .padding(4)
           }
-          .padding(4)
         }
         if let routeSet = model.channelRouteSet {
           GroupBox("Current Mission routes") {

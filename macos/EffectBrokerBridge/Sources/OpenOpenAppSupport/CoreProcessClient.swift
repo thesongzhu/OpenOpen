@@ -93,6 +93,7 @@ enum IMessageRuntimeAuthenticator {
 }
 
 public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendable {
+  public var permitsIMessageSelfChatRoutes: Bool { true }
   private enum CallStartPolicy {
     case startIfNeeded
     case requireRunning
@@ -707,6 +708,22 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
     try await call(
       method: "choice.confirm.prepare",
       parameters: PrepareChoiceConfirmationParameters(proof: proof))
+  }
+
+  public func prepareChoiceIMessageReply(proof: BrokerRuntimeState) async throws
+    -> ChoiceIMessageReplyPrepareResponse
+  {
+    try await call(
+      method: "choice.imessage.reply.prepare",
+      parameters: PrepareChoiceConfirmationParameters(proof: proof))
+  }
+
+  public func authorizeChoiceIMessageReply(
+    _ preview: ChoiceIMessageReplyPreview, proof: BrokerRuntimeState
+  ) async throws -> ChoiceIMessageReplyResponse {
+    try await call(
+      method: "choice.imessage.reply.authorize",
+      parameters: AuthorizeChoiceIMessageReplyParameters(preview: preview, proof: proof))
   }
 
   public func recordChoiceReminderSchedule(

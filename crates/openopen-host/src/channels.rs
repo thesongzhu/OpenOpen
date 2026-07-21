@@ -4,11 +4,12 @@ use openopen_discord_adapter::{
     InboundEnvelope as DiscordInbound, OutboundRequest, RecoveryBatch, RecoveryRequest,
 };
 use openopen_imsg_adapter::{
-    AdapterConfig as ImsgConfig, Chat, ChatId, ImsgAdapter, ImsgEvent, InboundPairing,
-    InboundRejection, ListChatsRequest, MessageCursor, OPENOPEN_IMESSAGE_PREFIX,
-    OutboundRecoveryRequest, SendRequest, SubscriptionId, WatchRequest, normalize_inbound,
+    AdapterConfig as ImsgConfig, Chat, ChatId, HistoryRequest, ImsgAdapter, ImsgEvent,
+    InboundPairing, InboundRejection, ListChatsRequest, Message, MessageCursor,
+    OPENOPEN_IMESSAGE_PREFIX, OutboundRecovery, OutboundRecoveryRequest, SelfChatMessage,
+    SendRequest, SendState, SubscriptionId, WatchRequest, classify_self_chat_message,
 };
-use openopen_protocol::{ChannelCursor, ChannelKind, ChannelPairing};
+use openopen_protocol::{ChannelCursor, ChannelKind, ChannelPairing, IMessagePairingMetadata};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -27,6 +28,7 @@ const DISCORD_INBOUND_CAPACITY: usize = 32;
 const DISCORD_RECOVERY_PAGES: u8 = 10;
 const MAX_IMESSAGE_CHAT_FIELD_BYTES: usize = 256;
 const MAX_IMESSAGE_CHAT_PARTICIPANTS: usize = 64;
+const SELF_CHAT_IDENTITY_HISTORY_LIMIT: u16 = 32;
 
 #[derive(Debug, Error)]
 pub(crate) enum ChannelRuntimeError {
@@ -68,6 +70,10 @@ pub(crate) struct TransportInbound {
 pub(crate) enum TransportEvent {
     Inbound(TransportInbound),
     Cursor(ChannelCursor),
+    IMessageEcho {
+        provider_message_id: String,
+        cursor: ChannelCursor,
+    },
 }
 
 struct DiscordSession {
@@ -95,6 +101,7 @@ struct ImsgSession {
     pairing: InboundPairing,
     subscription: SubscriptionId,
     conversation_id: String,
+    identity: IMessagePairingMetadata,
 }
 
 struct PreparedImsgSession {
@@ -102,12 +109,15 @@ struct PreparedImsgSession {
     pairing: InboundPairing,
     since_rowid: Option<MessageCursor>,
     conversation_id: String,
+    identity: IMessagePairingMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImessageChat {
     pub chat_id: String,
+    pub chat_guid: String,
+    pub chat_identifier: String,
     pub name: String,
     pub service: String,
     pub participants: Vec<String>,
@@ -213,7 +223,7 @@ impl ChannelSendHandle {
                 let Ok(after_rowid) = MessageCursor::new(after_rowid) else {
                     return ChannelSendResult::Uncertain;
                 };
-                let _ = adapter.recover_outbound(&OutboundRecoveryRequest {
+                let recovery = adapter.recover_outbound(&OutboundRecoveryRequest {
                     chat_id: *chat_id,
                     body: match imessage_adapter_body(content) {
                         Some(body) => body.to_owned(),
@@ -222,7 +232,25 @@ impl ChannelSendHandle {
                     after_rowid,
                     history_limit: openopen_imsg_adapter::MAX_HISTORY_MESSAGES,
                 });
-                ChannelSendResult::Uncertain
+                let Ok(OutboundRecovery::SingleLocalCandidate(candidate)) = recovery else {
+                    return ChannelSendResult::Uncertain;
+                };
+                let Some(guid) = candidate.guid else {
+                    return ChannelSendResult::Uncertain;
+                };
+                adapter
+                    .send_status(&guid)
+                    .ok()
+                    .and_then(|status| {
+                        (status.ok
+                            && status.guid == guid
+                            && status.service.as_deref() == Some("iMessage")
+                            && matches!(status.send_state, SendState::Sent | SendState::Delivered))
+                        .then_some(ChannelSendResult::Accepted {
+                            provider_message_id: guid,
+                        })
+                    })
+                    .unwrap_or(ChannelSendResult::Uncertain)
             }
             #[cfg(test)]
             Self::Test { recoveries, .. } => {
@@ -470,7 +498,7 @@ impl ChannelRuntime {
         {
             return Err(ChannelRuntimeError::AlreadyRunning);
         }
-        if pairing.channel != ChannelKind::IMessage || !pairing.require_explicit_address {
+        if pairing.channel != ChannelKind::IMessage || pairing.require_explicit_address {
             return Err(ChannelRuntimeError::PairingMismatch);
         }
         let chat_id = ChatId::new(
@@ -482,10 +510,34 @@ impl ChannelRuntime {
         .map_err(|_| ChannelRuntimeError::PairingMismatch)?;
         let inbound_pairing = InboundPairing::new(chat_id, pairing.owner_sender_id.clone())
             .map_err(|_| ChannelRuntimeError::PairingMismatch)?;
+        let identity = pairing
+            .imessage
+            .clone()
+            .ok_or(ChannelRuntimeError::PairingMismatch)?;
+        if identity.participant_ids.as_slice() != [pairing.owner_sender_id.as_str()] {
+            return Err(ChannelRuntimeError::PairingMismatch);
+        }
         let adapter = Arc::new(
             ImsgAdapter::spawn(&ImsgConfig::new(executable))
                 .map_err(|_| ChannelRuntimeError::Adapter)?,
         );
+        let messages = adapter
+            .history(HistoryRequest {
+                chat_id,
+                limit: SELF_CHAT_IDENTITY_HISTORY_LIMIT,
+            })
+            .map_err(|_| ChannelRuntimeError::Adapter)?;
+        validate_self_chat_identity_evidence(
+            &ImessageChat {
+                chat_id: pairing.conversation_id.clone(),
+                chat_guid: identity.chat_guid.clone(),
+                chat_identifier: identity.chat_identifier.clone(),
+                name: String::new(),
+                service: identity.service.clone(),
+                participants: identity.participant_ids.clone(),
+            },
+            &messages,
+        )?;
         let since_rowid = cursor
             .map(|value| value.order)
             .map(i64::try_from)
@@ -502,6 +554,7 @@ impl ChannelRuntime {
             pairing: inbound_pairing,
             since_rowid,
             conversation_id: pairing.conversation_id.clone(),
+            identity,
         });
         Ok(process_identifier)
     }
@@ -538,7 +591,29 @@ impl ChannelRuntime {
                 unread_only: false,
             })
             .map_err(|_| ChannelRuntimeError::Adapter)
-            .and_then(validate_imessage_chats);
+            .and_then(validate_imessage_chats)
+            .and_then(|chats| {
+                let mut verified = Vec::new();
+                for chat in chats {
+                    let chat_id = chat
+                        .chat_id
+                        .parse::<i64>()
+                        .map_err(|_| ChannelRuntimeError::PairingMismatch)
+                        .and_then(|value| {
+                            ChatId::new(value).map_err(|_| ChannelRuntimeError::PairingMismatch)
+                        })?;
+                    let messages = adapter
+                        .history(HistoryRequest {
+                            chat_id,
+                            limit: SELF_CHAT_IDENTITY_HISTORY_LIMIT,
+                        })
+                        .map_err(|_| ChannelRuntimeError::Adapter)?;
+                    if validate_self_chat_identity_evidence(&chat, &messages).is_ok() {
+                        verified.push(chat);
+                    }
+                }
+                Ok(verified)
+            });
         let shutdown = adapter.shutdown().map_err(|_| ChannelRuntimeError::Adapter);
         shutdown.and(chats)
     }
@@ -562,6 +637,7 @@ impl ChannelRuntime {
             pairing: prepared.pairing,
             subscription,
             conversation_id: prepared.conversation_id,
+            identity: prepared.identity,
         });
         Ok(ChannelConnectionStatus::Connected)
     }
@@ -652,35 +728,60 @@ impl ChannelRuntime {
                 subscription,
                 message,
             } if subscription == session.subscription => {
-                match normalize_inbound(&session.pairing, &message) {
-                    Ok(value) => Ok(Some(TransportEvent::Inbound(TransportInbound {
-                        channel: ChannelKind::IMessage,
-                        source_message_id: value.source_guid,
-                        sender_id: value.sender,
-                        conversation_id: session.conversation_id.clone(),
-                        content: value.body,
-                        cursor_opaque_value: value.source_rowid.to_string(),
-                        cursor_order: u64::try_from(value.source_rowid)
-                            .map_err(|_| ChannelRuntimeError::Adapter)?,
-                        received_at_ms: observed_at_ms,
-                    }))),
-                    Err(
-                        InboundRejection::SenderNotOwner
-                        | InboundRejection::FromLocalUser
-                        | InboundRejection::NotAddressed
-                        | InboundRejection::EmptyBody
-                        | InboundRejection::BodyTooLarge,
-                    ) if message.id > 0 => Ok(Some(TransportEvent::Cursor(ChannelCursor {
-                        channel: ChannelKind::IMessage,
-                        conversation_id: session.conversation_id.clone(),
-                        opaque_value: message.id.to_string(),
-                        order: u64::try_from(message.id)
-                            .map_err(|_| ChannelRuntimeError::Adapter)?,
-                        observed_at_ms,
-                    }))),
+                if message.chat_guid != session.identity.chat_guid
+                    || message.chat_identifier != session.identity.chat_identifier
+                    || message.participants != session.identity.participant_ids
+                    || message.destination_caller_id.as_deref()
+                        != Some(session.pairing.owner_sender.as_str())
+                    || message.is_group
+                {
+                    return Err(ChannelRuntimeError::PairingMismatch);
+                }
+                match classify_self_chat_message(&session.pairing, &message) {
+                    Ok(SelfChatMessage::UserAuthored(value)) => {
+                        Ok(Some(TransportEvent::Inbound(TransportInbound {
+                            channel: ChannelKind::IMessage,
+                            source_message_id: value.source_guid,
+                            sender_id: value.sender,
+                            conversation_id: session.conversation_id.clone(),
+                            content: value.body,
+                            cursor_opaque_value: value.source_rowid.to_string(),
+                            cursor_order: u64::try_from(value.source_rowid)
+                                .map_err(|_| ChannelRuntimeError::Adapter)?,
+                            received_at_ms: observed_at_ms,
+                        })))
+                    }
+                    Ok(SelfChatMessage::OpenOpenEcho(value)) => {
+                        Ok(Some(TransportEvent::IMessageEcho {
+                            provider_message_id: value.source_guid,
+                            cursor: ChannelCursor {
+                                channel: ChannelKind::IMessage,
+                                conversation_id: session.conversation_id.clone(),
+                                opaque_value: value.source_rowid.to_string(),
+                                order: u64::try_from(value.source_rowid)
+                                    .map_err(|_| ChannelRuntimeError::Adapter)?,
+                                observed_at_ms,
+                            },
+                        }))
+                    }
+                    Err(InboundRejection::EmptyBody | InboundRejection::BodyTooLarge)
+                        if message.id > 0 =>
+                    {
+                        Ok(Some(TransportEvent::Cursor(ChannelCursor {
+                            channel: ChannelKind::IMessage,
+                            conversation_id: session.conversation_id.clone(),
+                            opaque_value: message.id.to_string(),
+                            order: u64::try_from(message.id)
+                                .map_err(|_| ChannelRuntimeError::Adapter)?,
+                            observed_at_ms,
+                        })))
+                    }
                     Err(
                         InboundRejection::InvalidPairing
                         | InboundRejection::ChatNotPaired
+                        | InboundRejection::GroupChat
+                        | InboundRejection::NotFromLocalUser
+                        | InboundRejection::AmbiguousProductPrefix
                         | InboundRejection::InvalidSourceIdentity
                         | InboundRejection::SenderNotOwner
                         | InboundRejection::FromLocalUser
@@ -765,6 +866,7 @@ impl ChannelRuntime {
             owner_sender_id: "1001".into(),
             conversation_id: "2002".into(),
             require_explicit_address: true,
+            imessage: None,
             discord: Some(openopen_protocol::DiscordPairingMetadata {
                 guild_id: "3003".into(),
                 bot_user_id: "4004".into(),
@@ -825,15 +927,39 @@ impl ChannelRuntime {
     }
 }
 
+fn validate_self_chat_identity_evidence(
+    chat: &ImessageChat,
+    messages: &[Message],
+) -> Result<(), ChannelRuntimeError> {
+    let [owner_identity] = chat.participants.as_slice() else {
+        return Err(ChannelRuntimeError::PairingMismatch);
+    };
+    let exact_local_identity = messages.iter().any(|message| {
+        message.is_from_me
+            && !message.is_group
+            && message.chat_guid == chat.chat_guid
+            && message.chat_identifier == chat.chat_identifier
+            && message.participants == chat.participants
+            && message.destination_caller_id.as_deref() == Some(owner_identity.as_str())
+    });
+    exact_local_identity
+        .then_some(())
+        .ok_or(ChannelRuntimeError::PairingMismatch)
+}
+
 fn validate_imessage_chats(chats: Vec<Chat>) -> Result<Vec<ImessageChat>, ChannelRuntimeError> {
     let mut result = Vec::with_capacity(chats.len());
     for chat in chats {
         if chat.service != "iMessage" {
             continue;
         }
+        if chat.participants.len() > MAX_IMESSAGE_CHAT_PARTICIPANTS {
+            return Err(ChannelRuntimeError::Adapter);
+        }
+        if chat.is_group || chat.participants.len() != 1 {
+            continue;
+        }
         if !valid_imessage_chat_field(&chat.name, true)
-            || chat.participants.is_empty()
-            || chat.participants.len() > MAX_IMESSAGE_CHAT_PARTICIPANTS
             || chat
                 .participants
                 .iter()
@@ -848,6 +974,8 @@ fn validate_imessage_chats(chats: Vec<Chat>) -> Result<Vec<ImessageChat>, Channe
         }
         result.push(ImessageChat {
             chat_id: chat.id.get().to_string(),
+            chat_guid: chat.guid,
+            chat_identifier: chat.identifier,
             name: chat.name,
             service: chat.service,
             participants,
@@ -927,7 +1055,9 @@ fn poll_discord_session(
 fn transport_event_channel(event: &TransportEvent) -> ChannelKind {
     match event {
         TransportEvent::Inbound(inbound) => inbound.channel,
-        TransportEvent::Cursor(cursor) => cursor.channel,
+        TransportEvent::Cursor(cursor) | TransportEvent::IMessageEcho { cursor, .. } => {
+            cursor.channel
+        }
     }
 }
 
@@ -1041,6 +1171,7 @@ mod tests {
             owner_sender_id: "1001".into(),
             conversation_id: "2002".into(),
             require_explicit_address: true,
+            imessage: None,
             discord: Some(DiscordPairingMetadata {
                 guild_id: "3003".into(),
                 bot_user_id: "4004".into(),
@@ -1380,7 +1511,7 @@ mod tests {
             let log = canonical_root.join("requests.log");
             let log_json = serde_json::to_string(&log.display().to_string()).unwrap();
             let participants = if invalid_list {
-                "[]"
+                "['']"
             } else {
                 "['+15550000002','+15550000001']"
             };
@@ -1411,7 +1542,10 @@ for line in sys.stdin:
             {{'id':42,'identifier':'first','guid':'iMessage;+;first','name':'First','service':'iMessage','last_message_at':'2026-07-14T00:00:00Z','participants':{participants},'is_group':False}}
         ]}}}})
     elif method == 'messages.history':
-        emit({{'jsonrpc':'2.0','id':request_id,'result':{{'messages':[{{'id':101,'chat_id':42,'chat_identifier':'first','chat_guid':'iMessage;+;first','chat_name':'First','participants':['+15550000001'],'is_group':False,'guid':'same-text-guid','sender':'','is_from_me':True,'text':'OpenOpen · AI\nWorking on it','created_at':'2026-07-15T00:02:00Z'}}]}}}})
+        chat_id = request['params']['chat_id']
+        identifier = 'second' if chat_id == 43 else 'first'
+        owner = '+15550000003' if chat_id == 43 else '+15550000001'
+        emit({{'jsonrpc':'2.0','id':request_id,'result':{{'messages':[{{'id':101,'chat_id':chat_id,'chat_identifier':identifier,'chat_guid':'iMessage;+;'+identifier,'chat_name':identifier.title(),'participants':[owner],'is_group':False,'guid':'same-text-guid','sender':'','is_from_me':True,'text':'OpenOpen · AI\nWorking on it','created_at':'2026-07-15T00:02:00Z','destination_caller_id':owner}}]}}}})
 "
             );
             fs::write(&executable, script).unwrap();
@@ -1496,20 +1630,14 @@ for line in sys.stdin:
         );
         assert_eq!(
             runtime.list_imessage_chats().unwrap(),
-            vec![
-                ImessageChat {
-                    chat_id: "42".into(),
-                    name: "First".into(),
-                    service: "iMessage".into(),
-                    participants: vec!["+15550000001".into(), "+15550000002".into()],
-                },
-                ImessageChat {
-                    chat_id: "43".into(),
-                    name: "Second".into(),
-                    service: "iMessage".into(),
-                    participants: vec!["+15550000003".into()],
-                },
-            ]
+            vec![ImessageChat {
+                chat_id: "43".into(),
+                chat_guid: "iMessage;+;second".into(),
+                chat_identifier: "second".into(),
+                name: "Second".into(),
+                service: "iMessage".into(),
+                participants: vec!["+15550000003".into()],
+            }]
         );
         assert_eq!(
             runtime.status(ChannelKind::IMessage),
@@ -1547,6 +1675,8 @@ for line in sys.stdin:
                 .unwrap(),
             vec![ImessageChat {
                 chat_id: "42".into(),
+                chat_guid: "iMessage;+;chat-42".into(),
+                chat_identifier: "chat-42".into(),
                 name: String::new(),
                 service: "iMessage".into(),
                 participants: vec!["owner@example.invalid".into()],
@@ -1555,7 +1685,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn mixed_named_and_unnamed_imessage_chats_are_valid() {
+    fn group_chats_are_excluded_while_one_to_one_self_chat_remains() {
         let chats = validate_imessage_chats(vec![
             imessage_chat(
                 84,
@@ -1570,12 +1700,44 @@ for line in sys.stdin:
                 .iter()
                 .map(|chat| (chat.chat_id.as_str(), chat.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("42", ""), ("84", "Family")]
+            vec![("42", "")]
         );
-        assert_eq!(
-            chats[1].participants,
-            vec!["owner@example.invalid", "second@example.invalid"]
-        );
+    }
+
+    #[test]
+    fn self_chat_identity_requires_local_destination_equal_to_the_sole_participant() {
+        let chat = ImessageChat {
+            chat_id: "42".into(),
+            chat_guid: "iMessage;+;self".into(),
+            chat_identifier: "self".into(),
+            name: String::new(),
+            service: "iMessage".into(),
+            participants: vec!["owner@example.invalid".into()],
+        };
+        let mut message = Message {
+            id: 7,
+            chat_id: ChatId::new(42).unwrap(),
+            chat_identifier: "self".into(),
+            chat_guid: "iMessage;+;self".into(),
+            chat_name: String::new(),
+            participants: chat.participants.clone(),
+            is_group: false,
+            guid: "self-proof-guid".into(),
+            sender: String::new(),
+            sender_name: None,
+            is_from_me: true,
+            text: "Owner-authored proof".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            reply_to_guid: None,
+            reply_to_text: None,
+            reply_to_sender: None,
+            destination_caller_id: Some("owner@example.invalid".into()),
+            is_read: None,
+            date_read: None,
+        };
+        assert!(validate_self_chat_identity_evidence(&chat, &[message.clone()]).is_ok());
+        message.destination_caller_id = Some("different-local-account@example.invalid".into());
+        assert!(validate_self_chat_identity_evidence(&chat, &[message]).is_err());
     }
 
     #[test]
@@ -1592,8 +1754,6 @@ for line in sys.stdin:
         }
 
         let invalid_participant_sets = [
-            Vec::<&str>::new(),
-            vec!["owner@example.invalid", "owner@example.invalid"],
             vec![""],
             vec!["owner@example.invalid\0"],
             vec![" owner@example.invalid"],
@@ -1603,6 +1763,20 @@ for line in sys.stdin:
                 validate_imessage_chats(vec![imessage_chat(42, "Owner", &participants)]).is_err()
             );
         }
+        assert!(
+            validate_imessage_chats(vec![imessage_chat(42, "Owner", &[])])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            validate_imessage_chats(vec![imessage_chat(
+                42,
+                "Owner",
+                &["owner@example.invalid", "other@example.invalid"]
+            )])
+            .unwrap()
+            .is_empty()
+        );
         let oversized_participant = "p".repeat(MAX_IMESSAGE_CHAT_FIELD_BYTES + 1);
         assert!(
             validate_imessage_chats(vec![imessage_chat(
@@ -1634,6 +1808,8 @@ for line in sys.stdin:
             validate_imessage_chats(vec![sms, valid]).unwrap(),
             vec![ImessageChat {
                 chat_id: "42".into(),
+                chat_guid: "iMessage;+;chat-42".into(),
+                chat_identifier: "chat-42".into(),
                 name: String::new(),
                 service: "iMessage".into(),
                 participants: vec!["owner@example.invalid".into()],

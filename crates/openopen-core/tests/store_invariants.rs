@@ -13,10 +13,11 @@ use openopen_protocol::{
     ChannelMissionEvent, ChannelModelDisposition, ChannelObservation, ChannelOutboundDisposition,
     ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision,
     ChannelRouteRole, EFFECT_PROTOCOL_VERSION, EffectBrokerSession, EffectNonCommit, EffectPermit,
-    EffectPermitPurpose, EffectReceipt, EvidenceKind, MissionFileEffect, MissionStatus,
-    OutcomeSuggestion, RuntimeControlAuthorization, RuntimeControlReceipt, WorkItemStatus,
-    effect_noncommit_signing_bytes, effect_permit_hash, effect_receipt_signing_bytes,
-    runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
+    EffectPermitPurpose, EffectReceipt, EvidenceKind, IMessagePairingMetadata, MissionFileEffect,
+    MissionStatus, OutcomeSuggestion, RuntimeControlAuthorization, RuntimeControlReceipt,
+    WorkItemStatus, effect_noncommit_signing_bytes, effect_permit_hash,
+    effect_receipt_signing_bytes, runtime_control_authorization_hash,
+    runtime_control_receipt_signing_bytes,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -483,6 +484,7 @@ fn channel_pairing() -> ChannelPairing {
         owner_sender_id: "owner-1".into(),
         conversation_id: "channel-1".into(),
         require_explicit_address: true,
+        imessage: None,
         discord: Some(openopen_protocol::DiscordPairingMetadata {
             guild_id: "101".into(),
             bot_user_id: "102".into(),
@@ -527,6 +529,7 @@ fn imessage_pairing() -> ChannelPairing {
         owner_sender_id: "owner-imessage".into(),
         conversation_id: "chat-imessage".into(),
         require_explicit_address: true,
+        imessage: None,
         discord: None,
         paired_at_ms: 6,
     }
@@ -553,6 +556,50 @@ fn imessage_observation(id: u64) -> ChannelObservation {
         is_bot: false,
         explicitly_addressed: true,
     }
+}
+
+#[test]
+fn legacy_imessage_pairing_has_one_typed_self_chat_upgrade_and_then_freezes() {
+    let mut store = effect_store_in_memory(authority());
+    store.pair_channel(&imessage_pairing()).unwrap();
+    let upgraded = ChannelPairing {
+        channel: ChannelKind::IMessage,
+        owner_sender_id: "owner-imessage".into(),
+        conversation_id: "chat-imessage".into(),
+        require_explicit_address: false,
+        imessage: Some(IMessagePairingMetadata {
+            chat_guid: "iMessage;+;self-chat".into(),
+            chat_identifier: "self-chat".into(),
+            service: "iMessage".into(),
+            participant_ids: vec!["owner-imessage".into()],
+        }),
+        discord: None,
+        paired_at_ms: 7,
+    };
+    let mut rebound = upgraded.clone();
+    rebound.owner_sender_id = "other@example.invalid".into();
+    rebound.conversation_id = "43".into();
+    rebound.imessage.as_mut().unwrap().participant_ids = vec![rebound.owner_sender_id.clone()];
+    assert!(matches!(
+        store.pair_channel(&rebound),
+        Err(StoreError::ChannelPairingConflict)
+    ));
+    assert_eq!(
+        store.channel_pairing(ChannelKind::IMessage).unwrap(),
+        Some(imessage_pairing())
+    );
+    store.pair_channel(&upgraded).unwrap();
+    assert_eq!(
+        store.channel_pairing(ChannelKind::IMessage).unwrap(),
+        Some(upgraded.clone())
+    );
+    store.pair_channel(&upgraded).unwrap();
+    let mut changed = upgraded;
+    changed.conversation_id = "43".into();
+    assert!(matches!(
+        store.pair_channel(&changed),
+        Err(StoreError::ChannelPairingConflict)
+    ));
 }
 
 fn imessage_body(id: u64) -> String {

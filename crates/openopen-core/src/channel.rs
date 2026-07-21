@@ -42,12 +42,29 @@ pub enum ChannelError {
 pub(crate) fn validate_pairing(pairing: &ChannelPairing) -> Result<(), ChannelError> {
     if !valid_provider_identifier(&pairing.owner_sender_id)
         || !valid_provider_identifier(&pairing.conversation_id)
-        || !pairing.require_explicit_address
         || pairing.paired_at_ms < 0
-        || match (pairing.channel, pairing.discord.as_ref()) {
-            (ChannelKind::IMessage, None) => false,
-            (ChannelKind::Discord, Some(discord)) => {
-                !valid_discord_snowflake(&discord.guild_id)
+        || match (
+            pairing.channel,
+            pairing.imessage.as_ref(),
+            pairing.discord.as_ref(),
+        ) {
+            (ChannelKind::IMessage, Some(imessage), None) => {
+                pairing.require_explicit_address
+                    || !valid_provider_identifier(&imessage.chat_guid)
+                    || !valid_provider_identifier(&imessage.chat_identifier)
+                    || imessage.service != "iMessage"
+                    || imessage.participant_ids.len() != 1
+                    || imessage
+                        .participant_ids
+                        .iter()
+                        .any(|value| !valid_provider_identifier(value))
+            }
+            // Historical rows remain readable; the public PR2 pair/prepare
+            // routes require metadata and never create this shape.
+            (ChannelKind::IMessage, None, None) => false,
+            (ChannelKind::Discord, None, Some(discord)) => {
+                !pairing.require_explicit_address
+                    || !valid_discord_snowflake(&discord.guild_id)
                     || !valid_discord_snowflake(&discord.bot_user_id)
                     || !valid_discord_snowflake(&discord.application_id)
                     || !valid_discord_snowflake(&discord.setup_source_message_id)
@@ -270,6 +287,7 @@ mod tests {
             owner_sender_id: "owner".into(),
             conversation_id: "channel".into(),
             require_explicit_address: false,
+            imessage: None,
             discord: None,
             paired_at_ms: 1,
         };

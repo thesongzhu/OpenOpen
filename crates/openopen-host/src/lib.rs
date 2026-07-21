@@ -25,20 +25,22 @@ use openopen_core::{
 use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
 use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, ChannelDeliveryReceipt,
-    ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
-    ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
-    ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
-    ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
-    ChoiceDIntakeRecord, ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption,
-    ChoiceRefinementOperation, ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, BatchSealReason, ChannelCursor,
+    ChannelDeliveryReceipt, ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult,
+    ChannelKind, ChannelMessageKind, ChannelModelDisposition, ChannelModelStart,
+    ChannelObservation, ChannelOutboundDisposition, ChannelOutboundIntent, ChannelPairing,
+    ChannelRouteApproval, ChoiceBeginAccepted, ChoiceBeginRecord, ChoiceBeginRequest,
+    ChoiceConsolidatedConfirmation, ChoiceDInput, ChoiceDIntakeRecord,
+    ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview,
+    ChoiceInitialResult, ChoiceLoopSnapshot, ChoiceOption, ChoiceRefinementOperation,
+    ChoiceRefinementResult, ChoiceReminderItem, ChoiceReminderSchedule,
     ChoiceReminderScheduleInput, ChoiceResumeResult, ChoiceSession, ChoiceSessionState,
     ConversationTurnBatch, CoreInstanceLease, DiscordPairingMetadata, DocumentManifest,
     DocumentManifestEntry, EffectAuditAnchor, EvidenceKind, InterpretationFrame,
     MarkdownBaseIdentity, Mission, MissionStatus, ModelSelection, ModelSelectionState,
     OutcomeSuggestion, Receipt, RpcError, RpcRequest, RpcResponse, RuntimeControlAuthorization,
     RuntimeControlReceipt, Selection, SourceEnvelope, WorkItem, WorkItemStatus,
-    canonical_document_manifest_digest,
+    canonical_choice_set_digest, canonical_document_manifest_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -298,6 +300,31 @@ impl OperationState {
         let token = Arc::new(AtomicBool::new(false));
         gate.active = Some(token.clone());
         Some(token)
+    }
+
+    /// Serializes one irreversible provider initiation with protected Off.
+    /// Holding the operation gate through the initiation means Off either
+    /// wins before this closure (and no effect starts) or observes the effect
+    /// as already initiated before it can latch the runtime Off.
+    fn start_irreversible<T>(
+        &self,
+        token: &Arc<AtomicBool>,
+        start: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.load(Ordering::Acquire)
+            || !matches!(gate.runtime, RuntimeAuthorityState::Enabled)
+            || !gate
+                .active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return None;
+        }
+        Some(start())
     }
 
     fn cancel_active(&self) {
@@ -761,6 +788,12 @@ impl Host {
             "choice.reminder.schedule" => self.record_choice_reminder_schedule(&request, responses),
             "choice.confirm.prepare" => self.prepare_choice_confirmation(&request, responses),
             "choice.confirm" => self.confirm_choice(&request, responses),
+            "choice.imessage.reply.prepare" => {
+                self.prepare_choice_imessage_reply(&request, responses);
+            }
+            "choice.imessage.reply.authorize" => {
+                self.authorize_choice_imessage_reply(&request, responses);
+            }
             "choice.reminders.authorize" => {
                 self.authorize_choice_reminders(&request, responses);
             }
@@ -1314,6 +1347,8 @@ impl Host {
             return;
         };
         let result = if params.pairing.channel != ChannelKind::IMessage
+            || params.pairing.require_explicit_address
+            || params.pairing.imessage.is_none()
             || params.pairing.discord.is_some()
         {
             Err(StoreError::ChannelPairingConflict)
@@ -1415,6 +1450,7 @@ impl Host {
                 owner_sender_id: candidate.owner_user_id,
                 conversation_id: candidate.channel_id,
                 require_explicit_address: true,
+                imessage: None,
                 discord: Some(DiscordPairingMetadata {
                     guild_id: candidate.guild_id,
                     bot_user_id: candidate.bot_user_id,
@@ -1577,6 +1613,190 @@ impl Host {
             |error| call_failure(request.id, &error),
             |status| success(request.id, json!({"status": status})),
         ));
+    }
+
+    fn prepare_choice_imessage_reply(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<RuntimeProof>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params, responses) else {
+            return;
+        };
+        let result = (|| -> Result<(ChoiceIMessageReplyPreview, String), HostCallError> {
+            let (snapshot, pairing, source_message_id, delivery_binding_id) = self
+                .store
+                .current_choice_imessage_reply_context()?
+                .ok_or(HostCallError::ChoiceRefreshRequired)?;
+            let choice_set = snapshot
+                .active_choice_set
+                .as_ref()
+                .ok_or(HostCallError::ChoiceRefreshRequired)?;
+            if snapshot.session.state != ChoiceSessionState::Active
+                || snapshot.session.active_choice_set_id.as_deref() != Some(choice_set.id.as_str())
+            {
+                return Err(HostCallError::ChoiceRefreshRequired);
+            }
+            let visible_body = render_choice_imessage_reply(choice_set)?;
+            let choice_set_digest =
+                canonical_choice_set_digest(choice_set).ok_or(HostCallError::Internal)?;
+            let reply_id = hashed_identifier(
+                "choice-imessage-reply",
+                &json!({
+                    "sourceMessageId": source_message_id,
+                    "choiceSetDigest": choice_set_digest,
+                    "conversationId": pairing.conversation_id,
+                }),
+            )?;
+            let outbound_id =
+                hashed_identifier("choice-imessage-outbound", &json!({"replyId": reply_id}))?;
+            let created_at_ms = now_ms()?;
+            let payload_digest = format!("{:x}", Sha256::digest(visible_body.as_bytes()));
+            let mut intent = ChoiceIMessageReplyIntent {
+                preview: ChoiceIMessageReplyPreview {
+                    reply_id,
+                    preview_revision: snapshot.session.revision,
+                    destination: "Your selected iMessage self-chat".to_owned(),
+                    visible_body,
+                    confirmation_digest: "0".repeat(64),
+                },
+                outbound_id,
+                choice_session_id: snapshot.session.id.clone(),
+                session_revision: snapshot.session.revision,
+                choice_set_id: choice_set.id.clone(),
+                choice_set_digest,
+                source_message_id,
+                delivery_binding_id,
+                pairing,
+                persona_revision: choice_set.persona_revision.clone(),
+                source_manifest_digest: choice_set.source_manifest_digest.clone(),
+                model_provenance: choice_set.model_provenance.clone(),
+                canonical_payload_sha256: payload_digest,
+                created_at_ms,
+                approved_at_ms: None,
+                recovery_cursor: None,
+            };
+            intent.preview.confirmation_digest = intent
+                .expected_confirmation_digest()
+                .ok_or(HostCallError::Internal)?;
+            self.store
+                .prepare_choice_imessage_reply(&intent)
+                .map_err(HostCallError::Store)
+        })();
+        self.finish_operation(&operation);
+        let _ = responses.send(result.map_or_else(
+            |error| call_failure(request.id, &error),
+            |(preview, status)| success(request.id, json!({"preview": preview, "status": status})),
+        ));
+    }
+
+    fn authorize_choice_imessage_reply(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+    ) {
+        let Ok(params) = decode_params::<AuthorizeChoiceIMessageReply>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            return;
+        };
+        let started = self.store.authorize_choice_imessage_reply(
+            &params.reply_id,
+            params.preview_revision,
+            &params.confirmation_digest,
+            params.explicitly_approved,
+            now_ms().unwrap_or(-1),
+        );
+        let start = match started {
+            Ok(value) => value,
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(host_failure(request.id, &error));
+                return;
+            }
+        };
+        if start.disposition == ChoiceIMessageReplyDisposition::AlreadySent {
+            self.finish_operation(&operation);
+            let _ = responses.send(success(request.id, json!({"status": "sent"})));
+            return;
+        }
+        let handle = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_handle(ChannelKind::IMessage);
+        let Some(handle) = handle else {
+            self.finish_operation(&operation);
+            let _ = responses.send(call_failure(request.id, &HostCallError::ChannelUnavailable));
+            return;
+        };
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = match start.disposition {
+                ChoiceIMessageReplyDisposition::ExecuteNow => context
+                    .operations
+                    .start_irreversible(&operation, || {
+                        handle.send(
+                            &start.intent.outbound_id,
+                            &start.intent.preview.visible_body,
+                        )
+                    })
+                    .unwrap_or(ChannelSendResult::Uncertain),
+                ChoiceIMessageReplyDisposition::RecoverOnly => start
+                    .intent
+                    .recovery_cursor
+                    .as_ref()
+                    .map_or(ChannelSendResult::Uncertain, |cursor| {
+                        handle.recover(
+                            &start.intent.outbound_id,
+                            &start.intent.preview.visible_body,
+                            cursor,
+                        )
+                    }),
+                ChoiceIMessageReplyDisposition::AlreadySent => unreachable!(),
+            };
+            let response = match result {
+                ChannelSendResult::Accepted {
+                    provider_message_id,
+                } => {
+                    let recorded = (|| -> Result<Value, HostCallError> {
+                        let broker = context
+                            .trusted_broker
+                            .clone()
+                            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+                        let mut store = Store::open_with_trusted_broker(
+                            &context.paths.store,
+                            context.authority.clone(),
+                            broker,
+                        )?;
+                        store.record_choice_imessage_reply_delivery(
+                            &start.intent.preview.reply_id,
+                            &provider_message_id,
+                            now_ms()?,
+                        )?;
+                        Ok(json!({"status": "sent"}))
+                    })();
+                    recorded.map_or_else(
+                        |error| call_failure(request_id, &error),
+                        |value| success(request_id, value),
+                    )
+                }
+                ChannelSendResult::Uncertain => success(
+                    request_id,
+                    json!({"status": "needYou", "recoveryOnly": true}),
+                ),
+            };
+            context.finish_operation(&operation);
+            let _ = responses.send(response);
+        });
     }
 
     fn channel_status(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -1990,6 +2210,7 @@ impl Host {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps the ordered transport/cursor/echo gates auditable.
     fn poll_channel(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
         let Ok(params) = decode_params::<PollChannel>(request) else {
             let _ = responses.send(invalid_params(request.id));
@@ -2056,6 +2277,40 @@ impl Host {
             self.respond_when_channel_idle(request, responses, &params, &operation);
             return;
         };
+        if let TransportEvent::IMessageEcho {
+            provider_message_id,
+            cursor,
+        } = event
+        {
+            let result = self
+                .store
+                .verify_choice_imessage_reply_echo(&cursor.conversation_id, &provider_message_id)
+                .and_then(|choice_verified| {
+                    if choice_verified {
+                        Ok(true)
+                    } else {
+                        self.store
+                            .verify_imessage_echo(&cursor.conversation_id, &provider_message_id)
+                    }
+                })
+                .and_then(|verified| {
+                    if !verified {
+                        return Err(StoreError::ChannelOutboundConflict);
+                    }
+                    self.store.advance_channel_cursor(&cursor)
+                });
+            self.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| host_failure(request.id, &error),
+                |()| {
+                    success(
+                        request.id,
+                        self.channel_poll_value(params.channel, "echo", None),
+                    )
+                },
+            ));
+            return;
+        }
         if let TransportEvent::Cursor(cursor) = event {
             match self.store.advance_channel_cursor(&cursor) {
                 Ok(()) => {
@@ -2125,6 +2380,10 @@ impl Host {
         operation: Arc<AtomicBool>,
         inbound: &TransportInbound,
     ) {
+        if inbound.channel == ChannelKind::IMessage {
+            self.process_imessage_choice_begin(request, responses, params, operation, inbound);
+            return;
+        }
         let observation = channel_observation(inbound);
         let ingested = match self
             .store
@@ -2171,6 +2430,165 @@ impl Host {
                 model_work_ready,
             },
         );
+    }
+
+    /// Converts one authenticated self-chat row into the same Host-owned
+    /// Choice intake used by the Mac, with a channel-specific immutable source
+    /// envelope. It never uses the retired Outcome path or grants a send.
+    #[allow(clippy::too_many_lines)] // Keeps the single Host-owned self-chat intake transaction ordered.
+    fn process_imessage_choice_begin(
+        &mut self,
+        request: &RpcRequest,
+        responses: &Sender<RpcResponse>,
+        params: &PollChannel,
+        operation: Arc<AtomicBool>,
+        inbound: &TransportInbound,
+    ) {
+        let result =
+            (|| -> Result<(ChoiceBeginAccepted, Option<ChoiceBeginRecord>), HostCallError> {
+                if !params.model_work_allowed {
+                    return Err(HostCallError::Codex(CodexError::RequiredModelUnavailable));
+                }
+                let selection = self
+                    .store
+                    .selected_model_selection()?
+                    .ok_or(HostCallError::Codex(CodexError::RequiredModelUnavailable))?;
+                let input = ChoiceBeginRequest {
+                    request_id: hashed_identifier(
+                        "imessage-choice-begin",
+                        &json!({
+                            "conversationId": inbound.conversation_id,
+                            "sourceMessageId": inbound.source_message_id,
+                        }),
+                    )?,
+                    bounded_local_question: inbound.content.clone(),
+                    expected_model_provenance_ref: selection.id.clone(),
+                    expected_catalog_fingerprint: selection.catalog_fingerprint.clone(),
+                    expected_catalog_revision: selection.catalog_revision,
+                    expected_protocol_revision: selection.protocol_schema_revision,
+                };
+                let input_digest = input.request_digest().ok_or(HostCallError::Internal)?;
+                let cursor = ChannelCursor {
+                    channel: inbound.channel,
+                    conversation_id: inbound.conversation_id.clone(),
+                    opaque_value: inbound.cursor_opaque_value.clone(),
+                    order: inbound.cursor_order,
+                    observed_at_ms: inbound.received_at_ms,
+                };
+                let request_digest = format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&json!({
+                            "inputDigest": input_digest,
+                            "cursor": cursor,
+                        }))
+                        .map_err(|_| HostCallError::Internal)?
+                    )
+                );
+                if let Some((record, requires_worker)) =
+                    self.store.replay_imessage_choice_begin_with_cursor(
+                        &input.request_id,
+                        &request_digest,
+                        &cursor,
+                    )?
+                {
+                    let accepted = record.accepted.clone();
+                    return Ok((accepted, requires_worker.then_some(record)));
+                }
+                let prior = self.store.choice_loop_snapshot()?;
+                let session_revision = match prior.as_ref() {
+                    None => 1,
+                    Some(snapshot)
+                        if matches!(
+                            snapshot.session.state,
+                            ChoiceSessionState::Completed
+                                | ChoiceSessionState::Cancelled
+                                | ChoiceSessionState::Executing
+                        ) =>
+                    {
+                        snapshot
+                            .session
+                            .revision
+                            .checked_add(1)
+                            .ok_or(HostCallError::Internal)?
+                    }
+                    Some(_) => return Err(HostCallError::ChoiceRefreshRequired),
+                };
+                let now = now_ms()?;
+                let persona_revision = self
+                    .persona
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .accept_turn();
+                let delivery_binding_id = hashed_identifier(
+                    "imessage-self-chat-binding",
+                    &json!({"conversationId": inbound.conversation_id}),
+                )?;
+                let (mut record, snapshot) = new_choice_begin_state_for_source(
+                    &input,
+                    &selection,
+                    session_revision,
+                    params.authorization.revision,
+                    &persona_revision,
+                    now,
+                    "imessage-self-chat",
+                    delivery_binding_id,
+                    Some(inbound.source_message_id.clone()),
+                )?;
+                record.request_digest.clone_from(&request_digest);
+                let clock = ChoiceIdleClockEvidence {
+                    boot_id: self.idle_boot_id.clone(),
+                    wall_clock_ms: now,
+                    monotonic_ms: boot_scoped_monotonic_ms()?,
+                };
+                let accepted = self.operations.reconcile_active_model_selection(
+                    &operation,
+                    &selection,
+                    params.authorization.revision,
+                    now,
+                    || {
+                        let (accepted, requires_worker) =
+                            self.store.begin_imessage_choice_session_with_clock(
+                                &record, &snapshot, &clock, &cursor,
+                            )?;
+                        (accepted == record.accepted)
+                            .then_some((accepted, requires_worker))
+                            .ok_or(HostCallError::Internal)
+                    },
+                )?;
+                Ok((accepted.0, accepted.1.then_some(record)))
+            })();
+        match result {
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(call_failure(request.id, &error));
+            }
+            Ok((_accepted, None)) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "deferred", None),
+                ));
+            }
+            Ok((_accepted, Some(record))) => {
+                let context = self.background_context(params.proof());
+                let _ = responses.send(success(
+                    request.id,
+                    self.channel_poll_value(params.channel, "deferred", None),
+                ));
+                std::thread::spawn(move || {
+                    let result = run_initial_choice_generation(&context, &operation, &record);
+                    if result.is_err() {
+                        let _ = context.block_initial_choice_operation(
+                            &operation,
+                            &record.accepted.operation_id,
+                            record.runtime_revision,
+                        );
+                    }
+                    context.finish_operation(&operation);
+                });
+            }
+        }
     }
 
     fn process_durable_channel_inbound(
@@ -6360,6 +6778,26 @@ struct SendChannelMessage {
     broker_receipt: RuntimeControlReceipt,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthorizeChoiceIMessageReply {
+    reply_id: String,
+    preview_revision: u64,
+    confirmation_digest: String,
+    explicitly_approved: bool,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl AuthorizeChoiceIMessageReply {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
 impl SendChannelMessage {
     fn proof(&self) -> RuntimeProof {
         RuntimeProof {
@@ -6857,17 +7295,11 @@ fn is_public_family(method: &str) -> bool {
 fn is_pr1_deferred_channel_route(method: &str) -> bool {
     matches!(
         method,
-        "channel.pair"
-            | "channel.route.bind"
+        "channel.route.bind"
             | "channel.discord.setup.start"
             | "channel.discord.setup.poll"
             | "channel.discord.setup.confirm"
             | "channel.discord.start"
-            | "channel.imessage.chats.prepare"
-            | "channel.imessage.chats.list"
-            | "channel.imessage.prepare"
-            | "channel.imessage.activate"
-            | "channel.poll"
             | "channel.outbound.send"
     )
 }
@@ -7559,6 +7991,31 @@ fn new_choice_begin_state(
     persona_revision: &openopen_protocol::PersonaRevisionRef,
     accepted_at_ms: i64,
 ) -> Result<(ChoiceBeginRecord, ChoiceLoopSnapshot), HostCallError> {
+    new_choice_begin_state_for_source(
+        request,
+        selection,
+        session_revision,
+        runtime_revision,
+        persona_revision,
+        accepted_at_ms,
+        "mac",
+        "mac-local-owner".to_owned(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn new_choice_begin_state_for_source(
+    request: &ChoiceBeginRequest,
+    selection: &ModelSelection,
+    session_revision: u64,
+    runtime_revision: u64,
+    persona_revision: &openopen_protocol::PersonaRevisionRef,
+    accepted_at_ms: i64,
+    surface: &str,
+    delivery_binding_id: String,
+    provider_message_id: Option<String>,
+) -> Result<(ChoiceBeginRecord, ChoiceLoopSnapshot), HostCallError> {
     let request_digest = request.request_digest().ok_or(HostCallError::Internal)?;
     let session_id = hashed_identifier(
         "choice-session",
@@ -7582,9 +8039,9 @@ fn new_choice_begin_state(
     );
     let source_envelope = SourceEnvelope {
         id: source_envelope_id.clone(),
-        surface: "mac".to_owned(),
-        delivery_binding_id: "mac-local-owner".to_owned(),
-        provider_message_id: None,
+        surface: surface.to_owned(),
+        delivery_binding_id,
+        provider_message_id,
         owner_id: ISSUER_ID.to_owned(),
         received_at_ms: accepted_at_ms,
         monotonic_sequence: session_revision,
@@ -7608,6 +8065,7 @@ fn new_choice_begin_state(
     };
     let source_manifest =
         choice_begin_source_manifest(&request.bounded_local_question, &session_id, accepted_at_ms)?;
+    let primary_delivery_binding_id = source_envelope.delivery_binding_id.clone();
     let accepted = ChoiceBeginAccepted {
         request_id: request.request_id.clone(),
         operation_id,
@@ -7636,6 +8094,7 @@ fn new_choice_begin_state(
         selection,
         session_revision,
         accepted_at_ms,
+        primary_delivery_binding_id,
     );
     if !record.is_valid() || !snapshot.is_valid() {
         return Err(HostCallError::Internal);
@@ -7650,6 +8109,7 @@ fn choice_begin_snapshot(
     selection: &ModelSelection,
     session_revision: u64,
     accepted_at_ms: i64,
+    delivery_binding_id: String,
 ) -> ChoiceLoopSnapshot {
     ChoiceLoopSnapshot {
         session: ChoiceSession {
@@ -7666,7 +8126,7 @@ fn choice_begin_snapshot(
             last_input_at_ms: accepted_at_ms,
             soft_idle_at_ms: accepted_at_ms + openopen_protocol::CHOICE_SESSION_SOFT_IDLE_MS,
             stale_review_at_ms: accepted_at_ms + openopen_protocol::CHOICE_SESSION_STALE_REVIEW_MS,
-            primary_delivery_binding_id: Some("mac-local-owner".to_owned()),
+            primary_delivery_binding_id: Some(delivery_binding_id),
             pending_confirmation_id: None,
             background_mission_ids: Vec::new(),
         },
@@ -8755,6 +9215,27 @@ fn hashed_identifier(prefix: &str, value: &impl serde::Serialize) -> Result<Stri
     Ok(format!("{prefix}-{}", &serialized_sha256(value)?[..24]))
 }
 
+fn render_choice_imessage_reply(
+    choice_set: &openopen_protocol::ChoiceSet,
+) -> Result<String, HostCallError> {
+    if !choice_set.is_valid() {
+        return Err(HostCallError::Internal);
+    }
+    let labels = ["A", "B", "C"];
+    let mut lines = vec!["OpenOpen · AI".to_owned()];
+    for (label, option) in labels.into_iter().zip(&choice_set.options) {
+        lines.push(format!("{label} — {}", option.direction));
+        lines.push(option.rationale.clone());
+    }
+    lines.push("D — Something else".to_owned());
+    lines.push("Describe what these options missed.".to_owned());
+    let body = lines.join("\n");
+    if body.chars().count() > 2_000 || body.as_bytes().contains(&0) {
+        return Err(HostCallError::Internal);
+    }
+    Ok(body)
+}
+
 fn serialized_sha256(value: &impl serde::Serialize) -> Result<String, HostCallError> {
     let encoded = serde_json::to_vec(value).map_err(|_| HostCallError::Internal)?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -8864,7 +9345,8 @@ mod tests {
         ReminderTarget, RpcRequest, SendChannelMessage, TransportEvent, TransportInbound,
         boot_scoped_monotonic_ms, channel_outcome_request, decode_params,
         initial_choice_result_from_generation, is_lower_sha256, mission_command_batch,
-        model_selection_status, new_choice_begin_state, read_bootstrap,
+        model_selection_status, new_choice_begin_state, new_choice_begin_state_for_source,
+        read_bootstrap, render_choice_imessage_reply,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_codex_client::{StructuredChoiceGeneration, StructuredChoiceOption};
@@ -8879,10 +9361,12 @@ mod tests {
         ChannelFailureIncident, ChannelInboundMessageClass, ChannelKind, ChannelMessageKind,
         ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
         ChannelPairing, ChannelRouteApproval, ChannelRouteApprovalDecision, ChoiceBeginRequest,
+        ChoiceIMessageReplyDisposition, ChoiceIMessageReplyIntent, ChoiceIMessageReplyPreview,
         ChoiceRefinementOperation, ChoiceReminderScheduleInput, ChoiceSessionState,
-        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EvidenceKind, MissionStatus, ModelSelection,
-        OptionSelection, OutcomeSuggestion, Receipt, RpcResponse, RuntimeControlAuthorization,
-        RuntimeControlReceipt, Selection, WorkItemStatus, core_instance_lease_signing_bytes,
+        CoreInstanceLease, EFFECT_PROTOCOL_VERSION, EvidenceKind, IMessagePairingMetadata,
+        MissionStatus, ModelSelection, OptionSelection, OutcomeSuggestion, Receipt, RpcResponse,
+        RuntimeControlAuthorization, RuntimeControlReceipt, Selection, WorkItemStatus,
+        canonical_choice_set_digest, core_instance_lease_signing_bytes,
         runtime_control_authorization_hash, runtime_control_receipt_signing_bytes,
     };
     use rusqlite::Connection;
@@ -8931,21 +9415,15 @@ mod tests {
     }
 
     #[test]
-    fn production_host_rejects_every_deferred_channel_route() {
+    fn production_host_rejects_discord_and_outbound_routes_deferred_after_pr1() {
         let (_root, mut host) = fixture();
         host.allow_pr1_deferred_channel_routes_for_tests = false;
         for (id, method) in [
-            (1, "channel.pair"),
             (2, "channel.route.bind"),
             (3, "channel.discord.setup.start"),
             (4, "channel.discord.setup.poll"),
             (5, "channel.discord.setup.confirm"),
             (6, "channel.discord.start"),
-            (7, "channel.imessage.chats.prepare"),
-            (8, "channel.imessage.chats.list"),
-            (9, "channel.imessage.prepare"),
-            (10, "channel.imessage.activate"),
-            (11, "channel.poll"),
             (12, "channel.outbound.send"),
         ] {
             let response = request(
@@ -9303,6 +9781,10 @@ for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'chats.list':
         result = {'chats':[{'id':42,'identifier':'owner','guid':'iMessage;+;owner','name':'Owner','service':'iMessage','last_message_at':'2026-07-15T00:00:00Z','participants':['+15550000001'],'is_group':False}]}
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}, separators=(',', ':')) + '\n')
+        sys.stdout.flush()
+    elif request['method'] == 'messages.history':
+        result = {'messages':[{'id':101,'chat_id':42,'chat_identifier':'owner','chat_guid':'iMessage;+;owner','chat_name':'Owner','participants':['+15550000001'],'is_group':False,'guid':'self-proof-guid','sender':'','is_from_me':True,'text':'Self-chat proof','created_at':'2026-07-15T00:00:00Z','destination_caller_id':'+15550000001'}]}
         sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}, separators=(',', ':')) + '\n')
         sys.stdout.flush()
 ",
@@ -10065,6 +10547,21 @@ for line in sys.stdin:
         assert!(!model_operation.authorize_codex_abort());
         assert!(!model_token.load(Ordering::Acquire));
         assert!(model_operation.gate.lock().unwrap().active.is_some());
+    }
+
+    #[test]
+    fn protected_off_wins_before_an_irreversible_reply_start() {
+        let operations = OperationState::default();
+        operations.accept_recovered_runtime(true, 1);
+        let token = operations.begin_operation().unwrap();
+        operations.cancel_active();
+        let started = AtomicBool::new(false);
+        assert!(
+            operations
+                .start_irreversible(&token, || started.store(true, Ordering::Release))
+                .is_none()
+        );
+        assert!(!started.load(Ordering::Acquire));
     }
 
     #[test]
@@ -11907,6 +12404,8 @@ for line in sys.stdin:
             json!({
                 "chats": [{
                     "chatId": "42",
+                    "chatGuid": "iMessage;+;owner",
+                    "chatIdentifier": "owner",
                     "name": "Owner",
                     "service": "iMessage",
                     "participants": ["+15550000001"],
@@ -12104,6 +12603,7 @@ for line in sys.stdin:
                 owner_sender_id: "imessage-owner".into(),
                 conversation_id: "42".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 4,
             })
@@ -12202,6 +12702,7 @@ for line in sys.stdin:
                 owner_sender_id: "imessage-owner".into(),
                 conversation_id: "42".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: first.approved_at_ms + 1,
             })
@@ -12392,7 +12893,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn model_forbidden_poll_ingests_inbound_without_starting_a_dispatch() {
+    fn model_forbidden_self_chat_poll_keeps_intake_unconsumed_without_choice_work() {
         let (_root, mut host) = fixture();
         host.store
             .install_trusted_broker(&broker_record(&host))
@@ -12407,6 +12908,7 @@ for line in sys.stdin:
                 owner_sender_id: "owner@example.invalid".into(),
                 conversation_id: "42".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 1,
             })
@@ -12438,23 +12940,16 @@ for line in sys.stdin:
         let operation = host.operations.begin_operation().unwrap();
         let (send, receive) = mpsc::sync_channel(1);
         host.process_channel_inbound(&request, &send, &params, operation, &inbound);
-        let response = receive.recv().unwrap().result.unwrap();
-
-        assert_eq!(response["eventStatus"], "recovering");
-        assert!(response["suggestion"].is_null());
-        assert_eq!(
-            host.store
-                .next_queued_channel_model(ChannelKind::IMessage)
-                .unwrap()
-                .as_deref(),
-            Some("imessage-awaiting-account")
-        );
+        let response = receive.recv().unwrap();
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert!(host.store.choice_loop_snapshot().unwrap().is_none());
         assert!(
             host.store
                 .started_channel_model(ChannelKind::IMessage)
                 .unwrap()
                 .is_none(),
-            "a model-forbidden poll may persist/dedupe input but cannot start its dispatch"
+            "a model-forbidden self-chat poll cannot start a Choice or legacy dispatch"
         );
         assert!(
             host.operations
@@ -12462,6 +12957,312 @@ for line in sys.stdin:
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn self_chat_poll_creates_one_host_owned_choice_and_exact_replay_advances_no_revision() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        let receipt = broker_receipt(&on, None);
+        host.store.commit_runtime_control(&on, &receipt).unwrap();
+        host.operations.accept_committed_runtime(true, on.revision);
+        let selection = ModelSelection {
+            id: "model-selection-imessage".into(),
+            model_id: "gpt-test-model".into(),
+            requested_effort: "high".into(),
+            actual_effort: "high".into(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".into(),
+            protocol_schema_revision: 1,
+        };
+        host.store.select_model_selection(&selection, 2).unwrap();
+        *host.operations.model_catalog_snapshot.lock().unwrap() = Some(
+            test_model_catalog_snapshot(on.revision, super::now_ms().unwrap()),
+        );
+        host.store
+            .pair_channel(&ChannelPairing {
+                channel: ChannelKind::IMessage,
+                owner_sender_id: "owner@example.invalid".into(),
+                conversation_id: "42".into(),
+                require_explicit_address: false,
+                imessage: Some(IMessagePairingMetadata {
+                    chat_guid: "iMessage;+;self".into(),
+                    chat_identifier: "self".into(),
+                    service: "iMessage".into(),
+                    participant_ids: vec!["owner@example.invalid".into()],
+                }),
+                discord: None,
+                paired_at_ms: 1,
+            })
+            .unwrap();
+        let params = PollChannel {
+            channel: ChannelKind::IMessage,
+            model_work_allowed: true,
+            authorization: on,
+            broker_receipt: receipt,
+        };
+        let inbound = TransportInbound {
+            channel: ChannelKind::IMessage,
+            source_message_id: "imessage-choice-1".into(),
+            sender_id: "owner@example.invalid".into(),
+            conversation_id: "42".into(),
+            content: "Help me prepare tomorrow morning.".into(),
+            cursor_opaque_value: "101".into(),
+            cursor_order: 101,
+            received_at_ms: 2,
+        };
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 700, "method": "channel.poll", "params": {}
+        }))
+        .unwrap();
+        let operation = host.operations.begin_operation().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        host.process_channel_inbound(&request, &send, &params, operation, &inbound);
+        let response = receive.recv().unwrap();
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.result.unwrap()["eventStatus"], "deferred");
+        let first = host.store.choice_loop_snapshot().unwrap().unwrap();
+        assert_eq!(first.session.revision, 1);
+        assert_eq!(
+            first.active_batch.as_ref().unwrap().delivery_binding_id,
+            first.session.primary_delivery_binding_id.clone().unwrap()
+        );
+        assert_eq!(
+            host.store
+                .channel_cursor(ChannelKind::IMessage, "42")
+                .unwrap()
+                .unwrap()
+                .order,
+            101
+        );
+        for _ in 0..100 {
+            if host.operations.gate.lock().unwrap().active.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let durable_before_replay = host.store.choice_loop_snapshot().unwrap().unwrap();
+        let operation = host.operations.begin_operation().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        host.process_channel_inbound(&request, &send, &params, operation, &inbound);
+        let response = receive.recv().unwrap();
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.result.unwrap()["eventStatus"], "deferred");
+        assert_eq!(
+            host.store
+                .choice_loop_snapshot()
+                .unwrap()
+                .unwrap()
+                .session
+                .revision,
+            durable_before_replay.session.revision
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn choice_imessage_reply_consumes_one_exact_authority_and_echo_is_guid_bound() {
+        let (_root, mut host) = fixture();
+        host.store
+            .install_trusted_broker(&broker_record(&host))
+            .unwrap();
+        let on = host.store.prepare_runtime_control(true, 1).unwrap();
+        host.store
+            .commit_runtime_control(&on, &broker_receipt(&on, None))
+            .unwrap();
+        let selection = ModelSelection {
+            id: "model-selection-imessage-reply".into(),
+            model_id: "gpt-test-model".into(),
+            requested_effort: "high".into(),
+            actual_effort: "high".into(),
+            catalog_fingerprint: "a".repeat(64),
+            catalog_revision: 7,
+            account_display_class: "chatgpt:plus".into(),
+            protocol_schema_revision: 1,
+        };
+        host.store.select_model_selection(&selection, 2).unwrap();
+        let pairing = ChannelPairing {
+            channel: ChannelKind::IMessage,
+            owner_sender_id: "owner@example.invalid".into(),
+            conversation_id: "42".into(),
+            require_explicit_address: false,
+            imessage: Some(IMessagePairingMetadata {
+                chat_guid: "iMessage;+;self".into(),
+                chat_identifier: "self".into(),
+                service: "iMessage".into(),
+                participant_ids: vec!["owner@example.invalid".into()],
+            }),
+            discord: None,
+            paired_at_ms: 1,
+        };
+        host.store.pair_channel(&pairing).unwrap();
+        let input = ChoiceBeginRequest {
+            request_id: "choice-imessage-reply-begin".into(),
+            bounded_local_question: "Prepare the self-chat demo".into(),
+            expected_model_provenance_ref: selection.id.clone(),
+            expected_catalog_fingerprint: selection.catalog_fingerprint.clone(),
+            expected_catalog_revision: selection.catalog_revision,
+            expected_protocol_revision: selection.protocol_schema_revision,
+        };
+        let (record, initial) = new_choice_begin_state_for_source(
+            &input,
+            &selection,
+            1,
+            on.revision,
+            &persona_revision(),
+            10,
+            "imessage-self-chat",
+            "self-chat-binding".into(),
+            Some("self-chat-source-guid".into()),
+        )
+        .unwrap();
+        let cursor = ChannelCursor {
+            channel: ChannelKind::IMessage,
+            conversation_id: "42".into(),
+            opaque_value: "101".into(),
+            order: 101,
+            observed_at_ms: 10,
+        };
+        host.store
+            .begin_imessage_choice_session_with_clock(
+                &record,
+                &initial,
+                &ChoiceIdleClockEvidence {
+                    boot_id: "reply-test-boot".into(),
+                    wall_clock_ms: 10,
+                    monotonic_ms: 10,
+                },
+                &cursor,
+            )
+            .unwrap();
+        let generated = StructuredChoiceGeneration {
+            understood_goal: "Prepare the self-chat demo".into(),
+            current_context: "One private inbound is accepted.".into(),
+            assumptions: vec![],
+            constraints: vec![],
+            uncertainties: vec![],
+            what_to_avoid: vec![],
+            options: ["Review", "Narrow", "Rehearse"]
+                .map(|direction| StructuredChoiceOption {
+                    direction: direction.into(),
+                    rationale: "Keep the next action bounded.".into(),
+                    expected_result: "One clear next step.".into(),
+                    information_needed: vec![],
+                    external_effects_preview: vec![],
+                    source_categories: vec!["ownerInput".into()],
+                })
+                .to_vec(),
+            source_refs: vec![],
+        };
+        let active = host
+            .store
+            .commit_initial_choice_result(
+                &initial_choice_result_from_generation(&record, generated).unwrap(),
+            )
+            .unwrap();
+        let choice_set = active.active_choice_set.as_ref().unwrap();
+        let visible_body = render_choice_imessage_reply(choice_set).unwrap();
+        let mut intent = ChoiceIMessageReplyIntent {
+            preview: ChoiceIMessageReplyPreview {
+                reply_id: "choice-imessage-reply-1".into(),
+                preview_revision: active.session.revision,
+                destination: "Your selected iMessage self-chat".into(),
+                visible_body: visible_body.clone(),
+                confirmation_digest: "0".repeat(64),
+            },
+            outbound_id: "choice-imessage-outbound-1".into(),
+            choice_session_id: active.session.id.clone(),
+            session_revision: active.session.revision,
+            choice_set_id: choice_set.id.clone(),
+            choice_set_digest: canonical_choice_set_digest(choice_set).unwrap(),
+            source_message_id: "self-chat-source-guid".into(),
+            delivery_binding_id: "self-chat-binding".into(),
+            pairing,
+            persona_revision: choice_set.persona_revision.clone(),
+            source_manifest_digest: choice_set.source_manifest_digest.clone(),
+            model_provenance: choice_set.model_provenance.clone(),
+            canonical_payload_sha256: format!("{:x}", Sha256::digest(visible_body.as_bytes())),
+            created_at_ms: 20,
+            approved_at_ms: None,
+            recovery_cursor: None,
+        };
+        intent.preview.confirmation_digest = intent.expected_confirmation_digest().unwrap();
+        assert!(intent.is_valid(), "{intent:#?}");
+        assert_eq!(
+            host.store.prepare_choice_imessage_reply(&intent).unwrap(),
+            (intent.preview.clone(), "prepared".to_owned())
+        );
+        let first = host
+            .store
+            .authorize_choice_imessage_reply(
+                &intent.preview.reply_id,
+                intent.preview.preview_revision,
+                &intent.preview.confirmation_digest,
+                true,
+                21,
+            )
+            .unwrap();
+        assert_eq!(
+            first.disposition,
+            ChoiceIMessageReplyDisposition::ExecuteNow
+        );
+        let replay = host
+            .store
+            .authorize_choice_imessage_reply(
+                &intent.preview.reply_id,
+                intent.preview.preview_revision,
+                &intent.preview.confirmation_digest,
+                true,
+                22,
+            )
+            .unwrap();
+        assert_eq!(
+            replay.disposition,
+            ChoiceIMessageReplyDisposition::RecoverOnly
+        );
+        host.store
+            .record_choice_imessage_reply_delivery(&intent.preview.reply_id, "provider-guid-1", 23)
+            .unwrap();
+        assert!(
+            host.store
+                .verify_choice_imessage_reply_echo("42", "provider-guid-1")
+                .unwrap()
+        );
+        assert!(
+            !host
+                .store
+                .verify_choice_imessage_reply_echo("43", "provider-guid-1")
+                .unwrap()
+        );
+        let delivered = host
+            .store
+            .authorize_choice_imessage_reply(
+                &intent.preview.reply_id,
+                intent.preview.preview_revision,
+                &intent.preview.confirmation_digest,
+                true,
+                24,
+            )
+            .unwrap();
+        assert_eq!(
+            delivered.disposition,
+            ChoiceIMessageReplyDisposition::AlreadySent
+        );
+        assert!(
+            host.store
+                .authorize_choice_imessage_reply(
+                    &intent.preview.reply_id,
+                    intent.preview.preview_revision,
+                    &"f".repeat(64),
+                    true,
+                    25,
+                )
+                .is_err()
         );
     }
 
@@ -12482,6 +13283,7 @@ for line in sys.stdin:
                 owner_sender_id: "1001".into(),
                 conversation_id: "2002".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: Some(openopen_protocol::DiscordPairingMetadata {
                     guild_id: "3003".into(),
                     bot_user_id: "4004".into(),
@@ -12854,6 +13656,7 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn host_restart_surfaces_started_channel_model_as_need_you_without_reexecution() {
         let (_root, mut host) = fixture();
         let broker = broker_record(&host);
@@ -12867,6 +13670,7 @@ for line in sys.stdin:
                 owner_sender_id: "owner@example.invalid".into(),
                 conversation_id: "42".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 1,
             })
@@ -12978,6 +13782,7 @@ for line in sys.stdin:
                 owner_sender_id: "owner@example.invalid".into(),
                 conversation_id: "42".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: None,
                 paired_at_ms: 1,
             })
@@ -13163,6 +13968,7 @@ for line in sys.stdin:
                 owner_sender_id: "1001".into(),
                 conversation_id: "2002".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: Some(openopen_protocol::DiscordPairingMetadata {
                     guild_id: "3003".into(),
                     bot_user_id: "4004".into(),
@@ -13268,6 +14074,7 @@ for line in sys.stdin:
                 owner_sender_id: "1001".into(),
                 conversation_id: "2002".into(),
                 require_explicit_address: true,
+                imessage: None,
                 discord: Some(openopen_protocol::DiscordPairingMetadata {
                     guild_id: "3003".into(),
                     bot_user_id: "4004".into(),

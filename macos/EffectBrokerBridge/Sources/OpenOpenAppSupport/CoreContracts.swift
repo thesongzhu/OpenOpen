@@ -102,6 +102,7 @@ public struct ChannelPairing: Codable, Equatable, Sendable {
   public let ownerSenderId: String
   public let conversationId: String
   public let requireExplicitAddress: Bool
+  public let imessage: IMessagePairingMetadata?
   public let discord: DiscordPairingMetadata?
   public let pairedAtMs: Int64
 
@@ -109,13 +110,15 @@ public struct ChannelPairing: Codable, Equatable, Sendable {
     channel: ChannelKind,
     ownerSenderId: String,
     conversationId: String,
+    imessage: IMessagePairingMetadata? = nil,
     discord: DiscordPairingMetadata? = nil,
     pairedAtMs: Int64
   ) {
     self.channel = channel
     self.ownerSenderId = ownerSenderId
     self.conversationId = conversationId
-    requireExplicitAddress = true
+    requireExplicitAddress = channel != .iMessage
+    self.imessage = imessage
     self.discord = discord
     self.pairedAtMs = pairedAtMs
   }
@@ -124,21 +127,28 @@ public struct ChannelPairing: Codable, Equatable, Sendable {
     guard expectedChannel == nil || channel == expectedChannel,
       ChannelContractValidation.providerId(ownerSenderId),
       ChannelContractValidation.providerId(conversationId),
-      requireExplicitAddress,
+      requireExplicitAddress == (channel != .iMessage),
       pairedAtMs >= 0
     else {
       throw CoreClientError.contractViolation("Core returned an invalid durable channel pairing.")
     }
-    switch (channel, discord) {
-    case (.iMessage, nil):
+    switch (channel, imessage, discord) {
+    case (.iMessage, _, nil):
       break
-    case (.discord, .some(let discord)):
+    case (.discord, nil, .some(let discord)):
       _ = try discord.validated()
     default:
       throw CoreClientError.contractViolation("Core returned mismatched channel pairing metadata.")
     }
     return self
   }
+}
+
+public struct IMessagePairingMetadata: Codable, Equatable, Sendable {
+  public let chatGuid: String
+  public let chatIdentifier: String
+  public let service: String
+  public let participantIds: [String]
 }
 
 public struct DiscordPairingMetadata: Codable, Equatable, Sendable {
@@ -612,9 +622,27 @@ public struct IMessagePrepareResponse: Codable, Equatable, Sendable {
 
 public struct IMessageChat: Codable, Equatable, Identifiable, Sendable {
   public let chatId: String
+  public let chatGuid: String
+  public let chatIdentifier: String
   public let name: String
   public let service: String
   public let participants: [String]
+
+  public init(
+    chatId: String,
+    chatGuid: String? = nil,
+    chatIdentifier: String? = nil,
+    name: String,
+    service: String,
+    participants: [String]
+  ) {
+    self.chatId = chatId
+    self.chatGuid = chatGuid ?? "iMessage;+;test-\(chatId)"
+    self.chatIdentifier = chatIdentifier ?? "test-\(chatId)"
+    self.name = name
+    self.service = service
+    self.participants = participants
+  }
 
   public var id: String { chatId }
 
@@ -636,6 +664,8 @@ public struct IMessageChatsResponse: Codable, Equatable, Sendable {
       guard let identifier = Int64(chat.chatId), identifier > 0,
         identifiers.insert(chat.chatId).inserted,
         chat.service == "iMessage",
+        Self.validField(chat.chatGuid, allowEmpty: false),
+        Self.validField(chat.chatIdentifier, allowEmpty: false),
         Self.validField(chat.name, allowEmpty: true),
         (1...64).contains(chat.participants.count),
         Set(chat.participants).count == chat.participants.count,
@@ -1914,6 +1944,70 @@ public struct PrepareChoiceConfirmationParameters: Codable, Sendable {
   public init(proof: BrokerRuntimeState) {
     authorization = proof.authorization
     brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChoiceIMessageReplyPreview: Codable, Equatable, Sendable {
+  public let replyId: String
+  public let previewRevision: UInt64
+  public let destination: String
+  public let visibleBody: String
+  public let confirmationDigest: String
+
+  public func validated() throws -> Self {
+    guard ChoiceLoopContract.identifier(replyId), previewRevision > 0,
+      destination == "Your selected iMessage self-chat",
+      !visibleBody.isEmpty, visibleBody.utf8.count <= 8_000,
+      !visibleBody.utf8.contains(0), ChoiceLoopContract.sha256(confirmationDigest)
+    else {
+      throw CoreClientError.contractViolation("Core returned an invalid iMessage reply preview.")
+    }
+    return self
+  }
+}
+
+public struct ChoiceIMessageReplyPrepareResponse: Codable, Equatable, Sendable {
+  public let preview: ChoiceIMessageReplyPreview
+  public let status: String
+
+  public func validated() throws -> Self {
+    guard ["prepared", "authorized", "delivered"].contains(status) else {
+      throw CoreClientError.contractViolation("Core returned an invalid iMessage reply state.")
+    }
+    _ = try preview.validated()
+    return self
+  }
+}
+
+public struct AuthorizeChoiceIMessageReplyParameters: Codable, Sendable {
+  public let replyId: String
+  public let previewRevision: UInt64
+  public let confirmationDigest: String
+  public let explicitlyApproved: Bool
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(preview: ChoiceIMessageReplyPreview, proof: BrokerRuntimeState) {
+    replyId = preview.replyId
+    previewRevision = preview.previewRevision
+    confirmationDigest = preview.confirmationDigest
+    explicitlyApproved = true
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ChoiceIMessageReplyResponse: Codable, Equatable, Sendable {
+  public let status: String
+  public let recoveryOnly: Bool?
+
+  public func validated() throws -> Self {
+    guard status == "sent" || status == "needYou",
+      status == "needYou" ? recoveryOnly == true : recoveryOnly == nil
+    else {
+      throw CoreClientError.contractViolation("Core returned an invalid iMessage reply result.")
+    }
+    return self
   }
 }
 

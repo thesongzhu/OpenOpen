@@ -13,6 +13,7 @@ public protocol CoreServing: Sendable {
   /// The explicit test double override keeps historical recovery fixtures
   /// covered without making the shipped App surface writable channel routes.
   var permitsDeferredChannelTestRoutes: Bool { get }
+  var permitsIMessageSelfChatRoutes: Bool { get }
   func beginCoreGenerationFence() async throws -> CoreGenerationFence
   func closeCoreGenerationFence(_ fence: CoreGenerationFence) async -> Bool
   func runtime() async throws -> RuntimeControl
@@ -106,6 +107,11 @@ public protocol CoreServing: Sendable {
   func prepareChoiceConfirmation(
     proof: BrokerRuntimeState
   ) async throws -> ChoiceConsolidatedConfirmation
+  func prepareChoiceIMessageReply(proof: BrokerRuntimeState) async throws
+    -> ChoiceIMessageReplyPrepareResponse
+  func authorizeChoiceIMessageReply(
+    _ preview: ChoiceIMessageReplyPreview, proof: BrokerRuntimeState
+  ) async throws -> ChoiceIMessageReplyResponse
   func recordChoiceReminderSchedule(
     _ input: ChoiceReminderScheduleInput, proof: BrokerRuntimeState
   ) async throws -> ChoiceReminderSchedule
@@ -180,6 +186,7 @@ extension CoreServing {
   }
 
   public var permitsDeferredChannelTestRoutes: Bool { false }
+  public var permitsIMessageSelfChatRoutes: Bool { false }
   public func selectChoice(_: ChoiceSelection, proof _: BrokerRuntimeState) async throws
     -> ChoiceLoopSnapshot
   {
@@ -206,6 +213,18 @@ extension CoreServing {
     proof _: BrokerRuntimeState
   ) async throws -> ChoiceConsolidatedConfirmation {
     throw CoreClientError.contractViolation("Choice confirmation is unavailable from this Core.")
+  }
+
+  public func prepareChoiceIMessageReply(proof _: BrokerRuntimeState) async throws
+    -> ChoiceIMessageReplyPrepareResponse
+  {
+    throw CoreClientError.contractViolation("Choice iMessage reply is unavailable from this Core.")
+  }
+
+  public func authorizeChoiceIMessageReply(
+    _: ChoiceIMessageReplyPreview, proof _: BrokerRuntimeState
+  ) async throws -> ChoiceIMessageReplyResponse {
+    throw CoreClientError.contractViolation("Choice iMessage reply is unavailable from this Core.")
   }
 
   public func recordChoiceReminderSchedule(
@@ -554,7 +573,8 @@ public final class AppModel: ObservableObject {
   /// Channel setup belongs to PR2/PR3, not the PR1 local Choice Core. The
   /// historical connection state remains readable, but this stage never
   /// exposes setup, pairing, token, or listener actions.
-  public var choiceCoreConnectionsAvailable: Bool { core.permitsDeferredChannelTestRoutes }
+  public var choiceCoreConnectionsAvailable: Bool { core.permitsIMessageSelfChatRoutes }
+  public var discordSetupVisible: Bool { core.permitsDeferredChannelTestRoutes }
 
   /// PR1 renders durable historical Mission/Receipt state read-only. The
   /// shipped Core never permits the pre-Choice Mission effect family; the
@@ -625,6 +645,8 @@ public final class AppModel: ObservableObject {
   @Published public private(set) var choiceReminderPickerIsPresented = false
   @Published public private(set) var choiceReminderScheduleIsVisible = true
   @Published public private(set) var choiceConfirmationPreview: ChoiceConsolidatedConfirmation?
+  @Published public private(set) var choiceIMessageReplyPreview: ChoiceIMessageReplyPreview?
+  @Published public private(set) var choiceIMessageReplyStatus: String?
   // These identities survive an ambiguous in-process RPC response. They are
   // cleared only after Host continuity proves the corresponding durable
   // transition, never when transport delivery is uncertain.
@@ -1234,6 +1256,12 @@ public final class AppModel: ObservableObject {
     }
     retirePrivateChoiceIntakeBodies(after: snapshot)
     choiceLoopSnapshot = snapshot
+    if choiceIMessageReplyPreview?.previewRevision != snapshot.session.revision
+      || snapshot.session.state != "active"
+    {
+      choiceIMessageReplyPreview = nil
+      choiceIMessageReplyStatus = nil
+    }
     if priorChoiceRevision != snapshot.session.revision {
       choiceReminderScheduleIsVisible = true
     }
@@ -1249,7 +1277,9 @@ public final class AppModel: ObservableObject {
   /// Bounded local polling is only a continuity read: the accepted Host
   /// operation owns generation and result commits. It never starts a second
   /// model turn, writes an effect, or presents a blocking alert.
-  private func awaitInitialChoiceResult(expectedGeneration: UInt64, sessionID: String) {
+  private func awaitInitialChoiceResult(
+    expectedGeneration: UInt64, sessionID: String, prepareIMessageReply: Bool = false
+  ) {
     choiceResultTask?.cancel()
     choiceResultTask = Task { [weak self] in
       guard let self else { return }
@@ -1261,6 +1291,9 @@ public final class AppModel: ObservableObject {
         guard !Task.isCancelled, expectedGeneration == runtimeGeneration else { return }
         guard let snapshot = choiceLoopSnapshot, snapshot.session.id == sessionID else { return }
         if snapshot.session.state != "interpreting" {
+          if prepareIMessageReply, snapshot.session.state == "active" {
+            await prepareCurrentChoiceIMessageReply(expectedGeneration: expectedGeneration)
+          }
           choiceResultTask = nil
           return
         }
@@ -1354,6 +1387,11 @@ public final class AppModel: ObservableObject {
             expectedGeneration: generation,
             authenticatedOwnerReturn: authenticatedHomeForeground && attempt == 0
               && runtime.enabled && protectedMatchesRuntime && desiredEnabled && accountReady)
+          if choiceIMessageReplyPreview == nil,
+            choiceLoopSnapshot?.session.state == "active", iMessageIsConnected
+          {
+            await prepareCurrentChoiceIMessageReply(expectedGeneration: generation)
+          }
           guard generation == runtimeGeneration, switchTask == nil else {
             throw CoreClientError.requestCancelled
           }
@@ -2148,9 +2186,14 @@ public final class AppModel: ObservableObject {
       return
     }
     try requireCurrentOnGeneration(expectedGeneration)
-    let iMessagePairing = try await core.channelPairing(.iMessage)
+    let storedIMessagePairing = try await core.channelPairing(.iMessage)
+    let iMessagePairing =
+      storedIMessagePairing?.imessage == nil
+        && !core.permitsDeferredChannelTestRoutes ? nil : storedIMessagePairing
     try requireCurrentOnGeneration(expectedGeneration)
-    let discordPairing = try await core.channelPairing(.discord)
+    let discordPairing =
+      core.permitsDeferredChannelTestRoutes
+      ? try await core.channelPairing(.discord) : nil
     try requireCurrentOnGeneration(expectedGeneration)
 
     var validatedPairings: [ChannelKind: ChannelPairing] = [:]
@@ -3069,6 +3112,73 @@ public final class AppModel: ObservableObject {
     }
   }
 
+  private func prepareCurrentChoiceIMessageReply(expectedGeneration: UInt64) async {
+    guard expectedGeneration == runtimeGeneration,
+      let snapshot = choiceLoopSnapshot, snapshot.session.state == "active",
+      iMessageIsConnected
+    else { return }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
+      let prepared = try await core.prepareChoiceIMessageReply(proof: proof).validated()
+      let preview = prepared.preview
+      try requireCurrentOnGeneration(expectedGeneration)
+      guard choiceLoopSnapshot?.session.id == snapshot.session.id,
+        choiceLoopSnapshot?.session.revision == preview.previewRevision,
+        choiceLoopSnapshot?.session.state == "active"
+      else { return }
+      choiceIMessageReplyPreview = preview
+      choiceIMessageReplyStatus = prepared.status == "prepared" ? nil : prepared.status
+    } catch {
+      guard expectedGeneration == runtimeGeneration else { return }
+      choiceIMessageReplyPreview = nil
+      choiceIMessageReplyStatus = nil
+      errorMessage = userMessage(for: error)
+    }
+  }
+
+  public var choiceIMessageReplySendEnabled: Bool {
+    guard let preview = choiceIMessageReplyPreview,
+      let snapshot = choiceLoopSnapshot
+    else { return false }
+    return !isBusy && storeControlEnabled && iMessageIsConnected
+      && snapshot.session.state == "active"
+      && snapshot.session.revision == preview.previewRevision
+      && choiceIMessageReplyStatus == nil
+  }
+
+  public var choiceIMessageReplyRecoveryEnabled: Bool {
+    guard let preview = choiceIMessageReplyPreview,
+      let snapshot = choiceLoopSnapshot
+    else { return false }
+    return !isBusy && storeControlEnabled && iMessageIsConnected
+      && snapshot.session.state == "active"
+      && snapshot.session.revision == preview.previewRevision
+      && choiceIMessageReplyStatus == "authorized"
+  }
+
+  public func authorizeCurrentChoiceIMessageReply() async {
+    guard choiceIMessageReplySendEnabled || choiceIMessageReplyRecoveryEnabled,
+      let preview = choiceIMessageReplyPreview
+    else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let generation = runtimeGeneration
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let response = try await core.authorizeChoiceIMessageReply(preview, proof: proof).validated()
+      try requireCurrentOnGeneration(generation)
+      guard choiceIMessageReplyPreview == preview else { return }
+      choiceIMessageReplyStatus = response.status == "sent" ? "delivered" : "authorized"
+      errorMessage =
+        response.status == "needYou"
+        ? "Need you: verify the existing iMessage reply before trying anything else."
+        : nil
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      errorMessage = userMessage(for: error)
+    }
+  }
+
   /// Returns nil only when the user has not supplied any schedule fields.
   /// Partial data fails locally before an RPC; complete data is still treated
   /// as untrusted and revalidated by the Host/Store transaction.
@@ -3824,6 +3934,13 @@ public final class AppModel: ObservableObject {
         channel: .iMessage,
         ownerSenderId: owner,
         conversationId: String(chatId),
+        imessage: iMessageChats.first(where: { $0.chatId == iMessageChatId }).map {
+          IMessagePairingMetadata(
+            chatGuid: $0.chatGuid,
+            chatIdentifier: $0.chatIdentifier,
+            service: $0.service,
+            participantIds: $0.participants)
+        },
         pairedAtMs: Self.currentMilliseconds()
       )
     )
@@ -4155,17 +4272,30 @@ public final class AppModel: ObservableObject {
       let usesExistingPairing: Bool
       if let existing = try await core.channelPairing(requested.channel) {
         _ = try existing.validated(expectedChannel: requested.channel)
-        guard existing.channel == requested.channel,
+        if existing.channel == .iMessage, existing.imessage == nil,
+          requested.imessage != nil, !requireExistingPairing,
           existing.ownerSenderId == requested.ownerSenderId,
-          existing.conversationId == requested.conversationId,
-          existing.requireExplicitAddress
-        else {
-          throw CoreClientError.contractViolation(
-            "This channel is already paired to a different owner or conversation."
-          )
+          existing.conversationId == requested.conversationId
+        {
+          let proof = try await currentEnabledProof(expectedGeneration: generation)
+          try await core.pairChannel(requested, proof: proof)
+          pairing = requested
+          durablePairings[requested.channel] = requested
+          usesExistingPairing = false
+        } else {
+          guard existing.channel == requested.channel,
+            existing.ownerSenderId == requested.ownerSenderId,
+            existing.conversationId == requested.conversationId,
+            existing.imessage == requested.imessage,
+            !existing.requireExplicitAddress
+          else {
+            throw CoreClientError.contractViolation(
+              "This channel is already paired to a different owner or conversation."
+            )
+          }
+          pairing = existing
+          usesExistingPairing = true
         }
-        pairing = existing
-        usesExistingPairing = true
       } else {
         guard !requireExistingPairing, modelEntryEnabled else {
           throw CoreClientError.contractViolation(
@@ -4247,6 +4377,18 @@ public final class AppModel: ObservableObject {
                 if result.connectionStatus == "connected" {
                   if channelListenerFeedback[.iMessage] != nil {
                     channelListenerFeedback.removeValue(forKey: .iMessage)
+                  }
+                }
+                if result.eventStatus == "deferred" {
+                  await refreshChoiceLoopContinuity(expectedGeneration: generation)
+                  if let snapshot = choiceLoopSnapshot,
+                    snapshot.session.state == "interpreting"
+                  {
+                    awaitInitialChoiceResult(
+                      expectedGeneration: generation,
+                      sessionID: snapshot.session.id,
+                      prepareIMessageReply: true
+                    )
                   }
                 }
               }

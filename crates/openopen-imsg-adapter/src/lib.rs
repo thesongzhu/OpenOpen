@@ -366,6 +366,10 @@ pub enum InboundRejection {
     ChatNotPaired,
     #[error("message did not come from the paired owner")]
     SenderNotOwner,
+    #[error("message is a group conversation")]
+    GroupChat,
+    #[error("self-chat message was not authored by the local account")]
+    NotFromLocalUser,
     #[error("outbound echo is not accepted as inbound work")]
     FromLocalUser,
     #[error("message is not explicitly addressed to OpenOpen")]
@@ -374,6 +378,8 @@ pub enum InboundRejection {
     EmptyBody,
     #[error("addressed message body exceeds the bound")]
     BodyTooLarge,
+    #[error("message has an ambiguous OpenOpen output prefix")]
+    AmbiguousProductPrefix,
     #[error("message has no valid rowid or GUID")]
     InvalidSourceIdentity,
 }
@@ -382,6 +388,26 @@ pub enum InboundRejection {
 pub struct NormalizedInbound {
     pub chat_id: ChatId,
     pub sender: String,
+    pub source_rowid: i64,
+    pub source_guid: String,
+    pub body: String,
+}
+
+/// One safely classified row from the dedicated same-account self-chat.
+///
+/// Messages represents both owner-authored input and `OpenOpen` output as
+/// `is_from_me`. The exact product prefix separates an output echo from an
+/// owner-authored input; malformed prefix-shaped rows remain ambiguous and
+/// fail closed instead of becoming either authority or an acknowledged echo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfChatMessage {
+    UserAuthored(NormalizedInbound),
+    OpenOpenEcho(SelfChatEcho),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfChatEcho {
+    pub chat_id: ChatId,
     pub source_rowid: i64,
     pub source_guid: String,
     pub body: String,
@@ -924,6 +950,71 @@ pub fn normalize_inbound(
         source_guid: message.guid.clone(),
         body: body.to_owned(),
     })
+}
+
+/// Classifies one row from the dedicated same-account self-chat without a
+/// wake-word gate.
+///
+/// This classifier does not grant model or send authority. It accepts only an
+/// exact paired, one-to-one, locally authored row with a bounded identity and
+/// body. Exact product-prefixed output is returned as an echo for the Host to
+/// bind to durable outbound state. Prefix-shaped but non-canonical rows fail
+/// closed as ambiguous.
+///
+/// # Errors
+///
+/// Returns a specific rejection for a wrong chat, group, non-local direction,
+/// invalid source identity, invalid body, or ambiguous product prefix.
+pub fn classify_self_chat_message(
+    pairing: &InboundPairing,
+    message: &Message,
+) -> Result<SelfChatMessage, InboundRejection> {
+    if message.chat_id != pairing.chat_id {
+        return Err(InboundRejection::ChatNotPaired);
+    }
+    if message.is_group {
+        return Err(InboundRejection::GroupChat);
+    }
+    if !message.is_from_me {
+        return Err(InboundRejection::NotFromLocalUser);
+    }
+    if message.id <= 0 || !valid_guid(&message.guid) {
+        return Err(InboundRejection::InvalidSourceIdentity);
+    }
+
+    if message.text.starts_with(OPENOPEN_IMESSAGE_PREFIX) {
+        let body = message
+            .text
+            .strip_prefix(OPENOPEN_IMESSAGE_PREFIX)
+            .and_then(|suffix| suffix.strip_prefix('\n'))
+            .ok_or(InboundRejection::AmbiguousProductPrefix)?;
+        let canonical =
+            prefixed_outbound_text(body).map_err(|_| InboundRejection::AmbiguousProductPrefix)?;
+        if canonical != message.text {
+            return Err(InboundRejection::AmbiguousProductPrefix);
+        }
+        return Ok(SelfChatMessage::OpenOpenEcho(SelfChatEcho {
+            chat_id: message.chat_id,
+            source_rowid: message.id,
+            source_guid: message.guid.clone(),
+            body: body.to_owned(),
+        }));
+    }
+
+    if message.text.len() > MAX_INBOUND_TEXT_BYTES || message.text.as_bytes().contains(&0) {
+        return Err(InboundRejection::BodyTooLarge);
+    }
+    let body = message.text.trim();
+    if body.is_empty() {
+        return Err(InboundRejection::EmptyBody);
+    }
+    Ok(SelfChatMessage::UserAuthored(NormalizedInbound {
+        chat_id: message.chat_id,
+        sender: pairing.owner_sender.clone(),
+        source_rowid: message.id,
+        source_guid: message.guid.clone(),
+        body: body.to_owned(),
+    }))
 }
 
 fn prefixed_outbound_text(body: &str) -> Result<String, AdapterError> {

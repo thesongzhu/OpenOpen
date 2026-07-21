@@ -2387,8 +2387,156 @@ pub struct ChannelPairing {
     pub owner_sender_id: String,
     pub conversation_id: String,
     pub require_explicit_address: bool,
+    #[serde(default)]
+    pub imessage: Option<IMessagePairingMetadata>,
     pub discord: Option<DiscordPairingMetadata>,
     pub paired_at_ms: i64,
+}
+
+/// Exact public-imsg identity selected for the dedicated same-account
+/// self-chat. The Host revalidates these immutable facts on every row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IMessagePairingMetadata {
+    pub chat_guid: String,
+    pub chat_identifier: String,
+    pub service: String,
+    pub participant_ids: Vec<String>,
+}
+
+/// Exact persisted, user-visible preview for one explicitly authorized reply
+/// to the dedicated same-account iMessage self-chat.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChoiceIMessageReplyPreview {
+    pub reply_id: String,
+    pub preview_revision: u64,
+    pub destination: String,
+    pub visible_body: String,
+    pub confirmation_digest: String,
+}
+
+impl ChoiceIMessageReplyPreview {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.reply_id)
+            && self.preview_revision > 0
+            && self.destination == "Your selected iMessage self-chat"
+            && !self.visible_body.trim().is_empty()
+            && self.visible_body == self.visible_body.trim()
+            && self.visible_body.len() <= 8_000
+            && !self
+                .visible_body
+                .chars()
+                .any(|character| character.is_control() && character != '\n')
+            && !self.visible_body.as_bytes().contains(&0)
+            && sha256_hex(&self.confirmation_digest)
+    }
+}
+
+/// Complete Store-private authority binding for one Choice reactive reply.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChoiceIMessageReplyIntent {
+    pub preview: ChoiceIMessageReplyPreview,
+    pub outbound_id: String,
+    pub choice_session_id: String,
+    pub session_revision: u64,
+    pub choice_set_id: String,
+    pub choice_set_digest: String,
+    pub source_message_id: String,
+    pub delivery_binding_id: String,
+    pub pairing: ChannelPairing,
+    pub persona_revision: PersonaRevisionRef,
+    pub source_manifest_digest: String,
+    pub model_provenance: ModelProvenance,
+    pub canonical_payload_sha256: String,
+    pub created_at_ms: i64,
+    pub approved_at_ms: Option<i64>,
+    pub recovery_cursor: Option<ChannelCursor>,
+}
+
+impl ChoiceIMessageReplyIntent {
+    #[must_use]
+    pub fn expected_confirmation_digest(&self) -> Option<String> {
+        serde_json::to_vec(&serde_json::json!({
+            "replyId": self.preview.reply_id,
+            "previewRevision": self.preview.preview_revision,
+            "destination": self.preview.destination,
+            "visibleBody": self.preview.visible_body,
+            "outboundId": self.outbound_id,
+            "choiceSessionId": self.choice_session_id,
+            "sessionRevision": self.session_revision,
+            "choiceSetId": self.choice_set_id,
+            "choiceSetDigest": self.choice_set_digest,
+            "sourceMessageId": self.source_message_id,
+            "deliveryBindingId": self.delivery_binding_id,
+            "pairing": self.pairing,
+            "personaRevision": self.persona_revision,
+            "sourceManifestDigest": self.source_manifest_digest,
+            "modelProvenance": self.model_provenance,
+            "canonicalPayloadSha256": self.canonical_payload_sha256,
+        }))
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.preview.is_valid()
+            && bounded_identifier(&self.outbound_id)
+            && bounded_identifier(&self.choice_session_id)
+            && self.session_revision > 0
+            && bounded_identifier(&self.choice_set_id)
+            && sha256_hex(&self.choice_set_digest)
+            && bounded_identifier(&self.source_message_id)
+            && bounded_identifier(&self.delivery_binding_id)
+            && self.pairing.channel == ChannelKind::IMessage
+            && !self.pairing.require_explicit_address
+            && self.pairing.imessage.is_some()
+            && self.pairing.discord.is_none()
+            && self.persona_revision.is_valid()
+            && sha256_hex(&self.source_manifest_digest)
+            && self.model_provenance.is_valid()
+            && sha256_hex(&self.canonical_payload_sha256)
+            && self.canonical_payload_sha256
+                == format!("{:x}", Sha256::digest(self.preview.visible_body.as_bytes()))
+            && self.expected_confirmation_digest().as_deref()
+                == Some(self.preview.confirmation_digest.as_str())
+            && self.created_at_ms >= 0
+            && self
+                .approved_at_ms
+                .is_none_or(|value| value >= self.created_at_ms)
+            && self.recovery_cursor.as_ref().is_none_or(|cursor| {
+                cursor.channel == ChannelKind::IMessage
+                    && cursor.conversation_id == self.pairing.conversation_id
+            })
+    }
+}
+
+#[must_use]
+pub fn canonical_choice_set_digest(choice_set: &ChoiceSet) -> Option<String> {
+    if !choice_set.is_valid() {
+        return None;
+    }
+    serde_json::to_vec(choice_set)
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChoiceIMessageReplyDisposition {
+    ExecuteNow,
+    RecoverOnly,
+    AlreadySent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChoiceIMessageReplyStart {
+    pub intent: ChoiceIMessageReplyIntent,
+    pub disposition: ChoiceIMessageReplyDisposition,
 }
 
 /// Immutable setup facts proven by the official Discord bot flow before the

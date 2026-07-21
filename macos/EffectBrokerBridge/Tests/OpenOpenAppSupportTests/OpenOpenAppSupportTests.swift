@@ -33,6 +33,45 @@ private func descendants(of root: NSView) -> [NSView] {
   [root] + root.subviews.flatMap { descendants(of: $0) }
 }
 
+@Test
+func choiceIMessageReplyPreviewIsExactAndRejectsHiddenOrMalformedAuthorityFields() throws {
+  let preview = ChoiceIMessageReplyPreview(
+    replyId: "choice-imessage-reply-1",
+    previewRevision: 2,
+    destination: "Your selected iMessage self-chat",
+    visibleBody: "OpenOpen · AI\nA — Review\nD — Something else",
+    confirmationDigest: String(repeating: "a", count: 64)
+  )
+  #expect(try preview.validated() == preview)
+  let encoded = try JSONEncoder().encode(
+    AuthorizeChoiceIMessageReplyParameters(
+      preview: preview,
+      proof: BrokerRuntimeState(
+        authorization: RuntimeControlAuthorization(
+          protocolVersion: 1,
+          enabled: true,
+          revision: 1,
+          updatedAtMs: 1,
+          coreKeyId: String(repeating: "c", count: 64),
+          authorizationSignatureHex: String(repeating: "a", count: 128)),
+        receipt: RuntimeControlReceipt(
+          protocolVersion: 1,
+          authorizationHash: String(repeating: "b", count: 64),
+          checkpointNonce: String(repeating: "e", count: 64),
+          requestNonce: nil,
+          brokerKeyId: String(repeating: "c", count: 64),
+          brokerSignatureHex: String(repeating: "d", count: 128))
+      )
+    ))
+  let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+  #expect(object["replyId"] as? String == preview.replyId)
+  #expect(object["explicitlyApproved"] as? Bool == true)
+  #expect(object["body"] == nil)
+  #expect(object["recipient"] == nil)
+  #expect(object["channel"] == nil)
+  #expect(object["sessionId"] == nil)
+}
+
 @MainActor
 private func dashboardOutcomeField(in root: NSView) -> NSTextField? {
   descendants(of: root)
@@ -368,6 +407,7 @@ private struct TestChannelSend: Equatable, Sendable {
 
 private actor MockCore: CoreServing {
   nonisolated var permitsDeferredChannelTestRoutes: Bool { true }
+  nonisolated var permitsIMessageSelfChatRoutes: Bool { true }
   var control = RuntimeControl(enabled: false, revision: 0, updatedAtMs: 0)
   let dashboardDelay: Duration
   let dashboardFails: Bool
@@ -432,6 +472,9 @@ private actor MockCore: CoreServing {
   var nextChoiceReminderScheduleReadError: CoreClientError?
   var choiceReminderScheduleInputs: [ChoiceReminderScheduleInput] = []
   var choiceConfirmationResponse: ChoiceConsolidatedConfirmation?
+  var choiceIMessageReplyPreviewResponse: ChoiceIMessageReplyPreview?
+  var choiceIMessageReplyPrepareStatus = "prepared"
+  var choiceIMessageReplyAuthorizations: [ChoiceIMessageReplyPreview] = []
   var choiceMarkdownReceiptCleanupAvailable = false
   var choiceMarkdownReceiptCleanupCount = 0
   var choiceCancellationResponse: ChoiceLoopSnapshot?
@@ -1021,6 +1064,24 @@ private actor MockCore: CoreServing {
       throw CoreClientError.contractViolation("Choice continuity refresh failed closed.")
     }
     return response
+  }
+
+  func prepareChoiceIMessageReply(proof _: BrokerRuntimeState) throws
+    -> ChoiceIMessageReplyPrepareResponse
+  {
+    guard let choiceIMessageReplyPreviewResponse else {
+      throw CoreClientError.contractViolation("No Choice iMessage reply is prepared.")
+    }
+    return ChoiceIMessageReplyPrepareResponse(
+      preview: choiceIMessageReplyPreviewResponse,
+      status: choiceIMessageReplyPrepareStatus)
+  }
+
+  func authorizeChoiceIMessageReply(
+    _ preview: ChoiceIMessageReplyPreview, proof _: BrokerRuntimeState
+  ) -> ChoiceIMessageReplyResponse {
+    choiceIMessageReplyAuthorizations.append(preview)
+    return ChoiceIMessageReplyResponse(status: "sent", recoveryOnly: nil)
   }
 
   func personaStatus() -> PersonaStatusView? { personaStatusResponse }
