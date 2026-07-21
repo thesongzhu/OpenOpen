@@ -871,7 +871,7 @@ Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.W
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-
 Contents/Resources/Codex/0.144.0/codex-path/rg|rg|$app_team|b117313f07e30d05462b942c318b1ae0b73b4e5c|ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6
-Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|19de2b3e834adf95fed67c0cfd1a6f6a7759d5de|35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a
+Contents/Resources/iMessage/0.13.0/bin/imsg|com.thesongzhu.OpenOpen.imsg|$app_team|a26439305914f6bc47e6c6c0a1228c89b2bdefc3|35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a
 EOF
 
   for rel in \
@@ -1060,7 +1060,7 @@ EOF
      and .resourceTreeSha256 == "7a5cb869823a893a7181bcacfef6dfc8be335a5ce2bf14caac579096f78909cc"
      and .signingIdentifier == "com.thesongzhu.OpenOpen.imsg"
      and .teamIdentifier == $team
-     and .cdhash == "19de2b3e834adf95fed67c0cfd1a6f6a7759d5de"' \
+     and .cdhash == "a26439305914f6bc47e6c6c0a1228c89b2bdefc3"' \
     "$candidate/Contents/Resources/iMessage/0.13.0/RUNTIME-RECEIPT.json" >/dev/null || {
     echo "exact imsg runtime receipt mismatch" >&2
     exit 66
