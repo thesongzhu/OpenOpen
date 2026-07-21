@@ -5,6 +5,7 @@ umask 077
 usage() {
   echo "usage: $0 --app ABSOLUTE_PATH --output ABSOLUTE_DMG [--developer-id-identity CERTIFICATE_NAME --identity-receipt ABSOLUTE_RECEIPT]" >&2
   echo "       $0 --app ABSOLUTE_PATH --identity-receipt ABSOLUTE_RECEIPT --developer-id-identity CERTIFICATE_NAME (--verify-identity-receipt-only|--test-identity-receipt)" >&2
+  echo "       $0 --app /Applications/OpenOpen.app --identity-receipt ABSOLUTE_RECEIPT --developer-id-identity CERTIFICATE_NAME --verify-installed-copy-only" >&2
   exit 64
 }
 
@@ -47,6 +48,11 @@ while [[ $# -gt 0 ]]; do
     --test-identity-receipt)
       [[ "$execution_mode" == "package" ]] || usage
       execution_mode="test"
+      shift
+      ;;
+    --verify-installed-copy-only)
+      [[ "$execution_mode" == "package" ]] || usage
+      execution_mode="installed-verify"
       shift
       ;;
     *) usage ;;
@@ -164,6 +170,7 @@ verify_owner_certificate() {
 
 verify_entry_operational_metadata() {
   local path="$1"
+  local policy="${2:-strict}"
   local flags acl_lines attribute
   flags="$(/usr/bin/stat -f '%f' "$path")"
   [[ "$flags" == "0" ]] || {
@@ -176,11 +183,22 @@ verify_entry_operational_metadata() {
     exit 66
   }
   while IFS= read -r attribute; do
-    [[ -z "$attribute" || "$attribute" == "com.apple.provenance" ]] || {
+    [[ -z "$attribute" || "$attribute" == "com.apple.provenance" \
+      || ("$policy" == "installed-root" \
+        && "$attribute" == "com.apple.macl") ]] || {
       echo "exact alpha entry has a forbidden extended attribute: $path" >&2
       exit 66
     }
   done < <(/usr/bin/xattr "$path" 2>/dev/null || true)
+  if [[ "$policy" == "installed-root" ]]; then
+    local macl_hex
+    macl_hex="$(/usr/bin/xattr -px com.apple.macl "$path" 2>/dev/null \
+      | /usr/bin/tr -d ' \r\n')"
+    [[ "$macl_hex" =~ ^0{144}$ ]] || {
+      echo "installed App root has an unexpected Finder macOS ACL marker" >&2
+      exit 66
+    }
+  fi
 }
 
 verify_developer_id_code() {
@@ -272,6 +290,38 @@ write_tree_manifest() {
         "$kind" "$mode" "$flags" "$attributes" "$size" "$sha" "$relative"
     done < <(/usr/bin/find -P "$root" -print0 | LC_ALL=C /usr/bin/sort -z)
   ) >"$destination"
+}
+
+write_installed_copy_manifest() {
+  local root="$1"
+  local destination="$2"
+  local raw path
+  raw="$(/usr/bin/mktemp /private/tmp/OpenOpen-installed-manifest.XXXXXX)"
+  while IFS= read -r -d '' path; do
+    if [[ "$path" != "$root" ]] \
+      && /usr/bin/xattr "$path" 2>/dev/null \
+        | /usr/bin/grep -Fx com.apple.macl >/dev/null; then
+      rm -f "$raw"
+      echo "installed App has a Finder ACL marker below its bundle root: $path" >&2
+      return 66
+    fi
+  done < <(/usr/bin/find -P "$root" -print0)
+  verify_entry_operational_metadata "$root" installed-root
+  write_tree_manifest "$root" "$raw"
+  /usr/bin/awk -F '\t' -v OFS='\t' '
+    NR == 1 { print; next }
+    $7 == "." {
+      if ($4 !~ /com\.apple\.macl=0{144};/) exit 66
+      sub(/com\.apple\.macl=0{144};/, "", $4)
+    }
+    /com\.apple\.macl=/ { exit 66 }
+    { print }
+  ' "$raw" >"$destination" || {
+    rm -f "$raw" "$destination"
+    echo "installed App Finder metadata normalization failed closed" >&2
+    return 66
+  }
+  rm -f "$raw"
 }
 
 snapshot_external_pair() {
@@ -563,6 +613,7 @@ verify_post_stage_identity_receipt() {
   local receipt="$1"
   local candidate="$2"
   local app_team="$3"
+  local verification_scope="${4:-strict}"
   local identity_json manifest_file scratch_manifest
   local source_snapshot_file scratch_source_snapshot source_snapshot_sha
   local actual_dirs expected_dirs actual_files expected_files
@@ -654,6 +705,14 @@ verify_post_stage_identity_receipt() {
       and .source.indexState == "empty"
       and .source.sourceSnapshotFile == "Contents/Resources/source-snapshot.tsv"
       and .source.sourceSnapshotFormat == "OPENOPEN-SOURCE-SNAPSHOT-V2"
+      and (.source.head | test("^[0-9a-f]{40}$"))
+      and (.source.statusSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.binaryDiffSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.sourceSnapshotSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.stageScriptSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.dmgScriptSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.provenanceSha256 | test("^[0-9a-f]{64}$"))
+      and (.source.thirdPartyNoticesSha256 | test("^[0-9a-f]{64}$"))
       and .signer == {identity: $identity, teamIdentifier: $team,
         leafCertificateSha256: $leaf}
       and (.app | keys) == ["bundleIdentifier", "components", "directoryCount",
@@ -711,31 +770,33 @@ verify_post_stage_identity_receipt() {
     echo "external identity receipt source snapshot digest mismatch" >&2
     exit 66
   }
-  scratch_source_snapshot="$(/usr/bin/mktemp \
-    /private/tmp/OpenOpen-source-snapshot.XXXXXX)"
-  write_source_snapshot_manifest "$repo_root" "$scratch_source_snapshot"
-  /usr/bin/cmp -s "$source_snapshot_file" "$scratch_source_snapshot" || {
+  if [[ "$verification_scope" == "strict" ]]; then
+    scratch_source_snapshot="$(/usr/bin/mktemp \
+      /private/tmp/OpenOpen-source-snapshot.XXXXXX)"
+    write_source_snapshot_manifest "$repo_root" "$scratch_source_snapshot"
+    /usr/bin/cmp -s "$source_snapshot_file" "$scratch_source_snapshot" || {
+      rm -f "$scratch_source_snapshot"
+      echo "external identity receipt source snapshot mismatch" >&2
+      exit 66
+    }
     rm -f "$scratch_source_snapshot"
-    echo "external identity receipt source snapshot mismatch" >&2
-    exit 66
-  }
-  rm -f "$scratch_source_snapshot"
-  /usr/bin/jq -e \
-    --arg head "$head" --arg status "$status_sha" --arg diff "$diff_sha" \
-    --arg stage "$stage_script_sha" --arg dmg "$dmg_script_sha" \
-    --arg snapshot "$source_snapshot_sha" \
-    --arg provenance "$provenance_sha" --arg notices "$third_party_notices_sha" \
-    '.source == {head: $head, statusSha256: $status,
-      binaryDiffSha256: $diff, indexState: "empty",
-      sourceSnapshotFile: "Contents/Resources/source-snapshot.tsv",
-      sourceSnapshotFormat: "OPENOPEN-SOURCE-SNAPSHOT-V2",
-      sourceSnapshotSha256: $snapshot,
-      stageScriptSha256: $stage,
-      dmgScriptSha256: $dmg, provenanceSha256: $provenance,
-      thirdPartyNoticesSha256: $notices}' "$identity_json" >/dev/null || {
-    echo "external identity receipt source fingerprint mismatch" >&2
-    exit 66
-  }
+    /usr/bin/jq -e \
+      --arg head "$head" --arg status "$status_sha" --arg diff "$diff_sha" \
+      --arg stage "$stage_script_sha" --arg dmg "$dmg_script_sha" \
+      --arg snapshot "$source_snapshot_sha" \
+      --arg provenance "$provenance_sha" --arg notices "$third_party_notices_sha" \
+      '.source == {head: $head, statusSha256: $status,
+        binaryDiffSha256: $diff, indexState: "empty",
+        sourceSnapshotFile: "Contents/Resources/source-snapshot.tsv",
+        sourceSnapshotFormat: "OPENOPEN-SOURCE-SNAPSHOT-V2",
+        sourceSnapshotSha256: $snapshot,
+        stageScriptSha256: $stage,
+        dmgScriptSha256: $dmg, provenanceSha256: $provenance,
+        thirdPartyNoticesSha256: $notices}' "$identity_json" >/dev/null || {
+      echo "external identity receipt source fingerprint mismatch" >&2
+      exit 66
+    }
+  fi
 
   manifest_sha="$(/usr/bin/shasum -a 256 "$manifest_file" \
     | /usr/bin/awk '{print $1}')"
@@ -744,7 +805,11 @@ verify_post_stage_identity_receipt() {
     exit 66
   }
   scratch_manifest="$(/usr/bin/mktemp /private/tmp/OpenOpen-app-manifest.XXXXXX)"
-  write_tree_manifest "$candidate" "$scratch_manifest"
+  if [[ "$verification_scope" == "installed-copy" ]]; then
+    write_installed_copy_manifest "$candidate" "$scratch_manifest"
+  else
+    write_tree_manifest "$candidate" "$scratch_manifest"
+  fi
   /usr/bin/cmp -s "$manifest_file" "$scratch_manifest" || {
     rm -f "$scratch_manifest"
     echo "App does not match its external post-stage identity receipt" >&2
@@ -791,6 +856,7 @@ verify_exact_developer_app() {
   local candidate="$1"
   local app_team="$2"
   local receipt="$3"
+  local verification_scope="${4:-strict}"
   local openai_team="2DC432GLL2"
   local rel path actual_macho expected_macho entitlement_json mode expected_mode
   local actual_app_files expected_app_files actual_app_dirs expected_app_dirs
@@ -798,7 +864,8 @@ verify_exact_developer_app() {
   local deep_zip_cdhash
   local provenance_sha third_party_notices_sha
 
-  verify_post_stage_identity_receipt "$receipt" "$candidate" "$app_team"
+  verify_post_stage_identity_receipt "$receipt" "$candidate" "$app_team" \
+    "$verification_scope"
   app_cdhash="$(receipt_component_value "$receipt" \
     Contents/MacOS/OpenOpen cdhash)"
   core_cdhash="$(receipt_component_value "$receipt" \
@@ -1045,7 +1112,11 @@ EOF
       echo "exact alpha directory mode mismatch: $rel" >&2
       exit 66
     }
-    verify_entry_operational_metadata "$candidate/$rel"
+    if [[ "$verification_scope" == "installed-copy" && "$rel" == "." ]]; then
+      verify_entry_operational_metadata "$candidate/$rel" installed-root
+    else
+      verify_entry_operational_metadata "$candidate/$rel"
+    fi
   done <<<"$expected_app_dirs"
   while IFS= read -r rel; do
     expected_mode="644"
@@ -1413,7 +1484,7 @@ cleanup_input_snapshot() {
   fi
 }
 trap cleanup_input_snapshot EXIT
-if [[ -n "$signing_identity" ]]; then
+if [[ -n "$signing_identity" && "$execution_mode" != "installed-verify" ]]; then
   input_snapshot="$(/usr/bin/mktemp -d \
     /private/tmp/OpenOpen-verified-input.XXXXXX)"
   snapshot_external_pair "$app" "$identity_receipt" "$input_snapshot"
@@ -1444,11 +1515,20 @@ if [[ -n "$signing_identity" ]]; then
       echo "requested Developer ID Application identity is unavailable" >&2
       exit 65
     }
-  verify_exact_developer_app "$app" "$app_team" "$identity_receipt"
+  if [[ "$execution_mode" == "installed-verify" ]]; then
+    verify_exact_developer_app "$app" "$app_team" "$identity_receipt" \
+      installed-copy
+  else
+    verify_exact_developer_app "$app" "$app_team" "$identity_receipt"
+  fi
 fi
 
 if [[ "$execution_mode" == "verify" ]]; then
   echo "POST_STAGE_IDENTITY_RECEIPT_VERIFY=PASS $app_team $original_app $original_identity_receipt"
+  exit 0
+fi
+if [[ "$execution_mode" == "installed-verify" ]]; then
+  echo "INSTALLED_COPY_IDENTITY_RECEIPT_VERIFY=PASS $app_team $original_app $original_identity_receipt"
   exit 0
 fi
 if [[ "$execution_mode" == "test" ]]; then
