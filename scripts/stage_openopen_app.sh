@@ -604,14 +604,15 @@ readonly expected_imsg_cli_sources_sha="2f39e12fcf0879359c3f16a60061d7ab9fadcf14
 readonly expected_imsg_unsigned_sha="35ea30bce9b5c75403ba4dd68541a51916f41f5c6ba9df3a46882a4287556a6a"
 readonly expected_rg_unsigned_before_sha="7894fcced308b247aee2315d133e0670d73e608bfb41d8bb003665cc31328c47"
 readonly expected_rg_unsigned_sha="ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6"
-readonly expected_app_unsigned_before_sha="56dfc437b2b745f9f9d3762bff55234645d13fe2fcd64481060b9ea8ee375ede"
-readonly expected_app_unsigned_sha="18415d3cf6b01cf9aeb2622cca51a91bf51a8d8145a26ec6da70c759f6a43cd2"
-readonly expected_core_unsigned_before_sha="13eea4908ded92518c7f32e903779b89dd3bbe87d5400fd210bf2ca88c9ac4c7"
-readonly expected_core_unsigned_sha="63756f89c29f5a1d4a66117483dc719b39d337a3dfce13af8c33dbe0bfab36a9"
+readonly expected_app_unsigned_before_sha="32aaa32e558a967460b65ab5724dfe592b7ec3a3cbab89859141b63f890770d3"
+readonly expected_app_unsigned_sha="0c8d8013405d75c06ac4d18211d5a6d994b0733383ef10dc1eda4cf5f4e38c10"
+readonly expected_core_unsigned_before_sha="2665f5d32b9fb9eaed44bef811dc87e472d4c3928f271aaec1324c609d6c1011"
+readonly expected_core_unsigned_sha="19518aeba40579f85dd358351837a3a8f4792e4acbf812194c0c28259c98987f"
 readonly expected_broker_unsigned_before_sha="e4d01892570bd48b7d34d5d206defae9c05fb1dba85fa6cd0e226d6291b3b4ad"
 readonly expected_broker_unsigned_sha="3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78"
-readonly expected_worker_unsigned_sha="e50c2bf30e78bd5b860d4766b8a28d3128748860eafaa95ad630fb23a5aa5545"
-readonly expected_deep_zip_unsigned_sha="a3cdd4d8e6ef3bcfb804cdf7602ddbc8388b498197ba465d04a4796c8ba93d68"
+readonly expected_worker_unsigned_sha="4788bb2cd6e3f4615c3b042d78b4f25dfd8ff29da94a997a53208bedb3eceec2"
+readonly expected_deep_zip_unsigned_before_sha="8db22f7c03273c453933f03ea23233ae589e85f6976b9fbf460cbfe4173c2e30"
+readonly expected_deep_zip_unsigned_sha="b0099bc496205e4e69174de1a30a2c3716493f5bb39e02acd10e084cf0055017"
 verify_sha "$expected_imsg_receipt_sha" "$imsg_receipt"
 imsg_receipt_sha="$expected_imsg_receipt_sha"
 receipt_value() {
@@ -856,6 +857,7 @@ sign_owned_code \
 sign_owned_code \
   "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
   com.thesongzhu.OpenOpen.DeepZipWorker "" \
+  "$expected_deep_zip_unsigned_before_sha" \
   "$expected_deep_zip_unsigned_sha"
 imsg_signed_sha="$(/usr/bin/shasum -a 256 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" | /usr/bin/awk '{print $1}')"
 imsg_cdhash="$(/usr/bin/codesign -d --verbose=4 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>&1 | /usr/bin/awk -F= '$1 == "CDHash" {print $2}')"

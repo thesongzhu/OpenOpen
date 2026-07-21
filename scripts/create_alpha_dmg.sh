@@ -17,7 +17,11 @@ execution_mode="package"
 readonly expected_developer_id_identity="Developer ID Application: Wenxin Dou (UHDY2275L5)"
 readonly expected_developer_id_team="UHDY2275L5"
 readonly expected_developer_id_leaf_sha="a7e43925d8ee4ad927f6ac27078eff554b7487a58f73b8f3acd7fabadc4057c8"
-readonly expected_deep_zip_unsigned_sha="a3cdd4d8e6ef3bcfb804cdf7602ddbc8388b498197ba465d04a4796c8ba93d68"
+readonly expected_app_unsigned_sha="0c8d8013405d75c06ac4d18211d5a6d994b0733383ef10dc1eda4cf5f4e38c10"
+readonly expected_core_unsigned_sha="19518aeba40579f85dd358351837a3a8f4792e4acbf812194c0c28259c98987f"
+readonly expected_broker_unsigned_sha="3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78"
+readonly expected_worker_unsigned_sha="4788bb2cd6e3f4615c3b042d78b4f25dfd8ff29da94a997a53208bedb3eceec2"
+readonly expected_deep_zip_unsigned_sha="b0099bc496205e4e69174de1a30a2c3716493f5bb39e02acd10e084cf0055017"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app)
@@ -844,10 +848,10 @@ verify_post_stage_identity_receipt() {
       exit 66
     }
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|18415d3cf6b01cf9aeb2622cca51a91bf51a8d8145a26ec6da70c759f6a43cd2
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|63756f89c29f5a1d4a66117483dc719b39d337a3dfce13af8c33dbe0bfab36a9
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|e50c2bf30e78bd5b860d4766b8a28d3128748860eafaa95ad630fb23a5aa5545
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$expected_app_unsigned_sha
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$expected_core_unsigned_sha
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$expected_broker_unsigned_sha
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$expected_worker_unsigned_sha
 Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$expected_deep_zip_unsigned_sha
 EOF
 }
@@ -938,10 +942,10 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|18415d3cf6b01cf9aeb2622cca51a91bf51a8d8145a26ec6da70c759f6a43cd2
-Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|63756f89c29f5a1d4a66117483dc719b39d337a3dfce13af8c33dbe0bfab36a9
-Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
-Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|e50c2bf30e78bd5b860d4766b8a28d3128748860eafaa95ad630fb23a5aa5545
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|$expected_app_unsigned_sha
+Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|$expected_core_unsigned_sha
+Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|$expected_broker_unsigned_sha
+Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|$expected_worker_unsigned_sha
 Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$app_team|$deep_zip_cdhash|$expected_deep_zip_unsigned_sha
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-
