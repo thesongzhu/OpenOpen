@@ -64,6 +64,16 @@ private func b2State(
 ) -> B2MemoryDemoState {
   let processing = stage == .prepared ? nil : b2ProcessingOperation()
   let hasResult = ![.prepared, .processing].contains(stage)
+  let candidates =
+    stage == .candidates
+    ? [
+      B2MemoryCandidateCard(
+        id: "memory-candidate-1",
+        title: "One candidate",
+        rationale: "Bound to the selected import.",
+        proposedLine: "- One confirmed memory line.",
+        sourceBindingDigest: b2Digest)
+    ] : []
   return B2MemoryDemoState(
     revision: stage == .prepared ? 1 : 2,
     stage: stage,
@@ -71,7 +81,7 @@ private func b2State(
     processingOperation: processing,
     processingResultDigest: hasResult ? b2Digest : nil,
     seal: stage == .prepared ? nil : b2Seal(),
-    candidates: [],
+    candidates: candidates,
     selectedCandidate: nil,
     markdownDiff: nil,
     confirmationDigest: nil,
@@ -120,6 +130,51 @@ func b2ProcessingRequiresTheExactPreparedSourceAndCurrentModelRuntime() {
         isBusy: isBusy,
         state: state,
         currentSource: currentSource))
+  }
+}
+
+@Test
+@MainActor
+func b2MemoryActionsAreUnavailableWhileOffBusyOrAtTheWrongStage() {
+  let candidates = b2State(stage: .candidates)
+  #expect(candidates.isValid)
+  #expect(
+    AppModel.b2MemoryActionIsEnabled(
+      storeControlEnabled: true, isBusy: false, state: candidates, kind: .selectCandidate))
+  #expect(
+    !AppModel.b2MemoryActionIsEnabled(
+      storeControlEnabled: false, isBusy: false, state: candidates, kind: .selectCandidate))
+  #expect(
+    !AppModel.b2MemoryActionIsEnabled(
+      storeControlEnabled: true, isBusy: true, state: candidates, kind: .selectCandidate))
+  #expect(
+    !AppModel.b2MemoryActionIsEnabled(
+      storeControlEnabled: true, isBusy: false, state: b2State(stage: .processing),
+      kind: .editMarkdown))
+  #expect(
+    !AppModel.b2MemoryActionIsEnabled(
+      storeControlEnabled: true, isBusy: false, state: b2State(stage: .prepared),
+      kind: .confirmDiff))
+
+  #expect(
+    AppModel.b2MemoryPendingActionIsEnabled(
+      storeControlEnabled: true,
+      isBusy: false,
+      state: candidates,
+      action: .selectCandidate,
+      candidateId: "memory-candidate-1"))
+  for (storeControlEnabled, isBusy, candidateId) in [
+    (false, false, "memory-candidate-1"),
+    (true, true, "memory-candidate-1"),
+    (true, false, "different-candidate"),
+  ] {
+    #expect(
+      !AppModel.b2MemoryPendingActionIsEnabled(
+        storeControlEnabled: storeControlEnabled,
+        isBusy: isBusy,
+        state: candidates,
+        action: .selectCandidate,
+        candidateId: candidateId))
   }
 }
 

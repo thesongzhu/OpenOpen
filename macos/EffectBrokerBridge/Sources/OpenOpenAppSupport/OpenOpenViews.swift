@@ -45,7 +45,7 @@ public struct OpenOpenRootView: View {
 
   public var body: some View {
     GeometryReader { geometry in
-      if geometry.size.width < 560 {
+      if geometry.size.width < 680 {
         VStack(spacing: 0) {
           EditorialCompactNavigation(section: $section)
           Divider()
@@ -141,7 +141,8 @@ private enum EditorialPalette {
   static let sidebar = Color.primary.opacity(0.048)
   static let card = Color(nsColor: .controlBackgroundColor).opacity(0.72)
   static let border = Color(nsColor: .separatorColor).opacity(0.65)
-  static let accent = Color(red: 51 / 255, green: 156 / 255, blue: 1)
+  static let selectedBackground = Color(nsColor: .textColor)
+  static let selectedForeground = Color(nsColor: .windowBackgroundColor)
   static let destructive = Color(red: 226 / 255, green: 85 / 255, blue: 7 / 255)
   static let cornerRadius: CGFloat = 20
 }
@@ -164,11 +165,14 @@ private struct EditorialSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(section == destination ? .white : .secondary)
+        .foregroundStyle(
+          section == destination ? EditorialPalette.selectedForeground : .secondary
+        )
         .background(
-          section == destination ? EditorialPalette.accent : .clear,
+          section == destination ? EditorialPalette.selectedBackground : .clear,
           in: RoundedRectangle(cornerRadius: 7, style: .continuous)
         )
+        .accessibilityAddTraits(section == destination ? .isSelected : [])
         .accessibilityIdentifier("openopen-nav-\(destination.rawValue)")
       }
       Spacer(minLength: 0)
@@ -194,15 +198,19 @@ private struct EditorialCompactNavigation: View {
     ScrollView(.horizontal, showsIndicators: false) {
       HStack(spacing: 2) {
         ForEach(destinations) { destination in
-          if destination == section {
-            Button(destination.title) { section = destination }
-              .buttonStyle(.borderedProminent)
-              .accessibilityIdentifier("openopen-nav-compact-\(destination.rawValue)")
-          } else {
-            Button(destination.title) { section = destination }
-              .buttonStyle(.borderless)
-              .accessibilityIdentifier("openopen-nav-compact-\(destination.rawValue)")
-          }
+          Button(destination.title) { section = destination }
+            .buttonStyle(.plain)
+            .foregroundStyle(
+              section == destination ? EditorialPalette.selectedForeground : .secondary
+            )
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+              section == destination ? EditorialPalette.selectedBackground : .clear,
+              in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .accessibilityAddTraits(section == destination ? .isSelected : [])
+            .accessibilityIdentifier("openopen-nav-compact-\(destination.rawValue)")
         }
       }
       .padding(.horizontal, 12)
@@ -478,6 +486,7 @@ private struct EditorialMemoryView: View {
     ) {
       Button("Cancel", role: .cancel) { model.cancelB2MemoryAction() }
       Button(pendingActionTitle) { Task { await model.confirmB2MemoryAction() } }
+        .disabled(!model.b2MemoryPendingActionEnabled)
     } message: {
       Text(pendingDetail)
     }
@@ -533,6 +542,7 @@ private struct EditorialMemoryView: View {
           Text(card.rationale).font(.caption).foregroundStyle(.secondary)
           Button("Review selected") { model.requestB2CandidateSelection(card.id) }
             .buttonStyle(.borderedProminent)
+            .disabled(!model.b2MemoryCandidateActionsEnabled)
             .accessibilityIdentifier("openopen-memory-candidate-\(card.id)")
         }
       }
@@ -542,11 +552,13 @@ private struct EditorialMemoryView: View {
           .accessibilityIdentifier("openopen-memory-edit-line")
         Button("Review Markdown") { Task { await model.saveB2MemoryEdit() } }
           .buttonStyle(.borderedProminent)
+          .disabled(!model.b2MemoryEditEnabled)
           .accessibilityIdentifier("openopen-memory-review-markdown")
         if let diff = model.b2MemoryDemoState?.markdownDiff {
           Text(diff.editedLine).font(.system(.body, design: .monospaced))
           Button("Confirm diff") { model.requestB2DiffConfirmation() }
             .buttonStyle(.borderedProminent)
+            .disabled(!model.b2MemoryConfirmDiffEnabled)
             .accessibilityIdentifier("openopen-memory-confirm-diff")
         }
       }
@@ -578,7 +590,13 @@ private struct EditorialMemoryView: View {
     }
   }
 
-  private var pageState: String { model.b2MemoryDemoState == nil ? "Ready" : "Needs you" }
+  private var pageState: String {
+    switch model.b2MemoryDemoState?.stage {
+    case nil, .readBack: "Ready"
+    case .processing, .confirmed: "Working"
+    case .prepared, .candidates, .selected, .diffReview: "Needs you"
+    }
+  }
   private var pendingTitle: String {
     switch model.b2MemoryPendingAction {
     case .selectCandidate: "Choose one memory"

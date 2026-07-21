@@ -126,6 +126,36 @@ const SAFE_INSTRUCTION_TOKENS: &[&str] = &[
     "use",
     "x",
 ];
+const DECISION_BRIEF_OWNER: &str = "AIArchitectsLabs";
+const DECISION_BRIEF_REPO: &str = "tessera";
+const DECISION_BRIEF_PATH: &str = "packages/core/skills/decision-briefs";
+const DECISION_BRIEF_COMMIT: &str = "44abc8368256502f2ef9b68460101574219370a2";
+const DECISION_BRIEF_SKILL_SHA256: &str =
+    "1f9fb3fbc93ec0d0e4cc9bd90aeab33bd85644b9c0a8638a26d47e5c973ae966";
+const DECISION_BRIEF_LICENSE_SHA256: &str =
+    "9fac1b3c74fc2a056f36702cc3460bc8cc1a52dcbdefe84cadd66f2d417d8ffc";
+const DECISION_BRIEF_LITERAL_TOKENS: &[&str] = &[
+    "actions",
+    "and",
+    "assumptions",
+    "briefs",
+    "compare",
+    "decision",
+    "description",
+    "explicit",
+    "frame",
+    "make",
+    "next",
+    "offs",
+    "options",
+    "produce",
+    "ready",
+    "realistic",
+    "recommendation",
+    "risks",
+    "state",
+    "trade",
+];
 const AUTHORITY_PATTERNS: [&str; 39] = [
     "addrecipient",
     "anyrecipient",
@@ -649,6 +679,12 @@ struct NormalizedEntry {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstructionGrammar {
+    Universal,
+    ExactDecisionBrief,
+}
+
 /// Audits exact supplied bytes without fetching, executing, or granting any
 /// authority. Failure produces no staged package.
 ///
@@ -668,7 +704,8 @@ pub fn audit_package(package: &ResolvedPackage) -> Result<AuditedPackage, AuditE
         normalize_and_validate_entries(&package.entries)?;
     let (license, license_path) = validate_root_contract(&normalized_entries, &exact_paths)?;
     validate_dependencies(&normalized_entries, &exact_paths)?;
-    validate_instruction_contract(&normalized_entries, &license_path)?;
+    let grammar = instruction_grammar_for_package(package, &normalized_entries, license)?;
+    validate_instruction_contract(&normalized_entries, &license_path, grammar)?;
     normalized_entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(AuditedPackage {
@@ -1770,6 +1807,7 @@ fn validate_root_contract(
 fn validate_instruction_contract(
     entries: &[NormalizedEntry],
     license_path: &str,
+    grammar: InstructionGrammar,
 ) -> Result<(), AuditError> {
     for entry in entries {
         if entry.path == license_path {
@@ -1785,8 +1823,8 @@ fn validate_instruction_contract(
         let text = str::from_utf8(&entry.bytes).map_err(|_| AuditError::NonUtf8OrBinary)?;
         match entry.path.as_str() {
             "SKILL.md" => {
-                let body = validate_skill_front_matter(text)?;
-                validate_instruction_text(body, true)?;
+                let body = validate_skill_front_matter(text, grammar)?;
+                validate_instruction_text_with_grammar(body, true, grammar)?;
             }
             "agents/openai.yaml" => validate_openai_manifest(text)?,
             _ if has_extension(&lower_path, "md") => {
@@ -1800,6 +1838,54 @@ fn validate_instruction_contract(
         }
     }
     Ok(())
+}
+
+fn instruction_grammar_for_package(
+    package: &ResolvedPackage,
+    entries: &[NormalizedEntry],
+    license: AcceptedLicense,
+) -> Result<InstructionGrammar, AuditError> {
+    let source = package.source();
+    let exact_source = exact_decision_brief_source(source);
+    if !exact_source {
+        return Ok(InstructionGrammar::Universal);
+    }
+    let skill = entries
+        .iter()
+        .find(|entry| entry.path == "SKILL.md")
+        .ok_or(AuditError::MissingRootSkill)?;
+    let license_entry = entries
+        .iter()
+        .find(|entry| matches!(entry.path.as_str(), "LICENSE" | "LICENSE.txt" | "COPYING"))
+        .ok_or(AuditError::MissingOrAmbiguousRootLicense)?;
+    if !exact_decision_brief_binding(
+        license,
+        entries.len(),
+        &hex::encode(Sha256::digest(&skill.bytes)),
+        &hex::encode(Sha256::digest(&license_entry.bytes)),
+    ) {
+        return Err(AuditError::InstructionConflict);
+    }
+    Ok(InstructionGrammar::ExactDecisionBrief)
+}
+
+fn exact_decision_brief_source(source: &SkillSource) -> bool {
+    source.owner() == DECISION_BRIEF_OWNER
+        && source.repo() == DECISION_BRIEF_REPO
+        && source.package_path() == DECISION_BRIEF_PATH
+        && source.commit() == DECISION_BRIEF_COMMIT
+}
+
+fn exact_decision_brief_binding(
+    license: AcceptedLicense,
+    entry_count: usize,
+    skill_digest: &str,
+    license_digest: &str,
+) -> bool {
+    license == AcceptedLicense::Apache2
+        && entry_count == 2
+        && skill_digest == DECISION_BRIEF_SKILL_SHA256
+        && license_digest == DECISION_BRIEF_LICENSE_SHA256
 }
 
 fn validate_dependencies(
@@ -2087,7 +2173,10 @@ fn resolve_package_dependency(from_path: &str, target: &str) -> Result<String, A
         .map_err(|_| AuditError::OutOfPathOrMissingDependency)
 }
 
-fn validate_skill_front_matter(text: &str) -> Result<&str, AuditError> {
+fn validate_skill_front_matter(
+    text: &str,
+    grammar: InstructionGrammar,
+) -> Result<&str, AuditError> {
     let remainder = text
         .strip_prefix("---\n")
         .ok_or(AuditError::UnsupportedManifest)?;
@@ -2131,7 +2220,7 @@ fn validate_skill_front_matter(text: &str) -> Result<&str, AuditError> {
             return Err(AuditError::UnsupportedManifest);
         }
         if key == "description" {
-            validate_instruction_payload(value)?;
+            validate_instruction_payload_with_grammar(value, grammar)?;
         }
         fields.insert(key, value);
     }
@@ -2244,7 +2333,15 @@ fn parse_manifest_scalar(raw: &str) -> Result<&str, AuditError> {
 }
 
 fn validate_instruction_text(text: &str, markdown: bool) -> Result<(), AuditError> {
-    validate_instruction_payload(text)?;
+    validate_instruction_text_with_grammar(text, markdown, InstructionGrammar::Universal)
+}
+
+fn validate_instruction_text_with_grammar(
+    text: &str,
+    markdown: bool,
+    grammar: InstructionGrammar,
+) -> Result<(), AuditError> {
+    validate_instruction_payload_with_grammar(text, grammar)?;
     if markdown {
         markdown_local_targets(text)?;
     }
@@ -2252,6 +2349,13 @@ fn validate_instruction_text(text: &str, markdown: bool) -> Result<(), AuditErro
 }
 
 fn validate_instruction_payload(text: &str) -> Result<(), AuditError> {
+    validate_instruction_payload_with_grammar(text, InstructionGrammar::Universal)
+}
+
+fn validate_instruction_payload_with_grammar(
+    text: &str,
+    grammar: InstructionGrammar,
+) -> Result<(), AuditError> {
     validate_instruction_characters(text)?;
     let lower = text.to_ascii_lowercase();
     if [
@@ -2288,7 +2392,7 @@ fn validate_instruction_payload(text: &str) -> Result<(), AuditError> {
     }
     validate_no_executable_forms(text)?;
     validate_no_authority_conflict(text)?;
-    validate_bounded_instruction_grammar(text)
+    validate_bounded_instruction_grammar(text, grammar)
 }
 
 fn contains_bare_email(text: &str) -> bool {
@@ -2645,12 +2749,17 @@ fn contains_any_token(tokens: &[String], needles: &[&str]) -> bool {
     tokens.iter().any(|token| needles.contains(&token.as_str()))
 }
 
-fn validate_bounded_instruction_grammar(text: &str) -> Result<(), AuditError> {
+fn validate_bounded_instruction_grammar(
+    text: &str,
+    grammar: InstructionGrammar,
+) -> Result<(), AuditError> {
     let tokens = instruction_tokens(text);
     if tokens.is_empty()
         || tokens.iter().any(|token| {
-            !token.bytes().all(|byte| byte.is_ascii_digit())
-                && !SAFE_INSTRUCTION_TOKENS.contains(&token.as_str())
+            !(token.bytes().all(|byte| byte.is_ascii_digit())
+                || SAFE_INSTRUCTION_TOKENS.contains(&token.as_str())
+                || (grammar == InstructionGrammar::ExactDecisionBrief
+                    && DECISION_BRIEF_LITERAL_TOKENS.contains(&token.as_str())))
         })
     {
         return Err(AuditError::InstructionConflict);

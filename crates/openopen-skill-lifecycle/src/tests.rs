@@ -1358,3 +1358,82 @@ fn first_use_requires_current_runnable_empty_permissions_and_precomputed_revisio
     );
     assert_eq!(lifecycle, overflow_before);
 }
+
+#[test]
+fn decision_brief_vocabulary_is_exact_fingerprint_bound() {
+    const SKILL: &str = "---\nname: decision-briefs\ndescription: Compare options and produce recommendation-ready decision briefs.\n---\n\n# Decision Briefs\n\nFrame the decision, compare realistic options, state a recommendation, and make risks, assumptions, trade-offs, and next actions explicit.\n";
+    assert_eq!(
+        hex::encode(Sha256::digest(SKILL.as_bytes())),
+        DECISION_BRIEF_SKILL_SHA256
+    );
+    assert_eq!(DECISION_BRIEF_LITERAL_TOKENS.len(), 20);
+    assert!(
+        DECISION_BRIEF_LITERAL_TOKENS
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    );
+
+    let body = validate_skill_front_matter(SKILL, InstructionGrammar::ExactDecisionBrief)
+        .expect("exact candidate front matter");
+    validate_instruction_text_with_grammar(body, true, InstructionGrammar::ExactDecisionBrief)
+        .expect("exact candidate vocabulary");
+    assert_eq!(
+        validate_skill_front_matter(SKILL, InstructionGrammar::Universal),
+        Err(AuditError::InstructionConflict)
+    );
+
+    let request = GitHubRequest::parse(&format!(
+        "https://github.com/{DECISION_BRIEF_OWNER}/{DECISION_BRIEF_REPO}/tree/{DECISION_BRIEF_COMMIT}/{DECISION_BRIEF_PATH}"
+    ))
+    .expect("exact immutable candidate URL");
+    let source = SkillSource::resolve(request, DECISION_BRIEF_COMMIT).expect("exact source");
+    assert!(exact_decision_brief_source(&source));
+
+    let wrong_source = SkillSource::resolve(
+        GitHubRequest::parse(&format!(
+            "https://github.com/example/{DECISION_BRIEF_REPO}/tree/{DECISION_BRIEF_COMMIT}/{DECISION_BRIEF_PATH}"
+        ))
+        .expect("alternate source URL"),
+        DECISION_BRIEF_COMMIT,
+    )
+    .expect("alternate source");
+    assert!(!exact_decision_brief_source(&wrong_source));
+}
+
+#[test]
+fn decision_brief_exception_requires_exact_skill_license_and_tree_shape() {
+    assert!(exact_decision_brief_binding(
+        AcceptedLicense::Apache2,
+        2,
+        DECISION_BRIEF_SKILL_SHA256,
+        DECISION_BRIEF_LICENSE_SHA256,
+    ));
+    for binding in [
+        exact_decision_brief_binding(
+            AcceptedLicense::Mit,
+            2,
+            DECISION_BRIEF_SKILL_SHA256,
+            DECISION_BRIEF_LICENSE_SHA256,
+        ),
+        exact_decision_brief_binding(
+            AcceptedLicense::Apache2,
+            3,
+            DECISION_BRIEF_SKILL_SHA256,
+            DECISION_BRIEF_LICENSE_SHA256,
+        ),
+        exact_decision_brief_binding(
+            AcceptedLicense::Apache2,
+            2,
+            &"0".repeat(64),
+            DECISION_BRIEF_LICENSE_SHA256,
+        ),
+        exact_decision_brief_binding(
+            AcceptedLicense::Apache2,
+            2,
+            DECISION_BRIEF_SKILL_SHA256,
+            &"0".repeat(64),
+        ),
+    ] {
+        assert!(!binding);
+    }
+}

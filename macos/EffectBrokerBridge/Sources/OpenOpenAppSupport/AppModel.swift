@@ -2761,6 +2761,86 @@ public final class AppModel: ObservableObject {
       currentSource: b2MemoryPreparedSource)
   }
 
+  public var b2MemoryCandidateActionsEnabled: Bool {
+    Self.b2MemoryActionIsEnabled(
+      storeControlEnabled: storeControlEnabled,
+      isBusy: isBusy,
+      state: b2MemoryDemoState,
+      kind: .selectCandidate)
+  }
+
+  public var b2MemoryEditEnabled: Bool {
+    Self.b2MemoryActionIsEnabled(
+      storeControlEnabled: storeControlEnabled,
+      isBusy: isBusy,
+      state: b2MemoryDemoState,
+      kind: .editMarkdown)
+  }
+
+  public var b2MemoryConfirmDiffEnabled: Bool {
+    Self.b2MemoryActionIsEnabled(
+      storeControlEnabled: storeControlEnabled,
+      isBusy: isBusy,
+      state: b2MemoryDemoState,
+      kind: .confirmDiff)
+  }
+
+  public var b2MemoryPendingActionEnabled: Bool {
+    Self.b2MemoryPendingActionIsEnabled(
+      storeControlEnabled: storeControlEnabled,
+      isBusy: isBusy,
+      state: b2MemoryDemoState,
+      action: b2MemoryPendingAction,
+      candidateId: b2MemoryPendingCandidateId)
+  }
+
+  static func b2MemoryPendingActionIsEnabled(
+    storeControlEnabled: Bool,
+    isBusy: Bool,
+    state: B2MemoryDemoState?,
+    action: B2MemoryCommandKind?,
+    candidateId: String?
+  ) -> Bool {
+    switch action {
+    case .selectCandidate:
+      return b2MemoryActionIsEnabled(
+        storeControlEnabled: storeControlEnabled,
+        isBusy: isBusy,
+        state: state,
+        kind: .selectCandidate)
+        && state?.candidates.contains(where: {
+          $0.id == candidateId
+        }) == true
+    case .confirmDiff:
+      return b2MemoryActionIsEnabled(
+        storeControlEnabled: storeControlEnabled,
+        isBusy: isBusy,
+        state: state,
+        kind: .confirmDiff)
+    case nil, .editMarkdown, .prepare:
+      return false
+    }
+  }
+
+  static func b2MemoryActionIsEnabled(
+    storeControlEnabled: Bool,
+    isBusy: Bool,
+    state: B2MemoryDemoState?,
+    kind: B2MemoryCommandKind
+  ) -> Bool {
+    guard storeControlEnabled, !isBusy, let state, state.isValid else { return false }
+    switch kind {
+    case .selectCandidate:
+      return state.stage == .candidates && !state.candidates.isEmpty
+    case .editMarkdown:
+      return state.stage == .selected || state.stage == .diffReview
+    case .confirmDiff:
+      return state.stage == .diffReview && state.markdownDiff?.isValid == true
+    case .prepare:
+      return false
+    }
+  }
+
   static func b2MemoryProcessSourceIsEnabled(
     modelEntryEnabled: Bool,
     isBusy: Bool,
@@ -2875,7 +2955,7 @@ public final class AppModel: ObservableObject {
   }
 
   public func requestB2CandidateSelection(_ candidateId: String) {
-    guard b2MemoryDemoState?.stage == .candidates,
+    guard b2MemoryCandidateActionsEnabled,
       b2MemoryDemoState?.candidates.contains(where: { $0.id == candidateId }) == true
     else { return }
     b2MemoryPendingCandidateId = candidateId
@@ -2883,7 +2963,7 @@ public final class AppModel: ObservableObject {
   }
 
   public func requestB2DiffConfirmation() {
-    guard b2MemoryDemoState?.markdownDiff?.isValid == true else { return }
+    guard b2MemoryConfirmDiffEnabled else { return }
     b2MemoryPendingAction = .confirmDiff
   }
 
@@ -2894,6 +2974,10 @@ public final class AppModel: ObservableObject {
 
   public func confirmB2MemoryAction() async {
     guard let action = b2MemoryPendingAction else { return }
+    guard b2MemoryPendingActionEnabled else {
+      b2MemoryFeedback = "Nothing changed"
+      return
+    }
     await applyB2MemoryCommand(action)
     if b2MemoryFeedback == nil {
       b2MemoryPendingAction = nil
@@ -2902,6 +2986,7 @@ public final class AppModel: ObservableObject {
   }
 
   public func saveB2MemoryEdit() async {
+    guard b2MemoryEditEnabled else { return }
     await applyB2MemoryCommand(.editMarkdown)
   }
 

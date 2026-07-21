@@ -63,6 +63,11 @@ func frozenMemorySetupUsesOnlyTypedImportAndProcessingAuthority() throws {
   #expect(!memory.contains("requestB2CandidateGeneration"))
   #expect(memory.contains("model.requestB2CandidateSelection"))
   #expect(memory.contains("model.requestB2DiffConfirmation"))
+  #expect(memory.contains(".disabled(!model.b2MemoryCandidateActionsEnabled)"))
+  #expect(memory.contains(".disabled(!model.b2MemoryEditEnabled)"))
+  #expect(memory.contains(".disabled(!model.b2MemoryConfirmDiffEnabled)"))
+  #expect(memory.contains(".disabled(!model.b2MemoryPendingActionEnabled)"))
+  #expect(memory.contains("case .processing, .confirmed: \"Working\""))
   #expect(memory.contains("openopen-memory-confirmed-readback"))
   #expect(memory.contains("Only this change will be written"))
   #expect(memory.contains("Review the exact line added to the local Memory file."))
@@ -80,6 +85,17 @@ func frozenMemorySetupUsesOnlyTypedImportAndProcessingAuthority() throws {
   #expect(!appModel.contains("The Memory Demo state could not be verified."))
   #expect(!appModel.contains("The Memory Demo command is invalid."))
   #expect(!appModel.contains("The Memory Demo step was not verified."))
+}
+
+@Test
+func frozenShellKeepsTheExactResponsiveAndSelectedNavigationContract() throws {
+  let source = try openOpenViewsSource()
+  #expect(source.contains("geometry.size.width < 680"))
+  #expect(!source.contains("geometry.size.width < 560"))
+  #expect(source.contains("EditorialPalette.selectedBackground"))
+  #expect(source.contains("EditorialPalette.selectedForeground"))
+  #expect(source.contains(".accessibilityAddTraits(section == destination ? .isSelected : [])"))
+  #expect(!source.contains("Color(red: 51 / 255, green: 156 / 255, blue: 1)"))
 }
 
 @Test
@@ -138,7 +154,7 @@ func frozenEditorialShellUsesOneToolbarAndAnExplicitStableSidebar() throws {
 
   #expect(views.contains(".toolbar { EditorialWindowToolbar(model: model, section: $section) }"))
   #expect(views.contains(".frame(width: 180)"))
-  #expect(views.contains("section == destination ? EditorialPalette.accent : .clear"))
+  #expect(views.contains("section == destination ? EditorialPalette.selectedBackground : .clear"))
   #expect(!views.contains("NavigationSplitView"))
   #expect(!views.contains(".listStyle(.sidebar)"))
   #expect(app.contains("window.titleVisibility = .hidden"))
