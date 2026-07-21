@@ -8149,7 +8149,9 @@ func unrecoverableStartedChannelModelSurfacesNeedYouAndKeepsCorrectionPollingLiv
   #expect(model.errorMessage == nil)
   #expect(model.channelFailureIncidents.count == 1)
   let pollsAfterNeedYou = await core.channelPollCount
-  try? await Task.sleep(for: .milliseconds(1_100))
+  for _ in 0..<200 where await core.channelPollCount <= pollsAfterNeedYou {
+    try? await Task.sleep(for: .milliseconds(20))
+  }
   #expect(await core.channelPollCount > pollsAfterNeedYou)
 
   await model.updateEnabled(false)
