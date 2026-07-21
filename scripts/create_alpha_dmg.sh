@@ -16,6 +16,7 @@ execution_mode="package"
 readonly expected_developer_id_identity="Developer ID Application: Wenxin Dou (UHDY2275L5)"
 readonly expected_developer_id_team="UHDY2275L5"
 readonly expected_developer_id_leaf_sha="a7e43925d8ee4ad927f6ac27078eff554b7487a58f73b8f3acd7fabadc4057c8"
+readonly expected_deep_zip_unsigned_sha="aafaa597bb3c23e107a999fe4ff6af56ad314ae5b6d2378779991a98e72117aa"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app)
@@ -661,15 +662,16 @@ verify_post_stage_identity_receipt() {
       and .app.bundleIdentifier == "com.thesongzhu.OpenOpen"
       and .app.manifestFile == "Contents/Resources/app-manifest.tsv"
       and .app.manifestFormat == "OPENOPEN-TREE-MANIFEST-V1"
-      and .app.directoryCount == 18 and .app.fileCount == 617
+      and .app.directoryCount == 19 and .app.fileCount == 618
       and .app.metadataPolicy == {types: ["directory", "regular-file"],
         directoryMode: "755", regularFileMode: "644", machOMode: "755",
         bsdFlags: "0", aclEntries: 0,
         allowedExtendedAttributes: ["com.apple.provenance"]}
-      and (.app.components | length) == 4
+      and (.app.components | length) == 5
       and [.app.components[].path] == ["Contents/MacOS/OpenOpen",
         "Contents/MacOS/OpenOpenCore", "Contents/MacOS/OpenOpenEffectBroker",
-        "Contents/MacOS/OpenOpenEffectBrokerWorker"]
+        "Contents/MacOS/OpenOpenEffectBrokerWorker",
+        "Contents/Resources/DeepZip/openopen-deep-zip-worker"]
       and all(.app.components[];
         (keys == ["cdhash", "entitlements", "hardenedRuntime", "identifier", "path",
           "secureTimestamp", "signedSha256", "teamIdentifier", "unsignedSha256"])
@@ -753,7 +755,7 @@ verify_post_stage_identity_receipt() {
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
   file_count="$(/usr/bin/find -P "$candidate" -type f -print \
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "$directory_count" == "18" && "$file_count" == "617" ]] || {
+  [[ "$directory_count" == "19" && "$file_count" == "618" ]] || {
     echo "App shape does not match its external identity receipt" >&2
     exit 66
   }
@@ -781,6 +783,7 @@ Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|5ff93aba993f74a68e3a66a2dea5515c
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$expected_deep_zip_unsigned_sha
 EOF
 }
 
@@ -792,6 +795,7 @@ verify_exact_developer_app() {
   local rel path actual_macho expected_macho entitlement_json mode expected_mode
   local actual_app_files expected_app_files actual_app_dirs expected_app_dirs
   local notice_hashes runtime_sha app_cdhash core_cdhash broker_cdhash worker_cdhash
+  local deep_zip_cdhash
   local provenance_sha third_party_notices_sha
 
   verify_post_stage_identity_receipt "$receipt" "$candidate" "$app_team"
@@ -803,6 +807,8 @@ verify_exact_developer_app() {
     Contents/MacOS/OpenOpenEffectBroker cdhash)"
   worker_cdhash="$(receipt_component_value "$receipt" \
     Contents/MacOS/OpenOpenEffectBrokerWorker cdhash)"
+  deep_zip_cdhash="$(receipt_component_value "$receipt" \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker cdhash)"
   provenance_sha="$(/usr/bin/jq -er '.source.provenanceSha256' \
     "$receipt/Contents/Resources/identity.json")"
   third_party_notices_sha="$(/usr/bin/jq -er '.source.thirdPartyNoticesSha256' \
@@ -830,6 +836,7 @@ verify_exact_developer_app() {
     Contents/Resources/Codex/0.144.0/bin/codex \
     Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host \
     Contents/Resources/Codex/0.144.0/codex-path/rg \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker \
     Contents/Resources/iMessage/0.13.0/bin/imsg | LC_ALL=C sort)"
   actual_macho="$(
     /usr/bin/find -P "$candidate" -type f -print0 \
@@ -868,6 +875,7 @@ Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|5ff93aba99
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$app_team|$deep_zip_cdhash|$expected_deep_zip_unsigned_sha
 Contents/Resources/Codex/0.144.0/bin/codex|codex|$openai_team|cf4f00c153b0ef5af3f71281d1a6c47be9c85c8e|-
 Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host|codex-code-mode-host|$openai_team|3ed966beb3746263b5d22e6ba0e81f41ace50f03|-
 Contents/Resources/Codex/0.144.0/codex-path/rg|rg|$app_team|b117313f07e30d05462b942c318b1ae0b73b4e5c|ea91b02e833a93bea206911bb80434a837d11a4d2eca520548abd07cece2c2c6
@@ -879,6 +887,7 @@ EOF
     Contents/MacOS/OpenOpenCore \
     Contents/MacOS/OpenOpenEffectBroker \
     Contents/MacOS/OpenOpenEffectBrokerWorker \
+    Contents/Resources/DeepZip/openopen-deep-zip-worker \
     Contents/Resources/Codex/0.144.0/codex-path/rg; do
     [[ "$(entitlements_json "$candidate/$rel")" == "{}" ]] || {
       echo "unexpected entitlement on exact alpha component: $rel" >&2
@@ -968,6 +977,7 @@ EOF
         Contents/MacOS/OpenOpenCore \
         Contents/MacOS/OpenOpenEffectBroker \
         Contents/MacOS/OpenOpenEffectBrokerWorker \
+        Contents/Resources/DeepZip/openopen-deep-zip-worker \
         Contents/Resources/Codex/0.144.0/bin/codex \
         Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host \
         Contents/Resources/Codex/0.144.0/codex-package.json \
@@ -1012,6 +1022,7 @@ EOF
     Contents/Resources/Codex/0.144.0 \
     Contents/Resources/Codex/0.144.0/bin \
     Contents/Resources/Codex/0.144.0/codex-path \
+    Contents/Resources/DeepZip \
     Contents/Resources/Notices \
     Contents/Resources/Notices/third_party \
     Contents/Resources/Notices/third_party/texts \

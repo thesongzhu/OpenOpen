@@ -204,6 +204,7 @@ normalize_app_modes() {
     "$candidate/Contents/MacOS/OpenOpenCore" \
     "$candidate/Contents/MacOS/OpenOpenEffectBroker" \
     "$candidate/Contents/MacOS/OpenOpenEffectBrokerWorker" \
+    "$candidate/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
     "$candidate/Contents/Resources/Codex/0.144.0/bin/codex" \
     "$candidate/Contents/Resources/Codex/0.144.0/bin/codex-code-mode-host" \
     "$candidate/Contents/Resources/Codex/0.144.0/codex-path/rg" \
@@ -610,6 +611,7 @@ readonly expected_core_unsigned_sha="18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0
 readonly expected_broker_unsigned_before_sha="e4d01892570bd48b7d34d5d206defae9c05fb1dba85fa6cd0e226d6291b3b4ad"
 readonly expected_broker_unsigned_sha="3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78"
 readonly expected_worker_unsigned_sha="f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab"
+readonly expected_deep_zip_unsigned_sha="aafaa597bb3c23e107a999fe4ff6af56ad314ae5b6d2378779991a98e72117aa"
 verify_sha "$expected_imsg_receipt_sha" "$imsg_receipt"
 imsg_receipt_sha="$expected_imsg_receipt_sha"
 receipt_value() {
@@ -750,7 +752,8 @@ prebuild_source_snapshot="$staging/prebuild-source-snapshot.tsv"
 write_source_snapshot_manifest "$repo_root" "$prebuild_source_snapshot"
 
 cd "$repo_root"
-cargo build --release -p openopen-host -p openopen-effect-broker
+cargo build --release -p openopen-host -p openopen-effect-broker \
+  -p openopen-deep-zip-worker
 swift build \
   --package-path macos/EffectBrokerBridge \
   --product OpenOpen \
@@ -766,6 +769,7 @@ app="$staging/OpenOpen.app"
 mkdir -p \
   "$app/Contents/MacOS" \
   "$app/Contents/Resources/Codex/0.144.0" \
+  "$app/Contents/Resources/DeepZip" \
   "$app/Contents/Resources/iMessage/0.13.0/bin" \
   "$app/Contents/Resources/Notices" \
   "$app/Contents/Library/LaunchDaemons"
@@ -776,6 +780,9 @@ mkdir -p \
 /usr/bin/ditto \
   target/release/OpenOpenEffectBrokerWorker \
   "$app/Contents/MacOS/OpenOpenEffectBrokerWorker"
+/usr/bin/ditto \
+  target/release/openopen-deep-zip-worker \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker"
 /usr/bin/ditto \
   macos/EffectBrokerBridge/Sources/EffectBrokerBridge/Resources/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist \
   "$app/Contents/Library/LaunchDaemons/com.thesongzhu.OpenOpen.EffectBroker.plist"
@@ -846,6 +853,10 @@ sign_owned_code \
   com.thesongzhu.OpenOpen.imsg \
   "$imsg_entitlements" \
   "$expected_imsg_unsigned_sha"
+sign_owned_code \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
+  com.thesongzhu.OpenOpen.DeepZipWorker "" \
+  "$expected_deep_zip_unsigned_sha"
 imsg_signed_sha="$(/usr/bin/shasum -a 256 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" | /usr/bin/awk '{print $1}')"
 imsg_cdhash="$(/usr/bin/codesign -d --verbose=4 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>&1 | /usr/bin/awk -F= '$1 == "CDHash" {print $2}')"
 imsg_team="$(/usr/bin/codesign -d --verbose=4 "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>&1 | /usr/bin/awk -F= '$1 == "TeamIdentifier" {print $2}')"
@@ -910,6 +921,9 @@ verify_signing_field "$app/Contents/MacOS/OpenOpenEffectBrokerWorker" Identifier
   com.thesongzhu.OpenOpen.EffectBroker.Worker
 verify_signing_field "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" Identifier \
   com.thesongzhu.OpenOpen.imsg
+verify_signing_field \
+  "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" Identifier \
+  com.thesongzhu.OpenOpen.DeepZipWorker
 imsg_automation="$({ /usr/bin/codesign -d --entitlements :- \
   "$app/Contents/Resources/iMessage/0.13.0/bin/imsg" 2>/dev/null || true; } \
   | /usr/bin/plutil -extract 'com\.apple\.security\.automation\.apple-events' raw - \
@@ -928,6 +942,7 @@ if [[ "$signing_mode" == "developer-id" ]]; then
     "$app/Contents/MacOS/OpenOpenCore" \
     "$app/Contents/MacOS/OpenOpenEffectBroker" \
     "$app/Contents/MacOS/OpenOpenEffectBrokerWorker" \
+    "$app/Contents/Resources/DeepZip/openopen-deep-zip-worker" \
     "$app/Contents/Resources/iMessage/0.13.0/bin/imsg"; do
     verify_signing_field "$owned" TeamIdentifier "$imsg_team"
     verify_hardened_timestamped "$owned"
@@ -978,6 +993,9 @@ verify_signing_field "$output/Contents/MacOS/OpenOpenEffectBrokerWorker" Identif
   com.thesongzhu.OpenOpen.EffectBroker.Worker
 verify_signing_field "$output/Contents/Resources/iMessage/0.13.0/bin/imsg" Identifier \
   com.thesongzhu.OpenOpen.imsg
+verify_signing_field \
+  "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker" Identifier \
+  com.thesongzhu.OpenOpen.DeepZipWorker
 verify_sha "$imsg_receipt_sha" "$output/Contents/Resources/iMessage/0.13.0/BUILD-RECEIPT.json"
 verify_sha "$imsg_signed_sha" "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
 /usr/bin/jq -e --arg build "$imsg_receipt_sha" --arg binary "$imsg_signed_sha" \
@@ -999,12 +1017,16 @@ if [[ "$signing_mode" == "developer-id" ]]; then
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenCore"
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenEffectBroker"
   verify_owner_certificate "$output/Contents/MacOS/OpenOpenEffectBrokerWorker"
+  verify_owner_certificate \
+    "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker"
   verify_owner_certificate "$output/Contents/Resources/Codex/0.144.0/codex-path/rg"
   verify_owner_certificate "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
   verify_unsigned_macho_sha "$expected_app_unsigned_sha" "$output/Contents/MacOS/OpenOpen"
   verify_unsigned_macho_sha "$expected_core_unsigned_sha" "$output/Contents/MacOS/OpenOpenCore"
   verify_unsigned_macho_sha "$expected_broker_unsigned_sha" "$output/Contents/MacOS/OpenOpenEffectBroker"
   verify_unsigned_macho_sha "$expected_worker_unsigned_sha" "$output/Contents/MacOS/OpenOpenEffectBrokerWorker"
+  verify_unsigned_macho_sha "$expected_deep_zip_unsigned_sha" \
+    "$output/Contents/Resources/DeepZip/openopen-deep-zip-worker"
   verify_unsigned_macho_sha "$expected_rg_unsigned_sha" "$output/Contents/Resources/Codex/0.144.0/codex-path/rg"
   verify_unsigned_macho_sha "$expected_imsg_unsigned_sha" "$output/Contents/Resources/iMessage/0.13.0/bin/imsg"
   /usr/bin/jq -e \
@@ -1040,7 +1062,7 @@ if [[ "$signing_mode" == "developer-id" ]]; then
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
   app_file_count="$(/usr/bin/find -P "$output" -type f -print \
     | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "$app_directory_count" == "18" && "$app_file_count" == "617" ]] || {
+  [[ "$app_directory_count" == "19" && "$app_file_count" == "618" ]] || {
     echo "post-stage App shape changed before identity receipt" >&2
     exit 66
   }
@@ -1092,6 +1114,7 @@ Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$expected_app_unsigned_sha
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$expected_core_unsigned_sha
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$expected_broker_unsigned_sha
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$expected_worker_unsigned_sha
+Contents/Resources/DeepZip/openopen-deep-zip-worker|com.thesongzhu.OpenOpen.DeepZipWorker|$expected_deep_zip_unsigned_sha
 EOF
 
   source_head="$(git rev-parse HEAD)"
@@ -1171,7 +1194,7 @@ EOF
     '.schemaVersion == 2
       and .receiptKind == "com.thesongzhu.OpenOpen.post-stage-identity"
       and .app.manifestSha256 == $manifest_sha
-      and (.app.components | length) == 4' "$identity_json" >/dev/null
+      and (.app.components | length) == 5' "$identity_json" >/dev/null
 
   claimed_receipt=1
   /usr/bin/ditto "$receipt_staging" "$identity_receipt_output"
