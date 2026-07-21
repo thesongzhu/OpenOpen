@@ -1491,6 +1491,24 @@ impl Host {
         let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
             return;
         };
+        let selection = self.store.selected_model_selection();
+        let current_model = selection
+            .map_err(HostCallError::Store)
+            .and_then(|selection| selection.ok_or(HostCallError::Internal))
+            .and_then(|selection| {
+                self.operations.reconcile_active_model_selection(
+                    &operation,
+                    &selection,
+                    params.authorization.revision,
+                    now_ms()?,
+                    || Ok(()),
+                )
+            });
+        if let Err(error) = current_model {
+            self.finish_operation(&operation);
+            let _ = responses.send(call_failure(request.id, &error));
+            return;
+        }
         let context = self.background_context(params.proof());
         let responses = responses.clone();
         let request_id = request.id;
@@ -6293,6 +6311,18 @@ impl BackgroundContext {
             .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
         let store =
             Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+        if let Some(state) = store.b2_memory_demo_state()?
+            && let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.request_id == consent.request_id)
+                .cloned()
+        {
+            return (receipt.command_digest == serialized_sha256(consent)?
+                && receipt.stage == openopen_protocol::B2MemoryDemoStage::Candidates)
+                .then_some((state, receipt))
+                .ok_or(StoreError::B2MemoryDemoConflict.into());
+        }
         let record = store
             .b2_memory_prepared_source()?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
@@ -9654,7 +9684,7 @@ fn pin_b2_memory_source(
         return Err(HostCallError::Internal);
     }
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1_024];
+    let mut buffer = vec![0_u8; 64 * 1_024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -9808,7 +9838,7 @@ mod tests {
         boot_scoped_monotonic_ms, channel_outcome_request, decode_params,
         initial_choice_result_from_generation, is_lower_sha256, mission_command_batch,
         model_selection_status, new_choice_begin_state, new_choice_begin_state_for_source,
-        read_bootstrap, render_choice_imessage_reply,
+        pin_b2_memory_source, read_bootstrap, render_choice_imessage_reply,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use openopen_codex_client::{StructuredChoiceGeneration, StructuredChoiceOption};
@@ -9875,6 +9905,22 @@ mod tests {
         openopen_persona::PersonaBundle::embedded_default(1)
             .unwrap()
             .revision_ref
+    }
+
+    #[test]
+    fn b2_source_pin_accepts_regular_file_and_rejects_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("synthetic.zip");
+        std::fs::write(&source, b"synthetic archive bytes").unwrap();
+        let record = pin_b2_memory_source(&source, "b2-source-request", 1).unwrap();
+        assert_eq!(record.source.byte_length, 23);
+        assert!(record.device_id > 0);
+        assert!(record.inode > 0);
+        assert_eq!(record.selected_path, source);
+
+        let link = root.path().join("linked.zip");
+        std::os::unix::fs::symlink(&record.selected_path, &link).unwrap();
+        assert!(pin_b2_memory_source(&link, "b2-linked-request", 2).is_err());
     }
 
     #[test]

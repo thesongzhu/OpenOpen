@@ -78,6 +78,7 @@ const B2_MEMORY_DEMO_ACTION: &str = "memory.demo_state_changed";
 const B2_MEMORY_DEMO_ENTITY: &str = "b2-demo-memory";
 const B2_MEMORY_SOURCE_ACTION: &str = "memory.source_prepared";
 const B2_MEMORY_SOURCE_ENTITY: &str = "b2-demo-memory-source";
+const B2_MEMORY_SOURCE_RETIRED_ACTION: &str = "memory.source_retired";
 /// The App contract accepts a bounded current incident projection. The full
 /// verified/audited history remains durable in the Store; this limit only
 /// bounds one UI/RPC response.
@@ -257,6 +258,11 @@ CREATE TABLE IF NOT EXISTS b2_memory_prepared_source (
  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), request_id TEXT NOT NULL UNIQUE,
  source_identity_digest TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
  blob_hash TEXT NOT NULL, prepared_at_ms INTEGER NOT NULL CHECK (prepared_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS b2_memory_source_tombstone (
+ singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1), request_id TEXT NOT NULL UNIQUE,
+ source_identity_digest TEXT NOT NULL UNIQUE, encrypted_blob BLOB NOT NULL,
+ blob_hash TEXT NOT NULL, retired_at_ms INTEGER NOT NULL CHECK (retired_at_ms >= 0)
 );
 CREATE TABLE IF NOT EXISTS audit_ledger (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, audit_id TEXT NOT NULL UNIQUE,
@@ -496,14 +502,15 @@ mod b2_memory_demo_tests {
                 source_binding_digest: "e".repeat(64),
             },
         ];
+        let consent = B2MemoryProcessingConsent {
+            request_id: "b2-process".to_owned(),
+            expected_revision: prepared.revision,
+            source_identity_digest: source_record.source.source_identity_digest.clone(),
+            explicitly_confirmed: true,
+        };
         let candidates = store
             .commit_b2_memory_candidates(
-                &B2MemoryProcessingConsent {
-                    request_id: "b2-process".to_owned(),
-                    expected_revision: prepared.revision,
-                    source_identity_digest: source_record.source.source_identity_digest.clone(),
-                    explicitly_confirmed: true,
-                },
+                &consent,
                 &seal,
                 &cards,
                 &authorization,
@@ -512,6 +519,42 @@ mod b2_memory_demo_tests {
             )
             .expect("private candidate result");
         assert_eq!(candidates.0.candidates.len(), 2);
+        assert!(store.b2_memory_prepared_source().unwrap().is_none());
+        assert_eq!(
+            store
+                .commit_b2_memory_candidates(
+                    &consent,
+                    &seal,
+                    &cards,
+                    &authorization,
+                    &broker_receipt,
+                    21,
+                )
+                .unwrap(),
+            candidates
+        );
+        let mut changed_consent = consent.clone();
+        changed_consent.source_identity_digest = "f".repeat(64);
+        assert!(matches!(
+            store.commit_b2_memory_candidates(
+                &changed_consent,
+                &seal,
+                &cards,
+                &authorization,
+                &broker_receipt,
+                21,
+            ),
+            Err(StoreError::B2MemoryDemoConflict)
+        ));
+        let tombstone_blob: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_blob FROM b2_memory_source_tombstone WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&tombstone_blob).contains("synthetic-chatgpt.zip"));
 
         let mut select = command(
             "b2-select",
@@ -654,6 +697,25 @@ impl B2MemoryPreparedSourceRecord {
             && self.modified_at_ns >= 0
             && is_sha256_hex(&self.source_digest)
             && self.prepared_at_ms >= 0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct B2MemorySourceTombstone {
+    source: B2MemoryPreparedSource,
+    source_digest: String,
+    processing_request_id: String,
+    retired_at_ms: i64,
+}
+
+impl B2MemorySourceTombstone {
+    fn is_valid(&self) -> bool {
+        self.source.is_valid()
+            && is_sha256_hex(&self.source_digest)
+            && !self.processing_request_id.is_empty()
+            && self.processing_request_id.len() <= 256
+            && self.retired_at_ms >= 0
     }
 }
 
@@ -1941,6 +2003,11 @@ impl Store {
 
     /// Returns the verified Store-private source record for the Host worker.
     /// The selected path never crosses the public RPC boundary after prepare.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the audit chain, encrypted record, or indexed
+    /// descriptor identity is malformed or has been changed.
     pub fn b2_memory_prepared_source(
         &self,
     ) -> Result<Option<B2MemoryPreparedSourceRecord>, StoreError> {
@@ -1951,6 +2018,11 @@ impl Store {
     /// Atomically persists one descriptor-pinned source without reading or
     /// processing archive members. Exact replay returns the existing state;
     /// a changed replay or a second source fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity, protected-runtime drift,
+    /// changed replay, failed encryption, or failed atomic persistence.
     pub fn prepare_b2_memory_source(
         &mut self,
         record: &B2MemoryPreparedSourceRecord,
@@ -2186,6 +2258,12 @@ impl Store {
 
     /// Private Host result commit for one explicitly-consented, descriptor-
     /// pinned scan. The caller cannot provide candidates through public RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale consent, source/model drift, changed replay,
+    /// invalid candidates, protected Off, or failed atomic persistence.
+    #[allow(clippy::too_many_lines)] // One transaction keeps validation, commit, retirement, and audit atomic.
     pub fn commit_b2_memory_candidates(
         &mut self,
         consent: &B2MemoryProcessingConsent,
@@ -2224,6 +2302,21 @@ impl Store {
         verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
         let mut state = load_b2_memory_demo_state(&transaction, &self.authority)?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
+        let command_digest = sha256_json(consent)?;
+        if let Some(receipt) = state
+            .receipts
+            .iter()
+            .find(|receipt| receipt.request_id == consent.request_id)
+            .cloned()
+        {
+            return (receipt.command_digest == command_digest
+                && receipt.stage == B2MemoryDemoStage::Candidates
+                && state.stage == B2MemoryDemoStage::Candidates
+                && state.seal.as_ref() == Some(seal)
+                && state.candidates == candidates)
+                .then_some((state, receipt))
+                .ok_or(StoreError::B2MemoryDemoConflict);
+        }
         let source = load_b2_memory_prepared_source(&transaction, &self.authority)?
             .ok_or(StoreError::B2MemoryDemoConflict)?;
         if source.source.source_identity_digest != consent.source_identity_digest
@@ -2236,22 +2329,6 @@ impl Store {
             .ok_or(StoreError::ChoiceModelSelectionConflict)?;
         if !model_provenance_matches_selection(&seal.model_provenance, &selection) {
             return Err(StoreError::ChoiceModelSelectionConflict);
-        }
-        let command_digest = sha256_json(&json!({
-            "consent": consent,
-            "seal": seal,
-            "candidates": candidates,
-        }))?;
-        if let Some(receipt) = state
-            .receipts
-            .iter()
-            .find(|receipt| receipt.request_id == consent.request_id)
-            .cloned()
-        {
-            return (receipt.command_digest == command_digest
-                && state.stage == B2MemoryDemoStage::Candidates)
-                .then_some((state, receipt))
-                .ok_or(StoreError::B2MemoryDemoConflict);
         }
         if state.stage == B2MemoryDemoStage::Candidates
             && state.seal.as_ref() == Some(seal)
@@ -2289,6 +2366,20 @@ impl Store {
             &consent.request_id,
             &command_digest,
             completed_at_ms,
+        )?;
+        persist_b2_memory_source_tombstone(
+            &transaction,
+            &self.authority,
+            &B2MemorySourceTombstone {
+                source: source.source,
+                source_digest: source.source_digest,
+                processing_request_id: consent.request_id.clone(),
+                retired_at_ms: completed_at_ms,
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM b2_memory_prepared_source WHERE singleton_id = 1",
+            [],
         )?;
         transaction.commit()?;
         Ok((state, receipt))
@@ -9339,6 +9430,7 @@ fn verify_all_bindings(
     let _ = load_choice_model_selection(connection, authority)?;
     let _ = load_c2_skill_demo_state(connection, authority)?;
     let _ = load_b2_memory_prepared_source(connection, authority)?;
+    let _ = load_b2_memory_source_tombstone(connection, authority)?;
     let _ = load_b2_memory_demo_state(connection, authority)?;
     let choice_snapshot = load_choice_loop_snapshot(connection, authority)?;
     verify_choice_private_bindings(connection, authority, choice_snapshot.as_ref())?;
@@ -9755,6 +9847,104 @@ fn persist_b2_memory_prepared_source(
     Ok(())
 }
 
+fn b2_memory_source_tombstone_aad(identity_digest: &str) -> String {
+    format!("memory:source-tombstone:{identity_digest}")
+}
+
+fn load_b2_memory_source_tombstone(
+    connection: &Connection,
+    authority: &LocalAuthority,
+) -> Result<Option<B2MemorySourceTombstone>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT request_id, source_identity_digest, encrypted_blob, blob_hash, retired_at_ms
+             FROM b2_memory_source_tombstone WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((request_id, identity_digest, blob, expected_hash, retired_at_ms)) = row else {
+        return Ok(None);
+    };
+    if blob_hash(&blob) != expected_hash {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    verify_blob_binding(
+        connection,
+        B2_MEMORY_SOURCE_RETIRED_ACTION,
+        B2_MEMORY_SOURCE_ENTITY,
+        "memory:source_tombstone",
+        &blob,
+    )?;
+    let tombstone: B2MemorySourceTombstone = authority.decrypt_json(
+        &blob,
+        b2_memory_source_tombstone_aad(&identity_digest).as_bytes(),
+    )?;
+    if !tombstone.is_valid()
+        || tombstone.source.request_id != request_id
+        || tombstone.source.source_identity_digest != identity_digest
+        || tombstone.retired_at_ms != retired_at_ms
+    {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    Ok(Some(tombstone))
+}
+
+fn persist_b2_memory_source_tombstone(
+    transaction: &Transaction<'_>,
+    authority: &LocalAuthority,
+    tombstone: &B2MemorySourceTombstone,
+) -> Result<(), StoreError> {
+    if !tombstone.is_valid() {
+        return Err(StoreError::B2MemoryDemoConflict);
+    }
+    let blob = authority.encrypt_json(
+        tombstone,
+        b2_memory_source_tombstone_aad(&tombstone.source.source_identity_digest).as_bytes(),
+    )?;
+    let state_hash = blob_hash(&blob);
+    transaction.execute(
+        "INSERT INTO b2_memory_source_tombstone
+            (singleton_id, request_id, source_identity_digest, encrypted_blob, blob_hash,
+             retired_at_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            tombstone.source.request_id,
+            tombstone.source.source_identity_digest,
+            blob,
+            state_hash,
+            tombstone.retired_at_ms,
+        ],
+    )?;
+    append_audit(
+        transaction,
+        authority,
+        &AuditRecord {
+            id: &format!(
+                "b2-memory-source-retired-{}",
+                tombstone.processing_request_id
+            ),
+            command_id: &tombstone.processing_request_id,
+            command_hash: &tombstone.source.source_identity_digest,
+            actor: "openopen-host",
+            action: B2_MEMORY_SOURCE_RETIRED_ACTION,
+            entity_id: B2_MEMORY_SOURCE_ENTITY,
+            created_at_ms: tombstone.retired_at_ms,
+            state_kind: "memory:source_tombstone",
+            state_hash: &state_hash,
+        },
+    )?;
+    Ok(())
+}
+
 fn persist_b2_memory_demo_state(
     transaction: &Transaction<'_>,
     authority: &LocalAuthority,
@@ -10125,6 +10315,7 @@ fn verify_audited_state_entities_exist(
     verify_audited_entities_exist(connection, CHOICE_IDLE_CLOCK_ACTION)?;
     verify_audited_entities_exist(connection, C2_SKILL_DEMO_ACTION)?;
     verify_audited_entities_exist(connection, B2_MEMORY_SOURCE_ACTION)?;
+    verify_audited_entities_exist(connection, B2_MEMORY_SOURCE_RETIRED_ACTION)?;
     verify_audited_entities_exist(connection, B2_MEMORY_DEMO_ACTION)?;
     if connection
         .query_row(
@@ -10632,6 +10823,7 @@ fn verify_channel_bindings(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Central action-to-authoritative-row mapping is intentionally auditable.
 fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Result<(), StoreError> {
     let lookup = match action {
         MISSION_COMMAND_ACTION => "SELECT 1 FROM mission_state WHERE mission_id = ?1",
@@ -10705,7 +10897,12 @@ fn verify_audited_entities_exist(connection: &Connection, action: &str) -> Resul
              WHERE singleton_id = 1 AND ?1 = 'b2-demo-memory'"
         }
         B2_MEMORY_SOURCE_ACTION => {
-            "SELECT 1 FROM b2_memory_prepared_source
+            "SELECT 1 WHERE ?1 = 'b2-demo-memory-source' AND
+             (EXISTS(SELECT 1 FROM b2_memory_prepared_source WHERE singleton_id = 1)
+              OR EXISTS(SELECT 1 FROM b2_memory_source_tombstone WHERE singleton_id = 1))"
+        }
+        B2_MEMORY_SOURCE_RETIRED_ACTION => {
+            "SELECT 1 FROM b2_memory_source_tombstone
              WHERE singleton_id = 1 AND ?1 = 'b2-demo-memory-source'"
         }
         CHANNEL_ROUTE_SET_ACTION => "SELECT 1 FROM channel_route_set WHERE mission_id = ?1",

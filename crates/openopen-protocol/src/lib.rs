@@ -2995,7 +2995,7 @@ impl B2MemoryPrepareSourceRequest {
     pub fn is_valid(&self) -> bool {
         bounded_identifier(&self.request_id)
             && !self.selected_path.is_empty()
-            && self.selected_path.as_bytes().len() <= 4_096
+            && self.selected_path.len() <= 4_096
             && self.selected_path.starts_with('/')
             && !self
                 .selected_path
