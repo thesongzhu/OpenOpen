@@ -2,12 +2,14 @@
 members = [
     "crates/openopen-codex-client",
     "crates/openopen-core",
+    "crates/openopen-deep-zip-worker",
     "crates/openopen-discord-adapter",
     "crates/openopen-effect-broker",
     "crates/openopen-host",
     "crates/openopen-imsg-adapter",
     "crates/openopen-persona",
     "crates/openopen-protocol",
+    "crates/openopen-skill-lifecycle",
 ]
 resolver = "2"
 

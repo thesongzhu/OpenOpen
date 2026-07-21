@@ -1,0 +1,30 @@
+[package]
+name = "openopen-skill-lifecycle"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/thesongzhu/OpenOpen"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+hex = "0.4.3"
+percent-encoding = "2.3.2"
+serde = { version = "=1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+sha1 = "=0.11.0"
+thiserror = "2.0.18"
+unicode-normalization = "0.1.24"
+ureq = { version = "=3.3.0", default-features = false, features = ["json", "rustls"] }
+url = "2.5.7"
+
+[dev-dependencies]
+serde_json = "=1.0.149"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
