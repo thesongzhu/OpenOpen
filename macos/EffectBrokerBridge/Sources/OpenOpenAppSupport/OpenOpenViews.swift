@@ -95,7 +95,7 @@ public struct OpenOpenRootView: View {
     case .memory:
       EditorialMemoryView()
     case .skills:
-      EditorialSkillsView()
+      EditorialSkillsView(model: model)
     }
   }
 }
@@ -468,6 +468,7 @@ private struct EditorialMemoryView: View {
 }
 
 private struct EditorialSkillsView: View {
+  @ObservedObject var model: AppModel
   private let boundaries = [
     (
       "Acquire for review",
@@ -506,14 +507,74 @@ private struct EditorialSkillsView: View {
             "Executable files and external-effect Skills are not eligible for this instruction-only setup.",
           actionTitle: "Find a Skill",
           accessibilityIdentifier: "openopen-skills-find",
-          boundaries: boundaries
+          boundaries: boundaries,
+          action: { model.requestNextC2SkillDemoAction() },
+          enabled: model.storeControlEnabled && !model.isBusy
         )
+        if let feedback = model.c2SkillDemoFeedback {
+          Text(feedback)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("openopen-skills-feedback")
+        }
+        if !model.c2SkillDemoRequestIds.isEmpty {
+          Text(model.c2SkillDemoRequestIds.joined(separator: " · "))
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("openopen-skills-receipt-identities")
+        }
       }
       .padding(30)
       .frame(maxWidth: 760, alignment: .leading)
     }
     .background(EditorialPalette.background)
     .accessibilityIdentifier("openopen-editorial-skills")
+    .alert(
+      skillConfirmationTitle,
+      isPresented: Binding(
+        get: { model.c2SkillDemoPendingAction != nil },
+        set: { if !$0 { model.cancelC2SkillDemoAction() } })
+    ) {
+      Button("Cancel", role: .cancel) { model.cancelC2SkillDemoAction() }
+      Button(skillConfirmationAction) {
+        Task { await model.confirmC2SkillDemoAction() }
+      }
+    } message: {
+      Text(skillConfirmationDetail)
+    }
+  }
+
+  private var skillConfirmationTitle: String {
+    switch model.c2SkillDemoPendingAction {
+    case .registerCandidate: "Download this public Skill for review?"
+    case .stageReviewed: "Reviewing the staged Skill"
+    case .enableRunnable: "Enable Decision brief?"
+    case .recordFirstNoEffectUse: "Try without external effects"
+    case nil: "No skills"
+    }
+  }
+
+  private var skillConfirmationAction: String {
+    switch model.c2SkillDemoPendingAction {
+    case .registerCandidate: "Acquire"
+    case .stageReviewed: "Audit"
+    case .enableRunnable: "Enable"
+    case .recordFirstNoEffectUse: "Use Skill"
+    case nil: "Cancel"
+    }
+  }
+
+  private var skillConfirmationDetail: String {
+    switch model.c2SkillDemoPendingAction {
+    case .registerCandidate: "Acquisition does not enable it. The staged copy remains inactive."
+    case .stageReviewed:
+      "Checking instructions, files, network use, credentials, and external effects."
+    case .enableRunnable:
+      "Only the reviewed instruction text will be promoted. No script or external effect is allowed."
+    case .recordFirstNoEffectUse:
+      "Ask a question that only needs reasoning and a written recommendation."
+    case nil: "Skills can shape how OpenOpen works without gaining hidden permission."
+    }
   }
 }
 
@@ -523,6 +584,8 @@ private struct EditorialBoundaryCard: View {
   let actionTitle: String
   let accessibilityIdentifier: String
   let boundaries: [(String, String)]
+  var action: () -> Void = {}
+  var enabled = false
 
   var body: some View {
     EditorialCard(title: title, symbol: "lock.shield") {
@@ -542,9 +605,9 @@ private struct EditorialBoundaryCard: View {
           }
         }
       }
-      Button(actionTitle) {}
+      Button(actionTitle, action: action)
         .buttonStyle(.borderedProminent)
-        .disabled(true)
+        .disabled(!enabled)
         .accessibilityIdentifier(accessibilityIdentifier)
     }
   }

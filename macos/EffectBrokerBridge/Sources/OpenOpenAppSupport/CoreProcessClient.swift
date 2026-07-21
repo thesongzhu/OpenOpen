@@ -608,6 +608,20 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
     try await call(method: "models.selection.read", parameters: RuntimeProofParameters(proof))
   }
 
+  public func c2SkillDemo(proof: BrokerRuntimeState) async throws -> C2SkillDemoState? {
+    let view: C2SkillDemoView = try await call(
+      method: "skill.demo.read", parameters: RuntimeProofParameters(proof))
+    return view.state
+  }
+
+  public func applyC2SkillDemo(
+    _ command: C2SkillDemoCommand, proof: BrokerRuntimeState
+  ) async throws -> ApplyC2SkillDemoResponse {
+    try await call(
+      method: "skill.demo.command",
+      parameters: ApplyC2SkillDemoParameters(command: command, proof: proof))
+  }
+
   public func personaStatus() async throws -> PersonaStatusView? {
     let response: PersonaStatusView = try await call(
       method: "persona.status", parameters: EmptyParameters())

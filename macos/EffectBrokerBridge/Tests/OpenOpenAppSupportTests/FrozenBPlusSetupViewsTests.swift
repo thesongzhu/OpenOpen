@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 
+@testable import OpenOpenAppSupport
+
 private func openOpenViewsSource() throws -> String {
   let sourceURL = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent()
@@ -39,7 +41,7 @@ func frozenMemorySetupShowsExactBoundariesWithoutImportAuthority() throws {
 }
 
 @Test
-func frozenSkillSetupShowsExactBoundariesWithoutLifecycleAuthority() throws {
+func frozenSkillSetupUsesOnlyTheTypedLifecycleAuthority() throws {
   let source = try openOpenViewsSource()
   let skills = try sourceSlice(
     source,
@@ -57,12 +59,13 @@ func frozenSkillSetupShowsExactBoundariesWithoutLifecycleAuthority() throws {
   #expect(skills.contains("Try without external effects"))
   #expect(skills.contains("openopen-skills-find"))
   #expect(!skills.contains("URLSession"))
-  #expect(!skills.contains("Task {"))
-  #expect(!skills.contains("model."))
+  #expect(skills.contains("model.requestNextC2SkillDemoAction()"))
+  #expect(skills.contains("model.confirmC2SkillDemoAction()"))
+  #expect(skills.contains("openopen-skills-receipt-identities"))
 }
 
 @Test
-func frozenSetupActionsRemainDisabledUntilTypedHostStateExists() throws {
+func frozenSetupActionsRequireTypedHostState() throws {
   let source = try openOpenViewsSource()
   let boundary = try sourceSlice(
     source,
@@ -70,7 +73,41 @@ func frozenSetupActionsRemainDisabledUntilTypedHostStateExists() throws {
     to: "private struct EditorialPageHeader: View"
   )
 
-  #expect(boundary.contains("Button(actionTitle) {}"))
-  #expect(boundary.contains(".disabled(true)"))
+  #expect(boundary.contains("Button(actionTitle, action: action)"))
+  #expect(boundary.contains(".disabled(!enabled)"))
   #expect(!source.contains("EditorialUnavailableView"))
+}
+
+@Test
+func c2SkillContractsRejectExecutableOrUnsealedAuthority() {
+  let valid = C2SkillDemoSeal(
+    packageId: "decision-brief",
+    sourceUrl:
+      "https://github.com/example/skills/tree/0123456789abcdef0123456789abcdef01234567/decision-brief",
+    commit: "0123456789abcdef0123456789abcdef01234567",
+    packageDigest: String(repeating: "a", count: 64),
+    auditAnchor: String(repeating: "b", count: 64),
+    permissionDigest: C2SkillDemoSeal.instructionOnlyPermissionDigest,
+    license: "MIT")
+  #expect(valid.isValid)
+  #expect(
+    !C2SkillDemoSeal(
+      packageId: valid.packageId, sourceUrl: valid.sourceUrl, commit: valid.commit,
+      packageDigest: valid.packageDigest, auditAnchor: valid.auditAnchor,
+      permissionDigest: String(repeating: "c", count: 64), license: valid.license
+    ).isValid)
+
+  let command = C2SkillDemoCommand(
+    requestId: "skill-request", expectedRevision: 0, kind: .registerCandidate, seal: valid,
+    actorId: "owner", decisionId: "decision-skill-request",
+    approvalNonce: String(repeating: "d", count: 64), resultDigest: nil,
+    explicitlyConfirmed: true, decidedAtMs: 0)
+  #expect(command.isValid)
+  #expect(
+    !C2SkillDemoCommand(
+      requestId: command.requestId, expectedRevision: 0, kind: .recordFirstNoEffectUse,
+      seal: valid, actorId: command.actorId, decisionId: command.decisionId,
+      approvalNonce: command.approvalNonce, resultDigest: nil, explicitlyConfirmed: true,
+      decidedAtMs: 0
+    ).isValid)
 }

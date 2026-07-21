@@ -92,6 +92,118 @@ public struct RuntimeProofParameters: Codable, Sendable {
   }
 }
 
+public enum C2SkillDemoStage: String, Codable, CaseIterable, Equatable, Sendable {
+  case candidate
+  case staged
+  case runnable
+  case used
+}
+
+public enum C2SkillDemoCommandKind: String, Codable, Equatable, Sendable {
+  case registerCandidate
+  case stageReviewed
+  case enableRunnable
+  case recordFirstNoEffectUse
+}
+
+public struct C2SkillDemoSeal: Codable, Equatable, Sendable {
+  public static let instructionOnlyPermissionDigest =
+    "3cb2dbae054a787c18b5ba9a60ab0e4541fbe6f9c4c165e9de77f84a7363c298"
+
+  public let packageId: String
+  public let sourceUrl: String
+  public let commit: String
+  public let packageDigest: String
+  public let auditAnchor: String
+  public let permissionDigest: String
+  public let license: String
+
+  public var isValid: Bool {
+    Self.validIdentifier(packageId)
+      && sourceUrl.hasPrefix("https://github.com/")
+      && sourceUrl.utf8.count <= 512
+      && !sourceUrl.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+      && Self.lowerHex(commit, count: 40)
+      && Self.lowerHex(packageDigest, count: 64)
+      && Self.lowerHex(auditAnchor, count: 64)
+      && permissionDigest == Self.instructionOnlyPermissionDigest
+      && (license == "MIT" || license == "Apache-2.0")
+  }
+
+  private static func validIdentifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 256
+      && value.utf8.allSatisfy { byte in
+        (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+          || byte == 45 || byte == 46 || byte == 95
+      }
+  }
+
+  public static func lowerHex(_ value: String, count: Int) -> Bool {
+    value.utf8.count == count
+      && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+  }
+}
+
+public struct C2SkillDemoCommand: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let expectedRevision: UInt64
+  public let kind: C2SkillDemoCommandKind
+  public let seal: C2SkillDemoSeal
+  public let actorId: String
+  public let decisionId: String
+  public let approvalNonce: String
+  public let resultDigest: String?
+  public let explicitlyConfirmed: Bool
+  public let decidedAtMs: Int64
+
+  public var isValid: Bool {
+    seal.isValid && C2SkillDemoSeal.lowerHex(approvalNonce, count: 64)
+      && explicitlyConfirmed && decidedAtMs >= 0
+      && (kind == .recordFirstNoEffectUse
+        ? resultDigest.map { C2SkillDemoSeal.lowerHex($0, count: 64) } == true
+        : resultDigest == nil)
+  }
+}
+
+public struct C2SkillDemoReceipt: Codable, Equatable, Identifiable, Sendable {
+  public var id: String { requestId }
+  public let requestId: String
+  public let commandDigest: String
+  public let revision: UInt64
+  public let stage: C2SkillDemoStage
+  public let receiptDigest: String
+}
+
+public struct C2SkillDemoState: Codable, Equatable, Sendable {
+  public let revision: UInt64
+  public let stage: C2SkillDemoStage
+  public let seal: C2SkillDemoSeal
+  public let consumedNonces: [String]
+  public let receipts: [C2SkillDemoReceipt]
+  public let firstUseResultDigest: String?
+}
+
+public struct C2SkillDemoView: Codable, Equatable, Sendable {
+  public let state: C2SkillDemoState?
+}
+
+public struct ApplyC2SkillDemoParameters: Codable, Sendable {
+  public let command: C2SkillDemoCommand
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(command: C2SkillDemoCommand, proof: BrokerRuntimeState) {
+    self.command = command
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ApplyC2SkillDemoResponse: Codable, Equatable, Sendable {
+  public let state: C2SkillDemoState
+  public let receipt: C2SkillDemoReceipt
+}
+
 public enum ChannelKind: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
   case iMessage
   case discord

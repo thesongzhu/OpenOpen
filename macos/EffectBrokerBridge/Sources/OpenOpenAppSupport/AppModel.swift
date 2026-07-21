@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CryptoKit
 import EffectBrokerBridge
 import Foundation
 
@@ -83,6 +84,10 @@ public protocol CoreServing: Sendable {
   func modelSetup(proof: BrokerRuntimeState) async throws -> ModelSetup
   func selectedModel(proof: BrokerRuntimeState) async throws -> ModelSelection?
   func personaStatus() async throws -> PersonaStatusView?
+  func c2SkillDemo(proof: BrokerRuntimeState) async throws -> C2SkillDemoState?
+  func applyC2SkillDemo(
+    _ command: C2SkillDemoCommand, proof: BrokerRuntimeState
+  ) async throws -> ApplyC2SkillDemoResponse
   func selectModel(
     modelId: String,
     requestedEffort: String,
@@ -154,6 +159,14 @@ public protocol CoreServing: Sendable {
 }
 
 extension CoreServing {
+  public func c2SkillDemo(proof _: BrokerRuntimeState) async throws -> C2SkillDemoState? { nil }
+
+  public func applyC2SkillDemo(
+    _: C2SkillDemoCommand, proof _: BrokerRuntimeState
+  ) async throws -> ApplyC2SkillDemoResponse {
+    throw CoreClientError.contractViolation("The instruction-only Skill lifecycle is unavailable.")
+  }
+
   public func authorizeChoiceReminders(
     confirmationId _: String, reminderTarget _: ReminderTarget, proof _: BrokerRuntimeState
   ) async throws -> ConfirmedMission {
@@ -622,6 +635,12 @@ public final class AppModel: ObservableObject {
   @Published public var selectedModelEffort = ""
   @Published public private(set) var persistedModelSelection: ModelSelection?
   @Published public private(set) var personaStatus: PersonaStatusView?
+  @Published public private(set) var c2SkillDemoState: C2SkillDemoState?
+  @Published public private(set) var c2SkillDemoPendingAction: C2SkillDemoCommandKind?
+  @Published public private(set) var c2SkillDemoFeedback: String?
+  @Published public private(set) var c2SkillDemoRequestIds: [String] = []
+  private var c2SkillDemoApprovedSeal: C2SkillDemoSeal?
+  private var c2SkillDemoFirstUseResultDigest: String?
   @Published public private(set) var modelSelectionStatus: ModelSelectionStatus = .unselected
   @Published public private(set) var catalogSnapshotId = ""
   @Published public private(set) var catalogFingerprint = ""
@@ -1387,6 +1406,9 @@ public final class AppModel: ObservableObject {
             expectedGeneration: generation,
             authenticatedOwnerReturn: authenticatedHomeForeground && attempt == 0
               && runtime.enabled && protectedMatchesRuntime && desiredEnabled && accountReady)
+          if runtime.enabled, protectedMatchesRuntime, desiredEnabled {
+            await refreshC2SkillDemo(expectedGeneration: generation)
+          }
           if choiceIMessageReplyPreview == nil,
             choiceLoopSnapshot?.session.state == "active", iMessageIsConnected
           {
@@ -2645,6 +2667,125 @@ public final class AppModel: ObservableObject {
       // Persona provenance before model work, so this read-only diagnostic
       // cannot create a permissive fallback.
     }
+  }
+
+  private func refreshC2SkillDemo(expectedGeneration: UInt64) async {
+    guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: expectedGeneration)
+      let state = try await core.c2SkillDemo(proof: proof)
+      guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      c2SkillDemoState = state
+      c2SkillDemoApprovedSeal = state?.seal ?? c2SkillDemoApprovedSeal
+      c2SkillDemoRequestIds = state?.receipts.map(\.requestId) ?? []
+      c2SkillDemoFeedback = nil
+    } catch {
+      guard expectedGeneration == runtimeGeneration, !Task.isCancelled else { return }
+      c2SkillDemoFeedback = "The reviewed Skill state could not be verified. No Skill action ran."
+    }
+  }
+
+  /// Accepts only an already acquired and reviewed seal. This local adapter
+  /// performs no acquisition, network access, script execution, or effect.
+  public func provideReviewedC2SkillSeal(_ seal: C2SkillDemoSeal) {
+    guard seal.isValid else {
+      c2SkillDemoFeedback = "A valid reviewed instruction-only Skill seal is required."
+      return
+    }
+    guard c2SkillDemoState == nil || c2SkillDemoState?.seal == seal else {
+      c2SkillDemoFeedback = "The supplied Skill does not match the durable reviewed package."
+      return
+    }
+    c2SkillDemoApprovedSeal = seal
+    c2SkillDemoFeedback = nil
+  }
+
+  /// Supplies the digest of an independently completed no-external-effect use.
+  /// The App never manufactures this proof or invokes a Skill runtime here.
+  public func provideC2FirstUseResultDigest(_ digest: String) {
+    guard C2SkillDemoSeal.lowerHex(digest, count: 64) else {
+      c2SkillDemoFeedback = "A verified no-external-effect result is required."
+      return
+    }
+    c2SkillDemoFirstUseResultDigest = digest
+    c2SkillDemoFeedback = nil
+  }
+
+  public func requestNextC2SkillDemoAction() {
+    guard storeControlEnabled, !isBusy else { return }
+    let action: C2SkillDemoCommandKind?
+    switch c2SkillDemoState?.stage {
+    case nil: action = c2SkillDemoApprovedSeal == nil ? nil : .registerCandidate
+    case .candidate: action = .stageReviewed
+    case .staged: action = .enableRunnable
+    case .runnable:
+      action = c2SkillDemoFirstUseResultDigest == nil ? nil : .recordFirstNoEffectUse
+    case .used: action = nil
+    }
+    guard let action else {
+      c2SkillDemoFeedback =
+        c2SkillDemoState?.stage == .runnable
+        ? "A verified no-external-effect result is required before recording first use."
+        : "A reviewed sealed instruction-only Skill is required before this step."
+      return
+    }
+    c2SkillDemoPendingAction = action
+    c2SkillDemoFeedback = nil
+  }
+
+  public func cancelC2SkillDemoAction() {
+    c2SkillDemoPendingAction = nil
+  }
+
+  public func confirmC2SkillDemoAction() async {
+    guard storeControlEnabled, !isBusy, let action = c2SkillDemoPendingAction,
+      let seal = c2SkillDemoApprovedSeal ?? c2SkillDemoState?.seal
+    else { return }
+    let expectedRevision = c2SkillDemoState?.revision ?? 0
+    let resultDigest = action == .recordFirstNoEffectUse ? c2SkillDemoFirstUseResultDigest : nil
+    guard action != .recordFirstNoEffectUse || resultDigest != nil else { return }
+    let material = "\(seal.packageDigest):\(expectedRevision):\(action.rawValue)"
+    let stableDigest = Self.c2StableDigest(material)
+    let command = C2SkillDemoCommand(
+      requestId: "skill-\(String(stableDigest.prefix(24)))",
+      expectedRevision: expectedRevision,
+      kind: action,
+      seal: seal,
+      actorId: "owner",
+      decisionId: "skill-decision-\(String(stableDigest.prefix(16)))",
+      approvalNonce: stableDigest,
+      resultDigest: resultDigest,
+      explicitlyConfirmed: true,
+      decidedAtMs: 0)
+    guard command.isValid else {
+      c2SkillDemoFeedback = "The reviewed Skill command is invalid. Nothing changed."
+      return
+    }
+    let generation = runtimeGeneration
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      let proof = try await currentEnabledProof(expectedGeneration: generation)
+      let response = try await core.applyC2SkillDemo(command, proof: proof)
+      try requireCurrentOnGeneration(generation)
+      guard response.receipt.requestId == command.requestId,
+        response.state.receipts.contains(response.receipt)
+      else {
+        throw CoreClientError.contractViolation("Core returned an unrelated Skill receipt.")
+      }
+      c2SkillDemoState = response.state
+      c2SkillDemoRequestIds = response.state.receipts.map(\.requestId)
+      c2SkillDemoPendingAction = nil
+      if response.state.stage == .used { c2SkillDemoFirstUseResultDigest = nil }
+      c2SkillDemoFeedback = "The confirmed instruction-only Skill step was recorded."
+    } catch {
+      guard generation == runtimeGeneration else { return }
+      c2SkillDemoFeedback = "The Skill step was not verified. Nothing was enabled or run."
+    }
+  }
+
+  private static func c2StableDigest(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
   }
 
   private func applyDashboard(_ dashboard: DashboardState) throws {
