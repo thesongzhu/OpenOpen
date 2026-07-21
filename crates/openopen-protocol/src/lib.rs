@@ -2968,6 +2968,63 @@ pub enum B2MemoryDemoStage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryPreparedSource {
+    pub request_id: String,
+    pub source_identity_digest: String,
+    pub byte_length: u64,
+}
+
+impl B2MemoryPreparedSource {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.request_id)
+            && sha256_hex(&self.source_identity_digest)
+            && self.byte_length > 0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryPrepareSourceRequest {
+    pub request_id: String,
+    pub selected_path: String,
+}
+
+impl B2MemoryPrepareSourceRequest {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.request_id)
+            && !self.selected_path.is_empty()
+            && self.selected_path.as_bytes().len() <= 4_096
+            && self.selected_path.starts_with('/')
+            && !self
+                .selected_path
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct B2MemoryProcessingConsent {
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub source_identity_digest: String,
+    pub explicitly_confirmed: bool,
+}
+
+impl B2MemoryProcessingConsent {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        bounded_identifier(&self.request_id)
+            && self.expected_revision > 0
+            && sha256_hex(&self.source_identity_digest)
+            && self.explicitly_confirmed
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct B2MemoryCandidateCard {
     pub id: String,
     pub title: String,
@@ -3132,6 +3189,8 @@ pub struct B2MemoryReadbackReceipt {
 pub struct B2MemoryDemoState {
     pub revision: u64,
     pub stage: B2MemoryDemoStage,
+    #[serde(default)]
+    pub prepared_source: Option<B2MemoryPreparedSource>,
     pub seal: Option<B2MemoryImportSeal>,
     pub candidates: Vec<B2MemoryCandidateCard>,
     pub selected_candidate: Option<B2MemoryCandidateCard>,

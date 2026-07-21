@@ -31,6 +31,7 @@ libc = "0.2.186"
 openopen-core = { path = "crates/openopen-core" }
 openopen-codex-client = { path = "crates/openopen-codex-client" }
 openopen-discord-adapter = { path = "crates/openopen-discord-adapter" }
+openopen-deep-zip-worker = { path = "crates/openopen-deep-zip-worker" }
 openopen-imsg-adapter = { path = "crates/openopen-imsg-adapter" }
 openopen-persona = { path = "crates/openopen-persona" }
 openopen-protocol = { path = "crates/openopen-protocol" }

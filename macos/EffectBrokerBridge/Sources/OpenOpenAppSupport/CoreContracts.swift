@@ -208,6 +208,40 @@ public enum B2MemoryDemoStage: String, Codable, Equatable, Sendable {
   case prepared, candidates, selected, diffReview, confirmed, readBack
 }
 
+public struct B2MemoryPreparedSource: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let sourceIdentityDigest: String
+  public let byteLength: UInt64
+
+  public var isValid: Bool {
+    !requestId.isEmpty && requestId.utf8.count <= 256 && byteLength > 0
+      && C2SkillDemoSeal.lowerHex(sourceIdentityDigest, count: 64)
+  }
+}
+
+public struct B2MemoryPrepareSourceRequest: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let selectedPath: String
+
+  public var isValid: Bool {
+    !requestId.isEmpty && requestId.utf8.count <= 256 && selectedPath.hasPrefix("/")
+      && !selectedPath.isEmpty && selectedPath.utf8.count <= 4_096
+      && !selectedPath.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f })
+  }
+}
+
+public struct B2MemoryProcessingConsent: Codable, Equatable, Sendable {
+  public let requestId: String
+  public let expectedRevision: UInt64
+  public let sourceIdentityDigest: String
+  public let explicitlyConfirmed: Bool
+
+  public var isValid: Bool {
+    !requestId.isEmpty && requestId.utf8.count <= 256 && expectedRevision > 0
+      && C2SkillDemoSeal.lowerHex(sourceIdentityDigest, count: 64) && explicitlyConfirmed
+  }
+}
+
 public struct B2MemoryCandidateCard: Codable, Equatable, Identifiable, Sendable {
   public let id: String
   public let title: String
@@ -307,6 +341,7 @@ public struct B2MemoryReadbackReceipt: Codable, Equatable, Sendable {
 public struct B2MemoryDemoState: Codable, Equatable, Sendable {
   public let revision: UInt64
   public let stage: B2MemoryDemoStage
+  public let preparedSource: B2MemoryPreparedSource?
   public let seal: B2MemoryImportSeal?
   public let candidates: [B2MemoryCandidateCard]
   public let selectedCandidate: B2MemoryCandidateCard?
@@ -314,6 +349,30 @@ public struct B2MemoryDemoState: Codable, Equatable, Sendable {
   public let confirmationDigest: String?
   public let readbackReceipt: B2MemoryReadbackReceipt?
   public let receipts: [B2MemoryCommandReceipt]
+}
+
+public struct PrepareB2MemorySourceParameters: Codable, Sendable {
+  public let request: B2MemoryPrepareSourceRequest
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(request: B2MemoryPrepareSourceRequest, proof: BrokerRuntimeState) {
+    self.request = request
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
+}
+
+public struct ProcessB2MemorySourceParameters: Codable, Sendable {
+  public let consent: B2MemoryProcessingConsent
+  public let authorization: RuntimeControlAuthorization
+  public let brokerReceipt: RuntimeControlReceipt
+
+  public init(consent: B2MemoryProcessingConsent, proof: BrokerRuntimeState) {
+    self.consent = consent
+    authorization = proof.authorization
+    brokerReceipt = proof.receipt
+  }
 }
 
 public struct B2MemoryDemoView: Codable, Equatable, Sendable {

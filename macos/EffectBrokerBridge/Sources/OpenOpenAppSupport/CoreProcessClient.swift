@@ -107,6 +107,7 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
   private static let maximumFrameBytes = 8 * 1024 * 1024
   private static let maximumAbandonedRequests = 1_024
   private static let loginDeadline: Duration = .seconds(660)
+  private static let memoryProcessingDeadline: Duration = .seconds(660)
 
   private typealias Completion = @Sendable (Result<Data, CoreClientError>) -> Void
   private struct PendingRequest {
@@ -626,6 +627,23 @@ public final class CoreProcessClient: CoreLifecycleMonitoring, @unchecked Sendab
     try await call(
       method: "memory.demo.command",
       parameters: ApplyB2MemoryDemoParameters(command: command, proof: proof))
+  }
+
+  public func prepareB2MemorySource(
+    _ request: B2MemoryPrepareSourceRequest, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    try await call(
+      method: "memory.demo.source.prepare",
+      parameters: PrepareB2MemorySourceParameters(request: request, proof: proof))
+  }
+
+  public func processB2MemorySource(
+    _ consent: B2MemoryProcessingConsent, proof: BrokerRuntimeState
+  ) async throws -> ApplyB2MemoryDemoResponse {
+    try await call(
+      method: "memory.demo.source.process",
+      parameters: ProcessB2MemorySourceParameters(consent: consent, proof: proof),
+      deadline: Self.memoryProcessingDeadline)
   }
 
   public func applyC2SkillDemo(

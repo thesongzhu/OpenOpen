@@ -23,7 +23,7 @@ pub use mission::{
     request_scope_change, transition_mission, transition_work_item,
 };
 pub use store::{
-    AuditAnchor, ChoiceIdleAdvance, ChoiceIdleClockEvidence, MarkdownRenderCleanup,
-    MarkdownRenderPublication, MissionCommandEnvelope, MissionCommandResult, RuntimeControl, Store,
-    StoreError,
+    AuditAnchor, B2MemoryPreparedSourceRecord, ChoiceIdleAdvance, ChoiceIdleClockEvidence,
+    MarkdownRenderCleanup, MarkdownRenderPublication, MissionCommandEnvelope, MissionCommandResult,
+    RuntimeControl, Store, StoreError,
 };

@@ -15,19 +15,22 @@ use openopen_codex_client::{
 };
 use openopen_core::{
     ActionGate, ActionProposal, ActionTarget, ApprovalDecision, AuditAnchor,
-    BrokerEnrollmentRecord, ChoiceIdleAdvance, ChoiceIdleClockEvidence, CreateMission,
-    CreateWorkItem, EffectKind, EvidenceClaims, GateDecision, LocalAuthority,
-    MarkdownRenderCleanup, MarkdownRenderPublication, MissionCommand, MissionCommandEnvelope,
-    NewBoundaryApproval, NewReceipt, Store, StoreError, TrustedBrokerEnrollment,
-    authorize_broker_enrollment, channel_message_payload, channel_need_you_content,
-    channel_receipt_content, verify_core_instance_lease,
+    B2MemoryPreparedSourceRecord, BrokerEnrollmentRecord, ChoiceIdleAdvance,
+    ChoiceIdleClockEvidence, CreateMission, CreateWorkItem, EffectKind, EvidenceClaims,
+    GateDecision, LocalAuthority, MarkdownRenderCleanup, MarkdownRenderPublication, MissionCommand,
+    MissionCommandEnvelope, NewBoundaryApproval, NewReceipt, Store, StoreError,
+    TrustedBrokerEnrollment, authorize_broker_enrollment, channel_message_payload,
+    channel_need_you_content, channel_receipt_content, verify_core_instance_lease,
 };
+use openopen_deep_zip_worker::{CandidateDraft, DeepZipSupervisor, PreviewSession};
 use openopen_persona::{PersonaError, PersonaManager, PersonaStatus};
 use openopen_protocol::ChannelRouteSet;
 use openopen_protocol::{
-    ApprovalKind, ApprovalStatus, ApprovalTarget, B2MemoryCommand, B2MemoryDemoState,
-    BatchSealReason, C2SkillDemoCommand, C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt,
-    ChannelEnvelope, ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
+    ApprovalKind, ApprovalStatus, ApprovalTarget, B2MemoryCandidateCard, B2MemoryCommand,
+    B2MemoryCommandReceipt, B2MemoryDemoState, B2MemoryImportSeal, B2MemoryPrepareSourceRequest,
+    B2MemoryPreparedSource, B2MemoryProcessingConsent, BatchSealReason, C2SkillDemoCommand,
+    C2SkillDemoState, ChannelCursor, ChannelDeliveryReceipt, ChannelEnvelope,
+    ChannelInboundDecision, ChannelInboundResult, ChannelKind, ChannelMessageKind,
     ChannelModelDisposition, ChannelModelStart, ChannelObservation, ChannelOutboundDisposition,
     ChannelOutboundIntent, ChannelPairing, ChannelRouteApproval, ChoiceBeginAccepted,
     ChoiceBeginRecord, ChoiceBeginRequest, ChoiceConsolidatedConfirmation, ChoiceDInput,
@@ -46,9 +49,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -56,7 +59,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::SyncSender as Sender,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -93,6 +96,7 @@ pub struct HostPaths {
     pub synthetic_home: PathBuf,
     pub model_input_root: PathBuf,
     pub imsg_runtime: PathBuf,
+    pub deep_zip_runtime: PathBuf,
     pub user_home: PathBuf,
     pub persona_root: PathBuf,
     pub persona_team_identifier: String,
@@ -137,6 +141,7 @@ impl HostPaths {
             synthetic_home: runtime_home.join("SyntheticHome"),
             model_input_root: support.join("ModelInput"),
             imsg_runtime: contents.join("Resources/iMessage/0.13.0/bin/imsg"),
+            deep_zip_runtime: contents.join("Resources/DeepZip/openopen-deep-zip-worker"),
             user_home: home,
             persona_root: support.join("Persona"),
             persona_team_identifier: current_executable_team_identifier().unwrap_or_default(),
@@ -774,6 +779,12 @@ impl Host {
             "skill.demo.command" => self.command_c2_skill_demo(&request, responses),
             "memory.demo.read" => self.read_b2_memory_demo(&request, responses),
             "memory.demo.command" => self.command_b2_memory_demo(&request, responses),
+            "memory.demo.source.prepare" => {
+                self.prepare_b2_memory_source(&request, responses);
+            }
+            "memory.demo.source.process" => {
+                self.process_b2_memory_source(&request, responses);
+            }
             "choice.loop.read" => self.read_choice_loop(&request, responses),
             "choice.reminder.schedule.read" => {
                 self.read_choice_reminder_schedule(&request, responses);
@@ -1441,6 +1452,56 @@ impl Host {
             |error| host_failure(request.id, &error),
             |(state, receipt)| success(request.id, json!({"state": state, "receipt": receipt})),
         ));
+    }
+
+    fn prepare_b2_memory_source(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<PrepareB2MemorySource>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !params.request.is_valid() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            return;
+        };
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = context.prepare_b2_memory_source(&operation, &params.request);
+            context.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |(state, receipt)| success(request_id, json!({"state": state, "receipt": receipt})),
+            ));
+        });
+    }
+
+    fn process_b2_memory_source(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
+        let Ok(params) = decode_params::<ProcessB2MemorySource>(request) else {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        };
+        if !params.consent.is_valid() {
+            let _ = responses.send(invalid_params(request.id));
+            return;
+        }
+        let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
+            return;
+        };
+        let context = self.background_context(params.proof());
+        let responses = responses.clone();
+        let request_id = request.id;
+        std::thread::spawn(move || {
+            let result = context.process_b2_memory_source(&operation, &params.consent);
+            context.finish_operation(&operation);
+            let _ = responses.send(result.map_or_else(
+                |error| call_failure(request_id, &error),
+                |(state, receipt)| success(request_id, json!({"state": state, "receipt": receipt})),
+            ));
+        });
     }
 
     fn bind_channel_route(&mut self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -6185,6 +6246,175 @@ struct BackgroundContext {
 }
 
 impl BackgroundContext {
+    fn prepare_b2_memory_source(
+        &self,
+        operation: &Arc<AtomicBool>,
+        request: &B2MemoryPrepareSourceRequest,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), HostCallError> {
+        self.require_enabled()?;
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            let selected_path = PathBuf::from(&request.selected_path);
+            let record = match store.b2_memory_prepared_source()? {
+                Some(existing)
+                    if existing.source.request_id == request.request_id
+                        && existing.selected_path == selected_path =>
+                {
+                    existing
+                }
+                Some(_) => return Err(StoreError::B2MemoryDemoConflict.into()),
+                None => pin_b2_memory_source(&selected_path, &request.request_id, now_ms()?)?,
+            };
+            store
+                .prepare_b2_memory_source(
+                    &record,
+                    &self.proof.authorization,
+                    &self.proof.broker_receipt,
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn process_b2_memory_source(
+        &self,
+        operation: &Arc<AtomicBool>,
+        consent: &B2MemoryProcessingConsent,
+    ) -> Result<(B2MemoryDemoState, B2MemoryCommandReceipt), HostCallError> {
+        self.require_enabled()?;
+        let broker = self
+            .trusted_broker
+            .clone()
+            .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+        let store =
+            Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+        let record = store
+            .b2_memory_prepared_source()?
+            .ok_or(StoreError::B2MemoryDemoConflict)?;
+        if record.source.source_identity_digest != consent.source_identity_digest {
+            return Err(StoreError::B2MemoryDemoConflict.into());
+        }
+        let pinned = pin_b2_memory_source(
+            &record.selected_path,
+            &record.source.request_id,
+            record.prepared_at_ms,
+        )?;
+        if pinned != record {
+            return Err(StoreError::B2MemoryDemoConflict.into());
+        }
+        let selection = store
+            .selected_model_selection()?
+            .ok_or(StoreError::ChoiceModelSelectionConflict)?;
+        drop(store);
+
+        let supervisor = DeepZipSupervisor::new(self.paths.deep_zip_runtime.clone());
+        let cancellation = supervisor.cancellation_token();
+        let operation_watch = operation.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_watch = finished.clone();
+        let watcher = std::thread::spawn(move || {
+            while !finished_watch.load(Ordering::Acquire) {
+                if operation_watch.load(Ordering::Acquire) {
+                    cancellation.cancel();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let catalog = supervisor
+            .scan(&record.selected_path)
+            .map_err(|_| HostCallError::Internal);
+        finished.store(true, Ordering::Release);
+        let _ = watcher.join();
+        let catalog = catalog?;
+        let source_digest = hex::encode(catalog.archive_sha256);
+        if source_digest != record.source_digest {
+            return Err(StoreError::B2MemoryDemoConflict.into());
+        }
+        let regular_entries = catalog
+            .entries
+            .iter()
+            .filter(|entry| !entry.directory)
+            .take(3)
+            .collect::<Vec<_>>();
+        if regular_entries.is_empty() {
+            return Err(StoreError::B2MemoryDemoConflict.into());
+        }
+        let drafts = regular_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| CandidateDraft {
+                id: format!("memory-candidate-{}", index + 1),
+                title: format!("Memory candidate {}", index + 1),
+                rationale: "Derived from one verified ChatGPT export member.".to_owned(),
+                source_entry_path: entry.path.clone(),
+                source_entry_sha256: entry.sha256,
+                proposed_markdown_line: format!(
+                    "- Review imported ChatGPT memory candidate {}.",
+                    index + 1
+                ),
+                private_derived_bytes: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let preview = PreviewSession::new(&catalog, drafts).map_err(|_| HostCallError::Internal)?;
+        let choice_set = preview.choice_set().map_err(|_| HostCallError::Internal)?;
+        let candidates = choice_set
+            .cards
+            .iter()
+            .zip(regular_entries)
+            .map(|(card, entry)| {
+                Ok(B2MemoryCandidateCard {
+                    id: card.id.clone(),
+                    title: card.title.clone(),
+                    rationale: card.rationale.clone(),
+                    proposed_line: format!(
+                        "- Review imported ChatGPT memory candidate {}.",
+                        card.position
+                    ),
+                    source_binding_digest: serialized_sha256(&json!({
+                        "path": entry.path,
+                        "sha256": hex::encode(entry.sha256),
+                    }))?,
+                })
+            })
+            .collect::<Result<Vec<_>, HostCallError>>()?;
+        let model_provenance = selection
+            .turn_provenance(
+                hashed_identifier("b2-provenance", consent)?,
+                hashed_identifier("b2-turn", consent)?,
+            )
+            .ok_or(HostCallError::Internal)?;
+        let seal = B2MemoryImportSeal {
+            source_digest,
+            catalog_digest: choice_set.catalog_digest,
+            source_manifest_digest: serialized_sha256(&catalog.entries)?,
+            model_provenance,
+        };
+        self.operations.reconcile_active(operation, || {
+            let broker = self
+                .trusted_broker
+                .clone()
+                .ok_or(StoreError::MissingTrustedBrokerEnrollment)?;
+            let mut store =
+                Store::open_with_trusted_broker(&self.paths.store, self.authority.clone(), broker)?;
+            store
+                .commit_b2_memory_candidates(
+                    consent,
+                    &seal,
+                    &candidates,
+                    &self.proof.authorization,
+                    &self.proof.broker_receipt,
+                    now_ms()?,
+                )
+                .map_err(Into::into)
+        })
+    }
+
     /// Executes the private, already-persisted Markdown journal.  A caller
     /// cannot supply body bytes, a path, a manifest, or a receipt: all are
     /// recovered from the encrypted Store intent and verified by the
@@ -6790,6 +7020,40 @@ struct ApplyB2MemoryDemo {
     command: B2MemoryCommand,
     authorization: RuntimeControlAuthorization,
     broker_receipt: RuntimeControlReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrepareB2MemorySource {
+    request: B2MemoryPrepareSourceRequest,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl PrepareB2MemorySource {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessB2MemorySource {
+    consent: B2MemoryProcessingConsent,
+    authorization: RuntimeControlAuthorization,
+    broker_receipt: RuntimeControlReceipt,
+}
+
+impl ProcessB2MemorySource {
+    fn proof(&self) -> RuntimeProof {
+        RuntimeProof {
+            authorization: self.authorization.clone(),
+            broker_receipt: self.broker_receipt.clone(),
+        }
+    }
 }
 
 impl ApplyB2MemoryDemo {
@@ -9367,6 +9631,78 @@ fn serialized_sha256(value: &impl serde::Serialize) -> Result<String, HostCallEr
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+fn pin_b2_memory_source(
+    selected_path: &Path,
+    request_id: &str,
+    prepared_at_ms: i64,
+) -> Result<B2MemoryPreparedSourceRecord, HostCallError> {
+    if !selected_path.is_absolute() || prepared_at_ms < 0 {
+        return Err(HostCallError::Internal);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(selected_path)
+        .map_err(|_| HostCallError::Internal)?;
+    let before = file.metadata().map_err(|_| HostCallError::Internal)?;
+    if !before.is_file()
+        || before.len() == 0
+        || before.len() > openopen_deep_zip_worker::FrozenLimits::MAX_ARCHIVE_BYTES
+        || before.dev() == 0
+        || before.ino() == 0
+    {
+        return Err(HostCallError::Internal);
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| HostCallError::Internal)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    buffer.zeroize();
+    let after = file.metadata().map_err(|_| HostCallError::Internal)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return Err(HostCallError::Internal);
+    }
+    let modified_at_ns = before
+        .mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(before.mtime_nsec()))
+        .filter(|value| *value >= 0)
+        .ok_or(HostCallError::Internal)?;
+    let source_digest = format!("{:x}", digest.finalize());
+    let source_identity_digest = serialized_sha256(&json!({
+        "deviceId": before.dev(),
+        "inode": before.ino(),
+        "byteLength": before.len(),
+        "modifiedAtNs": modified_at_ns,
+        "sourceDigest": source_digest,
+    }))?;
+    Ok(B2MemoryPreparedSourceRecord {
+        source: B2MemoryPreparedSource {
+            request_id: request_id.to_owned(),
+            source_identity_digest,
+            byte_length: before.len(),
+        },
+        selected_path: selected_path.to_owned(),
+        device_id: before.dev(),
+        inode: before.ino(),
+        modified_at_ns,
+        source_digest,
+        prepared_at_ms,
+    })
+}
+
 fn success<T: serde::Serialize>(id: u64, value: T) -> RpcResponse {
     match serde_json::to_value(value) {
         Ok(value) => RpcResponse::success(id, value),
@@ -9520,6 +9856,7 @@ mod tests {
                 synthetic_home: support.join("synthetic-home"),
                 model_input_root: support.join("model-input"),
                 imsg_runtime: root_path.join("missing-imsg"),
+                deep_zip_runtime: root_path.join("missing-deep-zip-worker"),
                 user_home: root_path.clone(),
                 persona_root: support.join("persona"),
                 persona_team_identifier: "A1B2C3D4E5".to_owned(),
