@@ -777,7 +777,7 @@ verify_post_stage_identity_receipt() {
       exit 66
     }
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|9d978c5ac0f7cb83502ed9e041276fafbb1ec5afb6d32e3ba4520f562d97d884
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|5ff93aba993f74a68e3a66a2dea5515ce2648b92900622b4e38f690eb111cab3
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
@@ -864,7 +864,7 @@ verify_exact_developer_app() {
       verify_owner_certificate "$path"
     fi
   done <<EOF
-Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|9d978c5ac0f7cb83502ed9e041276fafbb1ec5afb6d32e3ba4520f562d97d884
+Contents/MacOS/OpenOpen|com.thesongzhu.OpenOpen|$app_team|$app_cdhash|5ff93aba993f74a68e3a66a2dea5515ce2648b92900622b4e38f690eb111cab3
 Contents/MacOS/OpenOpenCore|com.thesongzhu.OpenOpen.Core|$app_team|$core_cdhash|18ac46aab3de88730e95522f0a9b4c3ee6f4032a9d0ca6ca4e439df85b507708
 Contents/MacOS/OpenOpenEffectBroker|com.thesongzhu.OpenOpen.EffectBroker|$app_team|$broker_cdhash|3ae8c92d4b50b6c0fc80c04d024b9d2c28279aa0fdf165294aac06563b595c78
 Contents/MacOS/OpenOpenEffectBrokerWorker|com.thesongzhu.OpenOpen.EffectBroker.Worker|$app_team|$worker_cdhash|f78638f7716f9ab15fa3b9b1ba1951ef28e6d1f65f52e7a24a23bcae07cb0aab
