@@ -5,8 +5,10 @@ mod process;
 mod wire;
 
 pub use contracts::{
-    AccountState, ChatGptLogin, ChoiceGenerationRequest, GptModel, OutcomeRequest, SelectedModel,
-    StructuredChoiceGeneration, StructuredChoiceOption, StructuredOutcome,
+    AccountState, ChatGptLogin, ChoiceGenerationRequest, GptModel,
+    MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS, MemoryCandidateGenerationRequest, OutcomeRequest,
+    SelectedModel, StructuredChoiceGeneration, StructuredChoiceOption, StructuredMemoryCandidate,
+    StructuredMemoryCandidateGeneration, StructuredOutcome,
 };
 pub use process::{
     CODEX_BINARY_SHA256, CODEX_CODE_MODE_HOST_SHA256, CODEX_PACKAGE_SHA256, CODEX_RG_SHA256,
@@ -83,6 +85,27 @@ impl StructuredRequest for ChoiceGenerationRequest {
     }
 }
 
+impl StructuredRequest for MemoryCandidateGenerationRequest {
+    fn validate_request(&self) -> Result<(), CodexError> {
+        self.validate()
+    }
+    fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    fn schema(&self) -> Value {
+        self.output_schema()
+    }
+    fn selected_model(&self) -> Option<&SelectedModel> {
+        Some(&self.selected_model)
+    }
+    fn allowed_source_refs(&self) -> &[String] {
+        &self.allowed_source_refs
+    }
+    fn developer_instructions(&self) -> &str {
+        &self.developer_instructions
+    }
+}
+
 impl StructuredResponse for StructuredOutcome {
     fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
         Self::parse_and_validate(text, allowed_source_refs)
@@ -90,6 +113,12 @@ impl StructuredResponse for StructuredOutcome {
 }
 
 impl StructuredResponse for StructuredChoiceGeneration {
+    fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
+        Self::parse_and_validate(text, allowed_source_refs)
+    }
+}
+
+impl StructuredResponse for StructuredMemoryCandidateGeneration {
     fn parse_response(text: &str, allowed_source_refs: &[String]) -> Result<Self, CodexError> {
         Self::parse_and_validate(text, allowed_source_refs)
     }
@@ -564,6 +593,37 @@ impl CodexClient {
     ) -> Result<StructuredChoiceGeneration, CodexError> {
         let workspace = self.model_workspace.clone();
         self.run_structured_in_workspace(request, &workspace)
+    }
+
+    /// Runs the sealed Memory-candidate contract with the selected catalog-
+    /// bound model. The turn remains read-only, network-disabled, tool-free,
+    /// and can return only one to three source-bound candidate records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable selected-model access, containment
+    /// mismatch, action/tool requests, failed turns, or invalid output.
+    pub fn run_structured_memory_candidate_generation(
+        &mut self,
+        request: &MemoryCandidateGenerationRequest,
+    ) -> Result<StructuredMemoryCandidateGeneration, CodexError> {
+        let workspace = self.model_workspace.clone();
+        self.run_structured_in_workspace(request, &workspace)
+    }
+
+    /// Runs the sealed Memory-candidate contract in an already-contained
+    /// read-only workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace escapes containment or the request,
+    /// selected model, or structured result violates the sealed contract.
+    pub fn run_structured_memory_candidate_generation_in_workspace(
+        &mut self,
+        request: &MemoryCandidateGenerationRequest,
+        workspace: &Path,
+    ) -> Result<StructuredMemoryCandidateGeneration, CodexError> {
+        self.run_structured_in_workspace(request, workspace)
     }
 
     /// # Errors

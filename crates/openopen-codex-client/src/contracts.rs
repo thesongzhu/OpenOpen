@@ -17,6 +17,12 @@ pub const MAX_REASONING_EFFORT_BYTES: usize = 32;
 pub const MAX_MODEL_CURSOR_BYTES: usize = 512;
 pub const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
 pub const MAX_DEVELOPER_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+pub const MAX_MEMORY_CANDIDATES: usize = 3;
+pub const MAX_MEMORY_CANDIDATE_ID_BYTES: usize = 64;
+pub const MAX_MEMORY_CANDIDATE_TITLE_CHARS: usize = 120;
+pub const MAX_MEMORY_CANDIDATE_RATIONALE_CHARS: usize = 600;
+pub const MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS: usize = 1024;
+pub const MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS: &str = "Return only the requested Memory-candidate JSON. Use only the supplied source references. Propose one to three local Markdown lines for review. Do not request or perform tools, actions, writes, network access, delivery, permissions, or any external effect.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,6 +155,35 @@ pub struct StructuredChoiceGeneration {
     pub source_refs: Vec<String>,
 }
 
+/// Host-owned, tool-free request for at most three Memory candidates. Source
+/// excerpts remain opaque prompt data; the model can cite only the exact
+/// source references supplied by Host and cannot grant write or effect
+/// authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryCandidateGenerationRequest {
+    pub prompt: String,
+    pub allowed_source_refs: Vec<String>,
+    pub selected_model: SelectedModel,
+    pub developer_instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredMemoryCandidate {
+    pub id: String,
+    pub title: String,
+    pub rationale: String,
+    pub proposed_markdown_line: String,
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StructuredMemoryCandidateGeneration {
+    pub candidates: Vec<StructuredMemoryCandidate>,
+}
+
 impl OutcomeRequest {
     /// Validates the host-owned prompt and source-reference bounds before any
     /// app-server process or model operation is started.
@@ -269,6 +304,83 @@ impl ChoiceGenerationRequest {
     }
 }
 
+impl MemoryCandidateGenerationRequest {
+    /// Validates the bounded Host-owned prompt, exact selected-model binding,
+    /// source-reference allowlist, and tool-free developer contract before a
+    /// model process can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any field is empty, malformed, duplicated, or
+    /// outside the sealed Memory-candidate bounds.
+    pub fn validate(&self) -> Result<(), CodexError> {
+        if self.prompt.trim().is_empty() || self.prompt.len() > MAX_PROMPT_BYTES {
+            return Err(CodexError::InvalidContract("invalid prompt length"));
+        }
+        self.selected_model.validate()?;
+        if self.developer_instructions != MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS {
+            return Err(CodexError::InvalidContract(
+                "invalid Memory candidate instructions",
+            ));
+        }
+        validate_source_refs(&self.allowed_source_refs, true)
+    }
+
+    pub(crate) fn output_schema(&self) -> Value {
+        let text = |maximum| json!({"maxLength": maximum, "minLength": 1, "type": "string"});
+        json!({
+            "additionalProperties": false,
+            "properties": {
+                "candidates": {
+                    "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": text(MAX_MEMORY_CANDIDATE_ID_BYTES),
+                            "proposedMarkdownLine": text(MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS),
+                            "rationale": text(MAX_MEMORY_CANDIDATE_RATIONALE_CHARS),
+                            "sourceRefs": {
+                                "items": {"enum": self.allowed_source_refs, "type": "string"},
+                                "maxItems": self.allowed_source_refs.len(),
+                                "minItems": 1,
+                                "type": "array"
+                            },
+                            "title": text(MAX_MEMORY_CANDIDATE_TITLE_CHARS)
+                        },
+                        "required": ["id", "title", "rationale", "proposedMarkdownLine", "sourceRefs"],
+                        "type": "object"
+                    },
+                    "maxItems": MAX_MEMORY_CANDIDATES,
+                    "minItems": 1,
+                    "type": "array"
+                }
+            },
+            "required": ["candidates"],
+            "type": "object"
+        })
+    }
+}
+
+fn validate_source_refs(source_refs: &[String], require_nonempty: bool) -> Result<(), CodexError> {
+    if (require_nonempty && source_refs.is_empty()) || source_refs.len() > MAX_SOURCE_REFS {
+        return Err(CodexError::InvalidContract("invalid source ref count"));
+    }
+    let mut unique = HashSet::new();
+    for source_ref in source_refs {
+        if source_ref.is_empty()
+            || source_ref.len() > MAX_SOURCE_REF_BYTES
+            || !source_ref.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+            || !unique.insert(source_ref)
+        {
+            return Err(CodexError::InvalidContract("invalid source ref"));
+        }
+    }
+    Ok(())
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64
         && value
@@ -363,6 +475,65 @@ impl StructuredChoiceGeneration {
     }
 }
 
+impl StructuredMemoryCandidateGeneration {
+    pub(crate) fn parse_and_validate(
+        text: &str,
+        allowed_source_refs: &[String],
+    ) -> Result<Self, CodexError> {
+        let value: Self = serde_json::from_str(text).map_err(|_| {
+            CodexError::InvalidContract("model output did not match Memory candidate schema")
+        })?;
+        if value.candidates.is_empty() || value.candidates.len() > MAX_MEMORY_CANDIDATES {
+            return Err(CodexError::InvalidContract(
+                "invalid Memory candidate count",
+            ));
+        }
+        let allowed = allowed_source_refs.iter().collect::<HashSet<_>>();
+        let mut candidate_ids = HashSet::new();
+        for candidate in &value.candidates {
+            if candidate.id.is_empty()
+                || candidate.id.len() > MAX_MEMORY_CANDIDATE_ID_BYTES
+                || !candidate.id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+                || !candidate_ids.insert(candidate.id.as_str())
+                || !valid_single_line(&candidate.title, MAX_MEMORY_CANDIDATE_TITLE_CHARS)
+                || !valid_single_line(&candidate.rationale, MAX_MEMORY_CANDIDATE_RATIONALE_CHARS)
+                || !valid_single_line(
+                    &candidate.proposed_markdown_line,
+                    MAX_MEMORY_CANDIDATE_MARKDOWN_CHARS,
+                )
+                || candidate.source_refs.is_empty()
+            {
+                return Err(CodexError::InvalidContract(
+                    "invalid Memory candidate bounds",
+                ));
+            }
+            let mut seen_refs = HashSet::new();
+            if candidate
+                .source_refs
+                .iter()
+                .any(|source_ref| !allowed.contains(source_ref) || !seen_refs.insert(source_ref))
+            {
+                return Err(CodexError::InvalidContract(
+                    "Memory candidate forged a source ref",
+                ));
+            }
+        }
+        Ok(value)
+    }
+}
+
+fn valid_single_line(value: &str, maximum_chars: usize) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= maximum_chars
+        && !value.chars().any(|character| {
+            character == '\n' || character == '\r' || character == '\0' || character.is_control()
+        })
+}
+
 pub(crate) fn model_from_value(value: &Value) -> Result<Option<GptModel>, CodexError> {
     let hidden = value
         .get("hidden")
@@ -430,9 +601,10 @@ pub(crate) fn model_from_value(value: &Value) -> Result<Option<GptModel>, CodexE
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountState, ChoiceGenerationRequest, MAX_MODEL_DISPLAY_NAME_BYTES, OutcomeRequest,
-        SelectedModel, StructuredChoiceGeneration, StructuredOutcome, is_sha256_hex,
-        model_from_value,
+        AccountState, ChoiceGenerationRequest, MAX_MEMORY_CANDIDATES, MAX_MODEL_DISPLAY_NAME_BYTES,
+        MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS, MemoryCandidateGenerationRequest, OutcomeRequest,
+        SelectedModel, StructuredChoiceGeneration, StructuredMemoryCandidateGeneration,
+        StructuredOutcome, is_sha256_hex, model_from_value,
     };
     use openopen_protocol::PersonaRevisionRef;
     use serde_json::json;
@@ -611,6 +783,80 @@ mod tests {
             request.output_schema()["properties"]["sourceRefs"]["maxItems"],
             0
         );
+    }
+
+    fn memory_candidate_request() -> MemoryCandidateGenerationRequest {
+        MemoryCandidateGenerationRequest {
+            prompt: "Source typed:conversation-1 says the owner prefers a weekly review.".into(),
+            allowed_source_refs: vec!["typed:conversation-1".into()],
+            selected_model: SelectedModel {
+                model_id: "gpt-example".into(),
+                reasoning_effort: Some("high".into()),
+                catalog_fingerprint: "a".repeat(64),
+                catalog_revision: 1,
+            },
+            developer_instructions: MEMORY_CANDIDATE_DEVELOPER_INSTRUCTIONS.into(),
+        }
+    }
+
+    #[test]
+    fn memory_candidate_request_binds_model_refs_and_exact_tool_free_instructions() {
+        let mut request = memory_candidate_request();
+        request.validate().unwrap();
+        assert_eq!(
+            request.output_schema()["properties"]["candidates"]["maxItems"],
+            MAX_MEMORY_CANDIDATES
+        );
+        assert_eq!(
+            request.output_schema()["properties"]["candidates"]["items"]["properties"]["sourceRefs"]
+                ["items"]["enum"][0],
+            "typed:conversation-1"
+        );
+
+        request.allowed_source_refs.clear();
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request
+            .allowed_source_refs
+            .push("typed:conversation-1".into());
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request.selected_model.catalog_fingerprint = "f".repeat(63);
+        assert!(request.validate().is_err());
+        request = memory_candidate_request();
+        request.developer_instructions.push_str(" Use a tool.");
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn memory_candidate_output_accepts_one_to_three_exact_source_bound_records() {
+        let allowed = vec!["typed:conversation-1".to_owned()];
+        let output = r#"{"candidates":[{"id":"weekly-review","title":"Weekly review","rationale":"The source states a recurring preference.","proposedMarkdownLine":"- Prefers a weekly review.","sourceRefs":["typed:conversation-1"]}]}"#;
+        let parsed =
+            StructuredMemoryCandidateGeneration::parse_and_validate(output, &allowed).unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+
+        let three = r#"{"candidates":[{"id":"first","title":"First","rationale":"A first bounded candidate.","proposedMarkdownLine":"- First candidate.","sourceRefs":["typed:conversation-1"]},{"id":"second","title":"Second","rationale":"A second bounded candidate.","proposedMarkdownLine":"- Second candidate.","sourceRefs":["typed:conversation-1"]},{"id":"third","title":"Third","rationale":"A third bounded candidate.","proposedMarkdownLine":"- Third candidate.","sourceRefs":["typed:conversation-1"]}]}"#;
+        assert!(StructuredMemoryCandidateGeneration::parse_and_validate(three, &allowed).is_ok());
+    }
+
+    #[test]
+    fn memory_candidate_output_rejects_forgery_duplicates_actions_and_extra_fields() {
+        let allowed = vec!["typed:conversation-1".to_owned()];
+        for output in [
+            r#"{"candidates":[]}"#,
+            r#"{"candidates":[{"id":"one","title":"One","rationale":"Reason","proposedMarkdownLine":"- One","sourceRefs":["typed:conversation-1"]},{"id":"two","title":"Two","rationale":"Reason","proposedMarkdownLine":"- Two","sourceRefs":["typed:conversation-1"]},{"id":"three","title":"Three","rationale":"Reason","proposedMarkdownLine":"- Three","sourceRefs":["typed:conversation-1"]},{"id":"four","title":"Four","rationale":"Reason","proposedMarkdownLine":"- Four","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"same","title":"One","rationale":"Reason","proposedMarkdownLine":"- One","sourceRefs":["typed:conversation-1"]},{"id":"same","title":"Two","rationale":"Reason","proposedMarkdownLine":"- Two","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"forged","title":"Forged","rationale":"Reason","proposedMarkdownLine":"- Forged","sourceRefs":["typed:other"]}]}"#,
+            r#"{"candidates":[{"id":"duplicate-ref","title":"Duplicate","rationale":"Reason","proposedMarkdownLine":"- Duplicate","sourceRefs":["typed:conversation-1","typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"multiline","title":"Multiline","rationale":"Reason","proposedMarkdownLine":"- One\n- Two","sourceRefs":["typed:conversation-1"]}]}"#,
+            r#"{"candidates":[{"id":"action","title":"Action","rationale":"Reason","proposedMarkdownLine":"- Action","sourceRefs":["typed:conversation-1"],"tool":"send"}]}"#,
+        ] {
+            assert!(
+                StructuredMemoryCandidateGeneration::parse_and_validate(output, &allowed).is_err(),
+                "unexpectedly accepted {output}"
+            );
+        }
     }
 
     #[test]
