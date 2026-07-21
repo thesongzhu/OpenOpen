@@ -2,10 +2,10 @@
 //!
 //! The public scanner is a hard child-process supervisor. The child first
 //! copies the selected regular file through a no-follow open into an unnamed
-//! private snapshot, then catalogs only that snapshot. A catalog is returned
-//! only after every member has passed path, resource, structure, and content
-//! validation. No API extracts files, invokes a model, or persists import
-//! state.
+//! private snapshot, then reads only that snapshot. A catalog or bounded
+//! in-memory conversation context is returned only after every member has
+//! passed path, resource, structure, and content validation. No API extracts
+//! files, invokes a model, or persists import state.
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +14,7 @@ use libproc::libproc::pid_rusage::{RUsageInfoV4, pidrusage};
 use nix::fcntl::{OFlag, open};
 use nix::sys::resource::{Resource, setrlimit};
 use nix::sys::stat::Mode;
-use serde::de::IgnoredAny;
+use serde::de::{DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -94,8 +94,8 @@ impl CancellationToken {
     }
 }
 
-/// The only public cataloging API. It owns child creation, monitoring, kill,
-/// wait, pipe draining, and cleanup.
+/// The public child-process supervisor. It owns child creation, monitoring,
+/// kill, wait, pipe draining, and cleanup.
 #[derive(Clone, Debug)]
 pub struct DeepZipSupervisor {
     worker_executable: PathBuf,
@@ -137,9 +137,40 @@ impl DeepZipSupervisor {
             return Err(ScanError::SupervisorUnavailable);
         }
 
+        match self.run_child("--isolated-scan-v1", path)? {
+            WorkerSuccess::Catalog(catalog) => Ok(catalog),
+            WorkerSuccess::MemoryContext(_) => Err(ScanError::WorkerProtocol),
+        }
+    }
+
+    /// Runs the same complete fail-closed scan while returning only bounded,
+    /// digest-bound context from the supported `ChatGPT` conversation members.
+    /// No archive member is extracted to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanError`] for the same source, supervision, archive,
+    /// resource, and cancellation failures as [`Self::scan`], or when the
+    /// child returns the wrong response kind.
+    pub fn scan_memory_context(&self, path: &Path) -> Result<DeepZipMemoryContext, ScanError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ScanError::Cancelled);
+        }
+        if !path.is_absolute() || !self.worker_executable.is_absolute() {
+            return Err(ScanError::SupervisorUnavailable);
+        }
+        match self.run_child("--isolated-memory-context-v1", path)? {
+            WorkerSuccess::MemoryContext(context) if context.is_valid() => Ok(context),
+            WorkerSuccess::Catalog(_) | WorkerSuccess::MemoryContext(_) => {
+                Err(ScanError::WorkerProtocol)
+            }
+        }
+    }
+
+    fn run_child(&self, mode: &str, path: &Path) -> Result<WorkerSuccess, ScanError> {
         let mut command = Command::new(&self.worker_executable);
         command
-            .arg("--isolated-scan-v1")
+            .arg(mode)
             .arg(path)
             .env_clear()
             .current_dir("/")
@@ -169,6 +200,116 @@ pub struct DeepZipCatalog {
     pub total_compressed_bytes: u64,
     pub total_expanded_bytes: u64,
     pub entries: Vec<CatalogEntry>,
+}
+
+/// Maximum private context retained in one child response. The worker still
+/// validates and authenticates the complete archive before returning it.
+pub const MAX_MEMORY_CONTEXT_BYTES: usize = 64 * 1_024;
+pub const MAX_MEMORY_CONTEXT_CONVERSATIONS: usize = 24;
+pub const MAX_MEMORY_CONTEXT_MESSAGES: usize = 128;
+pub const MAX_MEMORY_CONTEXT_MESSAGES_PER_CONVERSATION: usize = 16;
+pub const MAX_MEMORY_CONTEXT_TITLE_BYTES: usize = 256;
+pub const MAX_MEMORY_CONTEXT_MESSAGE_BYTES: usize = 2_048;
+pub const MAX_MEMORY_CONTEXT_RESPONSE_BYTES: usize = 96 * 1_024;
+
+/// One bounded user/assistant message admitted from a verified conversation.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ChatGptConversationMessage {
+    pub role: String,
+    pub text: String,
+}
+
+/// One structured conversation context bound to its exact archive member.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ChatGptConversationContext {
+    pub source_path: String,
+    pub source_sha256: [u8; 32],
+    pub conversation_index: u64,
+    pub title: String,
+    pub messages: Vec<ChatGptConversationMessage>,
+    pub context_digest: [u8; 32],
+}
+
+/// Bounded semantic input returned by the isolated child. This is an in-memory
+/// response only; the worker never creates an extracted file or directory.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct DeepZipMemoryContext {
+    pub archive_bytes: u64,
+    pub archive_sha256: [u8; 32],
+    pub catalog_digest: [u8; 32],
+    pub conversations: Vec<ChatGptConversationContext>,
+    pub context_bytes: u64,
+    pub context_digest: [u8; 32],
+}
+
+impl DeepZipMemoryContext {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.conversations.is_empty()
+            || self.archive_bytes == 0
+            || self.archive_sha256 == [0; 32]
+            || self.catalog_digest == [0; 32]
+            || self.context_digest == [0; 32]
+            || self.conversations.len() > MAX_MEMORY_CONTEXT_CONVERSATIONS
+            || usize::try_from(self.context_bytes)
+                .map_or(true, |bytes| bytes > MAX_MEMORY_CONTEXT_BYTES)
+            || serde_json::to_vec(self).map_or(true, |bytes| {
+                bytes.len() > MAX_MEMORY_CONTEXT_RESPONSE_BYTES
+            })
+        {
+            return false;
+        }
+        let mut messages = 0_usize;
+        let mut bytes = 0_usize;
+        let mut identities = HashSet::new();
+        let mut source_digests = HashMap::new();
+        for context in &self.conversations {
+            if !identities.insert((context.source_path.as_str(), context.conversation_index))
+                || source_digests
+                    .insert(context.source_path.as_str(), context.source_sha256)
+                    .is_some_and(|existing| existing != context.source_sha256)
+                || context.source_sha256 == [0; 32]
+                || context.context_digest == [0; 32]
+                || conversation_member(&context.source_path).is_none()
+                || context.messages.is_empty()
+                || context.messages.len() > MAX_MEMORY_CONTEXT_MESSAGES_PER_CONVERSATION
+                || context.title.len() > MAX_MEMORY_CONTEXT_TITLE_BYTES
+                || !allowed_text_controls(&context.title)
+                || memory_context_digest(context) != context.context_digest
+            {
+                return false;
+            }
+            bytes = match bytes.checked_add(context.title.len()) {
+                Some(value) => value,
+                None => return false,
+            };
+            for message in &context.messages {
+                if !matches!(message.role.as_str(), "user" | "assistant")
+                    || message.text.is_empty()
+                    || message.text.len() > MAX_MEMORY_CONTEXT_MESSAGE_BYTES
+                    || !allowed_text_controls(&message.text)
+                {
+                    return false;
+                }
+                messages += 1;
+                bytes = match bytes
+                    .checked_add(message.role.len())
+                    .and_then(|value| value.checked_add(message.text.len()))
+                {
+                    Some(value) => value,
+                    None => return false,
+                };
+            }
+        }
+        messages <= MAX_MEMORY_CONTEXT_MESSAGES
+            && u64::try_from(bytes).ok() == Some(self.context_bytes)
+            && memory_response_digest(
+                self.archive_bytes,
+                &self.archive_sha256,
+                &self.catalog_digest,
+                &self.conversations,
+            ) == self.context_digest
+    }
 }
 
 /// Maximum number of bounded import candidates shown beside the permanent D
@@ -914,7 +1055,14 @@ pub enum ScanError {
 #[derive(Debug, Deserialize, Serialize)]
 enum WorkerResponse {
     Catalog(DeepZipCatalog),
+    MemoryContext(DeepZipMemoryContext),
     Error(ScanError),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum WorkerSuccess {
+    Catalog(DeepZipCatalog),
+    MemoryContext(DeepZipMemoryContext),
 }
 
 #[derive(Clone, Copy)]
@@ -959,7 +1107,7 @@ fn supervise_command<P: ChildRssProbe>(
     cancellation: &CancellationToken,
     budget: SupervisorBudget,
     probe: &mut P,
-) -> Result<DeepZipCatalog, ScanError> {
+) -> Result<WorkerSuccess, ScanError> {
     let started = Instant::now();
     let mut child = command.spawn().map_err(|_| ScanError::WorkerSpawn)?;
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
@@ -1074,7 +1222,7 @@ fn fail_supervision(
     mut child: Child,
     reader: JoinHandle<io::Result<Vec<u8>>>,
     error: ScanError,
-) -> Result<DeepZipCatalog, ScanError> {
+) -> Result<WorkerSuccess, ScanError> {
     terminate_and_wait(&mut child);
     let _ = reader.join();
     Err(error)
@@ -1089,7 +1237,7 @@ fn finish_supervision(
     status: ExitStatus,
     reader: JoinHandle<io::Result<Vec<u8>>>,
     protocol_bytes: u64,
-) -> Result<DeepZipCatalog, ScanError> {
+) -> Result<WorkerSuccess, ScanError> {
     let bytes = reader
         .join()
         .map_err(|_| ScanError::WorkerProtocol)?
@@ -1101,7 +1249,8 @@ fn finish_supervision(
         return Err(ScanError::WorkerCrashed);
     }
     match serde_json::from_slice(&bytes).map_err(|_| ScanError::WorkerProtocol)? {
-        WorkerResponse::Catalog(catalog) => Ok(catalog),
+        WorkerResponse::Catalog(catalog) => Ok(WorkerSuccess::Catalog(catalog)),
+        WorkerResponse::MemoryContext(context) => Ok(WorkerSuccess::MemoryContext(context)),
         WorkerResponse::Error(error) => Err(error),
     }
 }
@@ -1112,9 +1261,13 @@ fn finish_supervision(
 pub fn isolated_worker_entrypoint() -> i32 {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--isolated-scan-v1")) {
-        return 64;
-    }
+    let mode = match arguments.next().as_deref() {
+        Some(value) if value == std::ffi::OsStr::new("--isolated-scan-v1") => WorkerMode::Catalog,
+        Some(value) if value == std::ffi::OsStr::new("--isolated-memory-context-v1") => {
+            WorkerMode::MemoryContext
+        }
+        _ => return 64,
+    };
     let Some(path) = arguments.next().map(PathBuf::from) else {
         return 64;
     };
@@ -1127,20 +1280,45 @@ pub fn isolated_worker_entrypoint() -> i32 {
     }
     let result = {
         let monitor = SystemMonitor::new(CancellationToken::new());
-        capture_snapshot(&path, &monitor)
-            .and_then(|snapshot| scan_immutable_snapshot(snapshot, &monitor))
+        capture_snapshot(&path, &monitor).and_then(|snapshot| match mode {
+            WorkerMode::Catalog => {
+                scan_immutable_snapshot(snapshot, &monitor).map(WorkerSuccess::Catalog)
+            }
+            WorkerMode::MemoryContext => {
+                scan_memory_context_snapshot(snapshot, &monitor).map(WorkerSuccess::MemoryContext)
+            }
+        })
     };
-    let response = match result {
-        Ok(catalog) => WorkerResponse::Catalog(catalog),
+    let mut response = match result {
+        Ok(WorkerSuccess::Catalog(catalog)) => WorkerResponse::Catalog(catalog),
+        Ok(WorkerSuccess::MemoryContext(context)) => WorkerResponse::MemoryContext(context),
         Err(error) => WorkerResponse::Error(error),
     };
+    let Ok(mut encoded) = serde_json::to_vec(&response) else {
+        return 74;
+    };
+    if matches!(response, WorkerResponse::MemoryContext(_))
+        && encoded.len() > MAX_MEMORY_CONTEXT_RESPONSE_BYTES
+    {
+        response = WorkerResponse::Error(ScanError::WorkerOutputExceeded);
+        let Ok(error_bytes) = serde_json::to_vec(&response) else {
+            return 74;
+        };
+        encoded = error_bytes;
+    }
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    if serde_json::to_writer(&mut output, &response).is_err() || output.flush().is_err() {
+    if output.write_all(&encoded).is_err() || output.flush().is_err() {
         74
     } else {
         0
     }
+}
+
+#[derive(Clone, Copy)]
+enum WorkerMode {
+    Catalog,
+    MemoryContext,
 }
 
 fn worker_handshake() -> io::Result<()> {
@@ -1955,6 +2133,23 @@ fn scan_immutable_snapshot<M: ResourceMonitor + ?Sized>(
     snapshot: ImmutableSnapshot,
     monitor: &M,
 ) -> Result<DeepZipCatalog, ScanError> {
+    scan_snapshot(snapshot, monitor, None)
+}
+
+fn scan_memory_context_snapshot<M: ResourceMonitor + ?Sized>(
+    snapshot: ImmutableSnapshot,
+    monitor: &M,
+) -> Result<DeepZipMemoryContext, ScanError> {
+    let mut collector = MemoryContextCollector::default();
+    let catalog = scan_snapshot(snapshot, monitor, Some(&mut collector))?;
+    collector.finish(&catalog)
+}
+
+fn scan_snapshot<M: ResourceMonitor + ?Sized>(
+    snapshot: ImmutableSnapshot,
+    monitor: &M,
+    memory_context: Option<&mut MemoryContextCollector>,
+) -> Result<DeepZipCatalog, ScanError> {
     check_budget(monitor)?;
     let ImmutableSnapshot {
         mut file,
@@ -1983,7 +2178,7 @@ fn scan_immutable_snapshot<M: ResourceMonitor + ?Sized>(
     }
 
     let plan = plan_archive(&mut archive, &authenticated, monitor)?;
-    let entries = stream_entries(&mut archive, plan.entries, monitor)?;
+    let entries = stream_entries(&mut archive, plan.entries, monitor, memory_context)?;
     if !plan.has_conversations {
         return Err(ScanError::UnsupportedArchiveLayout);
     }
@@ -2105,10 +2300,16 @@ fn stream_entries<M: ResourceMonitor + ?Sized>(
     archive: &mut ZipArchive<File>,
     plans: Vec<EntryPlan>,
     monitor: &M,
+    mut memory_context: Option<&mut MemoryContextCollector>,
 ) -> Result<Vec<CatalogEntry>, ScanError> {
     let mut entries = Vec::with_capacity(plans.len());
     for plan in plans {
-        entries.push(stream_entry(archive, plan, monitor)?);
+        entries.push(stream_entry(
+            archive,
+            plan,
+            monitor,
+            memory_context.as_deref_mut(),
+        )?);
     }
     entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
@@ -2118,6 +2319,7 @@ fn stream_entry<M: ResourceMonitor + ?Sized>(
     archive: &mut ZipArchive<File>,
     plan: EntryPlan,
     monitor: &M,
+    memory_context: Option<&mut MemoryContextCollector>,
 ) -> Result<CatalogEntry, ScanError> {
     check_budget(monitor)?;
     let entry = archive
@@ -2127,7 +2329,18 @@ fn stream_entry<M: ResourceMonitor + ?Sized>(
 
     let content_result = if plan.format == MemberFormat::Json {
         let mut deserializer = serde_json::Deserializer::from_reader(&mut inspected);
-        IgnoredAny::deserialize(&mut deserializer).and_then(|_| deserializer.end())
+        if let Some(collector) =
+            memory_context.filter(|_| conversation_member(&plan.path).is_some())
+        {
+            ConversationArraySeed {
+                collector,
+                source_path: &plan.path,
+            }
+            .deserialize(&mut deserializer)
+            .and_then(|()| deserializer.end())
+        } else {
+            IgnoredAny::deserialize(&mut deserializer).and_then(|_| deserializer.end())
+        }
     } else {
         io::copy(&mut inspected, &mut io::sink())
             .map(|_| ())
@@ -2157,6 +2370,314 @@ fn stream_entry<M: ResourceMonitor + ?Sized>(
         sha256: inspected.sha256,
         directory: plan.directory,
     })
+}
+
+#[derive(Default)]
+struct MemoryContextCollector {
+    conversations: Vec<PendingConversationContext>,
+    context_bytes: usize,
+    message_count: usize,
+}
+
+struct PendingConversationContext {
+    source_path: String,
+    conversation_index: u64,
+    title: String,
+    messages: Vec<ChatGptConversationMessage>,
+}
+
+impl MemoryContextCollector {
+    fn is_full(&self) -> bool {
+        self.conversations.len() >= MAX_MEMORY_CONTEXT_CONVERSATIONS
+            || self.message_count >= MAX_MEMORY_CONTEXT_MESSAGES
+            || self.context_bytes >= MAX_MEMORY_CONTEXT_BYTES
+    }
+
+    fn push(&mut self, source_path: &str, conversation_index: u64, value: &serde_json::Value) {
+        if self.is_full() {
+            return;
+        }
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        let title = object
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| truncate_utf8(value, MAX_MEMORY_CONTEXT_TITLE_BYTES))
+            .unwrap_or_default();
+        let Some(mapping) = object.get("mapping").and_then(serde_json::Value::as_object) else {
+            return;
+        };
+        let Some(mut node_id) = object
+            .get("current_node")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let mut visited = HashSet::new();
+        let mut messages = Vec::new();
+        while messages.len() < MAX_MEMORY_CONTEXT_MESSAGES_PER_CONVERSATION {
+            if !visited.insert(node_id) {
+                return;
+            }
+            let Some(node) = mapping.get(node_id).and_then(serde_json::Value::as_object) else {
+                return;
+            };
+            if let Some(message) = memory_message(node) {
+                messages.push(message);
+            }
+            let Some(parent) = node.get("parent") else {
+                break;
+            };
+            if parent.is_null() {
+                break;
+            }
+            let Some(parent) = parent.as_str() else {
+                return;
+            };
+            node_id = parent;
+        }
+        messages.reverse();
+
+        let mut accepted = Vec::new();
+        let mut bytes = title.len();
+        for message in messages {
+            if accepted.len() >= MAX_MEMORY_CONTEXT_MESSAGES_PER_CONVERSATION
+                || self.message_count + accepted.len() >= MAX_MEMORY_CONTEXT_MESSAGES
+            {
+                break;
+            }
+            let remaining = MAX_MEMORY_CONTEXT_BYTES
+                .saturating_sub(self.context_bytes)
+                .saturating_sub(bytes)
+                .saturating_sub(message.role.len());
+            if remaining == 0 {
+                break;
+            }
+            let text = truncate_utf8(
+                &message.text,
+                remaining.min(MAX_MEMORY_CONTEXT_MESSAGE_BYTES),
+            );
+            if text.is_empty() {
+                continue;
+            }
+            bytes = bytes
+                .saturating_add(message.role.len())
+                .saturating_add(text.len());
+            accepted.push(ChatGptConversationMessage {
+                role: message.role,
+                text,
+            });
+        }
+        if accepted.is_empty()
+            || self.context_bytes.saturating_add(bytes) > MAX_MEMORY_CONTEXT_BYTES
+        {
+            return;
+        }
+        self.context_bytes += bytes;
+        self.message_count += accepted.len();
+        self.conversations.push(PendingConversationContext {
+            source_path: source_path.to_owned(),
+            conversation_index,
+            title,
+            messages: accepted,
+        });
+    }
+
+    fn finish(self, catalog: &DeepZipCatalog) -> Result<DeepZipMemoryContext, ScanError> {
+        let mut conversations = Vec::with_capacity(self.conversations.len());
+        for pending in self.conversations {
+            let source_sha256 = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.path == pending.source_path && !entry.directory)
+                .map(|entry| entry.sha256)
+                .ok_or(ScanError::WorkerProtocol)?;
+            let mut context = ChatGptConversationContext {
+                source_path: pending.source_path,
+                source_sha256,
+                conversation_index: pending.conversation_index,
+                title: pending.title,
+                messages: pending.messages,
+                context_digest: [0; 32],
+            };
+            context.context_digest = memory_context_digest(&context);
+            conversations.push(context);
+        }
+        if conversations.is_empty() {
+            return Err(ScanError::UnsupportedArchiveLayout);
+        }
+        let catalog_digest = memory_catalog_digest(catalog);
+        let context_digest = memory_response_digest(
+            catalog.archive_bytes,
+            &catalog.archive_sha256,
+            &catalog_digest,
+            &conversations,
+        );
+        let context = DeepZipMemoryContext {
+            archive_bytes: catalog.archive_bytes,
+            archive_sha256: catalog.archive_sha256,
+            catalog_digest,
+            conversations,
+            context_bytes: u64::try_from(self.context_bytes)
+                .map_err(|_| ScanError::WorkerProtocol)?,
+            context_digest,
+        };
+        context
+            .is_valid()
+            .then_some(context)
+            .ok_or(ScanError::WorkerProtocol)
+    }
+}
+
+struct ConversationArraySeed<'a> {
+    collector: &'a mut MemoryContextCollector,
+    source_path: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for ConversationArraySeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ConversationArrayVisitor {
+            collector: self.collector,
+            source_path: self.source_path,
+        })
+    }
+}
+
+struct ConversationArrayVisitor<'a> {
+    collector: &'a mut MemoryContextCollector,
+    source_path: &'a str,
+}
+
+impl<'de> Visitor<'de> for ConversationArrayVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a ChatGPT conversation array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut index = 0_u64;
+        loop {
+            if self.collector.is_full() {
+                if sequence.next_element::<IgnoredAny>()?.is_none() {
+                    break;
+                }
+            } else {
+                let Some(value) = sequence.next_element::<serde_json::Value>()? else {
+                    break;
+                };
+                self.collector.push(self.source_path, index, &value);
+            }
+            index = index.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn memory_message(
+    node: &serde_json::Map<String, serde_json::Value>,
+) -> Option<ChatGptConversationMessage> {
+    let message = node.get("message")?.as_object()?;
+    let role = message.get("author")?.get("role")?.as_str()?;
+    if !matches!(role, "user" | "assistant") {
+        return None;
+    }
+    let parts = message.get("content")?.get("parts")?.as_array()?;
+    let mut text = String::new();
+    for part in parts
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|part| !part.is_empty())
+    {
+        if !text.is_empty() && text.len() < MAX_MEMORY_CONTEXT_MESSAGE_BYTES {
+            text.push('\n');
+        }
+        let remaining = MAX_MEMORY_CONTEXT_MESSAGE_BYTES.saturating_sub(text.len());
+        if remaining == 0 {
+            break;
+        }
+        text.push_str(&truncate_utf8(part, remaining));
+    }
+    if text.is_empty() || !allowed_text_controls(&text) {
+        return None;
+    }
+    Some(ChatGptConversationMessage {
+        role: role.to_owned(),
+        text,
+    })
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned()
+}
+
+fn memory_context_digest(context: &ChatGptConversationContext) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest_field(&mut digest, b"openopen-chatgpt-conversation-context-v1");
+    digest_field(&mut digest, context.source_path.as_bytes());
+    digest_field(&mut digest, &context.source_sha256);
+    digest_field(&mut digest, &context.conversation_index.to_be_bytes());
+    digest_field(&mut digest, context.title.as_bytes());
+    for message in &context.messages {
+        digest_field(&mut digest, message.role.as_bytes());
+        digest_field(&mut digest, message.text.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn memory_response_digest(
+    archive_bytes: u64,
+    archive_sha256: &[u8; 32],
+    catalog_digest: &[u8; 32],
+    conversations: &[ChatGptConversationContext],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest_field(&mut digest, b"openopen-chatgpt-memory-context-v1");
+    digest_field(&mut digest, &archive_bytes.to_be_bytes());
+    digest_field(&mut digest, archive_sha256);
+    digest_field(&mut digest, catalog_digest);
+    for context in conversations {
+        digest_field(&mut digest, &context.context_digest);
+    }
+    digest.finalize().into()
+}
+
+fn memory_catalog_digest(catalog: &DeepZipCatalog) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest_field(&mut digest, b"openopen-deep-zip-catalog-v1");
+    digest_field(&mut digest, &catalog.archive_bytes.to_be_bytes());
+    digest_field(&mut digest, &catalog.archive_sha256);
+    digest_field(&mut digest, &catalog.total_compressed_bytes.to_be_bytes());
+    digest_field(&mut digest, &catalog.total_expanded_bytes.to_be_bytes());
+    for entry in &catalog.entries {
+        digest_field(&mut digest, entry.path.as_bytes());
+        digest_field(&mut digest, &entry.compressed_bytes.to_be_bytes());
+        digest_field(&mut digest, &entry.expanded_bytes.to_be_bytes());
+        digest_field(&mut digest, &entry.sha256);
+        digest_field(&mut digest, &[u8::from(entry.directory)]);
+    }
+    digest.finalize().into()
+}
+
+fn digest_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(bytes);
 }
 
 struct InspectedEntry {
