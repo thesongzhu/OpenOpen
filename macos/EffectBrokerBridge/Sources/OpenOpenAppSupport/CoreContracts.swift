@@ -2369,8 +2369,13 @@ public struct ChoiceIMessageReplyPreview: Codable, Equatable, Sendable {
   public func validated() throws -> Self {
     guard ChoiceLoopContract.identifier(replyId), previewRevision > 0,
       destination == "Your selected iMessage self-chat",
-      !visibleBody.isEmpty, visibleBody.utf8.count <= 8_000,
-      !visibleBody.utf8.contains(0), ChoiceLoopContract.sha256(confirmationDigest)
+      !visibleBody.isEmpty,
+      visibleBody == visibleBody.trimmingCharacters(in: .whitespacesAndNewlines),
+      visibleBody.hasPrefix("OpenOpen · AI\n"), !visibleBody.contains("\r"),
+      visibleBody.unicodeScalars.count <= 2_000,
+      !visibleBody.unicodeScalars.contains(where: { scalar in
+        scalar.value != 0x0A && CharacterSet.controlCharacters.contains(scalar)
+      }), ChoiceLoopContract.sha256(confirmationDigest)
     else {
       throw CoreClientError.contractViolation("Core returned an invalid iMessage reply preview.")
     }
@@ -2383,7 +2388,7 @@ public struct ChoiceIMessageReplyPrepareResponse: Codable, Equatable, Sendable {
   public let status: String
 
   public func validated() throws -> Self {
-    guard ["prepared", "authorized", "delivered"].contains(status) else {
+    guard ["prepared", "authorized", "delivered", "verified"].contains(status) else {
       throw CoreClientError.contractViolation("Core returned an invalid iMessage reply state.")
     }
     _ = try preview.validated()
@@ -2414,7 +2419,7 @@ public struct ChoiceIMessageReplyResponse: Codable, Equatable, Sendable {
   public let recoveryOnly: Bool?
 
   public func validated() throws -> Self {
-    guard status == "sent" || status == "needYou",
+    guard status == "accepted" || status == "verified" || status == "needYou",
       status == "needYou" ? recoveryOnly == true : recoveryOnly == nil
     else {
       throw CoreClientError.contractViolation("Core returned an invalid iMessage reply result.")

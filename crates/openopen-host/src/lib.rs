@@ -1880,6 +1880,7 @@ impl Host {
         ));
     }
 
+    #[allow(clippy::too_many_lines)] // One-shot authority, recover-only, and audit paths stay co-located.
     fn authorize_choice_imessage_reply(
         &mut self,
         request: &RpcRequest,
@@ -1891,6 +1892,19 @@ impl Host {
         };
         let Some(operation) = self.begin_operation(request.id, &params.proof(), responses) else {
             return;
+        };
+        let handle = match self.choice_imessage_send_handle_or_delivered(&params) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(success(request.id, json!({"status": "accepted"})));
+                return;
+            }
+            Err(error) => {
+                self.finish_operation(&operation);
+                let _ = responses.send(call_failure(request.id, &error));
+                return;
+            }
         };
         let started = self.store.authorize_choice_imessage_reply(
             &params.reply_id,
@@ -1909,19 +1923,9 @@ impl Host {
         };
         if start.disposition == ChoiceIMessageReplyDisposition::AlreadySent {
             self.finish_operation(&operation);
-            let _ = responses.send(success(request.id, json!({"status": "sent"})));
+            let _ = responses.send(success(request.id, json!({"status": "verified"})));
             return;
         }
-        let handle = self
-            .channels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .send_handle(ChannelKind::IMessage);
-        let Some(handle) = handle else {
-            self.finish_operation(&operation);
-            let _ = responses.send(call_failure(request.id, &HostCallError::ChannelUnavailable));
-            return;
-        };
         let context = self.background_context(params.proof());
         let responses = responses.clone();
         let request_id = request.id;
@@ -1968,7 +1972,7 @@ impl Host {
                             &provider_message_id,
                             now_ms()?,
                         )?;
-                        Ok(json!({"status": "sent"}))
+                        Ok(json!({"status": "accepted"}))
                     })();
                     recorded.map_or_else(
                         |error| call_failure(request_id, &error),
@@ -1983,6 +1987,35 @@ impl Host {
             context.finish_operation(&operation);
             let _ = responses.send(response);
         });
+    }
+
+    /// Preflights one exact self-chat handle without consuming its approval.
+    /// `None` means that the exact reply was already durably delivered.
+    fn choice_imessage_send_handle_or_delivered(
+        &self,
+        params: &AuthorizeChoiceIMessageReply,
+    ) -> Result<Option<channels::ChannelSendHandle>, HostCallError> {
+        let handle = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_handle(ChannelKind::IMessage);
+        if let Some(handle) = handle {
+            return Ok(Some(handle));
+        }
+        let delivered = self
+            .store
+            .choice_imessage_reply_is_delivered(
+                &params.reply_id,
+                params.preview_revision,
+                &params.confirmation_digest,
+            )
+            .map_err(HostCallError::Store)?;
+        if delivered {
+            Ok(None)
+        } else {
+            Err(HostCallError::ChannelUnavailable)
+        }
     }
 
     fn channel_status(&self, request: &RpcRequest, responses: &Sender<RpcResponse>) {
@@ -2468,9 +2501,21 @@ impl Host {
             cursor,
         } = event
         {
+            let verified_at_ms = match now_ms() {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finish_operation(&operation);
+                    let _ = responses.send(call_failure(request.id, &error));
+                    return;
+                }
+            };
             let result = self
                 .store
-                .verify_choice_imessage_reply_echo(&cursor.conversation_id, &provider_message_id)
+                .verify_choice_imessage_reply_echo(
+                    &cursor.conversation_id,
+                    &provider_message_id,
+                    verified_at_ms,
+                )
                 .and_then(|choice_verified| {
                     if choice_verified {
                         Ok(true)
@@ -14060,18 +14105,53 @@ for line in sys.stdin:
             host.store.prepare_choice_imessage_reply(&intent).unwrap(),
             (intent.preview.clone(), "prepared".to_owned())
         );
-        let first = host
-            .store
-            .authorize_choice_imessage_reply(
-                &intent.preview.reply_id,
-                intent.preview.preview_revision,
-                &intent.preview.confirmation_digest,
-                true,
-                21,
-            )
-            .unwrap();
+        // A disconnected Host must use this exact read-only preflight and
+        // leave the first local approval available for a later connected
+        // retry. The production path obtains the send handle before invoking
+        // the consuming Store transition.
+        assert!(
+            !host
+                .store
+                .choice_imessage_reply_is_delivered(
+                    &intent.preview.reply_id,
+                    intent.preview.preview_revision,
+                    &intent.preview.confirmation_digest,
+                )
+                .unwrap()
+        );
+        host.operations.accept_committed_runtime(true, on.revision);
+        install_test_core_lease(&mut host);
+        let challenge = runtime_challenge(&mut host, 90);
+        let disconnected = request(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "choice.imessage.reply.authorize",
+                "params": {
+                    "replyId": intent.preview.reply_id,
+                    "previewRevision": intent.preview.preview_revision,
+                    "confirmationDigest": intent.preview.confirmation_digest,
+                    "explicitlyApproved": true,
+                    "authorization": on,
+                    "brokerReceipt": broker_receipt(&on, Some(&challenge)),
+                }
+            })
+            .to_string(),
+        );
+        assert!(disconnected.error.is_some());
+        // The unavailable preflight must not consume the one local approval.
         assert_eq!(
-            first.disposition,
+            host.store
+                .authorize_choice_imessage_reply(
+                    &intent.preview.reply_id,
+                    intent.preview.preview_revision,
+                    &intent.preview.confirmation_digest,
+                    true,
+                    21,
+                )
+                .unwrap()
+                .disposition,
             ChoiceIMessageReplyDisposition::ExecuteNow
         );
         let replay = host
@@ -14091,16 +14171,33 @@ for line in sys.stdin:
         host.store
             .record_choice_imessage_reply_delivery(&intent.preview.reply_id, "provider-guid-1", 23)
             .unwrap();
+        assert_eq!(
+            host.store
+                .authorize_choice_imessage_reply(
+                    &intent.preview.reply_id,
+                    intent.preview.preview_revision,
+                    &intent.preview.confirmation_digest,
+                    true,
+                    24,
+                )
+                .unwrap()
+                .disposition,
+            ChoiceIMessageReplyDisposition::RecoverOnly
+        );
         assert!(
             host.store
-                .verify_choice_imessage_reply_echo("42", "provider-guid-1")
+                .verify_choice_imessage_reply_echo("42", "provider-guid-1", 25)
                 .unwrap()
         );
         assert!(
-            !host
-                .store
-                .verify_choice_imessage_reply_echo("43", "provider-guid-1")
+            host.store
+                .verify_choice_imessage_reply_echo("42", "provider-guid-1", 26)
                 .unwrap()
+        );
+        assert!(
+            host.store
+                .verify_choice_imessage_reply_echo("43", "provider-guid-1", 27)
+                .is_err()
         );
         let delivered = host
             .store
@@ -14109,7 +14206,7 @@ for line in sys.stdin:
                 intent.preview.preview_revision,
                 &intent.preview.confirmation_digest,
                 true,
-                24,
+                28,
             )
             .unwrap();
         assert_eq!(
@@ -14123,7 +14220,7 @@ for line in sys.stdin:
                     intent.preview.preview_revision,
                     &"f".repeat(64),
                     true,
-                    25,
+                    29,
                 )
                 .is_err()
         );

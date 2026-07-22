@@ -2424,7 +2424,9 @@ impl ChoiceIMessageReplyPreview {
             && self.destination == "Your selected iMessage self-chat"
             && !self.visible_body.trim().is_empty()
             && self.visible_body == self.visible_body.trim()
-            && self.visible_body.len() <= 8_000
+            && self.visible_body.starts_with("OpenOpen · AI\n")
+            && !self.visible_body.contains('\r')
+            && self.visible_body.chars().count() <= 2_000
             && !self
                 .visible_body
                 .chars()
@@ -3732,9 +3734,9 @@ mod choice_contract_tests {
     use super::{
         BatchSealReason, CHOICE_BATCH_HARD_WINDOW_MS, CHOICE_BATCH_QUIET_WINDOW_MS,
         CHOICE_SESSION_SOFT_IDLE_MS, CHOICE_SESSION_STALE_REVIEW_MS,
-        ChoiceConsolidatedConfirmation, ChoiceOption, ChoiceReminderItem,
-        ChoiceReminderScheduleInput, ChoiceSession, ChoiceSessionState, ChoiceSet,
-        ConversationTurnBatch, DocumentManifest, DocumentManifestEntry, ModelProvenance,
+        ChoiceConsolidatedConfirmation, ChoiceIMessageReplyPreview, ChoiceOption,
+        ChoiceReminderItem, ChoiceReminderScheduleInput, ChoiceSession, ChoiceSessionState,
+        ChoiceSet, ConversationTurnBatch, DocumentManifest, DocumentManifestEntry, ModelProvenance,
         ModelSelectionState, canonical_document_manifest_digest, sha256_hex,
     };
 
@@ -3792,6 +3794,32 @@ mod choice_contract_tests {
             ..valid
         };
         assert!(!invalid_count.is_valid());
+    }
+
+    #[test]
+    fn choice_imessage_reply_preview_enforces_the_canonical_wire_boundary() {
+        let preview = ChoiceIMessageReplyPreview {
+            reply_id: "choice-imessage-reply-1".to_owned(),
+            preview_revision: 1,
+            destination: "Your selected iMessage self-chat".to_owned(),
+            visible_body: "OpenOpen · AI\nA — Review".to_owned(),
+            confirmation_digest: "a".repeat(64),
+        };
+        assert!(preview.is_valid());
+        for body in [
+            "A — missing prefix".to_owned(),
+            "OpenOpen · AI\r\nA — noncanonical newline".to_owned(),
+            "OpenOpen · AI\nA — control\u{0007}".to_owned(),
+            format!("OpenOpen · AI\n{}", "a".repeat(2_001)),
+        ] {
+            assert!(
+                !ChoiceIMessageReplyPreview {
+                    visible_body: body,
+                    ..preview.clone()
+                }
+                .is_valid()
+            );
+        }
     }
 
     #[test]
