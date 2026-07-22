@@ -400,20 +400,24 @@ private struct EditorialMessagesView: View {
 
         if let preview = model.choiceIMessageReplyPreview {
           EditorialCard(
-            title: model.choiceIMessageReplyStatus == "delivered" ? "Reply sent" : "Reply ready",
-            symbol: model.choiceIMessageReplyStatus == "delivered"
+            title: ["accepted", "verified"].contains(model.choiceIMessageReplyStatus)
+              ? "Reply sent" : "Reply ready",
+            symbol: ["accepted", "verified"].contains(model.choiceIMessageReplyStatus)
               ? "checkmark.circle" : "arrowshape.turn.up.left"
           ) {
             Text(preview.destination).font(.caption).foregroundStyle(.secondary)
             Text(preview.visibleBody)
               .textSelection(.enabled)
               .accessibilityIdentifier("openopen-messages-reply-body")
-            if model.choiceIMessageReplyStatus == "delivered" {
+            if model.choiceIMessageReplyStatus == "verified" {
               Text("Sent and verified")
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("openopen-messages-reply-delivered")
             } else {
-              Button(model.choiceIMessageReplyStatus == "authorized" ? "Verify delivery" : "Send") {
+              Button(
+                ["authorized", "accepted"].contains(model.choiceIMessageReplyStatus)
+                  ? "Verify delivery" : "Send"
+              ) {
                 Task { await model.authorizeCurrentChoiceIMessageReply() }
               }
               .buttonStyle(.borderedProminent)
@@ -1079,13 +1083,13 @@ private struct DashboardView: View {
               Text(preview.visibleBody)
                 .textSelection(.enabled)
                 .accessibilityIdentifier("openopen-choice-imessage-reply-body")
-              if model.choiceIMessageReplyStatus == "delivered" {
+              if model.choiceIMessageReplyStatus == "verified" {
                 Text("Sent and verified")
                   .foregroundStyle(.secondary)
                   .accessibilityIdentifier("openopen-choice-imessage-reply-delivered")
               } else {
                 Button(
-                  model.choiceIMessageReplyStatus == "authorized"
+                  ["authorized", "accepted"].contains(model.choiceIMessageReplyStatus)
                     ? "Verify delivery" : "Send reply"
                 ) {
                   Task { await model.authorizeCurrentChoiceIMessageReply() }

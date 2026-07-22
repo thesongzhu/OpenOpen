@@ -68,6 +68,7 @@ const CHOICE_BODY_RETIREMENT_ACTION: &str = "choice.private_body_retired";
 const CHOICE_IMESSAGE_REPLY_PREPARED_ACTION: &str = "choice.imessage_reply_prepared";
 const CHOICE_IMESSAGE_REPLY_AUTHORIZED_ACTION: &str = "choice.imessage_reply_authorized";
 const CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION: &str = "choice.imessage_reply_delivered";
+const CHOICE_IMESSAGE_REPLY_VERIFIED_ACTION: &str = "choice.imessage_reply_verified";
 const CHOICE_MARKDOWN_RENDER_INTENT_ACTION: &str = "choice.markdown_render_intent";
 const CHOICE_MARKDOWN_RENDER_RECEIPT_ACTION: &str = "choice.markdown_render_receipt";
 const CHOICE_REMINDER_SCHEDULE_ACTION: &str = "choice.reminder_schedule_selected";
@@ -6963,8 +6964,10 @@ impl Store {
             return Err(StoreError::ChannelOutboundConflict);
         }
         let disposition = match status.as_str() {
-            "delivered" => ChoiceIMessageReplyDisposition::AlreadySent,
-            "authorized" => ChoiceIMessageReplyDisposition::RecoverOnly,
+            // An adapter acceptance is not an echo verification. It remains
+            // recover-only until the exact self-chat GUID is observed.
+            "verified" => ChoiceIMessageReplyDisposition::AlreadySent,
+            "authorized" | "delivered" => ChoiceIMessageReplyDisposition::RecoverOnly,
             "prepared" => {
                 require_runtime_enabled(
                     &transaction,
@@ -7024,6 +7027,36 @@ impl Store {
         })
     }
 
+    /// Reports whether one exact reply is already durably delivered without
+    /// consuming any local approval. This lets the Host fail a disconnected
+    /// first-send preflight before transitioning `prepared` to `authorized`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing, tampered, or differently bound reply.
+    pub fn choice_imessage_reply_is_delivered(
+        &self,
+        reply_id: &str,
+        preview_revision: u64,
+        confirmation_digest: &str,
+    ) -> Result<bool, StoreError> {
+        verified_audit_tail(&self.connection, &self.authority)?;
+        verify_all_bindings(
+            &self.connection,
+            &self.authority,
+            self.trusted_broker.as_ref(),
+        )?;
+        let (intent, status, _) =
+            load_choice_imessage_reply_by_id(&self.connection, &self.authority, reply_id)?
+                .ok_or(StoreError::ChannelOutboundConflict)?;
+        if intent.preview.preview_revision != preview_revision
+            || intent.preview.confirmation_digest != confirmation_digest
+        {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        Ok(status == "delivered" || status == "verified")
+    }
+
     /// Records the provider GUID returned by the single authorized send. An
     /// uncertain result intentionally leaves the row authorized/recover-only.
     ///
@@ -7049,7 +7082,7 @@ impl Store {
         let (intent, status, existing_provider) =
             load_choice_imessage_reply_by_id(&transaction, &self.authority, reply_id)?
                 .ok_or(StoreError::ChannelOutboundConflict)?;
-        if status == "delivered" {
+        if status == "delivered" || status == "verified" {
             return (existing_provider.as_deref() == Some(provider_message_id))
                 .then_some(intent)
                 .ok_or(StoreError::ChannelOutboundConflict);
@@ -7088,21 +7121,23 @@ impl Store {
     ///
     /// Returns an error when durable reply or audit bindings are invalid.
     pub fn verify_choice_imessage_reply_echo(
-        &self,
+        &mut self,
         conversation_id: &str,
         provider_message_id: &str,
+        verified_at_ms: i64,
     ) -> Result<bool, StoreError> {
-        verified_audit_tail(&self.connection, &self.authority)?;
-        verify_all_bindings(
-            &self.connection,
-            &self.authority,
-            self.trusted_broker.as_ref(),
-        )?;
-        let row: Option<String> = self
+        if verified_at_ms < 0 {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verified_audit_tail(&transaction, &self.authority)?;
+        verify_all_bindings(&transaction, &self.authority, self.trusted_broker.as_ref())?;
+        let row: Option<String> = transaction
             .query_row(
                 "SELECT reply_id FROM choice_imessage_reply
-                 WHERE status_json = 'delivered' AND provider_message_id = ?1",
+                 WHERE status_json IN ('delivered', 'verified') AND provider_message_id = ?1",
                 [provider_message_id],
                 |row| row.get(0),
             )
@@ -7110,12 +7145,40 @@ impl Store {
         let Some(reply_id) = row else {
             return Ok(false);
         };
-        let Some((intent, _, _)) =
-            load_choice_imessage_reply_by_id(&self.connection, &self.authority, &reply_id)?
+        let Some((intent, status, _)) =
+            load_choice_imessage_reply_by_id(&transaction, &self.authority, &reply_id)?
         else {
             return Ok(false);
         };
-        Ok(intent.pairing.conversation_id == conversation_id)
+        if intent.pairing.conversation_id != conversation_id {
+            return Err(StoreError::ChannelOutboundConflict);
+        }
+        if status == "verified" {
+            return Ok(true);
+        }
+        append_audit(
+            &transaction,
+            &self.authority,
+            &AuditRecord {
+                id: &format!("choice-imessage-reply-verified-{reply_id}"),
+                command_id: &reply_id,
+                command_hash: &intent.canonical_payload_sha256,
+                actor: "imessage",
+                action: CHOICE_IMESSAGE_REPLY_VERIFIED_ACTION,
+                entity_id: &reply_id,
+                created_at_ms: verified_at_ms,
+                state_kind: "choice:imessage_reply",
+                state_hash: &blob_hash(provider_message_id.as_bytes()),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE choice_imessage_reply
+             SET status_json = 'verified'
+             WHERE reply_id = ?1 AND status_json = 'delivered'",
+            params![reply_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Persists the one owner-confirmed V1 pairing for a channel. Exact retries
@@ -12487,7 +12550,11 @@ fn load_choice_imessage_reply_by_id(
             if stored_hash != blob_hash(&blob) {
                 return Err(StoreError::ChannelOutboundConflict);
             }
-            if status != "prepared" && status != "authorized" && status != "delivered" {
+            if status != "prepared"
+                && status != "authorized"
+                && status != "delivered"
+                && status != "verified"
+            {
                 return Err(StoreError::ChannelOutboundConflict);
             }
             let action = if status == "prepared" {
@@ -12517,35 +12584,62 @@ fn load_choice_imessage_reply_by_id(
                 || intent.preview.preview_revision != preview_revision
                 || intent.preview.confirmation_digest != confirmation_digest
                 || (status == "prepared" && intent.approved_at_ms.is_some())
-                || ((status == "authorized" || status == "delivered")
+                || ((status == "authorized" || status == "delivered" || status == "verified")
                     && intent.approved_at_ms.is_none())
-                || (status == "delivered") != provider.is_some()
+                || ((status == "delivered" || status == "verified") != provider.is_some())
             {
                 return Err(StoreError::ChannelOutboundConflict);
             }
-            if let Some(provider_message_id) = provider.as_deref() {
-                let audit_binding: Option<(String, String)> = connection
-                    .query_row(
-                        "SELECT state_kind, state_hash FROM audit_ledger
-                     WHERE action = ?1 AND entity_id = ?2
-                     ORDER BY sequence DESC LIMIT 1",
-                        params![CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION, reply_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                if audit_binding
-                    != Some((
-                        "choice:imessage_reply".to_owned(),
-                        blob_hash(provider_message_id.as_bytes()),
-                    ))
-                {
-                    return Err(StoreError::ChannelOutboundConflict);
-                }
-            }
+            verify_choice_imessage_reply_delivery_audits(
+                connection,
+                reply_id,
+                &status,
+                provider.as_deref(),
+            )?;
             Ok((intent, status, provider))
         },
     )
     .transpose()
+}
+
+fn verify_choice_imessage_reply_delivery_audits(
+    connection: &Connection,
+    reply_id: &str,
+    status: &str,
+    provider_message_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(provider_message_id) = provider_message_id else {
+        return Ok(());
+    };
+    let state_hash = blob_hash(provider_message_id.as_bytes());
+    let delivered: Option<(String, String)> = connection
+        .query_row(
+            "SELECT state_kind, state_hash FROM audit_ledger
+             WHERE action = ?1 AND entity_id = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![CHOICE_IMESSAGE_REPLY_DELIVERED_ACTION, reply_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if delivered != Some(("choice:imessage_reply".to_owned(), state_hash.clone())) {
+        return Err(StoreError::ChannelOutboundConflict);
+    }
+    if status == "verified"
+        && connection
+            .query_row(
+                "SELECT 1 FROM audit_ledger
+                 WHERE action = ?1 AND entity_id = ?2
+                   AND state_kind = 'choice:imessage_reply' AND state_hash = ?3
+                 ORDER BY sequence DESC LIMIT 1",
+                params![CHOICE_IMESSAGE_REPLY_VERIFIED_ACTION, reply_id, state_hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+    {
+        return Err(StoreError::ChannelOutboundConflict);
+    }
+    Ok(())
 }
 
 fn load_choice_imessage_reply_by_source(

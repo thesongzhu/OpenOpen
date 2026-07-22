@@ -70,6 +70,48 @@ func choiceIMessageReplyPreviewIsExactAndRejectsHiddenOrMalformedAuthorityFields
   #expect(object["recipient"] == nil)
   #expect(object["channel"] == nil)
   #expect(object["sessionId"] == nil)
+
+  for invalidBody in [
+    "A — missing the OpenOpen prefix",
+    "OpenOpen · AI\r\nA — noncanonical newline",
+    "OpenOpen · AI\nA — control\u{0007}",
+    "OpenOpen · AI\n" + String(repeating: "a", count: 2_001),
+  ] {
+    let invalid = ChoiceIMessageReplyPreview(
+      replyId: preview.replyId,
+      previewRevision: preview.previewRevision,
+      destination: preview.destination,
+      visibleBody: invalidBody,
+      confirmationDigest: preview.confirmationDigest
+    )
+    #expect(throws: CoreClientError.self) { try invalid.validated() }
+  }
+}
+
+@Test
+func choiceIMessageReplyResponseSeparatesAdapterAcceptanceFromVerifiedEcho() throws {
+  let accepted = ChoiceIMessageReplyResponse(status: "accepted", recoveryOnly: nil)
+  let verified = ChoiceIMessageReplyResponse(status: "verified", recoveryOnly: nil)
+  #expect(
+    try accepted.validated().status == "accepted")
+  #expect(
+    try verified.validated().status == "verified")
+  #expect(throws: CoreClientError.self) {
+    try ChoiceIMessageReplyResponse(status: "sent", recoveryOnly: nil).validated()
+  }
+}
+
+@Test
+func choiceIMessageReplyPrepareRestoresDurablyVerifiedEcho() throws {
+  let preview = ChoiceIMessageReplyPreview(
+    replyId: "reply-verified",
+    previewRevision: 7,
+    destination: "Your selected iMessage self-chat",
+    visibleBody: "OpenOpen · AI\nA. Continue",
+    confirmationDigest: String(repeating: "a", count: 64))
+  #expect(
+    try ChoiceIMessageReplyPrepareResponse(preview: preview, status: "verified")
+      .validated().status == "verified")
 }
 
 @MainActor
@@ -1081,7 +1123,7 @@ private actor MockCore: CoreServing {
     _ preview: ChoiceIMessageReplyPreview, proof _: BrokerRuntimeState
   ) -> ChoiceIMessageReplyResponse {
     choiceIMessageReplyAuthorizations.append(preview)
-    return ChoiceIMessageReplyResponse(status: "sent", recoveryOnly: nil)
+    return ChoiceIMessageReplyResponse(status: "accepted", recoveryOnly: nil)
   }
 
   func personaStatus() -> PersonaStatusView? { personaStatusResponse }
