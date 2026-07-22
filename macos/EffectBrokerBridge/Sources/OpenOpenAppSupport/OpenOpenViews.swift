@@ -400,7 +400,8 @@ private struct EditorialMessagesView: View {
 
         if let preview = model.choiceIMessageReplyPreview {
           EditorialCard(
-            title: ["accepted", "verified"].contains(model.choiceIMessageReplyStatus) ? "Reply sent" : "Reply ready",
+            title: ["accepted", "verified"].contains(model.choiceIMessageReplyStatus)
+              ? "Reply sent" : "Reply ready",
             symbol: ["accepted", "verified"].contains(model.choiceIMessageReplyStatus)
               ? "checkmark.circle" : "arrowshape.turn.up.left"
           ) {
@@ -413,7 +414,10 @@ private struct EditorialMessagesView: View {
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("openopen-messages-reply-delivered")
             } else {
-              Button(["authorized", "accepted"].contains(model.choiceIMessageReplyStatus) ? "Verify delivery" : "Send") {
+              Button(
+                ["authorized", "accepted"].contains(model.choiceIMessageReplyStatus)
+                  ? "Verify delivery" : "Send"
+              ) {
                 Task { await model.authorizeCurrentChoiceIMessageReply() }
               }
               .buttonStyle(.borderedProminent)

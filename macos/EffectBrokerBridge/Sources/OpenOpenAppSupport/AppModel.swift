@@ -3627,12 +3627,13 @@ public final class AppModel: ObservableObject {
         choiceLoopSnapshot?.session.state == "active"
       else { return }
       choiceIMessageReplyPreview = preview
-      choiceIMessageReplyStatus = switch prepared.status {
-      case "prepared": nil
-      case "delivered": "accepted"
-      case "verified": "verified"
-      default: prepared.status
-      }
+      choiceIMessageReplyStatus =
+        switch prepared.status {
+        case "prepared": nil
+        case "delivered": "accepted"
+        case "verified": "verified"
+        default: prepared.status
+        }
     } catch {
       guard expectedGeneration == runtimeGeneration else { return }
       choiceIMessageReplyPreview = nil
@@ -3673,11 +3674,12 @@ public final class AppModel: ObservableObject {
       let response = try await core.authorizeChoiceIMessageReply(preview, proof: proof).validated()
       try requireCurrentOnGeneration(generation)
       guard choiceIMessageReplyPreview == preview else { return }
-      choiceIMessageReplyStatus = switch response.status {
-      case "accepted": "accepted"
-      case "verified": "verified"
-      default: "authorized"
-      }
+      choiceIMessageReplyStatus =
+        switch response.status {
+        case "accepted": "accepted"
+        case "verified": "verified"
+        default: "authorized"
+        }
       errorMessage =
         response.status == "needYou"
         ? "Need you: verify the existing iMessage reply before trying anything else."

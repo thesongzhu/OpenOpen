@@ -90,8 +90,12 @@ func choiceIMessageReplyPreviewIsExactAndRejectsHiddenOrMalformedAuthorityFields
 
 @Test
 func choiceIMessageReplyResponseSeparatesAdapterAcceptanceFromVerifiedEcho() throws {
-  #expect(try ChoiceIMessageReplyResponse(status: "accepted", recoveryOnly: nil).validated().status == "accepted")
-  #expect(try ChoiceIMessageReplyResponse(status: "verified", recoveryOnly: nil).validated().status == "verified")
+  let accepted = ChoiceIMessageReplyResponse(status: "accepted", recoveryOnly: nil)
+  let verified = ChoiceIMessageReplyResponse(status: "verified", recoveryOnly: nil)
+  #expect(
+    try accepted.validated().status == "accepted")
+  #expect(
+    try verified.validated().status == "verified")
   #expect(throws: CoreClientError.self) {
     try ChoiceIMessageReplyResponse(status: "sent", recoveryOnly: nil).validated()
   }
